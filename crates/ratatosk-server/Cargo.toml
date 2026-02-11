@@ -1,0 +1,52 @@
+[package]
+name = "ratatosk-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+ratatosk-core = { workspace = true }
+ratatosk-resp = { workspace = true }
+ratatosk-engine = { workspace = true }
+bytes = { workspace = true }
+mimalloc = { workspace = true, optional = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+mio = { workspace = true }
+tokio = { workspace = true }
+crossbeam-channel = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+hashbrown = { workspace = true }
+
+[lib]
+name = "ratatosk_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ratatosk"
+path = "src/main.rs"
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[[bench]]
+name = "hotpaths"
+harness = false
+
+[[bench]]
+name = "comprehensive"
+harness = false

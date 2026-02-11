@@ -1,0 +1,20 @@
+[package]
+name = "ratatosk-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ratatosk-core = { workspace = true }
+ratatosk-engine = { workspace = true }
+ratatosk-resp = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+crc = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skill Quality Gate"
+  short_description: "Create high-rigor skills with hard quality gates"
+  default_prompt: "Use $skill-quality-gate to create or upgrade this skill with strict lint+score pass criteria."

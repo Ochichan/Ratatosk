@@ -1,0 +1,28 @@
+name: Gap Ledger
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-gap-ledger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate Redis gap ledger
+        run: |
+          python3 scripts/redis_gap_ledger.py check \
+            --catalog docs/redis-command-catalog.json \
+            --ledger docs/redis-gap-ledger.json \
+            --markdown docs/redis-gap-ledger.md

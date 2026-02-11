@@ -1,0 +1,118 @@
+## Repo-local automatic triggers require one manual approval run.
+
+[[automations]]
+id = "fmt"
+title = "fmt"
+command = "nix develop . --command cargo fmt"
+trigger = "manual"
+confirm = true
+timeout_sec = 600
+
+[[automations]]
+id = "clippy"
+title = "clippy (all targets)"
+command = "nix develop . --command cargo clippy --all-targets --all-features -D warnings"
+trigger = "on_phase_diff"
+only_if_dirty = true
+confirm = false
+timeout_sec = 900
+max_parallel = 1
+
+[[automations]]
+id = "test"
+title = "tests"
+command = "nix develop . --command cargo test"
+trigger = "on_phase_apply"
+confirm = false
+timeout_sec = 1200
+max_parallel = 1
+
+[[automations]]
+id = "check"
+title = "check (workspace)"
+command = "nix develop . --command cargo check --all-targets"
+trigger = "on_stream_end"
+only_if_dirty = true
+confirm = false
+timeout_sec = 600
+max_parallel = 1
+
+[[automations]]
+id = "review-security"
+title = "review security (uncommitted)"
+command = "codex exec -o .command-center/review-security.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=high -c model_verbosity=medium -c model_instructions_file=.command-center/skills/security-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1800
+max_parallel = 1
+
+[[automations]]
+id = "review-stability"
+title = "review stability (uncommitted)"
+command = "codex exec -o .command-center/review-stability.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=high -c model_verbosity=medium -c model_instructions_file=.command-center/skills/stability-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1800
+max_parallel = 1
+
+[[automations]]
+id = "review-correctness"
+title = "review correctness (uncommitted)"
+command = "codex exec -o .command-center/review-correctness.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=high -c model_verbosity=medium -c model_instructions_file=.command-center/skills/correctness-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1800
+max_parallel = 1
+
+[[automations]]
+id = "review-test"
+title = "review test quality (uncommitted)"
+command = "codex exec -o .command-center/review-test.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=medium -c model_verbosity=medium -c model_instructions_file=.command-center/skills/test-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1500
+max_parallel = 1
+
+[[automations]]
+id = "review-perf"
+title = "review performance (uncommitted)"
+command = "codex exec -o .command-center/review-perf.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=medium -c model_verbosity=medium -c model_instructions_file=.command-center/skills/perf-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1500
+max_parallel = 1
+
+[[automations]]
+id = "review-ops"
+title = "review operational readiness (uncommitted)"
+command = "codex exec -o .command-center/review-ops.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=medium -c model_verbosity=medium -c model_instructions_file=.command-center/skills/ops-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1500
+max_parallel = 1
+
+[[automations]]
+id = "review-arch"
+title = "review architecture (uncommitted)"
+command = "codex exec -o .command-center/review-arch.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=medium -c model_verbosity=medium -c model_instructions_file=.command-center/skills/Arch-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1500
+max_parallel = 1
+
+[[automations]]
+id = "review-ui-ux"
+title = "review ui ux (uncommitted)"
+command = "codex exec -o .command-center/review-ui-ux.md review --uncommitted -m gpt-5.3-codex -c model_reasoning_effort=medium -c model_verbosity=medium -c model_instructions_file=.command-center/skills/ui-ux-review.md"
+trigger = "manual"
+only_if_dirty = true
+confirm = true
+timeout_sec = 1500
+max_parallel = 1

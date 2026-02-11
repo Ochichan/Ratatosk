@@ -1,0 +1,20 @@
+[package]
+name = "ratatosk-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ratatosk-core = { workspace = true }
+ratatosk-resp = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+smallvec = { workspace = true }
+rand = { workspace = true }
+argon2 = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+glob-match = { workspace = true }

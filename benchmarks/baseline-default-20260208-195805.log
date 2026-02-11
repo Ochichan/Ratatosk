@@ -1,0 +1,75 @@
+# Ratatosk baseline (20260208-195805)
+# profile: default allocator
+pipeline_set_parse_execute_encode/1
+                        time:   [432.21 ns 446.90 ns 468.32 ns]
+                        thrpt:  [2.1353 Melem/s 2.2377 Melem/s 2.3137 Melem/s]
+                 change:
+                        time:   [-8.7007% -3.7853% +1.6999%] (p = 0.20 > 0.05)
+                        thrpt:  [-1.6715% +3.9342% +9.5299%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+pipeline_set_parse_execute_encode/32
+                        time:   [12.877 µs 17.565 µs 23.281 µs]
+                        thrpt:  [1.3745 Melem/s 1.8218 Melem/s 2.4850 Melem/s]
+                 change:
+                        time:   [-62.464% -54.528% -43.919%] (p = 0.00 < 0.05)
+                        thrpt:  [+78.312% +119.92% +166.41%]
+                        Performance has improved.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+pipeline_set_parse_execute_encode/256
+                        time:   [99.934 µs 101.51 µs 103.61 µs]
+                        thrpt:  [2.4708 Melem/s 2.5219 Melem/s 2.5617 Melem/s]
+                 change:
+                        time:   [-0.9384% +0.0297% +1.0908%] (p = 0.96 > 0.05)
+                        thrpt:  [-1.0791% -0.0297% +0.9472%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+pipeline_set_parse_execute_encode/1024
+                        time:   [401.91 µs 404.58 µs 408.05 µs]
+                        thrpt:  [2.5095 Melem/s 2.5310 Melem/s 2.5479 Melem/s]
+                 change:
+                        time:   [+1.5262% +2.1495% +2.8119%] (p = 0.00 < 0.05)
+                        thrpt:  [-2.7350% -2.1042% -1.5033%]
+                        Performance has regressed.
+
+pipeline_ping_parse_execute_encode/1
+                        time:   [220.82 ns 225.17 ns 230.60 ns]
+                        thrpt:  [4.3365 Melem/s 4.4412 Melem/s 4.5286 Melem/s]
+                 change:
+                        time:   [-5.0388% +5.7764% +21.124%] (p = 0.52 > 0.05)
+                        thrpt:  [-17.440% -5.4610% +5.3062%]
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+pipeline_ping_parse_execute_encode/32
+                        time:   [3.8416 µs 3.8856 µs 3.9625 µs]
+                        thrpt:  [8.0757 Melem/s 8.2356 Melem/s 8.3299 Melem/s]
+                 change:
+                        time:   [-0.7274% +1.1258% +3.0874%] (p = 0.28 > 0.05)
+                        thrpt:  [-2.9949% -1.1133% +0.7328%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+pipeline_ping_parse_execute_encode/256
+                        time:   [50.585 µs 65.833 µs 77.826 µs]
+                        thrpt:  [3.2894 Melem/s 3.8886 Melem/s 5.0608 Melem/s]
+                 change:
+                        time:   [+113.84% +142.58% +162.42%] (p = 0.00 < 0.05)
+                        thrpt:  [-61.894% -58.776% -53.237%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
+pipeline_ping_parse_execute_encode/1024
+                        time:   [123.52 µs 211.80 µs 265.23 µs]
+                        thrpt:  [3.8608 Melem/s 4.8346 Melem/s 8.2904 Melem/s]
+                 change:
+                        time:   [+1.6591% +36.171% +80.409%] (p = 0.05 > 0.05)
+                        thrpt:  [-44.571% -26.563% -1.6321%]
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+
