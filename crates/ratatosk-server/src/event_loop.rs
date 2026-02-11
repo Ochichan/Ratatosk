@@ -1,0 +1,346 @@
+use std::{io, sync::Arc, time::Duration};
+
+use ratatosk_core::time::now_ms;
+use ratatosk_engine::{
+    eviction::{EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction},
+    expiry::active_expire_cycle,
+    keyspace::ServerState,
+};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+    time::timeout,
+};
+
+use crate::{
+    client::{ClientIoLimits, handle_client_with_limits},
+    config::ServerConfig,
+};
+
+const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy)]
+enum ShutdownSignal {
+    Interrupt,
+    Terminate,
+    #[cfg(not(unix))]
+    CtrlC,
+}
+
+fn is_transient_accept_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+    ) {
+        return true;
+    }
+
+    matches!(error.raw_os_error(), Some(11 | 23 | 24))
+}
+
+fn next_backoff(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(ACCEPT_ERROR_BACKOFF_MAX)
+        .min(ACCEPT_ERROR_BACKOFF_MAX)
+}
+
+fn is_expected_client_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = sigint.recv() => Ok(ShutdownSignal::Interrupt),
+        _ = sigterm.recv() => Ok(ShutdownSignal::Terminate),
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
+    tokio::signal::ctrl_c().await.map_err(io::Error::other)?;
+    Ok(ShutdownSignal::CtrlC)
+}
+
+async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
+    if tasks.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        active_clients = tasks.len(),
+        grace_ms = grace_period.as_millis(),
+        "waiting for active client handlers to drain"
+    );
+
+    let drain = async {
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                if error.is_cancelled() {
+                    tracing::debug!("client task cancelled during shutdown");
+                } else {
+                    tracing::warn!(error = %error, "client task join failure during shutdown");
+                }
+            }
+        }
+    };
+
+    if timeout(grace_period, drain).await.is_ok() {
+        tracing::info!("all client handlers drained before shutdown deadline");
+        return;
+    }
+
+    let remaining = tasks.len();
+    tracing::warn!(
+        remaining_clients = remaining,
+        "shutdown grace period expired; aborting remaining client handlers"
+    );
+    tasks.abort_all();
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                tracing::warn!(error = %error, "client task join failure after abort");
+            }
+        }
+    }
+}
+
+/// Build eviction config from current server config state.
+fn build_eviction_config(state: &ServerState) -> EvictionConfig {
+    let policy = EvictionPolicy::from_config_str(state.config.maxmemory_policy())
+        .unwrap_or(EvictionPolicy::NoEviction);
+    EvictionConfig {
+        policy,
+        maxmemory: state.config.maxmemory(),
+        maxmemory_samples: state.config.maxmemory_samples(),
+    }
+}
+
+/// server_cron housekeeping — called at `hz` frequency.
+///
+/// 1. Active expiry cycle (sampling-based)
+/// 2. Eviction check (maxmemory)
+async fn server_cron(server_state: &Arc<Mutex<ServerState>>) {
+    let mut server = server_state.lock().await;
+    let current_ms = now_ms();
+
+    // 1. Active expiry cycle
+    let expired = active_expire_cycle(&mut server, current_ms);
+    if expired > 0 {
+        tracing::debug!(expired, "active expiry cycle removed keys");
+    }
+
+    // 2. Eviction check
+    let eviction_config = build_eviction_config(&server);
+    if eviction_config.maxmemory > 0 {
+        let used = estimate_used_memory(&server);
+        if needs_eviction(used, &eviction_config) {
+            let evicted = perform_eviction(&mut server, &eviction_config);
+            if evicted > 0 {
+                tracing::info!(
+                    evicted,
+                    policy = eviction_config.policy.as_str(),
+                    "eviction cycle removed keys"
+                );
+            }
+        }
+    }
+}
+
+pub async fn run(config: ServerConfig) -> io::Result<()> {
+    let listener = TcpListener::bind(config.listen_addr()).await?;
+
+    // Lazy-free background thread for async deletion of large values
+    let (lazy_free_tx, lazy_free_rx) =
+        crossbeam_channel::bounded::<ratatosk_engine::keyspace::StoredValue>(4096);
+    let lazy_free_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lazy_free_flag = Arc::clone(&lazy_free_shutdown);
+    let lazy_free_handle = std::thread::spawn(move || {
+        while !lazy_free_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            match lazy_free_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(value) => drop(value),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        // Drain remaining values
+        for value in lazy_free_rx.try_iter() {
+            drop(value);
+        }
+    });
+
+    let mut initial_state = ServerState::with_default_dbs();
+    initial_state.set_lazy_free_sender(lazy_free_tx);
+    let server_state = Arc::new(Mutex::new(initial_state));
+    let client_permits = Arc::new(Semaphore::new(config.max_clients));
+    let io_limits = ClientIoLimits {
+        output_buffer_limit_bytes: config.output_buffer_limit_bytes,
+    };
+
+    let mut shutdown = Box::pin(wait_for_shutdown_signal());
+    let mut client_tasks: JoinSet<()> = JoinSet::new();
+    let mut accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+
+    // server_cron timer — default 10 Hz
+    let cron_hz = {
+        let server = server_state.lock().await;
+        server.config.hz()
+    };
+    let cron_period = Duration::from_millis(1000 / u64::from(cron_hz.max(1)));
+    let mut cron_interval = tokio::time::interval(cron_period);
+    cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // SIGUSR1 signal handler (Unix only) for triggering RDB save
+    #[cfg(unix)]
+    let mut sigusr1 = {
+        use tokio::signal::unix::{SignalKind, signal};
+        signal(SignalKind::user_defined1())?
+    };
+
+    loop {
+        // Wrap SIGUSR1 as a future that resolves to a flag.
+        // On non-unix, use a pending future that never resolves.
+        #[cfg(unix)]
+        let sigusr1_recv = sigusr1.recv();
+        #[cfg(not(unix))]
+        let sigusr1_recv = std::future::pending::<Option<()>>();
+
+        tokio::select! {
+            signal = &mut shutdown => {
+                match signal {
+                    Ok(kind) => {
+                        tracing::info!(
+                            ?kind,
+                            grace_ms = config.shutdown_grace_period_ms,
+                            "shutdown signal received"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            grace_ms = config.shutdown_grace_period_ms,
+                            "failed to wait for shutdown signal; initiating shutdown"
+                        );
+                    }
+                }
+                break;
+            }
+            accepted = listener.accept() => {
+                let (stream, addr) = match accepted {
+                    Ok(accepted) => {
+                        accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+                        accepted
+                    }
+                    Err(error) if is_transient_accept_error(&error) => {
+                        tracing::warn!(
+                            error = %error,
+                            backoff_ms = accept_backoff.as_millis(),
+                            "transient accept error; retrying"
+                        );
+                        tokio::time::sleep(accept_backoff).await;
+                        accept_backoff = next_backoff(accept_backoff);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+
+                let permit: OwnedSemaphorePermit = match Arc::clone(&client_permits).try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            remote_addr = %addr,
+                            max_clients = config.max_clients,
+                            "rejecting connection: max concurrent client limit reached"
+                        );
+                        drop(stream);
+                        continue;
+                    }
+                };
+
+                let state = Arc::clone(&server_state);
+                let remote_addr = addr;
+                client_tasks.spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = handle_client_with_limits(stream, state, io_limits).await {
+                        if is_expected_client_disconnect(&error) {
+                            tracing::debug!(remote_addr = %remote_addr, error = %error, "client disconnected");
+                        } else {
+                            tracing::warn!(remote_addr = %remote_addr, error = %error, "client handler error");
+                        }
+                    }
+                });
+            }
+            _ = cron_interval.tick() => {
+                server_cron(&server_state).await;
+            }
+            _ = sigusr1_recv => {
+                tracing::info!("SIGUSR1 received: RDB save requested (persistence not yet implemented)");
+            }
+        }
+    }
+
+    client_permits.close();
+    let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
+    drain_client_tasks(&mut client_tasks, grace_period).await;
+
+    // Shut down lazy-free background thread
+    lazy_free_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Err(error) = lazy_free_handle.join() {
+        tracing::warn!("lazy-free thread panicked: {error:?}");
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use tokio::task::JoinSet;
+
+    use super::drain_client_tasks;
+
+    #[tokio::test]
+    async fn drain_client_tasks_completes_ready_tasks() {
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        tasks.spawn(async {});
+        tasks.spawn(async {});
+
+        drain_client_tasks(&mut tasks, Duration::from_millis(100)).await;
+
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_client_tasks_aborts_stuck_tasks_after_grace() {
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        tasks.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        let started_at = Instant::now();
+        drain_client_tasks(&mut tasks, Duration::from_millis(20)).await;
+
+        assert!(tasks.is_empty());
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+}

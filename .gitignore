@@ -1,0 +1,35 @@
+# Rust
+/target/
+*.rs.bk
+
+# Nix
+/result
+/result-*
+/.direnv/
+
+# Runtime data
+/data/
+*.rdb
+*.aof
+
+# IDE
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+*.profraw
+/coverage/
+
+# Claude Code
+/.claude/
+
+# Python cache
+__pycache__/
+*.pyc
