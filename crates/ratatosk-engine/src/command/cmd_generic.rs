@@ -12,6 +12,7 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{
     ServerState, StoredValue, StreamEntry, StreamId, purge_expired_key, purge_expired_keys,
 };
+use crate::security::next_audit_stamp;
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
@@ -170,12 +171,36 @@ pub(super) fn cmd_delex(
         _ => return CommandOutcome::reply(err("ERR syntax error")),
     };
 
-    if should_delete {
+    let removed = if should_delete {
         db.remove(key);
-        CommandOutcome::reply(RespFrame::Integer(1))
+        1
     } else {
-        CommandOutcome::reply(RespFrame::Integer(0))
-    }
+        0
+    };
+
+    let key_text = String::from_utf8_lossy(key).into_owned();
+    let payload = format!(
+        "event=DELEX client_id={} db={} key={} removed={}",
+        client.id(),
+        client.selected_db,
+        key_text,
+        removed
+    );
+    let stamp = next_audit_stamp("DELEX", &payload);
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "DELEX",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
+        client_id = client.id(),
+        db = client.selected_db,
+        key = %key_text,
+        removed,
+        "conditional delete executed"
+    );
+
+    CommandOutcome::reply(RespFrame::Integer(removed))
 }
 
 pub(super) fn cmd_digest(

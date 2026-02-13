@@ -24,45 +24,45 @@ pub(super) fn cmd_ping(args: &[Bytes], server: &ServerState) -> CommandOutcome {
 }
 
 fn generate_health_report(server: &ServerState) -> String {
-    // 1. Check connection capacity
-    let connected = server.stats.connected_clients();
-    let max_clients = server.config.maxmemory(); // Note: this might be wrong field, should be maxclients
-    let conn_status = if connected > 4000 { "degraded" } else { "ok" };
-    
-    // 2. Check RDB save status
+    let connected_clients = server.stats.connected_clients();
+
     let rdb_status = match server.last_rdb_save_status() {
         Some(Ok(())) => "ok",
         Some(Err(_)) => "error",
         None => "none",
     };
-    
-    // 3. Check AOF status
-    let aof_status = if server.aof_enabled() { 
-        "enabled" 
-    } else { 
-        "disabled" 
-    };
-    
-    // 4. Memory status
-    let memory = server.stats.cached_memory_estimate();
-    let maxmemory = server.config.maxmemory();
-    let memory_status = if maxmemory > 0 && memory > maxmemory as u64 {
+
+    let aof_enabled = server.aof_enabled();
+    let memory_used = server.stats.cached_memory_estimate();
+    let maxmemory = server.config.maxmemory() as u64;
+
+    let memory_status = if maxmemory == 0 {
+        "unbounded"
+    } else if memory_used > maxmemory {
         "critical"
-    } else if maxmemory > 0 && memory > (maxmemory as u64 * 9 / 10) {
+    } else if memory_used >= (maxmemory * 9 / 10) {
         "warning"
     } else {
         "ok"
     };
-    
+
+    let status = if memory_status == "critical" || rdb_status == "error" {
+        "degraded"
+    } else {
+        "ok"
+    };
+
+    let total_keys: usize = (0..server.db_count()).map(|idx| server.db(idx).len()).sum();
+
     format!(
-        "status:{}|connections:{}/{}|rdb:{}|aof:{}|memory:{}|uptime:{}",
-        conn_status,
-        connected,
-        max_clients,
-        rdb_status,
-        aof_status,
-        memory_status,
-        server.uptime_seconds()
+        "status:{status}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|uptime_seconds:{}",
+        server.db_count(),
+        total_keys,
+        server.rdb_save_in_progress(),
+        aof_enabled,
+        memory_used,
+        maxmemory,
+        server.uptime_seconds(),
     )
 }
 

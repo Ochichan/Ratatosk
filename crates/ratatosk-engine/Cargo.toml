@@ -19,3 +19,4 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 glob-match = { workspace = true }
+sha2 = { workspace = true }

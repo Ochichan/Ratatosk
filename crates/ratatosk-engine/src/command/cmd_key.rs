@@ -5,6 +5,7 @@ use bytes::Bytes;
 use crate::expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, TtlMode};
 use crate::keyspace::{ServerState, StoredValue, purge_expired_key, purge_expired_keys};
 use crate::object::parse_f64;
+use crate::security::next_audit_stamp;
 use glob_match::glob_match;
 use ratatosk_resp::frame::RespFrame;
 
@@ -40,21 +41,7 @@ pub(super) fn cmd_del(
     server: &mut ServerState,
     client: &ClientState,
 ) -> CommandOutcome {
-    if args.is_empty() {
-        return wrong_arity("del");
-    }
-
-    let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    let mut removed = 0i64;
-    for key in args {
-        purge_expired_key(db, key, now);
-        if db.remove(key).is_some() {
-            removed += 1;
-        }
-    }
-
-    CommandOutcome::reply(RespFrame::Integer(removed))
+    cmd_delete_like(args, server, client, "del")
 }
 
 pub(super) fn cmd_exists(
@@ -112,11 +99,54 @@ pub(super) fn cmd_unlink(
     server: &mut ServerState,
     client: &ClientState,
 ) -> CommandOutcome {
+    cmd_delete_like(args, server, client, "unlink")
+}
+
+fn cmd_delete_like(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+    command: &str,
+) -> CommandOutcome {
     if args.is_empty() {
-        return wrong_arity("unlink");
+        return wrong_arity(command);
     }
 
-    cmd_del(args, server, client)
+    let now = now_ms();
+    let db = server.db_mut(client.selected_db);
+    let mut removed = 0i64;
+    for key in args {
+        purge_expired_key(db, key, now);
+        if db.remove(key).is_some() {
+            removed += 1;
+        }
+    }
+
+    let command_upper = command.to_ascii_uppercase();
+    let payload = format!(
+        "event=KEY_DELETE client_id={} db={} command={} requested_keys={} removed_keys={}",
+        client.id(),
+        client.selected_db,
+        command_upper,
+        args.len(),
+        removed
+    );
+    let stamp = next_audit_stamp("KEY_DELETE", &payload);
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "KEY_DELETE",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
+        client_id = client.id(),
+        db = client.selected_db,
+        command = command_upper,
+        requested_keys = args.len(),
+        removed_keys = removed,
+        "key deletion command executed"
+    );
+
+    CommandOutcome::reply(RespFrame::Integer(removed))
 }
 
 pub(super) fn cmd_rename(

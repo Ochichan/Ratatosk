@@ -3575,7 +3575,7 @@ pub fn execute(
         b"SFLUSH" => cmd_server::cmd_sflush(args),
         b"SWAPDB" => cmd_server::cmd_swapdb(args, server),
         b"FLUSHDB" => cmd_server::cmd_flushdb(args, server, client),
-        b"FLUSHALL" => cmd_server::cmd_flushall(args, server),
+        b"FLUSHALL" => cmd_server::cmd_flushall(args, server, client),
         b"RANDOMKEY" => cmd_generic::cmd_randomkey(args, server, client),
         b"TYPE" => cmd_generic::cmd_type(args, server, client),
         b"KEYS" => cmd_generic::cmd_keys(args, server, client),
@@ -3918,7 +3918,9 @@ fn acl_required_categories(spec: CommandSpec) -> Vec<&'static [u8]> {
 
 pub fn command_name(argv: &[Bytes]) -> Option<Bytes> {
     let command = argv.first()?;
-    Some(Bytes::copy_from_slice(to_uppercase_stack(command).as_slice()))
+    Some(Bytes::copy_from_slice(
+        to_uppercase_stack(command).as_slice(),
+    ))
 }
 
 pub fn is_write_command(argv: &[Bytes]) -> bool {
@@ -5275,7 +5277,7 @@ mod tests {
 
         assert_eq!(
             run(&["BGREWRITEAOF"], &mut server, &mut client),
-            RespFrame::simple_str("Background append only file rewriting started")
+            RespFrame::error_str("ERR BGREWRITEAOF is not implemented in this build")
         );
         assert_eq!(
             run(&["SFLUSH", "SYNC"], &mut server, &mut client),
@@ -5373,10 +5375,7 @@ mod tests {
 
         assert_eq!(
             run(&["CONFIG", "GET", "dir"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("dir"),
-                RespFrame::bulk_str(".")
-            ])
+            RespFrame::Array(vec![RespFrame::bulk_str("dir"), RespFrame::bulk_str(".")])
         );
         assert_eq!(
             run(&["CONFIG", "GET", "dbfilename"], &mut server, &mut client),

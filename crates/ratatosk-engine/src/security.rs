@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use std::sync::{Mutex, OnceLock};
 
 const TOKEN_PREFIXES: [&[u8]; 5] = [b"ghp_", b"sk-", b"npm_", b"xox", b"AKIA"];
 const REDACTED: &str = "[REDACTED]";
@@ -175,9 +177,73 @@ fn parse_i64_ascii(raw: &Bytes) -> Option<i64> {
     std::str::from_utf8(raw).ok()?.parse::<i64>().ok()
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AuditStamp {
+    pub seq: u64,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
+#[derive(Debug)]
+struct AuditChainState {
+    seq: u64,
+    last_hash: [u8; 32],
+}
+
+static AUDIT_CHAIN_STATE: OnceLock<Mutex<AuditChainState>> = OnceLock::new();
+
+fn audit_chain_state() -> &'static Mutex<AuditChainState> {
+    AUDIT_CHAIN_STATE.get_or_init(|| {
+        Mutex::new(AuditChainState {
+            seq: 0,
+            last_hash: [0u8; 32],
+        })
+    })
+}
+
+pub(crate) fn next_audit_stamp(event: &str, payload: &str) -> AuditStamp {
+    let mut state = audit_chain_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let prev_hash = state.last_hash;
+
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash);
+    hasher.update(b"|");
+    hasher.update(event.as_bytes());
+    hasher.update(b"|");
+    hasher.update(payload.as_bytes());
+
+    let digest = hasher.finalize();
+    let mut next_hash = [0u8; 32];
+    next_hash.copy_from_slice(&digest);
+
+    state.seq = state.seq.saturating_add(1);
+    state.last_hash = next_hash;
+
+    AuditStamp {
+        seq: state.seq,
+        prev_hash: bytes_to_hex(&prev_hash),
+        hash: bytes_to_hex(&state.last_hash),
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_acl_log_line, sanitize_error_message, sanitize_slowlog_argv};
+    use super::{
+        next_audit_stamp, sanitize_acl_log_line, sanitize_error_message, sanitize_slowlog_argv,
+    };
     use bytes::Bytes;
 
     #[test]
@@ -208,5 +274,15 @@ mod tests {
         let out = sanitize_acl_log_line(&long);
         assert!(out.chars().count() <= 256);
         assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn audit_stamp_chain_advances() {
+        let first = next_audit_stamp("TEST", "payload=one");
+        let second = next_audit_stamp("TEST", "payload=two");
+
+        assert!(second.seq > first.seq);
+        assert_eq!(second.prev_hash, first.hash);
+        assert_ne!(second.hash, first.hash);
     }
 }
