@@ -1,7 +1,9 @@
+use std::fs::File;
 use std::io::{self, Write};
+use std::path::Path;
 
 use bytes::Bytes;
-use ratatosk_engine::keyspace::{ServerState, StoredValue, ValueData};
+use ratatosk_engine::keyspace::{DbSnapshot, ServerState, StoredValue, ValueData};
 
 use super::checksum::Crc64Digest;
 use super::format::*;
@@ -10,6 +12,14 @@ use super::format::*;
 pub struct RdbSaver<W: Write> {
     writer: W,
     digest: Crc64Digest,
+}
+
+pub fn save(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
+    let file = File::create(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("creating RDB file '{}': {e}", path.display())))?;
+    let mut state = ServerState::new(snapshot.len());
+    state.load_from_rdb(snapshot.clone());
+    RdbSaver::new(file).save_state(&state)
 }
 
 impl<W: Write> RdbSaver<W> {
@@ -22,9 +32,12 @@ impl<W: Write> RdbSaver<W> {
 
     /// Write the full RDB file from the given server state.
     pub fn save_state(mut self, state: &ServerState) -> io::Result<()> {
-        self.write_header()?;
-        self.write_aux(b"redis-ver", b"7.0.0")?;
-        self.write_aux(b"ratatosk-ver", b"0.1.0")?;
+        self.write_header()
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB header: {e}")))?;
+        self.write_aux(b"redis-ver", b"7.0.0")
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))?;
+        self.write_aux(b"ratatosk-ver", b"0.1.0")
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))?;
 
         for db_idx in 0..state.db_count() {
             let db = state.db(db_idx);
@@ -32,17 +45,24 @@ impl<W: Write> RdbSaver<W> {
                 continue;
             }
 
-            self.write_select_db(db_idx)?;
+            self.write_select_db(db_idx).map_err(|e| {
+                io::Error::new(e.kind(), format!("writing RDB SELECTDB for db {db_idx}: {e}"))
+            })?;
 
             let expires_count = db.values().filter(|v| v.expire_at_ms.is_some()).count();
-            self.write_resize_db(db.len(), expires_count)?;
+            self.write_resize_db(db.len(), expires_count).map_err(|e| {
+                io::Error::new(e.kind(), format!("writing RDB RESIZEDB for db {db_idx}: {e}"))
+            })?;
 
             for (key, value) in db.iter() {
-                self.write_key_value(key, value)?;
+                self.write_key_value(key, value).map_err(|e| {
+                    io::Error::new(e.kind(), format!("writing RDB key-value in db {db_idx}: {e}"))
+                })?;
             }
         }
 
         self.write_eof()
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB EOF/CRC: {e}")))
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
@@ -224,7 +244,28 @@ mod tests {
         let mut buf = Vec::new();
         RdbSaver::new(&mut buf).save_state(&state).expect("save");
 
-        // Should contain EXPIRETIME_MS opcode
         assert!(buf.contains(&RDB_OPCODE_EXPIRETIME_MS));
+    }
+
+    #[test]
+    fn save_to_failing_writer_has_context_in_error() {
+        struct FailingWriter;
+        impl io::Write for FailingWriter {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock write failure"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock flush failure"))
+            }
+        }
+
+        let state = ServerState::with_default_dbs();
+        let result = RdbSaver::new(FailingWriter).save_state(&state);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("writing RDB header"),
+            "error should contain context about writing RDB header, got: {err_msg}"
+        );
     }
 }

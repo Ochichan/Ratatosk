@@ -1,0 +1,221 @@
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use ratatosk_core::time::now_ms;
+use ratatosk_engine::keyspace::ServerState;
+use ratatosk_persist::{
+    aof::{AofRecovery, AofWriter, FsyncPolicy},
+    rdb,
+};
+use tokio::sync::Mutex;
+
+use crate::config::ServerConfig;
+
+const AOF_FILENAME: &str = "appendonly.aof";
+
+#[derive(Clone)]
+pub struct PersistenceRuntime {
+    pub rdb_path: PathBuf,
+    pub aof_path: PathBuf,
+    pub aof_writer: Option<Arc<Mutex<AofWriter>>>,
+}
+
+impl PersistenceRuntime {
+    pub fn from_config(config: &ServerConfig) -> io::Result<Self> {
+        let rdb_path = config.dir.join(&config.dbfilename);
+        let aof_path = config.dir.join(AOF_FILENAME);
+        let aof_writer = if config.appendonly {
+            let policy = FsyncPolicy::from_config_str(config.appendfsync.as_bytes())
+                .unwrap_or(FsyncPolicy::EverySec);
+            let writer = AofWriter::open(&aof_path, policy)
+                .map_err(|e| io::Error::other(format!("opening AOF writer: {e}")))?;
+            Some(Arc::new(Mutex::new(writer)))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            rdb_path,
+            aof_path,
+            aof_writer,
+        })
+    }
+}
+
+pub async fn apply_server_persistence_config(
+    server_state: &Arc<Mutex<ServerState>>,
+    config: &ServerConfig,
+) {
+    let mut state = server_state.lock().await;
+    state.config.set_dir(config.dir.clone());
+    state.config.set_dbfilename(config.dbfilename.clone());
+    state
+        .config
+        .set_appendfsync(bytes::Bytes::from(config.appendfsync.clone()));
+    state.config.set_appendonly(config.appendonly);
+    state.set_aof_enabled(config.appendonly);
+}
+
+pub async fn load_startup_data(
+    server_state: &Arc<Mutex<ServerState>>,
+    runtime: &PersistenceRuntime,
+    appendonly: bool,
+) -> io::Result<()> {
+    if runtime.rdb_path.exists() {
+        let snapshot = rdb::loader::load(&runtime.rdb_path)
+            .map_err(|e| io::Error::other(format!("loading RDB snapshot: {e}")))?;
+        let key_count: usize = snapshot.iter().map(|db| db.len()).sum();
+        {
+            let mut state = server_state.lock().await;
+            state.load_from_rdb(snapshot);
+        }
+        tracing::info!(keys = key_count, "loaded RDB snapshot");
+    } else {
+        tracing::info!(path = %runtime.rdb_path.display(), "no RDB file found, starting empty");
+    }
+
+    if appendonly && runtime.aof_path.exists() {
+        let replayed = {
+            let mut state = server_state.lock().await;
+            AofRecovery::replay_file(&runtime.aof_path, &mut state)
+                .map_err(|e| io::Error::other(format!("replaying AOF: {e}")))?
+        };
+        tracing::info!(replayed, "replayed AOF over startup state");
+    }
+
+    Ok(())
+}
+
+pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathBuf) -> bool {
+    let snapshot = {
+        let mut state = server_state.lock().await;
+        if state.rdb_save_in_progress() {
+            return false;
+        }
+        state.set_rdb_save_in_progress(true);
+        state.snapshot_dbs()
+    };
+
+    tokio::spawn(async move {
+        let path_for_log = rdb_path.display().to_string();
+        let save_result = tokio::task::spawn_blocking(move || rdb::saver::save(&snapshot, &rdb_path))
+            .await
+            .map_err(|e| format!("joining BGSAVE worker: {e}"))
+            .and_then(|result| result.map_err(|e| e.to_string()));
+
+        let mut state = server_state.lock().await;
+        state.set_rdb_save_in_progress(false);
+
+        match save_result {
+            Ok(()) => {
+                state.stats.mark_last_save_now();
+                state.set_last_rdb_save_time_ms(now_ms());
+                state.set_last_rdb_save_status(Ok(()));
+                tracing::info!(path = %path_for_log, "background RDB save completed");
+            }
+            Err(error) => {
+                state.set_last_rdb_save_status(Err(error.clone()));
+                tracing::warn!(error = %error, path = %path_for_log, "background RDB save failed");
+            }
+        }
+    });
+
+    true
+}
+
+pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -> io::Result<()> {
+    let snapshot = {
+        let state = server_state.lock().await;
+        if state.rdb_save_in_progress() {
+            return Err(io::Error::other("background save already in progress"));
+        }
+        state.snapshot_dbs()
+    };
+
+    let result = rdb::saver::save(&snapshot, rdb_path);
+    let mut state = server_state.lock().await;
+    match &result {
+        Ok(()) => {
+            state.stats.mark_last_save_now();
+            state.set_last_rdb_save_time_ms(now_ms());
+            state.set_last_rdb_save_status(Ok(()));
+        }
+        Err(error) => {
+            state.set_last_rdb_save_status(Err(error.to_string()));
+        }
+    }
+    result
+}
+
+pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
+    let Some(writer) = &runtime.aof_writer else {
+        return Ok(());
+    };
+
+    let mut guard = writer.lock().await;
+    guard
+        .force_fsync()
+        .map_err(|e| io::Error::other(format!("flushing AOF: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use ratatosk_engine::keyspace::StoredValue;
+
+    #[tokio::test]
+    async fn startup_load_replays_rdb_then_aof() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut config = ServerConfig::default();
+        config.dir = dir.path().to_path_buf();
+        config.appendonly = true;
+        config.appendfsync = "always".to_string();
+
+        let runtime = PersistenceRuntime::from_config(&config).expect("runtime");
+
+        let mut state = ServerState::with_default_dbs();
+        state.db_mut(0).insert(
+            Bytes::from("from-rdb"),
+            StoredValue::string(Bytes::from("1"), None),
+        );
+        rdb::saver::save(&state.snapshot_dbs(), &runtime.rdb_path).expect("save rdb");
+
+        {
+            let mut writer = runtime.aof_writer.as_ref().expect("aof writer").lock().await;
+            writer
+                .append_command(
+                    0,
+                    &[
+                        Bytes::from("SET"),
+                        Bytes::from("from-aof"),
+                        Bytes::from("2"),
+                    ],
+                )
+                .expect("append");
+            writer.force_fsync().expect("fsync");
+        }
+
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        load_startup_data(&shared, &runtime, true)
+            .await
+            .expect("load startup");
+
+        let loaded = shared.lock().await;
+        assert_eq!(
+            loaded
+                .db(0)
+                .get(&Bytes::from("from-rdb"))
+                .and_then(|v| v.as_string()),
+            Some(&Bytes::from("1"))
+        );
+        assert_eq!(
+            loaded
+                .db(0)
+                .get(&Bytes::from("from-aof"))
+                .and_then(|v| v.as_string()),
+            Some(&Bytes::from("2"))
+        );
+    }
+}

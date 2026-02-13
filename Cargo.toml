@@ -86,7 +86,7 @@ memchr = "2"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-strip = true
+strip = "debuginfo"
 opt-level = 3
 
 [profile.dev.package.ratatosk-resp]

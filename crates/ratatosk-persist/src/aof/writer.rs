@@ -59,7 +59,13 @@ impl AofWriter {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)?;
+            .open(path)
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("opening AOF file '{}': {e}", path.display()),
+                )
+            })?;
 
         Ok(Self {
             writer: BufWriter::new(file),
@@ -86,13 +92,17 @@ impl AofWriter {
             self.write_resp_array(&[
                 &Bytes::from_static(b"SELECT"),
                 &Bytes::from(db_index.to_string()),
-            ])?;
+            ])
+            .map_err(|e| {
+                io::Error::new(e.kind(), format!("appending AOF SELECT db {db_index}: {e}"))
+            })?;
             self.current_db = db_index;
         }
 
         // Encode args as RESP array
         let refs: Vec<&Bytes> = args.iter().collect();
-        self.write_resp_array(&refs)?;
+        self.write_resp_array(&refs)
+            .map_err(|e| io::Error::new(e.kind(), format!("appending AOF command: {e}")))?;
 
         self.maybe_fsync()?;
 
@@ -103,20 +113,31 @@ impl AofWriter {
     pub fn maybe_fsync(&mut self) -> Result<(), PersistError> {
         match self.policy {
             FsyncPolicy::Always => {
-                self.writer.flush()?;
-                self.writer.get_ref().sync_all()?;
+                self.writer
+                    .flush()
+                    .map_err(|e| io::Error::new(e.kind(), format!("flushing AOF buffer: {e}")))?;
+                self.writer
+                    .get_ref()
+                    .sync_all()
+                    .map_err(|e| io::Error::new(e.kind(), format!("fsync AOF file: {e}")))?;
                 self.last_fsync = Instant::now();
             }
             FsyncPolicy::EverySec => {
                 if self.last_fsync.elapsed().as_secs() >= 1 {
-                    self.writer.flush()?;
-                    self.writer.get_ref().sync_all()?;
+                    self.writer.flush().map_err(|e| {
+                        io::Error::new(e.kind(), format!("flushing AOF buffer: {e}"))
+                    })?;
+                    self.writer.get_ref().sync_all().map_err(|e| {
+                        io::Error::new(e.kind(), format!("fsync AOF file: {e}"))
+                    })?;
                     self.last_fsync = Instant::now();
                 }
             }
             FsyncPolicy::No => {
                 // Flush buffered writer but no fsync
-                self.writer.flush()?;
+                self.writer
+                    .flush()
+                    .map_err(|e| io::Error::new(e.kind(), format!("flushing AOF buffer: {e}")))?;
             }
         }
         Ok(())
@@ -124,8 +145,13 @@ impl AofWriter {
 
     /// Force a flush and fsync regardless of policy.
     pub fn force_fsync(&mut self) -> Result<(), PersistError> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        self.writer
+            .flush()
+            .map_err(|e| io::Error::new(e.kind(), format!("flushing AOF buffer: {e}")))?;
+        self.writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| io::Error::new(e.kind(), format!("fsync AOF file: {e}")))?;
         self.last_fsync = Instant::now();
         Ok(())
     }
@@ -209,6 +235,24 @@ mod tests {
 
         let content = fs::read_to_string(&path).expect("read");
         assert!(!content.contains("SELECT"));
+    }
+
+    #[test]
+    fn open_nonexistent_path_has_context_in_error() {
+        let path = std::path::Path::new("/nonexistent/dir/test.aof");
+        let err = match AofWriter::open(path, FsyncPolicy::No) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for nonexistent path"),
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("opening AOF file"),
+            "error should contain context about opening AOF file, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("test.aof"),
+            "error should contain the file path, got: {err_msg}"
+        );
     }
 
     #[test]

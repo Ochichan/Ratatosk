@@ -424,3 +424,51 @@ fn to_hex(raw: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyspace::ServerState;
+
+    #[test]
+    fn test_auth_with_default_user_nopass() {
+        let server = ServerState::new(16);
+        let mut client = ClientState::new(1);
+
+        let password = Bytes::from_static(b"anypassword");
+        let outcome = cmd_auth(&[password], &server, &mut client);
+
+        // Default user has nopass enabled, so any password succeeds
+        match &outcome.response {
+            RespFrame::SimpleString(s) if s == "OK" => {
+                // Expected: AUTH succeeds with default user
+            }
+            other => panic!("Expected OK response, got: {:?}", other),
+        }
+
+        // Verify client is authenticated
+        assert!(client.authenticated);
+        assert_eq!(client.acl_user, Bytes::from_static(b"default"));
+    }
+
+    #[test]
+    fn test_auth_with_nonexistent_user() {
+        let server = ServerState::new(16);
+        let mut client = ClientState::new(2);
+
+        let username = Bytes::from_static(b"nonexistent");
+        let password = Bytes::from_static(b"anypass");
+        let outcome = cmd_auth(&[username, password], &server, &mut client);
+
+        // Nonexistent user should fail
+        match &outcome.response {
+            RespFrame::Error(_) => {
+                // Expected: AUTH failure for nonexistent user
+            }
+            other => panic!("Expected error response, got: {:?}", other),
+        }
+
+        // Verify client is not authenticated
+        assert!(!client.authenticated);
+    }
+}

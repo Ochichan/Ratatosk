@@ -10,9 +10,12 @@ use ratatosk_core::time::{now_ms as unix_ms_now, now_sec as unix_sec_now};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
 };
 
 pub const DEFAULT_DB_COUNT: usize = 16;
+
+pub type DbSnapshot = Vec<HashMap<Bytes, StoredValue>>;
 
 // ---------------------------------------------------------------------------
 // Stream data types
@@ -1024,6 +1027,21 @@ pub struct StatsState {
     slowlog_entries: VecDeque<SlowlogEntry>,
     next_slowlog_id: i64,
     latency_events: HashMap<Vec<u8>, VecDeque<(i64, i64)>>,
+    connected_clients: u64,
+    total_net_input_bytes: u64,
+    total_net_output_bytes: u64,
+    evicted_keys: u64,
+    expired_keys: u64,
+    keyspace_hits: u64,
+    keyspace_misses: u64,
+    /// Snapshot of `total_commands_processed` at the previous ops/sec sample.
+    prev_commands_snapshot: u64,
+    /// Computed instantaneous operations per second.
+    instantaneous_ops_per_sec: u64,
+    /// Cached memory estimate (bytes).
+    cached_memory_estimate: u64,
+    /// Cron tick when memory estimate was last computed.
+    last_memory_estimate_tick: u64,
 }
 
 impl Default for StatsState {
@@ -1036,6 +1054,17 @@ impl Default for StatsState {
             slowlog_entries: VecDeque::new(),
             next_slowlog_id: 0,
             latency_events: HashMap::new(),
+            connected_clients: 0,
+            total_net_input_bytes: 0,
+            total_net_output_bytes: 0,
+            evicted_keys: 0,
+            expired_keys: 0,
+            keyspace_hits: 0,
+            keyspace_misses: 0,
+            prev_commands_snapshot: 0,
+            instantaneous_ops_per_sec: 0,
+            cached_memory_estimate: 0,
+            last_memory_estimate_tick: 0,
         }
     }
 }
@@ -1055,6 +1084,98 @@ impl StatsState {
 
     pub fn reset(&mut self) {
         self.total_commands_processed = 0;
+        self.connected_clients = 0;
+        self.total_net_input_bytes = 0;
+        self.total_net_output_bytes = 0;
+        self.evicted_keys = 0;
+        self.expired_keys = 0;
+        self.keyspace_hits = 0;
+        self.keyspace_misses = 0;
+        self.prev_commands_snapshot = 0;
+        self.instantaneous_ops_per_sec = 0;
+    }
+
+    pub fn connected_clients(&self) -> u64 {
+        self.connected_clients
+    }
+
+    pub fn mark_client_connected(&mut self) {
+        self.connected_clients = self.connected_clients.saturating_add(1);
+    }
+
+    pub fn mark_client_disconnected(&mut self) {
+        self.connected_clients = self.connected_clients.saturating_sub(1);
+    }
+
+    pub fn total_net_input_bytes(&self) -> u64 {
+        self.total_net_input_bytes
+    }
+
+    pub fn add_net_input_bytes(&mut self, bytes: u64) {
+        self.total_net_input_bytes = self.total_net_input_bytes.saturating_add(bytes);
+    }
+
+    pub fn total_net_output_bytes(&self) -> u64 {
+        self.total_net_output_bytes
+    }
+
+    pub fn add_net_output_bytes(&mut self, bytes: u64) {
+        self.total_net_output_bytes = self.total_net_output_bytes.saturating_add(bytes);
+    }
+
+    pub fn evicted_keys(&self) -> u64 {
+        self.evicted_keys
+    }
+
+    pub fn add_evicted_keys(&mut self, count: u64) {
+        self.evicted_keys = self.evicted_keys.saturating_add(count);
+    }
+
+    pub fn expired_keys(&self) -> u64 {
+        self.expired_keys
+    }
+
+    pub fn add_expired_keys(&mut self, count: u64) {
+        self.expired_keys = self.expired_keys.saturating_add(count);
+    }
+
+    pub fn keyspace_hits(&self) -> u64 {
+        self.keyspace_hits
+    }
+
+    pub fn mark_keyspace_hit(&mut self) {
+        self.keyspace_hits = self.keyspace_hits.saturating_add(1);
+    }
+
+    pub fn add_keyspace_hits(&mut self, count: u64) {
+        self.keyspace_hits = self.keyspace_hits.saturating_add(count);
+    }
+
+    pub fn keyspace_misses(&self) -> u64 {
+        self.keyspace_misses
+    }
+
+    pub fn mark_keyspace_miss(&mut self) {
+        self.keyspace_misses = self.keyspace_misses.saturating_add(1);
+    }
+
+    pub fn add_keyspace_misses(&mut self, count: u64) {
+        self.keyspace_misses = self.keyspace_misses.saturating_add(count);
+    }
+
+    pub fn instantaneous_ops_per_sec(&self) -> u64 {
+        self.instantaneous_ops_per_sec
+    }
+
+    pub fn sample_ops_per_sec(&mut self, interval_secs: u64) {
+        let current = self.total_commands_processed;
+        let delta = current.saturating_sub(self.prev_commands_snapshot);
+        self.instantaneous_ops_per_sec = if interval_secs > 0 {
+            delta / interval_secs
+        } else {
+            delta
+        };
+        self.prev_commands_snapshot = current;
     }
 
     pub fn last_save_unix_sec(&self) -> i64 {
@@ -1178,6 +1299,19 @@ impl StatsState {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    pub fn cached_memory_estimate(&self) -> u64 {
+        self.cached_memory_estimate
+    }
+
+    pub fn set_cached_memory_estimate(&mut self, estimate: u64, tick: u64) {
+        self.cached_memory_estimate = estimate;
+        self.last_memory_estimate_tick = tick;
+    }
+
+    pub fn last_memory_estimate_tick(&self) -> u64 {
+        self.last_memory_estimate_tick
     }
 }
 
@@ -1365,6 +1499,9 @@ pub struct ConfigState {
     timeout: i64,
     appendonly: bool,
     save: Bytes,
+    dir: PathBuf,
+    dbfilename: String,
+    appendfsync: Bytes,
     maxmemory: usize,
     maxmemory_policy: Bytes,
     maxmemory_samples: usize,
@@ -1382,6 +1519,9 @@ impl Default for ConfigState {
             timeout: 0,
             appendonly: false,
             save: Bytes::from_static(b"3600 1 300 100 60 10000"),
+            dir: PathBuf::from("."),
+            dbfilename: "dump.rdb".to_string(),
+            appendfsync: Bytes::from_static(b"everysec"),
             maxmemory: 0,
             maxmemory_policy: Bytes::from_static(b"noeviction"),
             maxmemory_samples: 5,
@@ -1418,6 +1558,30 @@ impl ConfigState {
 
     pub fn set_save(&mut self, value: Bytes) {
         self.save = value;
+    }
+
+    pub fn dir(&self) -> &PathBuf {
+        &self.dir
+    }
+
+    pub fn set_dir(&mut self, value: PathBuf) {
+        self.dir = value;
+    }
+
+    pub fn dbfilename(&self) -> &str {
+        &self.dbfilename
+    }
+
+    pub fn set_dbfilename(&mut self, value: String) {
+        self.dbfilename = value;
+    }
+
+    pub fn appendfsync(&self) -> &Bytes {
+        &self.appendfsync
+    }
+
+    pub fn set_appendfsync(&mut self, value: Bytes) {
+        self.appendfsync = value;
     }
 
     pub fn maxmemory(&self) -> usize {
@@ -1537,6 +1701,10 @@ pub struct ServerState {
     pub script_cache: ScriptCache,
     pub cluster_node_id: Bytes,
     lazy_free_tx: Option<LazyFreeSender>,
+    rdb_save_in_progress: bool,
+    last_rdb_save_status: Option<Result<(), String>>,
+    last_rdb_save_time_ms: Option<i64>,
+    aof_enabled: bool,
 }
 
 impl ServerState {
@@ -1562,6 +1730,10 @@ impl ServerState {
             script_cache: ScriptCache::default(),
             cluster_node_id: node_id,
             lazy_free_tx: None,
+            rdb_save_in_progress: false,
+            last_rdb_save_status: None,
+            last_rdb_save_time_ms: None,
+            aof_enabled: false,
         }
     }
 
@@ -1608,6 +1780,15 @@ impl ServerState {
         for versions in &mut self.key_versions {
             versions.clear();
         }
+    }
+
+    pub fn snapshot_dbs(&self) -> DbSnapshot {
+        self.dbs.clone()
+    }
+
+    pub fn load_from_rdb(&mut self, data: DbSnapshot) {
+        self.dbs = data;
+        self.key_versions = (0..self.dbs.len()).map(|_| HashMap::new()).collect();
     }
 
     pub fn started_at_ms(&self) -> i64 {
@@ -1666,6 +1847,38 @@ impl ServerState {
         }
         drop(old_db);
     }
+
+    pub fn rdb_save_in_progress(&self) -> bool {
+        self.rdb_save_in_progress
+    }
+
+    pub fn set_rdb_save_in_progress(&mut self, value: bool) {
+        self.rdb_save_in_progress = value;
+    }
+
+    pub fn last_rdb_save_status(&self) -> Option<&Result<(), String>> {
+        self.last_rdb_save_status.as_ref()
+    }
+
+    pub fn set_last_rdb_save_status(&mut self, status: Result<(), String>) {
+        self.last_rdb_save_status = Some(status);
+    }
+
+    pub fn last_rdb_save_time_ms(&self) -> Option<i64> {
+        self.last_rdb_save_time_ms
+    }
+
+    pub fn set_last_rdb_save_time_ms(&mut self, value: i64) {
+        self.last_rdb_save_time_ms = Some(value);
+    }
+
+    pub fn aof_enabled(&self) -> bool {
+        self.aof_enabled
+    }
+
+    pub fn set_aof_enabled(&mut self, value: bool) {
+        self.aof_enabled = value;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1698,9 +1911,11 @@ fn generate_cluster_node_id() -> Bytes {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use bytes::Bytes;
 
-    use super::PubSubState;
+    use super::{PubSubState, ServerState, StatsState};
 
     #[test]
     fn remove_client_cleans_all_subscriptions() {
@@ -1808,5 +2023,191 @@ mod tests {
         ps.remove_client(1);
         ps.subscribe_channel(1, channel.clone());
         assert_eq!(ps.publish(&channel, &payload), 1);
+    }
+
+    #[test]
+    fn server_state_persistence_fields_default() {
+        let state = ServerState::with_default_dbs();
+        assert!(!state.rdb_save_in_progress());
+        assert!(state.last_rdb_save_status().is_none());
+        assert!(state.last_rdb_save_time_ms().is_none());
+        assert!(!state.aof_enabled());
+    }
+
+    #[test]
+    fn server_state_persistence_field_setters() {
+        let mut state = ServerState::with_default_dbs();
+
+        state.set_rdb_save_in_progress(true);
+        assert!(state.rdb_save_in_progress());
+
+        state.set_last_rdb_save_status(Ok(()));
+        assert_eq!(state.last_rdb_save_status(), Some(&Ok(())));
+
+        state.set_last_rdb_save_status(Err("disk full".to_string()));
+        assert_eq!(
+            state.last_rdb_save_status(),
+            Some(&Err("disk full".to_string()))
+        );
+
+        state.set_last_rdb_save_time_ms(1_234);
+        assert_eq!(state.last_rdb_save_time_ms(), Some(1_234));
+
+        state.set_aof_enabled(true);
+        assert!(state.aof_enabled());
+    }
+
+    #[test]
+    fn config_state_persistence_fields_default() {
+        let state = ServerState::with_default_dbs();
+        assert_eq!(state.config.dir(), &PathBuf::from("."));
+        assert_eq!(state.config.dbfilename(), "dump.rdb");
+        assert_eq!(state.config.appendfsync(), &Bytes::from_static(b"everysec"));
+        assert!(!state.config.appendonly());
+    }
+
+    #[test]
+    fn config_state_persistence_field_setters() {
+        let mut state = ServerState::with_default_dbs();
+
+        state.config.set_dir(PathBuf::from("/data"));
+        assert_eq!(state.config.dir(), &PathBuf::from("/data"));
+
+        state.config.set_dbfilename("backup.rdb".to_string());
+        assert_eq!(state.config.dbfilename(), "backup.rdb");
+
+        state.config.set_appendfsync(Bytes::from_static(b"always"));
+        assert_eq!(state.config.appendfsync(), &Bytes::from_static(b"always"));
+    }
+
+    #[test]
+    fn stats_connected_clients_tracks_connect_disconnect() {
+        let mut stats = StatsState::default();
+        assert_eq!(stats.connected_clients(), 0);
+
+        stats.mark_client_connected();
+        stats.mark_client_connected();
+        assert_eq!(stats.connected_clients(), 2);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 1);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 0);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 0, "should not underflow");
+    }
+
+    #[test]
+    fn stats_net_io_bytes_accumulate() {
+        let mut stats = StatsState::default();
+        assert_eq!(stats.total_net_input_bytes(), 0);
+        assert_eq!(stats.total_net_output_bytes(), 0);
+
+        stats.add_net_input_bytes(100);
+        stats.add_net_input_bytes(200);
+        assert_eq!(stats.total_net_input_bytes(), 300);
+
+        stats.add_net_output_bytes(50);
+        stats.add_net_output_bytes(150);
+        assert_eq!(stats.total_net_output_bytes(), 200);
+    }
+
+    #[test]
+    fn stats_evicted_and_expired_keys_accumulate() {
+        let mut stats = StatsState::default();
+        assert_eq!(stats.evicted_keys(), 0);
+        assert_eq!(stats.expired_keys(), 0);
+
+        stats.add_evicted_keys(3);
+        stats.add_evicted_keys(7);
+        assert_eq!(stats.evicted_keys(), 10);
+
+        stats.add_expired_keys(5);
+        assert_eq!(stats.expired_keys(), 5);
+    }
+
+    #[test]
+    fn stats_keyspace_hits_and_misses() {
+        let mut stats = StatsState::default();
+        assert_eq!(stats.keyspace_hits(), 0);
+        assert_eq!(stats.keyspace_misses(), 0);
+
+        stats.mark_keyspace_hit();
+        stats.mark_keyspace_hit();
+        stats.mark_keyspace_miss();
+        assert_eq!(stats.keyspace_hits(), 2);
+        assert_eq!(stats.keyspace_misses(), 1);
+
+        stats.add_keyspace_hits(10);
+        stats.add_keyspace_misses(5);
+        assert_eq!(stats.keyspace_hits(), 12);
+        assert_eq!(stats.keyspace_misses(), 6);
+    }
+
+    #[test]
+    fn stats_ops_per_sec_sampling() {
+        let mut stats = StatsState::default();
+        assert_eq!(stats.instantaneous_ops_per_sec(), 0);
+
+        for _ in 0..100 {
+            stats.mark_command_processed();
+        }
+        stats.sample_ops_per_sec(1);
+        assert_eq!(stats.instantaneous_ops_per_sec(), 100);
+
+        for _ in 0..50 {
+            stats.mark_command_processed();
+        }
+        stats.sample_ops_per_sec(1);
+        assert_eq!(stats.instantaneous_ops_per_sec(), 50);
+
+        stats.sample_ops_per_sec(1);
+        assert_eq!(stats.instantaneous_ops_per_sec(), 0, "no new commands");
+    }
+
+    #[test]
+    fn stats_reset_clears_all_counters() {
+        let mut stats = StatsState::default();
+        stats.mark_command_processed();
+        stats.mark_client_connected();
+        stats.add_net_input_bytes(100);
+        stats.add_net_output_bytes(200);
+        stats.add_evicted_keys(3);
+        stats.add_expired_keys(5);
+        stats.mark_keyspace_hit();
+        stats.mark_keyspace_miss();
+        stats.sample_ops_per_sec(1);
+
+        stats.reset();
+
+        assert_eq!(stats.total_commands_processed(), 0);
+        assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_net_input_bytes(), 0);
+        assert_eq!(stats.total_net_output_bytes(), 0);
+        assert_eq!(stats.evicted_keys(), 0);
+        assert_eq!(stats.expired_keys(), 0);
+        assert_eq!(stats.keyspace_hits(), 0);
+        assert_eq!(stats.keyspace_misses(), 0);
+        assert_eq!(stats.instantaneous_ops_per_sec(), 0);
+    }
+
+    #[test]
+    fn memory_estimate_cache_stores_and_retrieves() {
+        let mut stats = StatsState::default();
+        
+        assert_eq!(stats.cached_memory_estimate(), 0);
+        assert_eq!(stats.last_memory_estimate_tick(), 0);
+        
+        stats.set_cached_memory_estimate(12345, 42);
+        
+        assert_eq!(stats.cached_memory_estimate(), 12345);
+        assert_eq!(stats.last_memory_estimate_tick(), 42);
+        
+        stats.set_cached_memory_estimate(67890, 100);
+        
+        assert_eq!(stats.cached_memory_estimate(), 67890);
+        assert_eq!(stats.last_memory_estimate_tick(), 100);
     }
 }

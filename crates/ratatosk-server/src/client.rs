@@ -1,8 +1,8 @@
 use std::{io, sync::Arc, time::Duration};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use ratatosk_engine::{
-    command::{ClientState, CommandOutcome, execute},
+    command::{ClientState, CommandOutcome, execute, is_write_command},
     keyspace::{PubSubMessage, ServerState},
 };
 use ratatosk_resp::{RespFrame, encode, encode_to_vec, encoded_len, parse};
@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
+use crate::persistence::{PersistenceRuntime, run_save, start_bgsave};
 
 const QUERY_BUFFER_LIMIT: usize = 1024 * 1024;
 const OUTPUT_BUFFER_FLUSH_THRESHOLD: usize = 16 * 1024;
@@ -28,12 +29,14 @@ pub type SharedServerState = Arc<Mutex<ServerState>>;
 #[derive(Debug, Clone, Copy)]
 pub struct ClientIoLimits {
     pub output_buffer_limit_bytes: usize,
+    pub client_read_timeout_sec: u64,
 }
 
 impl Default for ClientIoLimits {
     fn default() -> Self {
         Self {
             output_buffer_limit_bytes: DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES,
+            client_read_timeout_sec: 0,
         }
     }
 }
@@ -53,12 +56,7 @@ fn append_encoded_frame(
     true
 }
 
-fn unix_ms_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
-}
+
 
 fn next_retry_backoff(current: Duration) -> Duration {
     current
@@ -122,15 +120,26 @@ async fn write_all_with_timeout(stream: &mut TcpStream, payload: &[u8]) -> io::R
 async fn run_with_blocking_retry(
     frame: RespFrame,
     server_state: &SharedServerState,
+    persistence: &Arc<PersistenceRuntime>,
     client_state: &mut ClientState,
     stream: &TcpStream,
 ) -> io::Result<CommandOutcome> {
-    let outcome = {
+    let first_argv = frame_to_argv_for_persistence(&frame);
+    let first_db = client_state.selected_db();
+    let mut outcome = {
         let mut server = server_state.lock().await;
         execute(frame, &mut server, client_state)
     };
 
-    let Some(retry) = outcome.retry_blocking else {
+    let Some(retry) = outcome.retry_blocking.clone() else {
+        apply_post_execute_persistence(
+            server_state,
+            persistence,
+            first_db,
+            first_argv,
+            &mut outcome,
+        )
+        .await;
         return Ok(outcome);
     };
 
@@ -140,9 +149,10 @@ async fn run_with_blocking_retry(
     let mut backoff = BLOCKING_RETRY_BACKOFF_INITIAL;
 
     loop {
-        let now_ms = unix_ms_now();
+        let now_ms = ratatosk_core::time::monotonic_ms();
         if let Some(deadline) = deadline_ms {
-            if now_ms >= deadline {
+            let deadline_u64 = u64::try_from(deadline).unwrap_or(u64::MAX);
+            if now_ms >= deadline_u64 {
                 return Ok(CommandOutcome {
                     response: last_response,
                     close: false,
@@ -152,9 +162,9 @@ async fn run_with_blocking_retry(
         }
 
         let wait_for = if let Some(deadline) = deadline_ms {
-            let remaining_ms = deadline.saturating_sub(now_ms);
-            let remaining_ms_u64 = u64::try_from(remaining_ms).unwrap_or(0);
-            Duration::from_millis(remaining_ms_u64).min(backoff)
+            let deadline_u64 = u64::try_from(deadline).unwrap_or(u64::MAX);
+            let remaining_ms = deadline_u64.saturating_sub(now_ms);
+            Duration::from_millis(remaining_ms).min(backoff)
         } else {
             backoff
         };
@@ -167,18 +177,94 @@ async fn run_with_blocking_retry(
         }
 
         let outcome = {
+            let argv = frame_to_argv_for_persistence(&frame);
+            let db = client_state.selected_db();
             let mut server = server_state.lock().await;
-            execute(frame, &mut server, client_state)
+            let mut outcome = execute(frame, &mut server, client_state);
+            if outcome.retry_blocking.is_none() {
+                drop(server);
+                apply_post_execute_persistence(server_state, persistence, db, argv, &mut outcome)
+                    .await;
+            }
+            outcome
         };
 
-        if outcome.retry_blocking.is_none() {
+        let Some(retry) = outcome.retry_blocking else {
             return Ok(outcome);
-        }
-
-        let retry = outcome.retry_blocking.expect("checked above");
+        };
         last_response = outcome.response;
         frame = retry.frame;
         backoff = next_retry_backoff(backoff);
+    }
+}
+
+fn frame_to_argv_for_persistence(frame: &RespFrame) -> Option<Vec<Bytes>> {
+    let RespFrame::Array(items) = frame else {
+        return None;
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            RespFrame::BulkString(Some(value)) => out.push(value.clone()),
+            RespFrame::SimpleString(value) => out.push(value.clone()),
+            RespFrame::Integer(value) => out.push(Bytes::from(value.to_string())),
+            RespFrame::BulkString(None) => return None,
+            _ => return None,
+        }
+    }
+
+    Some(out)
+}
+
+fn is_queued_response(frame: &RespFrame) -> bool {
+    match frame {
+        RespFrame::SimpleString(text) => text.eq_ignore_ascii_case(b"QUEUED"),
+        _ => false,
+    }
+}
+
+async fn apply_post_execute_persistence(
+    server_state: &SharedServerState,
+    persistence: &Arc<PersistenceRuntime>,
+    selected_db: usize,
+    argv: Option<Vec<Bytes>>,
+    outcome: &mut CommandOutcome,
+) {
+    let Some(argv) = argv else {
+        return;
+    };
+    if argv.is_empty() || matches!(outcome.response, RespFrame::Error(_)) {
+        return;
+    }
+
+    let command = argv[0].to_ascii_uppercase();
+
+    if command == b"SAVE" && !matches!(outcome.response, RespFrame::Error(_)) {
+        if let Err(error) = run_save(server_state, &persistence.rdb_path).await {
+            outcome.response = RespFrame::error_str(&format!("ERR SAVE failed: {error}"));
+        }
+        return;
+    }
+
+    if command == b"BGSAVE" && !matches!(outcome.response, RespFrame::Error(_)) {
+        if !start_bgsave(Arc::clone(server_state), persistence.rdb_path.clone()).await {
+            outcome.response = RespFrame::error_str("ERR Background save already in progress");
+        }
+        return;
+    }
+
+    if is_queued_response(&outcome.response) || !is_write_command(&argv) {
+        return;
+    }
+
+    let Some(writer) = &persistence.aof_writer else {
+        return;
+    };
+
+    let mut writer = writer.lock().await;
+    if let Err(error) = writer.append_command(selected_db, &argv) {
+        outcome.response = RespFrame::error_str(&format!("ERR AOF append failed: {error}"));
     }
 }
 
@@ -219,22 +305,27 @@ fn encode_pubsub_messages(
 }
 
 pub async fn handle_client(stream: TcpStream, server_state: SharedServerState) -> io::Result<()> {
-    handle_client_with_limits(stream, server_state, ClientIoLimits::default()).await
+    let persistence = Arc::new(PersistenceRuntime::from_config(&crate::config::ServerConfig::default())?);
+    handle_client_with_limits(stream, server_state, persistence, ClientIoLimits::default()).await
 }
 
 pub async fn handle_client_with_limits(
     stream: TcpStream,
     server_state: SharedServerState,
+    persistence: Arc<PersistenceRuntime>,
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
     let client_id = {
         let mut server = server_state.lock().await;
-        server.alloc_client_id()
+        let id = server.alloc_client_id();
+        server.stats.mark_client_connected();
+        id
     };
-    let result = handle_client_inner(stream, &server_state, client_id, io_limits).await;
+    let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits).await;
     {
         let mut server = server_state.lock().await;
         server.pubsub.remove_client(client_id);
+        server.stats.mark_client_disconnected();
     }
     result
 }
@@ -242,6 +333,7 @@ pub async fn handle_client_with_limits(
 async fn handle_client_inner(
     mut stream: TcpStream,
     server_state: &SharedServerState,
+    persistence: &Arc<PersistenceRuntime>,
     client_id: i64,
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
@@ -298,12 +390,30 @@ async fn handle_client_inner(
                 Ok(result) => result?,
                 Err(_) => continue,
             }
+        } else if io_limits.client_read_timeout_sec > 0 {
+            let idle_duration = Duration::from_secs(io_limits.client_read_timeout_sec);
+            match timeout(idle_duration, stream.read_buf(&mut input)).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    tracing::info!(
+                        client_id = client_id,
+                        timeout_sec = io_limits.client_read_timeout_sec,
+                        "disconnecting idle client: read timeout"
+                    );
+                    return Ok(());
+                }
+            }
         } else {
             stream.read_buf(&mut input).await?
         };
 
         if read == 0 {
             return Ok(());
+        }
+
+        {
+            let mut server = server_state.lock().await;
+            server.stats.add_net_input_bytes(read as u64);
         }
 
         if input.len() > QUERY_BUFFER_LIMIT {
@@ -325,7 +435,7 @@ async fn handle_client_inner(
             };
 
             let outcome =
-                run_with_blocking_retry(frame, server_state, &mut client_state, &stream).await?;
+                run_with_blocking_retry(frame, server_state, persistence, &mut client_state, &stream).await?;
             if !append_encoded_frame(
                 &mut output,
                 &outcome.response,
@@ -342,8 +452,11 @@ async fn handle_client_inner(
             }
 
             if output.len() >= OUTPUT_BUFFER_FLUSH_THRESHOLD {
+                let out_len = output.len() as u64;
                 write_all_with_timeout(&mut stream, &output).await?;
                 output.clear();
+                let mut server = server_state.lock().await;
+                server.stats.add_net_output_bytes(out_len);
             }
 
             if outcome.close {
@@ -381,8 +494,11 @@ async fn handle_client_inner(
         }
 
         if !output.is_empty() {
+            let out_len = output.len() as u64;
             write_all_with_timeout(&mut stream, &output).await?;
             output.clear();
+            let mut server = server_state.lock().await;
+            server.stats.add_net_output_bytes(out_len);
         }
 
         if should_close {
@@ -401,6 +517,8 @@ mod tests {
         time::timeout,
     };
 
+    use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
+    use crate::persistence::PersistenceRuntime;
     use super::{ClientIoLimits, handle_client, handle_client_with_limits};
 
     async fn setup_client_server() -> (TcpStream, tokio::task::JoinHandle<()>) {
@@ -418,7 +536,29 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
-            handle_client_with_limits(socket, shared, io_limits)
+            let persistence = Arc::new(PersistenceRuntime::from_config(&crate::config::ServerConfig::default()).expect("persistence runtime"));
+            handle_client_with_limits(socket, shared, persistence, io_limits)
+                .await
+                .expect("handle client");
+        });
+
+        let client = TcpStream::connect(addr).await.expect("connect client");
+        (client, server_task)
+    }
+
+    async fn setup_client_server_with_persistence(
+        io_limits: ClientIoLimits,
+        persistence: Arc<PersistenceRuntime>,
+    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            handle_client_with_limits(socket, shared, persistence, io_limits)
                 .await
                 .expect("handle client");
         });
@@ -526,6 +666,7 @@ mod tests {
     async fn oversized_response_disconnects_client() {
         let limits = ClientIoLimits {
             output_buffer_limit_bytes: 256,
+            client_read_timeout_sec: 0,
         };
         let (mut client, server_task) = setup_client_server_with_limits(limits).await;
 
@@ -631,5 +772,54 @@ mod tests {
         let _ = read_reply(&mut pubc).await;
 
         accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_read_timeout_disconnects_idle_client() {
+        let limits = ClientIoLimits {
+            output_buffer_limit_bytes: DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES,
+            client_read_timeout_sec: 1,
+        };
+        let (mut client, server_task) = setup_client_server_with_limits(limits).await;
+
+        client.write_all(b"PING\r\n").await.expect("write ping");
+        let ping = read_reply(&mut client).await;
+        assert_eq!(ping, b"+PONG\r\n");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let mut buf = [0u8; 1];
+        let n = client.read(&mut buf).await.expect("read after timeout");
+        assert_eq!(n, 0, "expected EOF after timeout");
+
+        server_task.await.expect("server task complete");
+    }
+
+    #[tokio::test]
+    async fn write_commands_append_to_aof() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut config = crate::config::ServerConfig::default();
+        config.dir = dir.path().to_path_buf();
+        config.appendonly = true;
+        config.appendfsync = "always".to_string();
+        let persistence = Arc::new(PersistenceRuntime::from_config(&config).expect("runtime"));
+
+        let (mut client, server_task) =
+            setup_client_server_with_persistence(ClientIoLimits::default(), persistence).await;
+
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .await
+            .expect("write set");
+        assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
+
+        client.write_all(b"QUIT\r\n").await.expect("quit");
+        let _ = read_reply(&mut client).await;
+        server_task.await.expect("server task complete");
+
+        let aof = std::fs::read_to_string(dir.path().join("appendonly.aof")).expect("read aof");
+        assert!(aof.contains("SET"));
+        assert!(aof.contains("foo"));
+        assert!(aof.contains("bar"));
     }
 }

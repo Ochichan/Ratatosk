@@ -187,7 +187,7 @@ pub(super) fn cmd_bpop(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
@@ -527,7 +527,7 @@ pub(super) fn cmd_brpoplpush(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
@@ -564,7 +564,7 @@ pub(super) fn cmd_blmove(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
@@ -675,7 +675,7 @@ pub(super) fn cmd_lmpop_inner(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
@@ -748,18 +748,22 @@ pub(super) fn try_lmpop_once(
 }
 
 pub(super) fn blocking_deadline_ms(timeout_sec: f64) -> Option<i64> {
+    use ratatosk_core::time::monotonic_ms;
+
     if timeout_sec <= 0.0 {
         return None;
     }
 
     let timeout_ms = (timeout_sec * 1000.0).ceil();
     let timeout_ms = if timeout_ms.is_finite() {
-        timeout_ms as i64
+        timeout_ms as u64
     } else {
-        i64::MAX
+        u64::MAX
     };
 
-    Some(now_ms().saturating_add(timeout_ms.max(0)))
+    let now = monotonic_ms();
+    let deadline = now.saturating_add(timeout_ms);
+    i64::try_from(deadline).ok()
 }
 
 pub(super) fn cmd_lrange(

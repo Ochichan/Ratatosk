@@ -86,10 +86,15 @@ fn stream_contains_id(stream: &[StreamEntry], id: StreamId) -> bool {
 }
 
 fn blocking_deadline_ms_from_block(block_ms: i64) -> Option<i64> {
+    use ratatosk_core::time::monotonic_ms;
+
     if block_ms <= 0 {
         None
     } else {
-        Some(now_ms().saturating_add(block_ms))
+        let now = monotonic_ms();
+        let timeout = u64::try_from(block_ms).ok()?;
+        let deadline = now.saturating_add(timeout);
+        i64::try_from(deadline).ok()
     }
 }
 
@@ -405,7 +410,9 @@ pub(super) fn cmd_xread(
     if out.is_empty() {
         if let Some(block_ms) = block_ms {
             let deadline_ms = blocking_deadline_ms_from_block(block_ms);
-            if deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
+            if deadline_ms.is_some_and(|deadline| {
+                ratatosk_core::time::monotonic_ms() as i64 >= deadline
+            }) {
                 return CommandOutcome::reply(RespFrame::Null);
             }
 
@@ -1050,7 +1057,9 @@ pub(super) fn cmd_xreadgroup(
     if out.is_empty() {
         if let Some(block_ms) = block_ms {
             let deadline_ms = blocking_deadline_ms_from_block(block_ms);
-            if deadline_ms.is_some_and(|deadline| now_ms() >= deadline) {
+            if deadline_ms.is_some_and(|deadline| {
+                ratatosk_core::time::monotonic_ms() as i64 >= deadline
+            }) {
                 return CommandOutcome::reply(RespFrame::Null);
             }
             let full_frame = build_blocking_frame("XREADGROUP", args);

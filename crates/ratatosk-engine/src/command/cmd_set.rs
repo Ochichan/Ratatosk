@@ -411,9 +411,10 @@ pub(super) fn cmd_srandmember(
             let mut iter = set.iter().cycle().skip(start);
             let mut out = Vec::with_capacity(requested);
             for _ in 0..requested {
-                let member = iter
-                    .next()
-                    .expect("set iterator is infinite when the set is non-empty");
+                let Some(member) = iter.next() else {
+                    debug_assert!(false, "cycled iterator infinite for non-empty set");
+                    return CommandOutcome::reply(err("ERR internal error in SRANDMEMBER"));
+                };
                 out.push(RespFrame::BulkString(Some(member.clone())));
             }
             CommandOutcome::reply(RespFrame::Array(out))

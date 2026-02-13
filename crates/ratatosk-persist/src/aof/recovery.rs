@@ -22,7 +22,12 @@ impl AofRecovery {
     ///
     /// Returns the number of commands replayed.
     pub fn replay_file(path: &Path, state: &mut ServerState) -> Result<usize, PersistError> {
-        let file = File::open(path)?;
+        let file = File::open(path).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("opening AOF file '{}': {e}", path.display()),
+            )
+        })?;
         Self::replay_reader(BufReader::new(file), state)
     }
 
@@ -37,7 +42,9 @@ impl AofRecovery {
 
         // Read all data into buffer
         let mut raw = Vec::new();
-        reader.read_to_end(&mut raw)?;
+        reader
+            .read_to_end(&mut raw)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("reading AOF data: {e}")))?;
         buf.extend_from_slice(&raw);
 
         // Parse and execute frames
@@ -150,6 +157,23 @@ mod tests {
         let mut state = ServerState::with_default_dbs();
         let replayed = AofRecovery::replay_file(&path, &mut state).expect("replay");
         assert_eq!(replayed, 0);
+    }
+
+    #[test]
+    fn replay_missing_file_has_context_in_error() {
+        let path = std::path::Path::new("/nonexistent/dir/missing.aof");
+        let mut state = ServerState::with_default_dbs();
+        let result = AofRecovery::replay_file(path, &mut state);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("opening AOF file"),
+            "error should contain context about opening AOF file, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("missing.aof"),
+            "error should contain the file path, got: {err_msg}"
+        );
     }
 
     #[test]
