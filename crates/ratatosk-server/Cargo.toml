@@ -30,6 +30,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 parking_lot = { workspace = true }
+fs2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

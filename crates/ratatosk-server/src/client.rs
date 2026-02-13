@@ -69,8 +69,6 @@ fn append_encoded_frame(
     true
 }
 
-
-
 fn next_retry_backoff(current: Duration) -> Duration {
     current
         .checked_mul(2)
@@ -140,22 +138,26 @@ async fn run_with_blocking_retry(
     let start = std::time::Instant::now();
     let first_argv = frame_to_argv_for_persistence(&frame);
     let first_db = client_state.selected_db();
-    
+
     // Extract command name for metrics
-    let command_name = first_argv.as_ref().and_then(|argv| {
-        argv.first().map(|cmd| String::from_utf8_lossy(cmd).to_ascii_uppercase())
-    }).unwrap_or_else(|| "UNKNOWN".to_string());
-    
+    let command_name = first_argv
+        .as_ref()
+        .and_then(|argv| {
+            argv.first()
+                .map(|cmd| String::from_utf8_lossy(cmd).to_ascii_uppercase())
+        })
+        .unwrap_or_else(|| "UNKNOWN".to_string());
+
     let mut outcome = {
         let mut server = server_state.lock().await;
         execute(frame, &mut server, client_state)
     };
-    
+
     // Record command metrics
     let duration = start.elapsed();
     let success = !matches!(outcome.response, ratatosk_resp::RespFrame::Error(_));
     metrics::record_command(&command_name, success, duration.as_secs_f64());
-    
+
     // Log slow commands (> 1ms)
     if duration.as_millis() > 1 {
         tracing::debug!(
@@ -182,12 +184,15 @@ async fn run_with_blocking_retry(
     let mut frame = retry.frame;
     let mut last_response = outcome.response;
     let mut backoff = BLOCKING_RETRY_BACKOFF_INITIAL;
+    let mut retry_attempts = 0u64;
 
     loop {
         let now_ms = ratatosk_core::time::monotonic_ms();
         if let Some(deadline) = deadline_ms {
             let deadline_u64 = u64::try_from(deadline).unwrap_or(u64::MAX);
             if now_ms >= deadline_u64 {
+                metrics::record_blocking_retry_deadline_exhausted(&command_name);
+                metrics::record_blocking_retry_completed(&command_name, retry_attempts);
                 return Ok(CommandOutcome {
                     response: last_response,
                     close: false,
@@ -204,7 +209,22 @@ async fn run_with_blocking_retry(
             backoff
         };
 
-        if wait_for_disconnect_or_timeout(stream, wait_for).await? {
+        retry_attempts = retry_attempts.saturating_add(1);
+        metrics::record_blocking_retry_iteration(&command_name);
+        metrics::record_blocking_retry_wait_ms(&command_name, wait_for.as_millis() as f64);
+
+        if wait_for_disconnect_or_timeout(stream, wait_for)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "waiting for blocking command retry readiness (command={}, attempt={}): {}",
+                        command_name, retry_attempts, error
+                    ),
+                )
+            })?
+        {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "client disconnected while waiting for blocking command",
@@ -225,6 +245,7 @@ async fn run_with_blocking_retry(
         };
 
         let Some(retry) = outcome.retry_blocking else {
+            metrics::record_blocking_retry_completed(&command_name, retry_attempts);
             return Ok(outcome);
         };
         last_response = outcome.response;
@@ -340,7 +361,16 @@ fn encode_pubsub_messages(
 }
 
 pub async fn handle_client(stream: TcpStream, server_state: SharedServerState) -> io::Result<()> {
-    let persistence = Arc::new(PersistenceRuntime::from_config(&crate::config::ServerConfig::default())?);
+    let persistence = Arc::new(
+        PersistenceRuntime::from_config(&crate::config::ServerConfig::default()).map_err(
+            |error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("creating default persistence runtime for client handler: {error}"),
+                )
+            },
+        )?,
+    );
     handle_client_with_limits(stream, server_state, persistence, ClientIoLimits::default()).await
 }
 
@@ -357,7 +387,10 @@ pub async fn handle_client_with_limits(
         let active = server.stats.connected_clients();
         metrics::set_active_connections(active as usize);
         metrics::record_connection_event("accepted");
-        let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+        let addr = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         (id, addr)
     };
 
@@ -377,8 +410,18 @@ pub async fn handle_client_with_limits(
         "client connected"
     );
 
-    let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits).await;
-    
+    let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "handling client I/O (client_id={}, remote_addr={}): {}",
+                    client_id, remote_addr, error
+                ),
+            )
+        });
+
     let disconnect_reason = match &result {
         Ok(()) => "closed",
         Err(e) if is_benign_disconnect(e) => "client_disconnect",
@@ -508,8 +551,24 @@ async fn handle_client_inner(
                 }
             };
 
-            let outcome =
-                run_with_blocking_retry(frame, server_state, persistence, &mut client_state, &stream).await?;
+            let outcome = run_with_blocking_retry(
+                frame,
+                server_state,
+                persistence,
+                &mut client_state,
+                &stream,
+            )
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "executing command pipeline for client_id={}: {}",
+                        client_state.id(),
+                        error
+                    ),
+                )
+            })?;
             if !append_encoded_frame(
                 &mut output,
                 &outcome.response,
@@ -591,9 +650,9 @@ mod tests {
         time::timeout,
     };
 
+    use super::{ClientIoLimits, handle_client, handle_client_with_limits};
     use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
     use crate::persistence::PersistenceRuntime;
-    use super::{ClientIoLimits, handle_client, handle_client_with_limits};
 
     async fn setup_client_server() -> (TcpStream, tokio::task::JoinHandle<()>) {
         setup_client_server_with_limits(ClientIoLimits::default()).await
@@ -610,7 +669,10 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
-            let persistence = Arc::new(PersistenceRuntime::from_config(&crate::config::ServerConfig::default()).expect("persistence runtime"));
+            let persistence = Arc::new(
+                PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
+                    .expect("persistence runtime"),
+            );
             handle_client_with_limits(socket, shared, persistence, io_limits)
                 .await
                 .expect("handle client");

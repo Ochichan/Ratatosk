@@ -7,6 +7,7 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, StoredValue, purge_expired_key, purge_expired_keys};
 use crate::object::now_us;
+use crate::security::next_audit_stamp;
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
@@ -512,7 +513,10 @@ pub(super) fn cmd_config_set(
                         "ERR value is not an integer or out of range",
                     ));
                 };
-                (ConfigSetOp::SlowlogLogSlowerThan(parsed), "slowlog-log-slower-than")
+                (
+                    ConfigSetOp::SlowlogLogSlowerThan(parsed),
+                    "slowlog-log-slower-than",
+                )
             }
             b"SLOWLOG-MAX-LEN" => {
                 let Some(parsed) = parse_i64(value) else {
@@ -523,7 +527,10 @@ pub(super) fn cmd_config_set(
                 if parsed < 0 {
                     return CommandOutcome::reply(err("ERR value is out of range"));
                 }
-                (ConfigSetOp::SlowlogMaxLen(parsed as usize), "slowlog-max-len")
+                (
+                    ConfigSetOp::SlowlogMaxLen(parsed as usize),
+                    "slowlog-max-len",
+                )
             }
             b"DATABASES" => {
                 return CommandOutcome::reply(err("ERR Unsupported CONFIG parameter: databases"));
@@ -540,10 +547,17 @@ pub(super) fn cmd_config_set(
     }
 
     for (op, param) in ops {
+        let payload = format!("event=CONFIG_SET client_id={} param={}", client.id(), param);
+        let stamp = next_audit_stamp("CONFIG_SET", &payload);
         tracing::info!(
+            target = "ratatosk::audit",
+            event = "CONFIG_SET",
+            audit_seq = stamp.seq,
+            audit_prev_hash = %stamp.prev_hash,
+            audit_hash = %stamp.hash,
             client_id = client.id(),
             param = param,
-            "CONFIG SET executed"
+            "configuration parameter changed"
         );
         match op {
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),
@@ -918,14 +932,8 @@ pub(super) fn append_info_stats_section(out: &mut String, server: &ServerState) 
         "total_net_output_bytes:{}\r\n",
         server.stats.total_net_output_bytes()
     ));
-    out.push_str(&format!(
-        "evicted_keys:{}\r\n",
-        server.stats.evicted_keys()
-    ));
-    out.push_str(&format!(
-        "expired_keys:{}\r\n",
-        server.stats.expired_keys()
-    ));
+    out.push_str(&format!("evicted_keys:{}\r\n", server.stats.evicted_keys()));
+    out.push_str(&format!("expired_keys:{}\r\n", server.stats.expired_keys()));
     out.push_str(&format!(
         "keyspace_hits:{}\r\n",
         server.stats.keyspace_hits()
@@ -939,9 +947,9 @@ pub(super) fn append_info_stats_section(out: &mut String, server: &ServerState) 
 
 pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerState) {
     use ratatosk_core::time::now_sec;
-    
+
     out.push_str("# Persistence\r\n");
-    
+
     // RDB section
     out.push_str(&format!(
         "rdb_last_save_time:{}\r\n",
@@ -955,7 +963,7 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
         "rdb_bgsave_in_progress:{}\r\n",
         i32::from(server.rdb_save_in_progress())
     ));
-    
+
     let (status, error_msg) = match server.last_rdb_save_status() {
         Some(Ok(())) | None => ("ok", None),
         Some(Err(e)) => ("err", Some(e.as_str())),
@@ -967,19 +975,16 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
     if let Some(time_ms) = server.last_rdb_save_time_ms() {
         out.push_str(&format!("rdb_last_save_timestamp_ms:{time_ms}\r\n"));
     }
-    
+
     // AOF section
-    out.push_str(&format!("aof_enabled:{}\r\n", i32::from(server.aof_enabled())));
     out.push_str(&format!(
-        "aof_rewrite_in_progress:0\r\n"
+        "aof_enabled:{}\r\n",
+        i32::from(server.aof_enabled())
     ));
-    out.push_str(&format!(
-        "aof_current_size:0\r\n"
-    ));
-    out.push_str(&format!(
-        "aof_base_size:0\r\n"
-    ));
-    
+    out.push_str(&format!("aof_rewrite_in_progress:0\r\n"));
+    out.push_str(&format!("aof_current_size:0\r\n"));
+    out.push_str(&format!("aof_base_size:0\r\n"));
+
     out.push_str("\r\n");
 }
 
@@ -1068,9 +1073,7 @@ pub(super) fn cmd_bgrewriteaof(args: &[Bytes]) -> CommandOutcome {
         return wrong_arity("bgrewriteaof");
     }
 
-    CommandOutcome::reply(RespFrame::simple_str(
-        "Background append only file rewriting started",
-    ))
+    CommandOutcome::reply(err("ERR BGREWRITEAOF is not implemented in this build"))
 }
 
 pub(super) fn cmd_sflush(args: &[Bytes]) -> CommandOutcome {
@@ -1127,99 +1130,169 @@ pub(super) fn cmd_flushdb(
         return outcome;
     }
 
+    let mode = args
+        .first()
+        .map(|raw| String::from_utf8_lossy(raw).to_ascii_uppercase())
+        .unwrap_or_else(|| "SYNC".to_string());
+
     server.clear_db(client.selected_db);
+
+    let payload = format!(
+        "event=FLUSHDB client_id={} db={} mode={}",
+        client.id(),
+        client.selected_db,
+        mode
+    );
+    let stamp = next_audit_stamp("FLUSHDB", &payload);
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "FLUSHDB",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
+        client_id = client.id(),
+        db = client.selected_db,
+        mode = mode,
+        "database cleared"
+    );
+
     CommandOutcome::reply(RespFrame::ok())
 }
 
-pub(super) fn cmd_flushall(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
+pub(super) fn cmd_flushall(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
     if let Err(outcome) = parse_flush_mode(args, "flushall") {
         return outcome;
     }
 
+    let mode = args
+        .first()
+        .map(|raw| String::from_utf8_lossy(raw).to_ascii_uppercase())
+        .unwrap_or_else(|| "SYNC".to_string());
+
+    let db_count = server.db_count();
     server.clear_all_dbs();
+
+    let payload = format!(
+        "event=FLUSHALL client_id={} db_count={} mode={}",
+        client.id(),
+        db_count,
+        mode
+    );
+    let stamp = next_audit_stamp("FLUSHALL", &payload);
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "FLUSHALL",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
+        client_id = client.id(),
+        db_count = db_count,
+        mode = mode,
+        "all databases cleared"
+    );
+
     CommandOutcome::reply(RespFrame::ok())
 }
 
 /// Rewrite the configuration file with current runtime settings.
 fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     use std::io::Write;
-    
+
     let config_dir = server.config.dir();
     let config_path = config_dir.join("ratatosk.conf");
     let temp_path = config_path.with_extension("conf.tmp");
-    
+
     // Create config directory if it doesn't exist
     if !config_dir.exists() {
         std::fs::create_dir_all(config_dir)
             .map_err(|e| format!("creating config directory: {e}"))?;
     }
-    
+
     let mut file = std::io::BufWriter::new(
-        std::fs::File::create(&temp_path)
-            .map_err(|e| format!("creating temp config file: {e}"))?
+        std::fs::File::create(&temp_path).map_err(|e| format!("creating temp config file: {e}"))?,
     );
-    
+
     // Write header
     writeln!(file, "# Ratatosk configuration file")
         .map_err(|e| format!("writing config header: {e}"))?;
     writeln!(file, "# Auto-generated by CONFIG REWRITE")
         .map_err(|e| format!("writing config header: {e}"))?;
-    writeln!(file, "# Generated at: {}", 
+    writeln!(
+        file,
+        "# Generated at: {}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-    ).map_err(|e| format!("writing config header: {e}"))?;
+    )
+    .map_err(|e| format!("writing config header: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
-    
+
     // Write current configuration values
-    writeln!(file, "# Network")
-        .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "bind 127.0.0.1")
-        .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "port 6379")
-        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "# Network").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "bind 127.0.0.1").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "port 6379").map_err(|e| format!("writing config: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
-    
-    writeln!(file, "# Persistence")
-        .map_err(|e| format!("writing config: {e}"))?;
+
+    writeln!(file, "# Persistence").map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "dir {}", server.config.dir().display())
         .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "dbfilename {}", server.config.dbfilename())
         .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "appendonly {}", if server.config.appendonly() { "yes" } else { "no" })
-        .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "appendfsync {}", String::from_utf8_lossy(server.config.appendfsync()))
-        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "appendonly {}",
+        if server.config.appendonly() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "appendfsync {}",
+        String::from_utf8_lossy(server.config.appendfsync())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
-    
-    writeln!(file, "# Memory management")
-        .map_err(|e| format!("writing config: {e}"))?;
+
+    writeln!(file, "# Memory management").map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "maxmemory {}", server.config.maxmemory())
         .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "maxmemory-policy {}", String::from_utf8_lossy(server.config.maxmemory_policy()))
-        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "maxmemory-policy {}",
+        String::from_utf8_lossy(server.config.maxmemory_policy())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
-    
-    writeln!(file, "# Logging")
-        .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "slowlog-log-slower-than {}", server.stats.slowlog_log_slower_than_us())
-        .map_err(|e| format!("writing config: {e}"))?;
+
+    writeln!(file, "# Logging").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "slowlog-log-slower-than {}",
+        server.stats.slowlog_log_slower_than_us()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "slowlog-max-len {}", server.stats.slowlog_max_len())
         .map_err(|e| format!("writing config: {e}"))?;
-    
+
     // Flush and close file
     drop(file);
-    
+
     // Atomically rename temp file to actual config file
-    std::fs::rename(&temp_path, &config_path)
-        .map_err(|e| format!("renaming config file: {e}"))?;
-    
+    std::fs::rename(&temp_path, &config_path).map_err(|e| format!("renaming config file: {e}"))?;
+
     tracing::info!(
         target = "ratatosk::config",
         path = %config_path.display(),
         "Configuration file rewritten"
     );
-    
+
     Ok(())
 }

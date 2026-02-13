@@ -2,7 +2,9 @@ use std::{io, sync::Arc, time::Duration};
 
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
-    eviction::{EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction},
+    eviction::{
+        EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction,
+    },
     expiry::{active_expire_cycle, detect_clock_jump},
     keyspace::ServerState,
 };
@@ -56,6 +58,10 @@ fn next_backoff(current: Duration) -> Duration {
         .min(ACCEPT_ERROR_BACKOFF_MAX)
 }
 
+fn io_error_kind_label(error: &io::Error) -> String {
+    format!("{:?}", error.kind()).to_ascii_lowercase()
+}
+
 fn is_expected_client_disconnect(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -105,7 +111,10 @@ async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 if error.is_cancelled() {
-                    tracing::debug!(target = "ratatosk::shutdown", "client task cancelled during shutdown");
+                    tracing::debug!(
+                        target = "ratatosk::shutdown",
+                        "client task cancelled during shutdown"
+                    );
                 } else {
                     tracing::warn!(target = "ratatosk::shutdown", error = %error, "client task join failure during shutdown");
                 }
@@ -125,7 +134,7 @@ async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
 
     let remaining = tasks.len();
     let aborted = initial_count - remaining;
-    
+
     tracing::warn!(
         target = "ratatosk::shutdown",
         remaining_clients = remaining,
@@ -133,9 +142,9 @@ async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
         elapsed_ms = start.elapsed().as_millis(),
         "shutdown grace period expired; aborting remaining client handlers"
     );
-    
+
     crate::metrics::record_shutdown_clients_aborted(remaining as u64);
-    
+
     tasks.abort_all();
 
     while let Some(result) = tasks.join_next().await {
@@ -169,7 +178,7 @@ async fn server_cron(
     ops_sec_interval: u64,
 ) {
     detect_clock_jump();
-    
+
     let mut server = server_state.lock().await;
     let current_ms = now_ms();
 
@@ -184,14 +193,16 @@ async fn server_cron(
     if eviction_config.maxmemory > 0 {
         let used = if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
             let estimate = estimate_used_memory(&server);
-            server.stats.set_cached_memory_estimate(estimate as u64, *cron_tick);
+            server
+                .stats
+                .set_cached_memory_estimate(estimate as u64, *cron_tick);
             // Record memory metric
             crate::metrics::set_memory_used(estimate as u64);
             estimate
         } else {
             server.stats.cached_memory_estimate() as usize
         };
-        
+
         if needs_eviction(used, &eviction_config) {
             let evicted = perform_eviction(&mut server, &eviction_config);
             if evicted > 0 {
@@ -208,20 +219,26 @@ async fn server_cron(
     // 3. Ops/sec sampling
     *cron_tick = cron_tick.wrapping_add(1);
     if *cron_tick % ops_sec_interval == 0 {
-        let interval_secs = ops_sec_interval.saturating_mul(1000)
-            / u64::from(server.config.hz().max(1))
-            / 1000;
+        let interval_secs =
+            ops_sec_interval.saturating_mul(1000) / u64::from(server.config.hz().max(1)) / 1000;
         server.stats.sample_ops_per_sec(interval_secs.max(1));
     }
 }
 
 pub async fn run(config: ServerConfig) -> io::Result<()> {
-    let listener = TcpListener::bind(config.listen_addr()).await?;
+    let listen_addr = config.listen_addr();
+    let listener = TcpListener::bind(&listen_addr).await.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("binding TCP listener on {listen_addr}: {error}"),
+        )
+    })?;
 
     // Lazy-free background thread for async deletion of large values
     const LAZY_FREE_CHANNEL_SIZE: usize = 4096;
-    let (lazy_free_tx, lazy_free_rx) =
-        crossbeam_channel::bounded::<ratatosk_engine::keyspace::StoredValue>(LAZY_FREE_CHANNEL_SIZE);
+    let (lazy_free_tx, lazy_free_rx) = crossbeam_channel::bounded::<
+        ratatosk_engine::keyspace::StoredValue,
+    >(LAZY_FREE_CHANNEL_SIZE);
     let lazy_free_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lazy_free_flag = Arc::clone(&lazy_free_shutdown);
     let lazy_free_handle = std::thread::spawn(move || {
@@ -237,7 +254,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             drop(value);
         }
     });
-    
+
     // Spawn lazy-free channel monitor
     let lazy_free_monitor_handle = tokio::spawn({
         let lazy_free_tx = lazy_free_tx.clone();
@@ -245,14 +262,14 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             loop {
                 interval.tick().await;
-                
+
                 // Estimate channel utilization (approximate)
                 let capacity = LAZY_FREE_CHANNEL_SIZE as f64;
                 let available = lazy_free_tx.capacity().unwrap_or(0) as f64;
                 let utilization = 1.0 - (available / capacity);
-                
+
                 crate::metrics::set_lazyfree_queue_utilization(utilization);
-                
+
                 if utilization > 0.9 {
                     tracing::warn!(
                         target = "ratatosk::memory",
@@ -270,10 +287,29 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let server_state = Arc::new(Mutex::new(initial_state));
     apply_server_persistence_config(&server_state, &config).await;
 
-    let persistence = Arc::new(PersistenceRuntime::from_config(&config)?);
-    load_startup_data(&server_state, &persistence, config.appendonly).await?;
+    let persistence = Arc::new(PersistenceRuntime::from_config(&config).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "initializing persistence runtime (dir={}, appendonly={}): {}",
+                config.dir.display(),
+                config.appendonly,
+                error
+            ),
+        )
+    })?);
+    load_startup_data(&server_state, &persistence, config.appendonly)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("loading startup persistence data: {error}"),
+            )
+        })?;
 
     let client_permits = Arc::new(Semaphore::new(config.max_clients));
+    crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
+
     let io_limits = ClientIoLimits {
         output_buffer_limit_bytes: config.output_buffer_limit_bytes,
         client_read_timeout_sec: config.client_timeout_sec,
@@ -282,7 +318,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut shutdown = Box::pin(wait_for_shutdown_signal());
     let mut client_tasks: JoinSet<()> = JoinSet::new();
     let mut accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
-    
+
     // Connection rate limiter (10 connections per 10 seconds per IP)
     let mut rate_limiter = ConnectionRateLimiter::default();
 
@@ -301,7 +337,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     #[cfg(unix)]
     let mut sigusr1 = {
         use tokio::signal::unix::{SignalKind, signal};
-        signal(SignalKind::user_defined1())?
+        signal(SignalKind::user_defined1()).map_err(|error| {
+            io::Error::new(error.kind(), format!("installing SIGUSR1 handler: {error}"))
+        })?
     };
 
     loop {
@@ -339,6 +377,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         accepted
                     }
                     Err(error) if is_transient_accept_error(&error) => {
+                        let kind = io_error_kind_label(&error);
+                        crate::metrics::record_accept_error(&kind, true);
+                        crate::metrics::record_accept_backoff(accept_backoff.as_millis() as f64);
                         tracing::warn!(
                             error = %error,
                             backoff_ms = accept_backoff.as_millis(),
@@ -348,11 +389,21 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         accept_backoff = next_backoff(accept_backoff);
                         continue;
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        let kind = io_error_kind_label(&error);
+                        crate::metrics::record_accept_error(&kind, false);
+                        return Err(io::Error::new(
+                            error.kind(),
+                            format!("accepting TCP connection on {listen_addr}: {error}"),
+                        ));
+                    }
                 };
 
                 // Rate limiting check
-                if !rate_limiter.check_rate_limit(addr.ip()) {
+                let within_rate_limit = rate_limiter.check_rate_limit(addr.ip());
+                crate::metrics::set_rate_limiter_tracked_ips(rate_limiter.tracked_ips());
+                if !within_rate_limit {
+                    crate::metrics::record_connection_rejected("rate_limited");
                     tracing::warn!(
                         target = "ratatosk::security",
                         remote_addr = %addr,
@@ -365,6 +416,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 let permit: OwnedSemaphorePermit = match Arc::clone(&client_permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
+                        crate::metrics::record_connection_rejected("max_clients");
+                        crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
                         tracing::warn!(
                             remote_addr = %addr,
                             max_clients = config.max_clients,
@@ -374,6 +427,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         continue;
                     }
                 };
+                crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
 
                 let state = Arc::clone(&server_state);
                 let persistence = Arc::clone(&persistence);
@@ -390,6 +444,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 });
             }
             _ = cron_interval.tick() => {
+                crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
                 server_cron(&server_state, &mut cron_tick, ops_sec_interval).await;
             }
             _ = sigusr1_recv => {
@@ -403,6 +458,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     }
 
     client_permits.close();
+    crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
     let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
     drain_client_tasks(&mut client_tasks, grace_period).await;
 

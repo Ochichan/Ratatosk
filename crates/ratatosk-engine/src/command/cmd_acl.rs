@@ -5,6 +5,7 @@ use rand::rngs::OsRng;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{AclState, AclUser, ServerState};
+use crate::security::next_audit_stamp;
 
 use super::{
     ClientState, CommandOutcome, acl_required_categories, err, parse_i64, to_uppercase_bytes,
@@ -235,11 +236,31 @@ pub(super) fn cmd_acl(
             for password in remove_passwords {
                 let _ = server.acl.remove_password(&username, &password);
             }
+            let rule_count = args.len().saturating_sub(2);
             server.acl.push_log(Bytes::from(format!(
                 "SETUSER {} rules={} OK",
                 String::from_utf8_lossy(&username),
-                args.len().saturating_sub(2)
+                rule_count
             )));
+            let username_text = String::from_utf8_lossy(&username).into_owned();
+            let payload = format!(
+                "event=ACL_SETUSER client_id={} username={} rules={}",
+                client.id(),
+                username_text,
+                rule_count
+            );
+            let stamp = next_audit_stamp("ACL_SETUSER", &payload);
+            tracing::info!(
+                target = "ratatosk::audit",
+                event = "ACL_SETUSER",
+                audit_seq = stamp.seq,
+                audit_prev_hash = %stamp.prev_hash,
+                audit_hash = %stamp.hash,
+                client_id = client.id(),
+                username = %username_text,
+                rules = rule_count,
+                "ACL user updated"
+            );
             CommandOutcome::reply(RespFrame::ok())
         }
         b"DELUSER" => {
@@ -250,6 +271,25 @@ pub(super) fn cmd_acl(
             server
                 .acl
                 .push_log(Bytes::from(format!("DELUSER count={removed}")));
+            let requested_users = args.len().saturating_sub(1);
+            let payload = format!(
+                "event=ACL_DELUSER client_id={} requested_users={} removed_users={}",
+                client.id(),
+                requested_users,
+                removed
+            );
+            let stamp = next_audit_stamp("ACL_DELUSER", &payload);
+            tracing::info!(
+                target = "ratatosk::audit",
+                event = "ACL_DELUSER",
+                audit_seq = stamp.seq,
+                audit_prev_hash = %stamp.prev_hash,
+                audit_hash = %stamp.hash,
+                client_id = client.id(),
+                requested_users = requested_users,
+                removed_users = removed,
+                "ACL users removed"
+            );
             CommandOutcome::reply(RespFrame::Integer(removed))
         }
         b"GENPASS" => {
@@ -361,7 +401,7 @@ pub(super) fn cmd_auth(
             args[0].clone()
         }
     });
-    
+
     let result = match args {
         [password] => {
             if authenticate_client(server, &Bytes::from_static(b"default"), password, client) {
@@ -379,22 +419,34 @@ pub(super) fn cmd_auth(
         }
         _ => wrong_arity("auth"),
     };
-    
+
     // Record auth metrics
     let success = !matches!(result.response, RespFrame::Error(_));
     let result_label = if success { "success" } else { "failure" };
-    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label.to_string()).increment(1);
-    
+    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label.to_string())
+        .increment(1);
+
     // Audit log for auth events
+    let username_text =
+        String::from_utf8_lossy(username.as_ref().unwrap_or(&Bytes::from_static(b"unknown")))
+            .into_owned();
+    let payload = format!(
+        "event=AUTH client_id={} username={} success={}",
+        client.id, username_text, success
+    );
+    let stamp = next_audit_stamp("AUTH", &payload);
     tracing::info!(
         target = "ratatosk::audit",
         event = "AUTH",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
         client_id = client.id,
-        username = %String::from_utf8_lossy(username.as_ref().unwrap_or(&Bytes::from_static(b"unknown"))),
+        username = %username_text,
         success,
         "ACL authentication attempt"
     );
-    
+
     result
 }
 

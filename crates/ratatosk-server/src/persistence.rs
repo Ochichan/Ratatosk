@@ -2,6 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fs2::available_space;
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::keyspace::ServerState;
 use ratatosk_persist::{
@@ -25,18 +26,18 @@ impl PersistenceRuntime {
     pub fn from_config(config: &ServerConfig) -> io::Result<Self> {
         // 1. Validate working directory exists and is writable
         validate_working_directory(&config.dir)?;
-        
+
         // 2. Check available disk space (minimum 100MB)
         check_disk_space(&config.dir, 100 * 1024 * 1024)?;
-        
+
         let rdb_path = config.dir.join(&config.dbfilename);
         let aof_path = config.dir.join(AOF_FILENAME);
-        
+
         // 3. Validate AOF file if exists and appendonly is enabled
         if config.appendonly && aof_path.exists() {
             validate_aof_file(&aof_path)?;
         }
-        
+
         let aof_writer = if config.appendonly {
             let policy = FsyncPolicy::from_config_str(config.appendfsync.as_bytes())
                 .unwrap_or(FsyncPolicy::EverySec);
@@ -62,14 +63,17 @@ fn validate_working_directory(dir: &Path) -> io::Result<()> {
             format!("working directory does not exist: {}", dir.display()),
         ));
     }
-    
+
     if !dir.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("working directory path is not a directory: {}", dir.display()),
+            format!(
+                "working directory path is not a directory: {}",
+                dir.display()
+            ),
         ));
     }
-    
+
     // Test write permission by creating a temp file
     let test_file = dir.join(".ratatosk_write_test");
     match std::fs::File::create(&test_file) {
@@ -79,37 +83,49 @@ fn validate_working_directory(dir: &Path) -> io::Result<()> {
         Err(e) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                format!("working directory is not writable: {} (error: {})", dir.display(), e),
+                format!(
+                    "working directory is not writable: {} (error: {})",
+                    dir.display(),
+                    e
+                ),
             ));
         }
     }
-    
+
     Ok(())
 }
 
 fn check_disk_space(dir: &Path, min_bytes: u64) -> io::Result<()> {
-    // Practical check: try to create a file to verify write capability
-    // Note: For proper disk space checking on Unix, use nix::sys::statvfs or similar
-    let test_file = dir.join(".ratatosk_space_test");
-    match std::fs::File::create(&test_file) {
-        Ok(_file) => {
-            let _ = std::fs::remove_file(&test_file);
-        }
-        Err(e) => {
-            return Err(io::Error::new(
-                io::ErrorKind::StorageFull,
-                format!("insufficient disk space or permission denied in {}: {}", dir.display(), e),
-            ));
-        }
+    let available = available_space(dir).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to query available disk space in {}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+
+    if available < min_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            format!(
+                "insufficient disk space in {}: available={} bytes, required={} bytes",
+                dir.display(),
+                available,
+                min_bytes
+            ),
+        ));
     }
-    
+
     tracing::info!(
         target = "ratatosk::startup",
         dir = %dir.display(),
+        available_bytes = available,
         min_bytes_required = min_bytes,
         "disk space validation passed"
     );
-    
+
     Ok(())
 }
 
@@ -124,12 +140,14 @@ fn validate_aof_file(path: &Path) -> io::Result<()> {
             );
             Ok(())
         }
-        Err(e) => {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("AOF file exists but cannot be read: {} (error: {})", path.display(), e),
-            ))
-        }
+        Err(e) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "AOF file exists but cannot be read: {} (error: {})",
+                path.display(),
+                e
+            ),
+        )),
     }
 }
 
@@ -171,7 +189,7 @@ pub async fn load_startup_data(
             AofRecovery::replay_file(&runtime.aof_path, &mut state)
                 .map_err(|e| io::Error::other(format!("replaying AOF: {e}")))?
         };
-        
+
         // Emit metrics for AOF replay
         if result.corruption_detected {
             tracing::warn!(
@@ -189,12 +207,15 @@ pub async fn load_startup_data(
                 "AOF replay completed successfully"
             );
         }
-        
+
         if result.version_mismatch {
-            tracing::warn!(
-                target = "ratatosk::startup",
-                "AOF file version mismatch detected"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF file {} has incompatible or unknown version header; refusing startup to protect rollback safety",
+                    runtime.aof_path.display()
+                ),
+            ));
         }
     }
 
@@ -210,15 +231,16 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
         state.set_rdb_save_in_progress(true);
         state.snapshot_dbs()
     };
-    
+
     crate::metrics::record_rdb_save(true); // background = true
 
     tokio::spawn(async move {
         let path_for_log = rdb_path.display().to_string();
-        let save_result = tokio::task::spawn_blocking(move || rdb::saver::save(&snapshot, &rdb_path))
-            .await
-            .map_err(|e| format!("joining BGSAVE worker: {e}"))
-            .and_then(|result| result.map_err(|e| e.to_string()));
+        let save_result =
+            tokio::task::spawn_blocking(move || rdb::saver::save(&snapshot, &rdb_path))
+                .await
+                .map_err(|e| format!("joining BGSAVE worker: {e}"))
+                .and_then(|result| result.map_err(|e| e.to_string()));
 
         let mut state = server_state.lock().await;
         state.set_rdb_save_in_progress(false);
@@ -249,7 +271,7 @@ pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -
         }
         state.snapshot_dbs()
     };
-    
+
     crate::metrics::record_rdb_save(false); // foreground = false
 
     let result = rdb::saver::save(&snapshot, rdb_path);
@@ -274,17 +296,15 @@ pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
     };
 
     let mut guard = writer.lock().await;
-    
+
     // Get fsync policy for metrics
     let fsync_policy = "always"; // force_fsync always does fsync
     crate::metrics::record_aof_write(fsync_policy);
-    
-    guard
-        .force_fsync()
-        .map_err(|e| {
-            crate::metrics::record_aof_write_error();
-            io::Error::other(format!("flushing AOF: {e}"))
-        })
+
+    guard.force_fsync().map_err(|e| {
+        crate::metrics::record_aof_write_error();
+        io::Error::other(format!("flushing AOF: {e}"))
+    })
 }
 
 #[cfg(test)]
@@ -311,7 +331,12 @@ mod tests {
         rdb::saver::save(&state.snapshot_dbs(), &runtime.rdb_path).expect("save rdb");
 
         {
-            let mut writer = runtime.aof_writer.as_ref().expect("aof writer").lock().await;
+            let mut writer = runtime
+                .aof_writer
+                .as_ref()
+                .expect("aof writer")
+                .lock()
+                .await;
             writer
                 .append_command(
                     0,

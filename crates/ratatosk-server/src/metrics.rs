@@ -38,10 +38,14 @@ pub fn init_metrics_default() -> Result<(), Box<dyn std::error::Error>> {
 #[inline]
 pub fn record_command(command: &str, success: bool, duration_secs: f64) {
     let status = if success { "success" } else { "error" };
-    
-    metrics::counter!("ratatosk_commands_total", "command" => command.to_string(), "status" => status.to_string())
-        .increment(1);
-    
+
+    metrics::counter!(
+        "ratatosk_commands_total",
+        "command" => command.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+
     metrics::histogram!("ratatosk_command_duration_seconds", "command" => command.to_string())
         .record(duration_secs);
 }
@@ -55,6 +59,37 @@ pub fn record_connection_event(event: &str) {
 #[inline]
 pub fn set_active_connections(count: usize) {
     metrics::gauge!("ratatosk_connections_active").set(count as f64);
+}
+
+#[inline]
+pub fn set_semaphore_available_permits(permits: usize) {
+    metrics::gauge!("ratatosk_connections_available_permits").set(permits as f64);
+}
+
+#[inline]
+pub fn set_rate_limiter_tracked_ips(count: usize) {
+    metrics::gauge!("ratatosk_rate_limiter_tracked_ips").set(count as f64);
+}
+
+#[inline]
+pub fn record_connection_rejected(reason: &str) {
+    metrics::counter!("ratatosk_connections_rejected_total", "reason" => reason.to_string())
+        .increment(1);
+}
+
+#[inline]
+pub fn record_accept_error(kind: &str, transient: bool) {
+    metrics::counter!(
+        "ratatosk_accept_errors_total",
+        "kind" => kind.to_string(),
+        "transient" => transient.to_string()
+    )
+    .increment(1);
+}
+
+#[inline]
+pub fn record_accept_backoff(backoff_ms: f64) {
+    metrics::histogram!("ratatosk_accept_backoff_ms").record(backoff_ms);
 }
 
 /// Record memory metrics.
@@ -83,9 +118,12 @@ pub fn record_aof_write_error() {
 
 #[inline]
 pub fn record_rdb_save(background: bool) {
-    let save_type = if background { "background" } else { "foreground" };
-    metrics::counter!("ratatosk_rdb_saves_total", "type" => save_type.to_string())
-        .increment(1);
+    let save_type = if background {
+        "background"
+    } else {
+        "foreground"
+    };
+    metrics::counter!("ratatosk_rdb_saves_total", "type" => save_type.to_string()).increment(1);
 }
 
 #[inline]
@@ -115,8 +153,7 @@ pub fn set_pubsub_pending_queue_size(client_id: i64, size: usize) {
 #[inline]
 pub fn record_auth_attempt(success: bool) {
     let result = if success { "success" } else { "failure" };
-    metrics::counter!("ratatosk_auth_attempts_total", "result" => result.to_string())
-        .increment(1);
+    metrics::counter!("ratatosk_auth_attempts_total", "result" => result.to_string()).increment(1);
 }
 
 /// Record clock jump detection.
@@ -142,4 +179,33 @@ pub fn record_rate_limited_connection() {
 #[inline]
 pub fn set_lazyfree_queue_utilization(utilization: f64) {
     metrics::gauge!("ratatosk_lazyfree_queue_utilization").set(utilization);
+}
+
+#[inline]
+pub fn record_blocking_retry_iteration(command: &str) {
+    metrics::counter!("ratatosk_blocking_retries_total", "command" => command.to_string())
+        .increment(1);
+}
+
+#[inline]
+pub fn record_blocking_retry_wait_ms(command: &str, wait_ms: f64) {
+    metrics::histogram!("ratatosk_blocking_retry_wait_ms", "command" => command.to_string())
+        .record(wait_ms);
+}
+
+#[inline]
+pub fn record_blocking_retry_deadline_exhausted(command: &str) {
+    metrics::counter!(
+        "ratatosk_blocking_retry_deadline_exhausted_total",
+        "command" => command.to_string()
+    )
+    .increment(1);
+}
+
+#[inline]
+pub fn record_blocking_retry_completed(command: &str, retries: u64) {
+    metrics::counter!("ratatosk_blocking_retry_completions_total", "command" => command.to_string())
+        .increment(1);
+    metrics::histogram!("ratatosk_blocking_retry_attempts", "command" => command.to_string())
+        .record(retries as f64);
 }

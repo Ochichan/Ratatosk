@@ -68,9 +68,11 @@ memmap2 = "0.9"
 
 # Temp files
 tempfile = "3"
+fs2 = "0.4"
 
 # Random
 rand = "0.8"
+sha2 = "0.10"
 
 # Password hashing
 argon2 = "0.5"
