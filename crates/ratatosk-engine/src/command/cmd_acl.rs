@@ -354,7 +354,15 @@ pub(super) fn cmd_auth(
     server: &ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    match args {
+    let username = args.first().map(|_| {
+        if args.len() == 1 {
+            Bytes::from_static(b"default")
+        } else {
+            args[0].clone()
+        }
+    });
+    
+    let result = match args {
         [password] => {
             if authenticate_client(server, &Bytes::from_static(b"default"), password, client) {
                 CommandOutcome::reply(RespFrame::ok())
@@ -370,7 +378,24 @@ pub(super) fn cmd_auth(
             }
         }
         _ => wrong_arity("auth"),
-    }
+    };
+    
+    // Record auth metrics
+    let success = !matches!(result.response, RespFrame::Error(_));
+    let result_label = if success { "success" } else { "failure" };
+    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label.to_string()).increment(1);
+    
+    // Audit log for auth events
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "AUTH",
+        client_id = client.id,
+        username = %String::from_utf8_lossy(username.as_ref().unwrap_or(&Bytes::from_static(b"unknown"))),
+        success,
+        "ACL authentication attempt"
+    );
+    
+    result
 }
 
 pub(super) fn cmd_reset(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {

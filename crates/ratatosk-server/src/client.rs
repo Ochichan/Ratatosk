@@ -14,6 +14,7 @@ use tokio::{
 };
 
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
+use crate::metrics;
 use crate::persistence::{PersistenceRuntime, run_save, start_bgsave};
 
 const QUERY_BUFFER_LIMIT: usize = 1024 * 1024;
@@ -25,6 +26,18 @@ const BLOCKING_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
 const OUTPUT_BUFFER_LIMIT_ERR: &str = "ERR output buffer limit exceeded";
 
 pub type SharedServerState = Arc<Mutex<ServerState>>;
+
+/// Check if an error represents an expected client disconnect (not a server error).
+fn is_benign_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof
+    )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ClientIoLimits {
@@ -124,12 +137,34 @@ async fn run_with_blocking_retry(
     client_state: &mut ClientState,
     stream: &TcpStream,
 ) -> io::Result<CommandOutcome> {
+    let start = std::time::Instant::now();
     let first_argv = frame_to_argv_for_persistence(&frame);
     let first_db = client_state.selected_db();
+    
+    // Extract command name for metrics
+    let command_name = first_argv.as_ref().and_then(|argv| {
+        argv.first().map(|cmd| String::from_utf8_lossy(cmd).to_ascii_uppercase())
+    }).unwrap_or_else(|| "UNKNOWN".to_string());
+    
     let mut outcome = {
         let mut server = server_state.lock().await;
         execute(frame, &mut server, client_state)
     };
+    
+    // Record command metrics
+    let duration = start.elapsed();
+    let success = !matches!(outcome.response, ratatosk_resp::RespFrame::Error(_));
+    metrics::record_command(&command_name, success, duration.as_secs_f64());
+    
+    // Log slow commands (> 1ms)
+    if duration.as_millis() > 1 {
+        tracing::debug!(
+            target = "ratatosk::slow_command",
+            command = %command_name,
+            duration_ms = duration.as_micros() as f64 / 1000.0,
+            "slow command detected"
+        );
+    }
 
     let Some(retry) = outcome.retry_blocking.clone() else {
         apply_post_execute_persistence(
@@ -315,18 +350,57 @@ pub async fn handle_client_with_limits(
     persistence: Arc<PersistenceRuntime>,
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
-    let client_id = {
+    let (client_id, remote_addr) = {
         let mut server = server_state.lock().await;
         let id = server.alloc_client_id();
         server.stats.mark_client_connected();
-        id
+        let active = server.stats.connected_clients();
+        metrics::set_active_connections(active as usize);
+        metrics::record_connection_event("accepted");
+        let addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+        (id, addr)
     };
+
+    // Create a tracing span for this client session
+    let client_span = tracing::info_span!(
+        "client_session",
+        client_id = client_id,
+        remote_addr = %remote_addr,
+    );
+
+    let _span_enter = client_span.enter();
+
+    tracing::info!(
+        target = "ratatosk::client",
+        client_id = client_id,
+        remote_addr = %remote_addr,
+        "client connected"
+    );
+
     let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits).await;
+    
+    let disconnect_reason = match &result {
+        Ok(()) => "closed",
+        Err(e) if is_benign_disconnect(e) => "client_disconnect",
+        Err(_) => "error",
+    };
+
     {
         let mut server = server_state.lock().await;
         server.pubsub.remove_client(client_id);
         server.stats.mark_client_disconnected();
+        let active = server.stats.connected_clients();
+        metrics::set_active_connections(active as usize);
+        metrics::record_connection_event(disconnect_reason);
     }
+
+    tracing::info!(
+        target = "ratatosk::client",
+        client_id = client_id,
+        reason = disconnect_reason,
+        "client disconnected"
+    );
+
     result
 }
 

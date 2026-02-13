@@ -3503,7 +3503,7 @@ pub fn execute(
     let started_us = now_us();
 
     let outcome = match command.as_slice() {
-        b"PING" => cmd_connection::cmd_ping(args),
+        b"PING" => cmd_connection::cmd_ping(args, server),
         b"ECHO" => cmd_connection::cmd_echo(args),
         b"HELLO" => cmd_connection::cmd_hello(args, server, client),
         b"QUIT" => cmd_connection::cmd_quit(args),

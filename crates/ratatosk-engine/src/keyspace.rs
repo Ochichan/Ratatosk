@@ -772,16 +772,32 @@ impl PubSubState {
 
     fn enqueue_pending(&mut self, client_id: i64, message: PubSubMessage) -> bool {
         if self.overflowed_clients.contains(&client_id) {
+            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "client_overflowed")
+                .increment(1);
             return false;
         }
 
         let queue = self.pending.entry(client_id).or_default();
         if queue.len() >= PUBSUB_PENDING_QUEUE_LIMIT {
             self.overflowed_clients.insert(client_id);
+            metrics::counter!("ratatosk_pubsub_clients_overflowed_total").increment(1);
+            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "queue_full")
+                .increment(1);
+            tracing::warn!(
+                target = "ratatosk::pubsub",
+                client_id,
+                queue_size = queue.len(),
+                "PubSub client overflowed - queue limit exceeded"
+            );
             return false;
         }
 
         queue.push(message);
+        
+        // Update queue size gauge for this client
+        metrics::gauge!("ratatosk_pubsub_pending_queue_size", "client_id" => client_id.to_string())
+            .set(queue.len() as f64);
+        
         true
     }
 
@@ -1793,6 +1809,12 @@ impl ServerState {
 
     pub fn started_at_ms(&self) -> i64 {
         self.started_at_ms
+    }
+
+    /// Returns the server uptime in seconds.
+    pub fn uptime_seconds(&self) -> i64 {
+        let now = ratatosk_core::time::now_ms();
+        (now - self.started_at_ms) / 1000
     }
 
     pub fn key_version(&self, db_idx: usize, key: &Bytes) -> u64 {

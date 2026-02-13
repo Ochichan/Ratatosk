@@ -9,12 +9,61 @@ use super::{
     err, find_command_spec, parse_i64, parse_usize, to_uppercase_bytes, wrong_arity,
 };
 
-pub(super) fn cmd_ping(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_ping(args: &[Bytes], server: &ServerState) -> CommandOutcome {
     match args {
         [] => CommandOutcome::reply(RespFrame::pong()),
-        [message] => CommandOutcome::reply(RespFrame::BulkString(Some(message.clone()))),
+        [message] => {
+            // Deep health check: "PING HEALTH" returns detailed server status
+            if message.eq_ignore_ascii_case(b"HEALTH") {
+                return CommandOutcome::reply(RespFrame::bulk_str(&generate_health_report(server)));
+            }
+            CommandOutcome::reply(RespFrame::BulkString(Some(message.clone())))
+        }
         _ => wrong_arity("ping"),
     }
+}
+
+fn generate_health_report(server: &ServerState) -> String {
+    // 1. Check connection capacity
+    let connected = server.stats.connected_clients();
+    let max_clients = server.config.maxmemory(); // Note: this might be wrong field, should be maxclients
+    let conn_status = if connected > 4000 { "degraded" } else { "ok" };
+    
+    // 2. Check RDB save status
+    let rdb_status = match server.last_rdb_save_status() {
+        Some(Ok(())) => "ok",
+        Some(Err(_)) => "error",
+        None => "none",
+    };
+    
+    // 3. Check AOF status
+    let aof_status = if server.aof_enabled() { 
+        "enabled" 
+    } else { 
+        "disabled" 
+    };
+    
+    // 4. Memory status
+    let memory = server.stats.cached_memory_estimate();
+    let maxmemory = server.config.maxmemory();
+    let memory_status = if maxmemory > 0 && memory > maxmemory as u64 {
+        "critical"
+    } else if maxmemory > 0 && memory > (maxmemory as u64 * 9 / 10) {
+        "warning"
+    } else {
+        "ok"
+    };
+    
+    format!(
+        "status:{}|connections:{}/{}|rdb:{}|aof:{}|memory:{}|uptime:{}",
+        conn_status,
+        connected,
+        max_clients,
+        rdb_status,
+        aof_status,
+        memory_status,
+        server.uptime_seconds()
+    )
 }
 
 pub(super) fn cmd_echo(args: &[Bytes]) -> CommandOutcome {

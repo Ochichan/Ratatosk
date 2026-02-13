@@ -7,6 +7,10 @@ use bytes::Bytes;
 
 use crate::error::PersistError;
 
+/// AOF file format version header.
+/// Format: "REDIS-AOF-001\n" followed by RESP commands.
+const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
+
 // ---------------------------------------------------------------------------
 // FsyncPolicy
 // ---------------------------------------------------------------------------
@@ -55,7 +59,11 @@ pub struct AofWriter {
 
 impl AofWriter {
     /// Open or create an AOF file at the given path.
+    /// 
+    /// If the file is newly created, writes the version header.
     pub fn open(path: &Path, policy: FsyncPolicy) -> Result<Self, PersistError> {
+        let is_new = !path.exists();
+        
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -67,8 +75,20 @@ impl AofWriter {
                 )
             })?;
 
+        let mut writer = BufWriter::new(file);
+        
+        // Write version header for new files
+        if is_new {
+            writer.write_all(AOF_VERSION_HEADER).map_err(|e| {
+                PersistError::Io(io::Error::new(
+                    e.kind(),
+                    format!("writing AOF version header: {e}"),
+                ))
+            })?;
+        }
+
         Ok(Self {
-            writer: BufWriter::new(file),
+            writer,
             policy,
             last_fsync: Instant::now(),
             current_db: 0,
@@ -194,7 +214,8 @@ mod tests {
         }
 
         let content = fs::read_to_string(&path).expect("read");
-        assert_eq!(content, "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+        assert!(content.starts_with(std::str::from_utf8(AOF_VERSION_HEADER).unwrap()), "AOF should start with version header");
+        assert!(content.contains("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"), "AOF should contain RESP command");
     }
 
     #[test]

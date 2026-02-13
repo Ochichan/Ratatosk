@@ -14,7 +14,9 @@ pub mod client;
 pub mod config;
 pub mod event_loop;
 pub mod io_thread;
+pub mod metrics;
 pub mod persistence;
+pub mod rate_limiter;
 
 #[cfg(test)]
 mod tests {
