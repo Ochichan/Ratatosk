@@ -46,7 +46,7 @@ mio = { version = "1", features = ["os-poll", "net"] }
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Metrics
 metrics = "0.23"

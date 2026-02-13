@@ -12,15 +12,22 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use clap::Parser;
-use ratatosk_server::{config::ServerConfig, event_loop, metrics};
+use ratatosk_server::{breadcrumbs, config::ServerConfig, event_loop, metrics};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CRASH_MAX_FILES: usize = 64;
 const DEFAULT_CRASH_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_FD_HEADROOM: usize = 128;
 
 #[derive(Parser)]
-#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"))]
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("GIT_HASH"),
+    ")"
+))]
 struct Args {}
 
 #[tokio::main]
@@ -28,8 +35,7 @@ async fn main() -> anyhow::Result<()> {
     let _args = Args::parse();
 
     setup_panic_hook();
-
-    tracing_subscriber::fmt::init();
+    init_tracing();
 
     if let Err(error) = prune_crash_files_startup() {
         tracing::warn!(
@@ -50,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config =
         ServerConfig::from_env().context("loading server configuration from environment")?;
+    run_startup_preflight(&config).context("running startup preflight checks")?;
 
     log_startup_config(&config);
 
@@ -60,16 +67,29 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn init_tracing() {
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ratatosk=info"));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .init();
+}
+
 fn setup_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let timestamp = format_timestamp();
         let backtrace = std::backtrace::Backtrace::force_capture();
         let pid = std::process::id();
         let version = env!("GIT_HASH");
+        let build_unix_ts = env!("BUILD_UNIX_TS");
 
         eprintln!(
-            "[{}] FATAL PANIC: {}\nPID: {}\nVersion: {}\n\n{}",
-            timestamp, info, pid, version, backtrace
+            "[{}] FATAL PANIC: {}\nPID: {}\nVersion: {}\nBuildUnixTs: {}\n\n{}",
+            timestamp, info, pid, version, build_unix_ts, backtrace
         );
 
         if let Err(error) = write_crash_file(&timestamp, info, &backtrace, pid, version) {
@@ -81,6 +101,7 @@ fn setup_panic_hook() {
             %info,
             pid,
             version,
+            build_unix_ts,
             %backtrace,
             "process panicking - will abort"
         );
@@ -108,6 +129,7 @@ fn write_crash_file(
     std::fs::create_dir_all(&crash_dir)?;
 
     let filename = crash_dir.join(format!("ratatosk-crash-{timestamp}-{pid}.json"));
+    let last_commands = breadcrumbs::snapshot(64);
 
     let crash_info = serde_json::json!({
         "timestamp": timestamp,
@@ -117,6 +139,8 @@ fn write_crash_file(
         "pid": pid,
         "version": version,
         "cargo_version": env!("CARGO_PKG_VERSION"),
+        "build_unix_ts": env!("BUILD_UNIX_TS"),
+        "breadcrumbs": last_commands,
     });
 
     std::fs::write(&filename, crash_info.to_string())?;
@@ -234,6 +258,7 @@ fn log_startup_config(config: &ServerConfig) {
         target = "ratatosk::startup",
         version = env!("CARGO_PKG_VERSION"),
         git_hash = env!("GIT_HASH"),
+        build_unix_ts = env!("BUILD_UNIX_TS"),
         bind = %config.bind,
         port = config.port,
         pid = std::process::id(),
@@ -247,4 +272,103 @@ fn log_startup_config(config: &ServerConfig) {
         appendfsync = %config.appendfsync,
         "Ratatosk server configuration loaded"
     );
+}
+
+fn run_startup_preflight(config: &ServerConfig) -> anyhow::Result<()> {
+    validate_fd_headroom(config)?;
+    validate_persistence_dir_access(config)?;
+    Ok(())
+}
+
+fn validate_persistence_dir_access(config: &ServerConfig) -> anyhow::Result<()> {
+    if !config.dir.exists() {
+        return Err(anyhow!("persistence directory does not exist: {}", config.dir.display()));
+    }
+
+    if !config.dir.is_dir() {
+        return Err(anyhow!(
+            "persistence directory path is not a directory: {}",
+            config.dir.display()
+        ));
+    }
+
+    let probe = config.dir.join(".ratatosk_startup_probe");
+    std::fs::write(&probe, b"ok").with_context(|| {
+        format!(
+            "writing startup probe file in persistence directory: {}",
+            probe.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+
+    tracing::info!(
+        target = "ratatosk::startup",
+        dir = %config.dir.display(),
+        "persistence directory preflight passed"
+    );
+
+    Ok(())
+}
+
+fn validate_fd_headroom(config: &ServerConfig) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(soft_limit) = linux_soft_nofile_limit() else {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                "could not parse /proc/self/limits for open files; skipping fd headroom validation"
+            );
+            return Ok(());
+        };
+
+        let required = config.max_clients.saturating_add(DEFAULT_FD_HEADROOM);
+        if soft_limit < required as u64 {
+            return Err(anyhow!(
+                "insufficient open-file limit: soft_limit={} required_at_least={} (max_clients={} + headroom={})",
+                soft_limit,
+                required,
+                config.max_clients,
+                DEFAULT_FD_HEADROOM
+            ));
+        }
+
+        tracing::info!(
+            target = "ratatosk::startup",
+            fd_soft_limit = soft_limit,
+            fd_required = required,
+            "file descriptor headroom preflight passed"
+        );
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        tracing::warn!(
+            target = "ratatosk::startup",
+            "fd headroom preflight is only implemented on Linux; skipping"
+        );
+        let _ = config;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_soft_nofile_limit() -> Option<u64> {
+    let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+    for line in limits.lines() {
+        if !line.starts_with("Max open files") {
+            continue;
+        }
+
+        let rest = line.trim_start_matches("Max open files").trim();
+        let mut parts = rest.split_whitespace();
+        let soft = parts.next()?;
+        if soft.eq_ignore_ascii_case("unlimited") {
+            return Some(u64::MAX);
+        }
+        return soft.parse::<u64>().ok();
+    }
+
+    None
 }

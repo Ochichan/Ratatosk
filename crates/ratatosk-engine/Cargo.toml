@@ -20,3 +20,4 @@ tracing = { workspace = true }
 metrics = { workspace = true }
 glob-match = { workspace = true }
 sha2 = { workspace = true }
+fs2 = { workspace = true }

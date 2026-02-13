@@ -1,6 +1,8 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use fs2::available_space;
 use ratatosk_core::time::now_ms;
@@ -14,6 +16,13 @@ use tokio::sync::Mutex;
 use crate::config::ServerConfig;
 
 const AOF_FILENAME: &str = "appendonly.aof";
+
+static BGSAVE_TASKS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+    OnceLock::new();
+
+fn bgsave_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    BGSAVE_TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
 
 #[derive(Clone)]
 pub struct PersistenceRuntime {
@@ -234,7 +243,7 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
 
     crate::metrics::record_rdb_save(true); // background = true
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let path_for_log = rdb_path.display().to_string();
         let save_result =
             tokio::task::spawn_blocking(move || rdb::saver::save(&snapshot, &rdb_path))
@@ -260,9 +269,52 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
         }
     });
 
+    if let Ok(mut tasks) = bgsave_tasks().lock() {
+        tasks.push(handle);
+    }
+
     true
 }
 
+pub async fn drain_bgsave_tasks(grace: Duration) -> (usize, usize) {
+    let tasks = match bgsave_tasks().lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+
+    if tasks.is_empty() {
+        return (0, 0);
+    }
+
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut completed = 0usize;
+    let mut aborted = 0usize;
+
+    for mut task in tasks {
+        let now = tokio::time::Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            task.abort();
+            aborted = aborted.saturating_add(1);
+            continue;
+        }
+
+        match tokio::time::timeout(remaining, &mut task).await {
+            Ok(Ok(())) => completed = completed.saturating_add(1),
+            Ok(Err(error)) => {
+                completed = completed.saturating_add(1);
+                tracing::warn!(error = %error, "background RDB save task finished with join error");
+            }
+            Err(_) => {
+                task.abort();
+                aborted = aborted.saturating_add(1);
+                tracing::warn!("background RDB save task did not complete before shutdown deadline");
+            }
+        }
+    }
+
+    (completed, aborted)
+}
 pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -> io::Result<()> {
     let snapshot = {
         let state = server_state.lock().await;

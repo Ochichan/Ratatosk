@@ -615,6 +615,42 @@ pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
             Bytes::from_static(b"timeout"),
             Bytes::from(server.config.timeout().to_string()),
         ),
+        (
+            Bytes::from_static(b"maxmemory"),
+            Bytes::from(server.config.maxmemory().to_string()),
+        ),
+        (
+            Bytes::from_static(b"maxmemory-policy"),
+            server.config.maxmemory_policy().clone(),
+        ),
+        (
+            Bytes::from_static(b"maxmemory-samples"),
+            Bytes::from(server.config.maxmemory_samples().to_string()),
+        ),
+        (
+            Bytes::from_static(b"hz"),
+            Bytes::from(server.config.hz().to_string()),
+        ),
+        (
+            Bytes::from_static(b"notify-keyspace-events"),
+            server.config.notify_keyspace_events().clone(),
+        ),
+        (
+            Bytes::from_static(b"lazyfree-lazy-expire"),
+            Bytes::from(if server.config.lazyfree_lazy_expire() { "yes" } else { "no" }),
+        ),
+        (
+            Bytes::from_static(b"lazyfree-lazy-server-del"),
+            Bytes::from(if server.config.lazyfree_lazy_server_del() { "yes" } else { "no" }),
+        ),
+        (
+            Bytes::from_static(b"lazyfree-lazy-user-del"),
+            Bytes::from(if server.config.lazyfree_lazy_user_del() { "yes" } else { "no" }),
+        ),
+        (
+            Bytes::from_static(b"tcp-keepalive"),
+            Bytes::from(server.config.tcp_keepalive().to_string()),
+        ),
     ]
 }
 
@@ -892,8 +928,10 @@ pub(super) fn cmd_memory_purge(args: &[Bytes]) -> CommandOutcome {
 pub(super) fn append_info_server_section(out: &mut String, server: &ServerState, now_ms: i64) {
     let uptime_seconds = (now_ms.saturating_sub(server.started_at_ms()) / 1000).max(0);
     out.push_str("# Server\r\n");
-    out.push_str("redis_version:7.2.0-ratatosk\r\n");
+    out.push_str(&format!("redis_version:{}-ratatosk\r\n", env!("CARGO_PKG_VERSION")));
     out.push_str("redis_mode:standalone\r\n");
+    out.push_str(&format!("ratatosk_git_hash:{}\r\n", env!("GIT_HASH")));
+    out.push_str(&format!("ratatosk_build_unix_ts:{}\r\n", env!("BUILD_UNIX_TS")));
     out.push_str(&format!("uptime_in_seconds:{uptime_seconds}\r\n"));
     out.push_str(&format!("uptime_in_days:{}\r\n", uptime_seconds / 86_400));
     out.push_str("\r\n");

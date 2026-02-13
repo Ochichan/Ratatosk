@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::ServerState;
+use crate::{keyspace::ServerState, security::next_audit_stamp};
 
 use super::{CommandOutcome, err, to_uppercase_bytes, wrong_arity};
 
@@ -92,17 +92,32 @@ fn script_flush(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
         return wrong_arity("script|flush");
     }
 
-    if args.len() == 1 {
+    let mode = if args.is_empty() {
+        "SYNC".to_string()
+    } else {
         let mode = to_uppercase_bytes(&args[0]);
         if !matches!(mode.as_slice(), b"ASYNC" | b"SYNC") {
             return CommandOutcome::reply(err("ERR SCRIPT FLUSH only supports ASYNC|SYNC option"));
         }
-    }
+        String::from_utf8_lossy(&mode).to_string()
+    };
 
     server.script_cache.scripts.clear();
+
+    let payload = format!("event=SCRIPT_FLUSH mode={mode}");
+    let stamp = next_audit_stamp("SCRIPT_FLUSH", &payload);
+    tracing::info!(
+        target = "ratatosk::audit",
+        event = "SCRIPT_FLUSH",
+        audit_seq = stamp.seq,
+        audit_prev_hash = %stamp.prev_hash,
+        audit_hash = %stamp.hash,
+        mode = %mode,
+        "script cache flushed"
+    );
+
     CommandOutcome::reply(RespFrame::ok())
 }
-
 fn script_help() -> CommandOutcome {
     let lines: Vec<RespFrame> = vec![
         RespFrame::BulkString(Some(Bytes::from_static(
@@ -128,7 +143,7 @@ fn script_help() -> CommandOutcome {
 }
 
 // ---------------------------------------------------------------------------
-// FCALL / FCALL_RO / FUNCTION
+// FCALL / FCALL_RO
 // ---------------------------------------------------------------------------
 
 pub(super) fn cmd_fcall(args: &[Bytes]) -> CommandOutcome {
@@ -155,14 +170,43 @@ pub(super) fn cmd_function(args: &[Bytes]) -> CommandOutcome {
         b"STATS" => function_stats(),
         b"LOAD" => CommandOutcome::reply(err("ERR Function not supported in this build")),
         b"DELETE" => CommandOutcome::reply(err("ERR Function not supported in this build")),
-        b"FLUSH" => CommandOutcome::reply(RespFrame::ok()),
+        b"FLUSH" => {
+            if args.len() > 2 {
+                return wrong_arity("function");
+            }
+
+            let mode = if args.len() == 1 {
+                "SYNC".to_string()
+            } else {
+                let mode = to_uppercase_bytes(&args[1]);
+                if !matches!(mode.as_slice(), b"ASYNC" | b"SYNC") {
+                    return CommandOutcome::reply(err(
+                        "ERR FUNCTION FLUSH only supports ASYNC|SYNC option",
+                    ));
+                }
+                String::from_utf8_lossy(&mode).to_string()
+            };
+
+            let payload = format!("event=FUNCTION_FLUSH mode={mode}");
+            let stamp = next_audit_stamp("FUNCTION_FLUSH", &payload);
+            tracing::info!(
+                target = "ratatosk::audit",
+                event = "FUNCTION_FLUSH",
+                audit_seq = stamp.seq,
+                audit_prev_hash = %stamp.prev_hash,
+                audit_hash = %stamp.hash,
+                mode = %mode,
+                "function registry flushed"
+            );
+
+            CommandOutcome::reply(RespFrame::ok())
+        }
         b"RESTORE" => CommandOutcome::reply(err("ERR Function not supported in this build")),
         _ => CommandOutcome::reply(err(
             "ERR unknown FUNCTION subcommand or wrong number of arguments",
         )),
     }
 }
-
 fn function_help() -> CommandOutcome {
     let lines: Vec<RespFrame> = vec![
         RespFrame::BulkString(Some(Bytes::from_static(

@@ -1,4 +1,11 @@
+use std::{
+    fs::OpenOptions,
+    io::Write,
+    path::{Path, PathBuf},
+};
+
 use bytes::Bytes;
+use fs2::available_space;
 
 use ratatosk_resp::frame::RespFrame;
 
@@ -24,6 +31,8 @@ pub(super) fn cmd_ping(args: &[Bytes], server: &ServerState) -> CommandOutcome {
 }
 
 fn generate_health_report(server: &ServerState) -> String {
+    const MIN_HEALTH_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
     let connected_clients = server.stats.connected_clients();
 
     let rdb_status = match server.last_rdb_save_status() {
@@ -46,7 +55,20 @@ fn generate_health_report(server: &ServerState) -> String {
         "ok"
     };
 
-    let status = if memory_status == "critical" || rdb_status == "error" {
+    let (disk_writable, disk_available_bytes, disk_error) = check_storage_health(server.config.dir());
+    let disk_status = if !disk_writable {
+        "error"
+    } else if disk_available_bytes < MIN_HEALTH_DISK_BYTES {
+        "low_space"
+    } else {
+        "ok"
+    };
+
+    let status = if memory_status == "critical"
+        || rdb_status == "error"
+        || disk_status == "error"
+        || disk_status == "low_space"
+    {
         "degraded"
     } else {
         "ok"
@@ -54,18 +76,56 @@ fn generate_health_report(server: &ServerState) -> String {
 
     let total_keys: usize = (0..server.db_count()).map(|idx| server.db(idx).len()).sum();
 
-    format!(
-        "status:{status}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|uptime_seconds:{}",
+    let mut report = format!(
+        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("GIT_HASH"),
+        env!("BUILD_UNIX_TS"),
         server.db_count(),
         total_keys,
         server.rdb_save_in_progress(),
         aof_enabled,
         memory_used,
         maxmemory,
+        disk_writable,
+        disk_available_bytes,
         server.uptime_seconds(),
-    )
+    );
+
+    if let Some(error) = disk_error {
+        report.push_str("|disk_error:");
+        report.push_str(&error.replace('|', "_"));
+    }
+
+    report
 }
 
+fn check_storage_health(dir: &Path) -> (bool, u64, Option<String>) {
+    let available = available_space(dir).unwrap_or(0);
+    let probe_file = PathBuf::from(dir).join(".ratatosk_health_probe");
+
+    match OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe_file)
+    {
+        Ok(mut file) => {
+            let write_result = file.write_all(b"ok");
+            let _ = std::fs::remove_file(&probe_file);
+            if write_result.is_ok() {
+                (true, available, None)
+            } else {
+                (
+                    false,
+                    available,
+                    Some("failed to write probe file".to_string()),
+                )
+            }
+        }
+        Err(error) => (false, available, Some(error.to_string())),
+    }
+}
 pub(super) fn cmd_echo(args: &[Bytes]) -> CommandOutcome {
     match args {
         [message] => CommandOutcome::reply(RespFrame::BulkString(Some(message.clone()))),
