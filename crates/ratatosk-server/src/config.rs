@@ -116,8 +116,7 @@ impl ServerConfig {
             .map(PathBuf::from)
             .unwrap_or(default.dir);
 
-        let dbfilename =
-            env::var("RATATOSK_DBFILENAME").unwrap_or(default.dbfilename);
+        let dbfilename = env::var("RATATOSK_DBFILENAME").unwrap_or(default.dbfilename);
 
         let appendonly = env::var("RATATOSK_APPENDONLY")
             .map(|v| {
@@ -128,12 +127,9 @@ impl ServerConfig {
             })
             .unwrap_or(default.appendonly);
 
-        let appendfsync =
-            env::var("RATATOSK_APPENDFSYNC").unwrap_or(default.appendfsync);
+        let appendfsync = env::var("RATATOSK_APPENDFSYNC").unwrap_or(default.appendfsync);
         if !APPENDFSYNC_VALUES.contains(&appendfsync.as_str()) {
-            return Err(ConfigError::InvalidAppendFsync {
-                value: appendfsync,
-            });
+            return Err(ConfigError::InvalidAppendFsync { value: appendfsync });
         }
 
         Ok(Self {

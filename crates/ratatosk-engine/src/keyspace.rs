@@ -793,11 +793,9 @@ impl PubSubState {
         }
 
         queue.push(message);
-        
-        // Update queue size gauge for this client
-        metrics::gauge!("ratatosk_pubsub_pending_queue_size", "client_id" => client_id.to_string())
-            .set(queue.len() as f64);
-        
+
+        metrics::histogram!("ratatosk_pubsub_pending_queue_len").record(queue.len() as f64);
+
         true
     }
 
@@ -1721,6 +1719,10 @@ pub struct ServerState {
     last_rdb_save_status: Option<Result<(), String>>,
     last_rdb_save_time_ms: Option<i64>,
     aof_enabled: bool,
+    aof_last_error: Option<String>,
+    aof_rewrite_in_progress: bool,
+    last_aof_rewrite_status: Option<Result<(), String>>,
+    last_aof_rewrite_time_ms: Option<i64>,
 }
 
 impl ServerState {
@@ -1750,6 +1752,10 @@ impl ServerState {
             last_rdb_save_status: None,
             last_rdb_save_time_ms: None,
             aof_enabled: false,
+            aof_last_error: None,
+            aof_rewrite_in_progress: false,
+            last_aof_rewrite_status: None,
+            last_aof_rewrite_time_ms: None,
         }
     }
 
@@ -1901,6 +1907,54 @@ impl ServerState {
     pub fn set_aof_enabled(&mut self, value: bool) {
         self.aof_enabled = value;
     }
+
+    pub fn aof_last_error(&self) -> Option<&str> {
+        self.aof_last_error.as_deref()
+    }
+
+    pub fn set_aof_last_error(&mut self, error: impl Into<String>) {
+        self.aof_last_error = Some(error.into());
+    }
+
+    pub fn clear_aof_last_error(&mut self) {
+        self.aof_last_error = None;
+    }
+
+    pub fn aof_write_latched(&self) -> bool {
+        self.aof_last_error.is_some()
+    }
+
+    pub fn aof_rewrite_in_progress(&self) -> bool {
+        self.aof_rewrite_in_progress
+    }
+
+    pub fn set_aof_rewrite_in_progress(&mut self, value: bool) {
+        self.aof_rewrite_in_progress = value;
+    }
+
+    pub fn last_aof_rewrite_status(&self) -> Option<&Result<(), String>> {
+        self.last_aof_rewrite_status.as_ref()
+    }
+
+    pub fn set_last_aof_rewrite_status(&mut self, status: Result<(), String>) {
+        self.last_aof_rewrite_status = Some(status);
+    }
+
+    pub fn clear_last_aof_rewrite_status(&mut self) {
+        self.last_aof_rewrite_status = None;
+    }
+
+    pub fn last_aof_rewrite_time_ms(&self) -> Option<i64> {
+        self.last_aof_rewrite_time_ms
+    }
+
+    pub fn set_last_aof_rewrite_time_ms(&mut self, value: i64) {
+        self.last_aof_rewrite_time_ms = Some(value);
+    }
+
+    pub fn clear_last_aof_rewrite_time_ms(&mut self) {
+        self.last_aof_rewrite_time_ms = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,7 +1972,6 @@ pub fn purge_expired_key(db: &mut HashMap<Bytes, StoredValue>, key: &Bytes, now_
 pub fn purge_expired_keys(db: &mut HashMap<Bytes, StoredValue>, now_ms: i64) {
     db.retain(|_, value| value.expire_at_ms.is_none_or(|ts| ts > now_ms));
 }
-
 
 fn generate_cluster_node_id() -> Bytes {
     use rand::Rng;
@@ -2054,6 +2107,11 @@ mod tests {
         assert!(state.last_rdb_save_status().is_none());
         assert!(state.last_rdb_save_time_ms().is_none());
         assert!(!state.aof_enabled());
+        assert!(!state.aof_write_latched());
+        assert!(state.aof_last_error().is_none());
+        assert!(!state.aof_rewrite_in_progress());
+        assert!(state.last_aof_rewrite_status().is_none());
+        assert!(state.last_aof_rewrite_time_ms().is_none());
     }
 
     #[test]
@@ -2077,6 +2135,36 @@ mod tests {
 
         state.set_aof_enabled(true);
         assert!(state.aof_enabled());
+
+        state.set_aof_last_error("disk full");
+        assert!(state.aof_write_latched());
+        assert_eq!(state.aof_last_error(), Some("disk full"));
+
+        state.clear_aof_last_error();
+        assert!(!state.aof_write_latched());
+        assert!(state.aof_last_error().is_none());
+
+        state.set_aof_rewrite_in_progress(true);
+        assert!(state.aof_rewrite_in_progress());
+
+        state.set_last_aof_rewrite_status(Ok(()));
+        assert_eq!(state.last_aof_rewrite_status(), Some(&Ok(())));
+
+        state.set_last_aof_rewrite_status(Err("rewrite failed".to_string()));
+        assert_eq!(
+            state.last_aof_rewrite_status(),
+            Some(&Err("rewrite failed".to_string()))
+        );
+
+        state.set_last_aof_rewrite_time_ms(9_999);
+        assert_eq!(state.last_aof_rewrite_time_ms(), Some(9_999));
+
+        state.set_aof_rewrite_in_progress(false);
+        state.clear_last_aof_rewrite_status();
+        state.clear_last_aof_rewrite_time_ms();
+        assert!(!state.aof_rewrite_in_progress());
+        assert!(state.last_aof_rewrite_status().is_none());
+        assert!(state.last_aof_rewrite_time_ms().is_none());
     }
 
     #[test]
@@ -2218,17 +2306,17 @@ mod tests {
     #[test]
     fn memory_estimate_cache_stores_and_retrieves() {
         let mut stats = StatsState::default();
-        
+
         assert_eq!(stats.cached_memory_estimate(), 0);
         assert_eq!(stats.last_memory_estimate_tick(), 0);
-        
+
         stats.set_cached_memory_estimate(12345, 42);
-        
+
         assert_eq!(stats.cached_memory_estimate(), 12345);
         assert_eq!(stats.last_memory_estimate_tick(), 42);
-        
+
         stats.set_cached_memory_estimate(67890, 100);
-        
+
         assert_eq!(stats.cached_memory_estimate(), 67890);
         assert_eq!(stats.last_memory_estimate_tick(), 100);
     }

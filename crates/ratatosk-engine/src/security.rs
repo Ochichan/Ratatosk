@@ -166,7 +166,6 @@ fn uppercase_ascii(raw: &Bytes) -> Vec<u8> {
     raw.iter().map(|byte| byte.to_ascii_uppercase()).collect()
 }
 
-
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
@@ -208,6 +207,10 @@ fn audit_log_path() -> PathBuf {
     env::var("RATATOSK_AUDIT_LOG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/tmp/ratatosk-audit.log"))
+}
+
+pub fn audit_paths_from_env() -> (PathBuf, PathBuf) {
+    (audit_log_path(), audit_state_path())
 }
 
 fn parse_env_u64(name: &str, default: u64) -> u64 {
@@ -320,9 +323,31 @@ fn persist_audit_chain_state(state: &AuditChainState) {
         .unwrap_or_else(|| PathBuf::from("."));
     let _ = fs::create_dir_all(parent);
 
-    let payload = format!("seq={}\nlast_hash={}\n", state.seq, bytes_to_hex(&state.last_hash));
-    if fs::write(&tmp_path, payload).is_ok() {
-        let _ = fs::rename(&tmp_path, path);
+    let payload = format!(
+        "seq={}\nlast_hash={}\n",
+        state.seq,
+        bytes_to_hex(&state.last_hash)
+    );
+    if let Err(error) = fs::write(&tmp_path, payload) {
+        metrics::counter!("ratatosk_audit_state_persist_failures_total").increment(1);
+        tracing::warn!(
+            target = "ratatosk::audit",
+            path = %tmp_path.display(),
+            error = %error,
+            "failed to write audit chain state temp file"
+        );
+        return;
+    }
+
+    if let Err(error) = fs::rename(&tmp_path, &path) {
+        metrics::counter!("ratatosk_audit_state_persist_failures_total").increment(1);
+        tracing::warn!(
+            target = "ratatosk::audit",
+            from = %tmp_path.display(),
+            to = %path.display(),
+            error = %error,
+            "failed to atomically persist audit chain state"
+        );
     }
 }
 
@@ -336,20 +361,37 @@ fn append_audit_event_log(stamp: &AuditStamp, event: &str, payload: &str) {
 
     rotate_audit_log_if_needed(&path);
 
-    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => file,
-        Err(_) => return,
+        Err(error) => {
+            metrics::counter!("ratatosk_audit_log_write_failures_total").increment(1);
+            tracing::warn!(
+                target = "ratatosk::audit",
+                path = %path.display(),
+                error = %error,
+                "failed to open audit log file"
+            );
+            return;
+        }
     };
 
     let safe_payload = sanitize_acl_log_line(payload)
         .replace('\n', " ")
         .replace('\r', " ");
 
-    let _ = writeln!(
+    if let Err(error) = writeln!(
         file,
         "seq={}\tevent={}\tprev_hash={}\thash={}\tpayload={}",
         stamp.seq, event, stamp.prev_hash, stamp.hash, safe_payload
-    );
+    ) {
+        metrics::counter!("ratatosk_audit_log_write_failures_total").increment(1);
+        tracing::warn!(
+            target = "ratatosk::audit",
+            path = %path.display(),
+            error = %error,
+            "failed to append audit event"
+        );
+    }
 }
 
 fn audit_chain_state() -> &'static Mutex<AuditChainState> {

@@ -16,7 +16,9 @@ use tokio::{
 use crate::breadcrumbs;
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
 use crate::metrics;
-use crate::persistence::{PersistenceRuntime, run_save, start_bgsave};
+use crate::persistence::{
+    PersistenceRuntime, append_aof_command, run_save, start_bgrewriteaof, start_bgsave,
+};
 
 const QUERY_BUFFER_LIMIT: usize = 1024 * 1024;
 const OUTPUT_BUFFER_FLUSH_THRESHOLD: usize = 16 * 1024;
@@ -24,9 +26,10 @@ const PUBSUB_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const BLOCKING_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
-const AOF_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
 const AOF_APPEND_SLOW_THRESHOLD: Duration = Duration::from_secs(3);
 const OUTPUT_BUFFER_LIMIT_ERR: &str = "ERR output buffer limit exceeded";
+const AOF_WRITE_LATCH_ERR_PREFIX: &str =
+    "MISCONF writes are blocked because AOF persistence is in an error state";
 
 pub type SharedServerState = Arc<Mutex<ServerState>>;
 
@@ -77,6 +80,42 @@ fn next_retry_backoff(current: Duration) -> Duration {
         .checked_mul(2)
         .unwrap_or(BLOCKING_RETRY_BACKOFF_MAX)
         .min(BLOCKING_RETRY_BACKOFF_MAX)
+}
+
+fn aof_write_latch_error(detail: &str) -> RespFrame {
+    RespFrame::error_str(&format!(
+        "{AOF_WRITE_LATCH_ERR_PREFIX}; last_error={detail}"
+    ))
+}
+
+async fn set_aof_write_latch(server_state: &SharedServerState, error: String) {
+    let mut server = server_state.lock().await;
+    server.set_aof_last_error(error.clone());
+    drop(server);
+
+    metrics::set_aof_write_latched(true);
+    tracing::error!(
+        target = "ratatosk::aof",
+        error = %error,
+        "AOF write latch engaged; write commands will be rejected"
+    );
+}
+
+async fn clear_aof_write_latch_if_set(server_state: &SharedServerState) {
+    let mut server = server_state.lock().await;
+    let was_latched = server.aof_write_latched();
+    if was_latched {
+        server.clear_aof_last_error();
+    }
+    drop(server);
+
+    if was_latched {
+        metrics::set_aof_write_latched(false);
+        tracing::warn!(
+            target = "ratatosk::aof",
+            "AOF write latch cleared after successful append"
+        );
+    }
 }
 
 async fn wait_for_disconnect_or_timeout(
@@ -151,17 +190,40 @@ async fn run_with_blocking_retry(
         })
         .unwrap_or_else(|| "UNKNOWN".to_string());
 
-    breadcrumbs::record_command(
-        client_state.id(),
-        &command_name,
-        first_db,
-        0,
-        "execute",
-    );
+    let is_write_operation = first_argv.as_deref().is_some_and(is_write_command);
+
+    breadcrumbs::record_command(client_state.id(), &command_name, first_db, 0, "execute");
 
     let mut outcome = {
+        let lock_wait_start = std::time::Instant::now();
         let mut server = server_state.lock().await;
-        execute(frame, &mut server, client_state)
+        metrics::record_server_state_lock_wait_ms(
+            "execute",
+            lock_wait_start.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        let lock_hold_start = std::time::Instant::now();
+        let aof_latched_error = if is_write_operation && server.aof_enabled() {
+            server.aof_last_error().map(str::to_owned)
+        } else {
+            None
+        };
+
+        let outcome = if let Some(aof_error) = aof_latched_error {
+            metrics::record_aof_write_rejected("latched");
+            CommandOutcome {
+                response: aof_write_latch_error(&aof_error),
+                close: false,
+                retry_blocking: None,
+            }
+        } else {
+            execute(frame, &mut server, client_state)
+        };
+        metrics::record_server_state_lock_hold_ms(
+            "execute",
+            lock_hold_start.elapsed().as_secs_f64() * 1000.0,
+        );
+        outcome
     };
 
     // Record command metrics
@@ -252,8 +314,36 @@ async fn run_with_blocking_retry(
         let outcome = {
             let argv = frame_to_argv_for_persistence(&frame);
             let db = client_state.selected_db();
+            let is_retry_write = argv.as_deref().is_some_and(is_write_command);
+
+            let lock_wait_start = std::time::Instant::now();
             let mut server = server_state.lock().await;
-            let mut outcome = execute(frame, &mut server, client_state);
+            metrics::record_server_state_lock_wait_ms(
+                "retry_execute",
+                lock_wait_start.elapsed().as_secs_f64() * 1000.0,
+            );
+
+            let lock_hold_start = std::time::Instant::now();
+            let aof_latched_error = if is_retry_write && server.aof_enabled() {
+                server.aof_last_error().map(str::to_owned)
+            } else {
+                None
+            };
+            let mut outcome = if let Some(aof_error) = aof_latched_error {
+                metrics::record_aof_write_rejected("latched_retry");
+                CommandOutcome {
+                    response: aof_write_latch_error(&aof_error),
+                    close: false,
+                    retry_blocking: None,
+                }
+            } else {
+                execute(frame, &mut server, client_state)
+            };
+            metrics::record_server_state_lock_hold_ms(
+                "retry_execute",
+                lock_hold_start.elapsed().as_secs_f64() * 1000.0,
+            );
+
             if outcome.retry_blocking.is_none() {
                 drop(server);
                 apply_post_execute_persistence(server_state, persistence, db, argv, &mut outcome)
@@ -328,44 +418,26 @@ async fn apply_post_execute_persistence(
         return;
     }
 
-    if is_queued_response(&outcome.response) || !is_write_command(&argv) {
+    if command == b"BGREWRITEAOF" && !matches!(outcome.response, RespFrame::Error(_)) {
+        if !start_bgrewriteaof(Arc::clone(server_state), Arc::clone(persistence)).await {
+            outcome.response =
+                RespFrame::error_str("ERR BGREWRITEAOF failed: appendonly is disabled");
+        }
         return;
     }
 
-    let Some(writer) = &persistence.aof_writer else {
+    if is_queued_response(&outcome.response) || !is_write_command(&argv) {
         return;
-    };
+    }
 
     let fsync_policy = {
         let server = server_state.lock().await;
         String::from_utf8_lossy(server.config.appendfsync()).to_string()
     };
-
-    let lock_start = std::time::Instant::now();
-    let mut writer = match timeout(AOF_LOCK_ACQUIRE_TIMEOUT, writer.lock()).await {
-        Ok(guard) => {
-            let wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
-            metrics::record_aof_lock_wait_ms(wait_ms);
-            guard
-        }
-        Err(_) => {
-            metrics::record_aof_append_timeout("lock");
-            outcome.response = RespFrame::error_str(
-                "ERR AOF append failed: timeout acquiring append lock",
-            );
-            tracing::error!(
-                target = "ratatosk::aof",
-                selected_db = selected_db,
-                command = %String::from_utf8_lossy(&argv[0]),
-                timeout_ms = AOF_LOCK_ACQUIRE_TIMEOUT.as_millis(),
-                "AOF append lock acquisition timed out"
-            );
-            return;
-        }
-    };
+    let command_name = String::from_utf8_lossy(&argv[0]).to_string();
 
     let append_start = std::time::Instant::now();
-    match writer.append_command(selected_db, &argv) {
+    match append_aof_command(persistence, selected_db, argv).await {
         Ok(()) => {
             let elapsed_ms = append_start.elapsed().as_secs_f64() * 1000.0;
             if append_start.elapsed() > AOF_APPEND_SLOW_THRESHOLD {
@@ -373,7 +445,7 @@ async fn apply_post_execute_persistence(
                 tracing::warn!(
                     target = "ratatosk::aof",
                     selected_db = selected_db,
-                    command = %String::from_utf8_lossy(&argv[0]),
+                    command = %command_name,
                     elapsed_ms = elapsed_ms,
                     threshold_ms = AOF_APPEND_SLOW_THRESHOLD.as_millis(),
                     "AOF append exceeded slow threshold"
@@ -381,15 +453,23 @@ async fn apply_post_execute_persistence(
             }
             metrics::record_aof_write(&fsync_policy);
             metrics::record_aof_append_duration_ms(elapsed_ms, "ok");
+            clear_aof_write_latch_if_set(server_state).await;
         }
         Err(error) => {
             let elapsed_ms = append_start.elapsed().as_secs_f64() * 1000.0;
             metrics::record_aof_append_duration_ms(elapsed_ms, "error");
-            outcome.response = RespFrame::error_str(&format!("ERR AOF append failed: {error}"));
+            metrics::record_aof_write_error();
+            if error.kind() == io::ErrorKind::TimedOut {
+                metrics::record_aof_append_timeout("worker");
+            }
+
+            let latch_error = format!("AOF append failed for command {}: {}", command_name, error);
+            set_aof_write_latch(server_state, latch_error.clone()).await;
+            outcome.response = aof_write_latch_error(&latch_error);
             tracing::error!(
                 target = "ratatosk::aof",
                 selected_db = selected_db,
-                command = %String::from_utf8_lossy(&argv[0]),
+                command = %command_name,
                 elapsed_ms = elapsed_ms,
                 error = %error,
                 "AOF append failed"
@@ -477,7 +557,7 @@ pub async fn handle_client_with_limits(
 
     let _span_enter = client_span.enter();
 
-    tracing::info!(
+    tracing::debug!(
         target = "ratatosk::client",
         client_id = client_id,
         remote_addr = %remote_addr,
@@ -511,7 +591,7 @@ pub async fn handle_client_with_limits(
         metrics::record_connection_event(disconnect_reason);
     }
 
-    tracing::info!(
+    tracing::debug!(
         target = "ratatosk::client",
         client_id = client_id,
         reason = disconnect_reason,
@@ -586,7 +666,7 @@ async fn handle_client_inner(
             match timeout(idle_duration, stream.read_buf(&mut input)).await {
                 Ok(result) => result?,
                 Err(_) => {
-                    tracing::info!(
+                    tracing::debug!(
                         client_id = client_id,
                         timeout_sec = io_limits.client_read_timeout_sec,
                         "disconnecting idle client: read timeout"
@@ -618,7 +698,14 @@ async fn handle_client_inner(
             let frame = match parse(&mut input) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(
+                        target = "ratatosk::protocol",
+                        client_id = client_state.id(),
+                        input_len = input.len(),
+                        error = %error,
+                        "protocol parse error; closing client connection"
+                    );
                     let response = encode(&RespFrame::error_str("ERR protocol error"));
                     write_all_with_timeout(&mut stream, &response).await?;
                     return Ok(());

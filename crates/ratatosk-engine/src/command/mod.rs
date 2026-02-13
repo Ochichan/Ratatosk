@@ -3571,7 +3571,7 @@ pub fn execute(
         b"LASTSAVE" => cmd_server::cmd_lastsave(args, server),
         b"SAVE" => cmd_server::cmd_save(args, server),
         b"BGSAVE" => cmd_server::cmd_bgsave(args, server),
-        b"BGREWRITEAOF" => cmd_server::cmd_bgrewriteaof(args),
+        b"BGREWRITEAOF" => cmd_server::cmd_bgrewriteaof(args, server),
         b"SFLUSH" => cmd_server::cmd_sflush(args),
         b"SWAPDB" => cmd_server::cmd_swapdb(args, server),
         b"FLUSHDB" => cmd_server::cmd_flushdb(args, server, client),
@@ -5277,7 +5277,7 @@ mod tests {
 
         assert_eq!(
             run(&["BGREWRITEAOF"], &mut server, &mut client),
-            RespFrame::error_str("ERR BGREWRITEAOF is not implemented in this build")
+            RespFrame::error_str("ERR BGREWRITEAOF requires appendonly to be enabled")
         );
         assert_eq!(
             run(&["SFLUSH", "SYNC"], &mut server, &mut client),

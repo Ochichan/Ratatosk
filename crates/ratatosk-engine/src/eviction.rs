@@ -51,10 +51,7 @@ impl EvictionPolicy {
     fn is_volatile(self) -> bool {
         matches!(
             self,
-            Self::VolatileLru
-                | Self::VolatileLfu
-                | Self::VolatileRandom
-                | Self::VolatileTtl
+            Self::VolatileLru | Self::VolatileLfu | Self::VolatileRandom | Self::VolatileTtl
         )
     }
 }
@@ -149,7 +146,11 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
             let entries_size: usize = entries
                 .iter()
                 .map(|e| {
-                    32 + e.fields.iter().map(|(k, v)| k.len() + v.len() + 48).sum::<usize>()
+                    32 + e
+                        .fields
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len() + 48)
+                        .sum::<usize>()
                 })
                 .sum();
             let groups_size = groups.len() * 256;
@@ -215,12 +216,11 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
     let duration = start.elapsed();
 
     state.stats.add_evicted_keys(evicted as u64);
-    
+
     // Record metrics
     metrics::counter!("ratatosk_eviction_keys_total", "policy" => config.policy.as_str())
         .increment(evicted as u64);
-    metrics::histogram!("ratatosk_eviction_duration_ms")
-        .record(duration.as_millis() as f64);
+    metrics::histogram!("ratatosk_eviction_duration_ms").record(duration.as_millis() as f64);
     metrics::histogram!("ratatosk_eviction_memory_freed_bytes")
         .record((memory_before.saturating_sub(memory_after)) as f64);
 

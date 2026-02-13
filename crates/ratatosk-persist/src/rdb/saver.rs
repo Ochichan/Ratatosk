@@ -15,8 +15,12 @@ pub struct RdbSaver<W: Write> {
 }
 
 pub fn save(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
-    let file = File::create(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("creating RDB file '{}': {e}", path.display())))?;
+    let file = File::create(path).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("creating RDB file '{}': {e}", path.display()),
+        )
+    })?;
     let mut state = ServerState::new(snapshot.len());
     state.load_from_rdb(snapshot.clone());
     RdbSaver::new(file).save_state(&state)
@@ -46,17 +50,26 @@ impl<W: Write> RdbSaver<W> {
             }
 
             self.write_select_db(db_idx).map_err(|e| {
-                io::Error::new(e.kind(), format!("writing RDB SELECTDB for db {db_idx}: {e}"))
+                io::Error::new(
+                    e.kind(),
+                    format!("writing RDB SELECTDB for db {db_idx}: {e}"),
+                )
             })?;
 
             let expires_count = db.values().filter(|v| v.expire_at_ms.is_some()).count();
             self.write_resize_db(db.len(), expires_count).map_err(|e| {
-                io::Error::new(e.kind(), format!("writing RDB RESIZEDB for db {db_idx}: {e}"))
+                io::Error::new(
+                    e.kind(),
+                    format!("writing RDB RESIZEDB for db {db_idx}: {e}"),
+                )
             })?;
 
             for (key, value) in db.iter() {
                 self.write_key_value(key, value).map_err(|e| {
-                    io::Error::new(e.kind(), format!("writing RDB key-value in db {db_idx}: {e}"))
+                    io::Error::new(
+                        e.kind(),
+                        format!("writing RDB key-value in db {db_idx}: {e}"),
+                    )
                 })?;
             }
         }
@@ -252,10 +265,16 @@ mod tests {
         struct FailingWriter;
         impl io::Write for FailingWriter {
             fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock write failure"))
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mock write failure",
+                ))
             }
             fn flush(&mut self) -> io::Result<()> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "mock flush failure"))
+                Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "mock flush failure",
+                ))
             }
         }
 

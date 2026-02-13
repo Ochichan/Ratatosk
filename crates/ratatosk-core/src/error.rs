@@ -16,7 +16,9 @@ pub enum RedisError {
     #[error("LOADING Redis is loading the dataset in memory")]
     Loading,
 
-    #[error("BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE")]
+    #[error(
+        "BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE"
+    )]
     Busy,
 
     #[error("NOAUTH Authentication required")]

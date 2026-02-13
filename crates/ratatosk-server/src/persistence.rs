@@ -1,9 +1,11 @@
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::{
+    env, io,
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
+use bytes::{Bytes, BytesMut};
 use fs2::available_space;
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::keyspace::ServerState;
@@ -11,48 +13,76 @@ use ratatosk_persist::{
     aof::{AofRecovery, AofWriter, FsyncPolicy},
     rdb,
 };
-use tokio::sync::Mutex;
+use ratatosk_resp::{RespFrame, parse};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::config::ServerConfig;
 
 const AOF_FILENAME: &str = "appendonly.aof";
+const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
+const DEFAULT_AOF_QUEUE_CAPACITY: usize = 4096;
+const AOF_APPEND_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const AOF_APPEND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AOF_FLUSH_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const AOF_REWRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(900);
 
-static BGSAVE_TASKS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+static BGSAVE_TASKS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+static BGREWRITEAOF_TASKS: OnceLock<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
     OnceLock::new();
 
 fn bgsave_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
     BGSAVE_TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+fn bgrewriteaof_tasks() -> &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>> {
+    BGREWRITEAOF_TASKS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+enum AofWorkerCommand {
+    Append {
+        db_index: usize,
+        argv: Vec<Bytes>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Flush {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Rewrite {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct PersistenceRuntime {
     pub rdb_path: PathBuf,
     pub aof_path: PathBuf,
-    pub aof_writer: Option<Arc<Mutex<AofWriter>>>,
+    aof_tx: Option<mpsc::Sender<AofWorkerCommand>>,
 }
 
 impl PersistenceRuntime {
     pub fn from_config(config: &ServerConfig) -> io::Result<Self> {
-        // 1. Validate working directory exists and is writable
         validate_working_directory(&config.dir)?;
-
-        // 2. Check available disk space (minimum 100MB)
         check_disk_space(&config.dir, 100 * 1024 * 1024)?;
 
         let rdb_path = config.dir.join(&config.dbfilename);
         let aof_path = config.dir.join(AOF_FILENAME);
 
-        // 3. Validate AOF file if exists and appendonly is enabled
         if config.appendonly && aof_path.exists() {
             validate_aof_file(&aof_path)?;
         }
 
-        let aof_writer = if config.appendonly {
+        let aof_tx = if config.appendonly {
             let policy = FsyncPolicy::from_config_str(config.appendfsync.as_bytes())
                 .unwrap_or(FsyncPolicy::EverySec);
             let writer = AofWriter::open(&aof_path, policy)
                 .map_err(|e| io::Error::other(format!("opening AOF writer: {e}")))?;
-            Some(Arc::new(Mutex::new(writer)))
+            let queue_capacity = aof_queue_capacity_from_env();
+            Some(spawn_aof_worker(
+                aof_path.clone(),
+                writer,
+                policy,
+                queue_capacity,
+            ))
         } else {
             None
         };
@@ -60,9 +90,223 @@ impl PersistenceRuntime {
         Ok(Self {
             rdb_path,
             aof_path,
-            aof_writer,
+            aof_tx,
         })
     }
+
+    fn aof_sender(&self) -> Option<&mpsc::Sender<AofWorkerCommand>> {
+        self.aof_tx.as_ref()
+    }
+}
+
+fn aof_queue_capacity_from_env() -> usize {
+    env::var("RATATOSK_AOF_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_AOF_QUEUE_CAPACITY)
+}
+
+fn observe_aof_queue_depth(sender: &mpsc::Sender<AofWorkerCommand>) {
+    let depth = sender.max_capacity().saturating_sub(sender.capacity());
+    crate::metrics::set_aof_queue_depth(depth);
+}
+
+fn spawn_aof_worker(
+    aof_path: PathBuf,
+    writer: AofWriter,
+    policy: FsyncPolicy,
+    queue_capacity: usize,
+) -> mpsc::Sender<AofWorkerCommand> {
+    let (tx, mut rx) = mpsc::channel::<AofWorkerCommand>(queue_capacity);
+    crate::metrics::set_aof_queue_depth(0);
+
+    tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(command) = rx.recv().await {
+            crate::metrics::set_aof_queue_depth(rx.len());
+            match command {
+                AofWorkerCommand::Append {
+                    db_index,
+                    argv,
+                    reply,
+                } => {
+                    let result = writer
+                        .append_command(db_index, &argv)
+                        .map_err(|error| format!("appending AOF command: {error}"));
+                    let _ = reply.send(result);
+                }
+                AofWorkerCommand::Flush { reply } => {
+                    let result = writer
+                        .force_fsync()
+                        .map_err(|error| format!("flushing AOF: {error}"));
+                    let _ = reply.send(result);
+                }
+                AofWorkerCommand::Rewrite { reply } => {
+                    let result = rewrite_aof_and_reopen(&aof_path, policy, &mut writer);
+                    let _ = reply.send(result);
+                }
+            }
+        }
+
+        crate::metrics::set_aof_queue_depth(0);
+        tracing::warn!(
+            target = "ratatosk::aof",
+            path = %aof_path.display(),
+            "AOF worker channel closed; worker exiting"
+        );
+    });
+
+    tx
+}
+
+fn rewrite_aof_and_reopen(
+    aof_path: &Path,
+    policy: FsyncPolicy,
+    writer: &mut AofWriter,
+) -> Result<(), String> {
+    writer
+        .force_fsync()
+        .map_err(|error| format!("forcing fsync before rewrite: {error}"))?;
+
+    rewrite_aof_file(aof_path).map_err(|error| format!("rewriting AOF file: {error}"))?;
+
+    let reopened = AofWriter::open(aof_path, policy)
+        .map_err(|error| format!("reopening rewritten AOF writer: {error}"))?;
+    *writer = reopened;
+    Ok(())
+}
+
+fn rewrite_aof_file(aof_path: &Path) -> io::Result<()> {
+    let raw = std::fs::read(aof_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "reading AOF file '{}' for rewrite: {error}",
+                aof_path.display()
+            ),
+        )
+    })?;
+
+    let payload: &[u8] = if raw.starts_with(AOF_VERSION_HEADER) {
+        &raw[AOF_VERSION_HEADER.len()..]
+    } else if raw.starts_with(b"*") || raw.is_empty() {
+        &raw
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "AOF file '{}' has unsupported format during rewrite",
+                aof_path.display()
+            ),
+        ));
+    };
+
+    let mut parser_buf = BytesMut::from(payload);
+    let mut current_db = 0usize;
+    let tmp_path = aof_path.with_extension("rewrite.tmp");
+
+    if tmp_path.exists() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+
+    let mut tmp_writer = AofWriter::open(&tmp_path, FsyncPolicy::No).map_err(|error| {
+        io::Error::other(format!(
+            "opening temporary rewrite file '{}': {error}",
+            tmp_path.display()
+        ))
+    })?;
+
+    while !parser_buf.is_empty() {
+        let parse_start = payload.len().saturating_sub(parser_buf.len());
+        match parse(&mut parser_buf) {
+            Ok(Some(frame)) => {
+                let argv = frame_to_argv(frame)?;
+                if let Some(db_index) = parse_select_db(&argv) {
+                    current_db = db_index;
+                    continue;
+                }
+
+                tmp_writer
+                    .append_command(current_db, &argv)
+                    .map_err(|error| {
+                        io::Error::other(format!("rewriting command into AOF: {error}"))
+                    })?;
+            }
+            Ok(None) => {
+                if parser_buf.is_empty() {
+                    break;
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "AOF rewrite encountered truncated command near byte {}",
+                        parse_start
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("AOF rewrite parse error near byte {}: {error}", parse_start),
+                ));
+            }
+        }
+    }
+
+    tmp_writer
+        .force_fsync()
+        .map_err(|error| io::Error::other(format!("fsyncing rewritten AOF temp file: {error}")))?;
+    drop(tmp_writer);
+
+    std::fs::rename(&tmp_path, aof_path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "replacing AOF file '{}' with rewritten temp '{}': {error}",
+                aof_path.display(),
+                tmp_path.display()
+            ),
+        )
+    })?;
+
+    Ok(())
+}
+
+fn frame_to_argv(frame: RespFrame) -> io::Result<Vec<Bytes>> {
+    let RespFrame::Array(items) = frame else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "AOF rewrite expected RESP array command frame",
+        ));
+    };
+
+    let mut argv = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            RespFrame::BulkString(Some(value)) => argv.push(value),
+            RespFrame::SimpleString(value) => argv.push(value),
+            RespFrame::Integer(value) => argv.push(Bytes::from(value.to_string())),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AOF rewrite encountered unsupported argument frame",
+                ));
+            }
+        }
+    }
+
+    Ok(argv)
+}
+
+fn parse_select_db(argv: &[Bytes]) -> Option<usize> {
+    if argv.len() != 2 || !argv[0].eq_ignore_ascii_case(b"SELECT") {
+        return None;
+    }
+
+    std::str::from_utf8(&argv[1])
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
 }
 
 fn validate_working_directory(dir: &Path) -> io::Result<()> {
@@ -83,19 +327,18 @@ fn validate_working_directory(dir: &Path) -> io::Result<()> {
         ));
     }
 
-    // Test write permission by creating a temp file
     let test_file = dir.join(".ratatosk_write_test");
     match std::fs::File::create(&test_file) {
         Ok(_) => {
             let _ = std::fs::remove_file(&test_file);
         }
-        Err(e) => {
+        Err(error) => {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
                     "working directory is not writable: {} (error: {})",
                     dir.display(),
-                    e
+                    error
                 ),
             ));
         }
@@ -139,7 +382,6 @@ fn check_disk_space(dir: &Path, min_bytes: u64) -> io::Result<()> {
 }
 
 fn validate_aof_file(path: &Path) -> io::Result<()> {
-    // Check if AOF file is readable
     match std::fs::File::open(path) {
         Ok(_) => {
             tracing::info!(
@@ -149,15 +391,24 @@ fn validate_aof_file(path: &Path) -> io::Result<()> {
             );
             Ok(())
         }
-        Err(e) => Err(io::Error::new(
+        Err(error) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
                 "AOF file exists but cannot be read: {} (error: {})",
                 path.display(),
-                e
+                error
             ),
         )),
     }
+}
+
+fn env_truthy(name: &str) -> bool {
+    env::var(name).is_ok_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
 }
 
 pub async fn apply_server_persistence_config(
@@ -172,6 +423,15 @@ pub async fn apply_server_persistence_config(
         .set_appendfsync(bytes::Bytes::from(config.appendfsync.clone()));
     state.config.set_appendonly(config.appendonly);
     state.set_aof_enabled(config.appendonly);
+
+    if !config.appendonly {
+        state.clear_aof_last_error();
+        state.set_aof_rewrite_in_progress(false);
+        state.clear_last_aof_rewrite_status();
+        state.clear_last_aof_rewrite_time_ms();
+    }
+
+    crate::metrics::set_aof_write_latched(state.aof_write_latched());
 }
 
 pub async fn load_startup_data(
@@ -181,7 +441,7 @@ pub async fn load_startup_data(
 ) -> io::Result<()> {
     if runtime.rdb_path.exists() {
         let snapshot = rdb::loader::load(&runtime.rdb_path)
-            .map_err(|e| io::Error::other(format!("loading RDB snapshot: {e}")))?;
+            .map_err(|error| io::Error::other(format!("loading RDB snapshot: {error}")))?;
         let key_count: usize = snapshot.iter().map(|db| db.len()).sum();
         {
             let mut state = server_state.lock().await;
@@ -196,10 +456,9 @@ pub async fn load_startup_data(
         let result = {
             let mut state = server_state.lock().await;
             AofRecovery::replay_file(&runtime.aof_path, &mut state)
-                .map_err(|e| io::Error::other(format!("replaying AOF: {e}")))?
+                .map_err(|error| io::Error::other(format!("replaying AOF: {error}")))?
         };
 
-        // Emit metrics for AOF replay
         if result.corruption_detected {
             tracing::warn!(
                 target = "ratatosk::startup",
@@ -226,6 +485,24 @@ pub async fn load_startup_data(
                 ),
             ));
         }
+
+        if result.legacy_format && !env_truthy("RATATOSK_ALLOW_LEGACY_AOF") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF file {} is in legacy headerless format; refusing startup by default (set RATATOSK_ALLOW_LEGACY_AOF=true to bypass)",
+                    runtime.aof_path.display()
+                ),
+            ));
+        }
+
+        if result.legacy_format {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                path = %runtime.aof_path.display(),
+                "AOF replay accepted legacy headerless format due to RATATOSK_ALLOW_LEGACY_AOF"
+            );
+        }
     }
 
     Ok(())
@@ -241,15 +518,15 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
         state.snapshot_dbs()
     };
 
-    crate::metrics::record_rdb_save(true); // background = true
+    crate::metrics::record_rdb_save(true);
 
     let handle = tokio::spawn(async move {
         let path_for_log = rdb_path.display().to_string();
         let save_result =
             tokio::task::spawn_blocking(move || rdb::saver::save(&snapshot, &rdb_path))
                 .await
-                .map_err(|e| format!("joining BGSAVE worker: {e}"))
-                .and_then(|result| result.map_err(|e| e.to_string()));
+                .map_err(|error| format!("joining BGSAVE worker: {error}"))
+                .and_then(|result| result.map_err(|error| error.to_string()));
 
         let mut state = server_state.lock().await;
         state.set_rdb_save_in_progress(false);
@@ -277,7 +554,87 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
 }
 
 pub async fn drain_bgsave_tasks(grace: Duration) -> (usize, usize) {
-    let tasks = match bgsave_tasks().lock() {
+    let (completed, aborted) = drain_task_handles(
+        bgsave_tasks(),
+        grace,
+        crate::metrics::record_bgsave_task_timeout,
+    )
+    .await;
+
+    if aborted > 0 {
+        crate::metrics::record_bgsave_tasks_aborted(aborted as u64);
+    }
+
+    (completed, aborted)
+}
+
+pub async fn start_bgrewriteaof(
+    server_state: Arc<Mutex<ServerState>>,
+    runtime: Arc<PersistenceRuntime>,
+) -> bool {
+    if runtime.aof_sender().is_none() {
+        let mut state = server_state.lock().await;
+        state.set_aof_rewrite_in_progress(false);
+        state.set_last_aof_rewrite_status(Err("appendonly is disabled".to_string()));
+        state.set_last_aof_rewrite_time_ms(now_ms());
+        return false;
+    }
+
+    crate::metrics::record_aof_rewrite("requested");
+
+    let handle = tokio::spawn(async move {
+        let result = request_aof_rewrite(&runtime).await;
+
+        let mut state = server_state.lock().await;
+        state.set_aof_rewrite_in_progress(false);
+        state.set_last_aof_rewrite_time_ms(now_ms());
+
+        match result {
+            Ok(()) => {
+                state.set_last_aof_rewrite_status(Ok(()));
+                crate::metrics::record_aof_rewrite("success");
+                tracing::info!(target = "ratatosk::aof", "background AOF rewrite completed");
+            }
+            Err(error) => {
+                state.set_last_aof_rewrite_status(Err(error.to_string()));
+                crate::metrics::record_aof_rewrite("error");
+                tracing::warn!(
+                    target = "ratatosk::aof",
+                    error = %error,
+                    "background AOF rewrite failed"
+                );
+            }
+        }
+    });
+
+    if let Ok(mut tasks) = bgrewriteaof_tasks().lock() {
+        tasks.push(handle);
+    }
+
+    true
+}
+
+pub async fn drain_bgrewriteaof_tasks(grace: Duration) -> (usize, usize) {
+    let (completed, aborted) = drain_task_handles(
+        bgrewriteaof_tasks(),
+        grace,
+        crate::metrics::record_bgrewriteaof_task_timeout,
+    )
+    .await;
+
+    if aborted > 0 {
+        crate::metrics::record_bgrewriteaof_tasks_aborted(aborted as u64);
+    }
+
+    (completed, aborted)
+}
+
+async fn drain_task_handles(
+    tasks_lock: &'static std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    grace: Duration,
+    record_timeout: fn(),
+) -> (usize, usize) {
+    let tasks = match tasks_lock.lock() {
         Ok(mut guard) => std::mem::take(&mut *guard),
         Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     };
@@ -291,30 +648,34 @@ pub async fn drain_bgsave_tasks(grace: Duration) -> (usize, usize) {
     let mut aborted = 0usize;
 
     for mut task in tasks {
-        let now = tokio::time::Instant::now();
-        let remaining = deadline.saturating_duration_since(now);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             task.abort();
             aborted = aborted.saturating_add(1);
+            record_timeout();
             continue;
         }
 
         match tokio::time::timeout(remaining, &mut task).await {
-            Ok(Ok(())) => completed = completed.saturating_add(1),
+            Ok(Ok(())) => {
+                completed = completed.saturating_add(1);
+            }
             Ok(Err(error)) => {
                 completed = completed.saturating_add(1);
-                tracing::warn!(error = %error, "background RDB save task finished with join error");
+                tracing::warn!(error = %error, "background task finished with join error");
             }
             Err(_) => {
                 task.abort();
                 aborted = aborted.saturating_add(1);
-                tracing::warn!("background RDB save task did not complete before shutdown deadline");
+                record_timeout();
+                tracing::warn!("background task did not complete before shutdown deadline");
             }
         }
     }
 
     (completed, aborted)
 }
+
 pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -> io::Result<()> {
     let snapshot = {
         let state = server_state.lock().await;
@@ -324,7 +685,7 @@ pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -
         state.snapshot_dbs()
     };
 
-    crate::metrics::record_rdb_save(false); // foreground = false
+    crate::metrics::record_rdb_save(false);
 
     let result = rdb::saver::save(&snapshot, rdb_path);
     let mut state = server_state.lock().await;
@@ -342,21 +703,156 @@ pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -
     result
 }
 
-pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
-    let Some(writer) = &runtime.aof_writer else {
+pub async fn append_aof_command(
+    runtime: &PersistenceRuntime,
+    db_index: usize,
+    argv: Vec<Bytes>,
+) -> io::Result<()> {
+    let Some(sender) = runtime.aof_sender() else {
         return Ok(());
     };
 
-    let mut guard = writer.lock().await;
+    observe_aof_queue_depth(sender);
+    let (reply_tx, reply_rx) = oneshot::channel();
 
-    // Get fsync policy for metrics
-    let fsync_policy = "always"; // force_fsync always does fsync
-    crate::metrics::record_aof_write(fsync_policy);
+    match tokio::time::timeout(
+        AOF_APPEND_QUEUE_TIMEOUT,
+        sender.send(AofWorkerCommand::Append {
+            db_index,
+            argv,
+            reply: reply_tx,
+        }),
+    )
+    .await
+    {
+        Err(_) => {
+            crate::metrics::record_aof_worker_enqueue_timeout("append");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out enqueueing AOF append request",
+            ));
+        }
+        Ok(Err(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AOF worker channel closed while enqueueing append",
+            ));
+        }
+        Ok(Ok(())) => {}
+    }
 
-    guard.force_fsync().map_err(|e| {
-        crate::metrics::record_aof_write_error();
-        io::Error::other(format!("flushing AOF: {e}"))
-    })
+    match tokio::time::timeout(AOF_APPEND_REPLY_TIMEOUT, reply_rx).await {
+        Err(_) => {
+            crate::metrics::record_aof_append_timeout("worker_reply");
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for AOF append completion",
+            ))
+        }
+        Ok(Err(_)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "AOF worker dropped append completion channel",
+        )),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(io::Error::other(error)),
+    }
+}
+
+async fn request_aof_rewrite(runtime: &PersistenceRuntime) -> io::Result<()> {
+    let Some(sender) = runtime.aof_sender() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "AOF rewrite requested while appendonly is disabled",
+        ));
+    };
+
+    observe_aof_queue_depth(sender);
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    match tokio::time::timeout(
+        AOF_APPEND_QUEUE_TIMEOUT,
+        sender.send(AofWorkerCommand::Rewrite { reply: reply_tx }),
+    )
+    .await
+    {
+        Err(_) => {
+            crate::metrics::record_aof_worker_enqueue_timeout("rewrite");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out enqueueing AOF rewrite request",
+            ));
+        }
+        Ok(Err(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AOF worker channel closed while enqueueing rewrite",
+            ));
+        }
+        Ok(Ok(())) => {}
+    }
+
+    match tokio::time::timeout(AOF_REWRITE_REPLY_TIMEOUT, reply_rx).await {
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for AOF rewrite completion",
+        )),
+        Ok(Err(_)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "AOF worker dropped rewrite completion channel",
+        )),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(io::Error::other(error)),
+    }
+}
+
+pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
+    let Some(sender) = runtime.aof_sender() else {
+        return Ok(());
+    };
+
+    observe_aof_queue_depth(sender);
+    let (reply_tx, reply_rx) = oneshot::channel();
+
+    match tokio::time::timeout(
+        AOF_APPEND_QUEUE_TIMEOUT,
+        sender.send(AofWorkerCommand::Flush { reply: reply_tx }),
+    )
+    .await
+    {
+        Err(_) => {
+            crate::metrics::record_aof_worker_enqueue_timeout("flush");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out enqueueing AOF flush request",
+            ));
+        }
+        Ok(Err(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AOF worker channel closed while enqueueing flush",
+            ));
+        }
+        Ok(Ok(())) => {}
+    }
+
+    match tokio::time::timeout(AOF_FLUSH_REPLY_TIMEOUT, reply_rx).await {
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for AOF flush completion",
+        )),
+        Ok(Err(_)) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "AOF worker dropped flush completion channel",
+        )),
+        Ok(Ok(Ok(()))) => {
+            crate::metrics::record_aof_write("always");
+            Ok(())
+        }
+        Ok(Ok(Err(error))) => {
+            crate::metrics::record_aof_write_error();
+            Err(io::Error::other(error))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -382,25 +878,18 @@ mod tests {
         );
         rdb::saver::save(&state.snapshot_dbs(), &runtime.rdb_path).expect("save rdb");
 
-        {
-            let mut writer = runtime
-                .aof_writer
-                .as_ref()
-                .expect("aof writer")
-                .lock()
-                .await;
-            writer
-                .append_command(
-                    0,
-                    &[
-                        Bytes::from("SET"),
-                        Bytes::from("from-aof"),
-                        Bytes::from("2"),
-                    ],
-                )
-                .expect("append");
-            writer.force_fsync().expect("fsync");
-        }
+        append_aof_command(
+            &runtime,
+            0,
+            vec![
+                Bytes::from("SET"),
+                Bytes::from("from-aof"),
+                Bytes::from("2"),
+            ],
+        )
+        .await
+        .expect("append aof command");
+        flush_aof(&runtime).await.expect("flush aof");
 
         let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
         load_startup_data(&shared, &runtime, true)
@@ -421,6 +910,65 @@ mod tests {
                 .get(&Bytes::from("from-aof"))
                 .and_then(|v| v.as_string()),
             Some(&Bytes::from("2"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_aof_via_worker_keeps_writer_usable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut config = ServerConfig::default();
+        config.dir = dir.path().to_path_buf();
+        config.appendonly = true;
+        config.appendfsync = "always".to_string();
+
+        let runtime = PersistenceRuntime::from_config(&config).expect("runtime");
+
+        append_aof_command(
+            &runtime,
+            0,
+            vec![
+                Bytes::from("SET"),
+                Bytes::from("pre"),
+                Bytes::from("rewrite"),
+            ],
+        )
+        .await
+        .expect("append before rewrite");
+        flush_aof(&runtime).await.expect("flush before rewrite");
+
+        request_aof_rewrite(&runtime)
+            .await
+            .expect("rewrite request should succeed");
+
+        append_aof_command(
+            &runtime,
+            0,
+            vec![
+                Bytes::from("SET"),
+                Bytes::from("post"),
+                Bytes::from("rewrite"),
+            ],
+        )
+        .await
+        .expect("append after rewrite");
+        flush_aof(&runtime).await.expect("flush after rewrite");
+
+        let mut loaded = ServerState::with_default_dbs();
+        AofRecovery::replay_file(&runtime.aof_path, &mut loaded).expect("replay rewritten aof");
+
+        assert_eq!(
+            loaded
+                .db(0)
+                .get(&Bytes::from("pre"))
+                .and_then(|v| v.as_string()),
+            Some(&Bytes::from("rewrite"))
+        );
+        assert_eq!(
+            loaded
+                .db(0)
+                .get(&Bytes::from("post"))
+                .and_then(|v| v.as_string()),
+            Some(&Bytes::from("rewrite"))
         );
     }
 }

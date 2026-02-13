@@ -1,9 +1,7 @@
 use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
-use criterion::{
-    BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hashbrown::HashMap;
 use ratatosk_engine::{
     command::{ClientState, execute},

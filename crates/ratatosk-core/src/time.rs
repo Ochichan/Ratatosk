@@ -94,6 +94,9 @@ mod tests {
         let start = monotonic_ms();
         std::thread::sleep(std::time::Duration::from_millis(10));
         let end = monotonic_ms();
-        assert!(end > start, "monotonic clock should advance: {start} -> {end}");
+        assert!(
+            end > start,
+            "monotonic clock should advance: {start} -> {end}"
+        );
     }
 }

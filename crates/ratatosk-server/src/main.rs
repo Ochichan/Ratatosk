@@ -45,14 +45,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Initialize metrics exporter
-    if let Err(error) = metrics::init_metrics_default() {
-        tracing::warn!(
-            target = "ratatosk::startup",
-            error = %error,
-            "failed to initialize metrics exporter, continuing without metrics"
-        );
-    }
+    init_metrics_exporter()?;
 
     let config =
         ServerConfig::from_env().context("loading server configuration from environment")?;
@@ -77,6 +70,40 @@ fn init_tracing() {
         .with_current_span(true)
         .with_span_list(true)
         .init();
+}
+
+fn init_metrics_exporter() -> anyhow::Result<()> {
+    let bind_addr = metrics::metrics_bind_addr_from_env();
+    let allow_without_metrics = env_truthy("RATATOSK_ALLOW_NO_METRICS");
+
+    if let Err(error) = metrics::init_metrics(&bind_addr) {
+        if allow_without_metrics {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                error = %error,
+                bind_addr = %bind_addr,
+                "failed to initialize metrics exporter; continuing due to RATATOSK_ALLOW_NO_METRICS"
+            );
+            return Ok(());
+        }
+
+        return Err(anyhow!(
+            "failed to initialize metrics exporter on {}: {} (set RATATOSK_ALLOW_NO_METRICS=true to bypass)",
+            bind_addr,
+            error
+        ));
+    }
+
+    Ok(())
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
 }
 
 fn setup_panic_hook() {
@@ -277,12 +304,16 @@ fn log_startup_config(config: &ServerConfig) {
 fn run_startup_preflight(config: &ServerConfig) -> anyhow::Result<()> {
     validate_fd_headroom(config)?;
     validate_persistence_dir_access(config)?;
+    validate_audit_log_access()?;
     Ok(())
 }
 
 fn validate_persistence_dir_access(config: &ServerConfig) -> anyhow::Result<()> {
     if !config.dir.exists() {
-        return Err(anyhow!("persistence directory does not exist: {}", config.dir.display()));
+        return Err(anyhow!(
+            "persistence directory does not exist: {}",
+            config.dir.display()
+        ));
     }
 
     if !config.dir.is_dir() {
@@ -306,6 +337,41 @@ fn validate_persistence_dir_access(config: &ServerConfig) -> anyhow::Result<()> 
         dir = %config.dir.display(),
         "persistence directory preflight passed"
     );
+
+    Ok(())
+}
+
+fn validate_audit_log_access() -> anyhow::Result<()> {
+    let (audit_log_path, audit_state_path) = ratatosk_engine::security::audit_paths_from_env();
+
+    validate_appendable_file_path("audit log", &audit_log_path)?;
+    validate_appendable_file_path("audit chain state", &audit_state_path)?;
+
+    tracing::info!(
+        target = "ratatosk::startup",
+        audit_log_path = %audit_log_path.display(),
+        audit_state_path = %audit_state_path.display(),
+        "audit preflight passed"
+    );
+
+    Ok(())
+}
+
+fn validate_appendable_file_path(label: &str, path: &Path) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "creating parent directory for {}: {}",
+            label,
+            parent.display()
+        )
+    })?;
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening {} path for append: {}", label, path.display()))?;
 
     Ok(())
 }

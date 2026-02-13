@@ -419,17 +419,16 @@ mod tests {
     #[test]
     fn roundtrip_list() {
         let mut state = ServerState::with_default_dbs();
-        let list = VecDeque::from(vec![
-            Bytes::from("a"),
-            Bytes::from("b"),
-            Bytes::from("c"),
-        ]);
+        let list = VecDeque::from(vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
         state
             .db_mut(0)
             .insert(Bytes::from("mylist"), StoredValue::list(list, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded.db(0).get(&Bytes::from("mylist")).expect("list exists");
+        let val = loaded
+            .db(0)
+            .get(&Bytes::from("mylist"))
+            .expect("list exists");
         let list = val.as_list().expect("is list");
         assert_eq!(list.len(), 3);
         assert_eq!(list[0], Bytes::from("a"));
@@ -472,8 +471,14 @@ mod tests {
             .expect("hash exists");
         let loaded_hash = val.as_hash().expect("is hash");
         assert_eq!(loaded_hash.len(), 2);
-        assert_eq!(loaded_hash.get(&Bytes::from("f1")).map(|e| &e.value), Some(&Bytes::from("v1")));
-        assert_eq!(loaded_hash.get(&Bytes::from("f2")).map(|e| &e.value), Some(&Bytes::from("v2")));
+        assert_eq!(
+            loaded_hash.get(&Bytes::from("f1")).map(|e| &e.value),
+            Some(&Bytes::from("v1"))
+        );
+        assert_eq!(
+            loaded_hash.get(&Bytes::from("f2")).map(|e| &e.value),
+            Some(&Bytes::from("v2"))
+        );
     }
 
     #[test]
@@ -515,7 +520,10 @@ mod tests {
         assert!(loaded.db(2).is_empty());
         assert_eq!(loaded.db(3).len(), 1);
         assert_eq!(
-            loaded.db(3).get(&Bytes::from("k3")).and_then(|v| v.as_string()),
+            loaded
+                .db(3)
+                .get(&Bytes::from("k3"))
+                .and_then(|v| v.as_string()),
             Some(&Bytes::from("v3"))
         );
     }
@@ -577,10 +585,9 @@ mod tests {
                 fields: vec![(Bytes::from("name"), Bytes::from("bob"))],
             },
         ];
-        state.db_mut(0).insert(
-            Bytes::from("mystream"),
-            StoredValue::stream(entries, None),
-        );
+        state
+            .db_mut(0)
+            .insert(Bytes::from("mystream"), StoredValue::stream(entries, None));
 
         let loaded = roundtrip_state(&state);
         let val = loaded
@@ -619,11 +626,17 @@ mod tests {
         assert_eq!(loaded.db(0).len(), 1);
         assert_eq!(loaded.db(1).len(), 1);
         assert_eq!(
-            loaded.db(0).get(&Bytes::from("k")).and_then(|v| v.as_string()),
+            loaded
+                .db(0)
+                .get(&Bytes::from("k"))
+                .and_then(|v| v.as_string()),
             Some(&Bytes::from("v"))
         );
         assert_eq!(
-            loaded.db(1).get(&Bytes::from("n")).and_then(|v| v.as_string()),
+            loaded
+                .db(1)
+                .get(&Bytes::from("n"))
+                .and_then(|v| v.as_string()),
             Some(&Bytes::from("1"))
         );
     }

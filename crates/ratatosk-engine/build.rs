@@ -29,5 +29,8 @@ fn main() {
 
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
     println!("cargo:rustc-env=BUILD_UNIX_TS={}", build_unix_ts);
-    println!("cargo:rustc-env=CARGO_PKG_VERSION={}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "cargo:rustc-env=CARGO_PKG_VERSION={}",
+        env!("CARGO_PKG_VERSION")
+    );
 }

@@ -248,14 +248,37 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 합계: 30개 테스트.
 
 ---
-
-## 미구현 / 향후 작업
+## 운영 상태 (2026-02-13)
 
 | 항목 | 상태 | 설명 |
 |------|------|------|
-| Background RDB save | 미구현 | `fork()` 또는 background thread 기반 snapshot |
-| AOF rewrite | 미구현 | 현재 keyspace를 compact AOF로 덤프 |
-| server_cron 통합 | 부분 | SIGUSR1 시그널 수신은 구현, 실제 save 트리거 미연결 |
-| AOF writer 서버 통합 | 미구현 | 쓰기 명령 후 AOF append 연동 |
+| Background RDB save | 구현 | `BGSAVE`가 백그라운드 태스크로 실행되고 shutdown 시 drain된다. |
+| AOF rewrite (`BGREWRITEAOF`) | 구현 | AOF 워커에서 rewrite를 수행한 뒤 writer를 reopen한다. |
+| AOF writer 서버 통합 | 구현 | 쓰기 명령이 AOF 워커 큐(`append`)로 비동기 전달된다. |
+| Legacy AOF format gate | 구현 | headerless AOF는 기본 거부하며 `RATATOSK_ALLOW_LEGACY_AOF=true`에서만 임시 허용한다. |
+| server_cron 통합 | 부분 | SIGUSR1 수신은 구현되어 있고, 추가 save 정책 자동화는 별도 작업이다. |
 | LZF 압축 | 미구현 | RDB string 압축 (큰 값 전용) |
 | Manifest 파일 I/O | 미구현 | manifest를 디스크에 직렬화/역직렬화 |
+
+---
+
+## Legacy AOF 게이트 운영 정책
+
+- 기본값: `RATATOSK_ALLOW_LEGACY_AOF`는 설정하지 않는다(또는 `false`)를 유지한다.
+- 예외 허용: 마이그레이션 윈도우에서만 `RATATOSK_ALLOW_LEGACY_AOF=true`를 단기 적용한다.
+- 종료 조건: 레거시 포맷으로 1회 부팅 후 즉시 `BGREWRITEAOF`를 실행해 버전 헤더가 있는 AOF로 재작성한다.
+- 재기동 검증: 우회 변수를 제거한 상태에서 재시작해도 정상 부팅되어야 릴리즈 가능으로 판정한다.
+
+---
+
+## 릴리즈 체크리스트 (AOF/BGREWRITEAOF)
+
+1. `BGREWRITEAOF` 실기동 스모크를 실행한다.
+   `bash scripts/smoke_bgrewriteaof.sh`
+2. appendonly 비활성 인스턴스에서 `BGREWRITEAOF`가 거부되는지 확인한다.
+   기대값: `ERR BGREWRITEAOF requires appendonly to be enabled`
+3. 레거시(headerless) AOF 기본 차단을 확인한다.
+   기대값: 부팅 실패 + `RATATOSK_ALLOW_LEGACY_AOF=true` 안내 메시지
+4. 레거시 AOF 마이그레이션 시나리오를 확인한다.
+   1회성으로 `RATATOSK_ALLOW_LEGACY_AOF=true`로 부팅 -> `BGREWRITEAOF` 실행 -> 변수 제거 후 재기동
+5. 롤백 안전성 확인: 신규 빌드로 rewrite된 AOF로 재기동 후 기존 운영 변수셋(우회 변수 없음)에서 문제 없이 올라오는지 점검한다.

@@ -31,23 +31,23 @@ impl ConnectionRateLimiter {
     }
 
     /// Check if a connection from the given IP should be allowed.
-    /// 
+    ///
     /// Returns `true` if the connection is within rate limits,
     /// `false` if it should be rejected.
     pub fn check_rate_limit(&mut self, addr: IpAddr) -> bool {
         let now = Instant::now();
-        
+
         // Periodic cleanup of old entries
         if now.duration_since(self.last_cleanup) > self.window {
             self.cleanup(now);
             self.last_cleanup = now;
         }
-        
+
         let attempts = self.attempts.entry(addr).or_default();
-        
+
         // Remove old attempts outside the window
         attempts.retain(|t| now.duration_since(*t) < self.window);
-        
+
         if attempts.len() >= self.max_attempts {
             tracing::warn!(
                 target = "ratatosk::security",
@@ -57,19 +57,18 @@ impl ConnectionRateLimiter {
                 window_sec = self.window.as_secs(),
                 "Connection rate limit exceeded"
             );
-            crate::metrics::record_rate_limited_connection();
             return false;
         }
-        
+
         attempts.push(now);
         true
     }
-    
+
     /// Get the number of tracked IPs (for metrics/debugging).
     pub fn tracked_ips(&self) -> usize {
         self.attempts.len()
     }
-    
+
     fn cleanup(&mut self, now: Instant) {
         self.attempts.retain(|_, attempts| {
             attempts.retain(|t| now.duration_since(*t) < self.window);
@@ -93,35 +92,35 @@ mod tests {
     fn rate_limiter_allows_within_limit() {
         let mut limiter = ConnectionRateLimiter::new(Duration::from_secs(60), 5);
         let ip = IpAddr::from([127, 0, 0, 1]);
-        
+
         for _ in 0..5 {
             assert!(limiter.check_rate_limit(ip), "Should allow within limit");
         }
     }
-    
+
     #[test]
     fn rate_limiter_blocks_over_limit() {
         let mut limiter = ConnectionRateLimiter::new(Duration::from_secs(60), 3);
         let ip = IpAddr::from([127, 0, 0, 1]);
-        
+
         for _ in 0..3 {
             assert!(limiter.check_rate_limit(ip), "Should allow within limit");
         }
-        
+
         assert!(!limiter.check_rate_limit(ip), "Should block over limit");
     }
-    
+
     #[test]
     fn rate_limiter_tracks_different_ips_separately() {
         let mut limiter = ConnectionRateLimiter::new(Duration::from_secs(60), 2);
         let ip1 = IpAddr::from([127, 0, 0, 1]);
         let ip2 = IpAddr::from([127, 0, 0, 2]);
-        
+
         // Exhaust limit for ip1
         assert!(limiter.check_rate_limit(ip1));
         assert!(limiter.check_rate_limit(ip1));
         assert!(!limiter.check_rate_limit(ip1));
-        
+
         // ip2 should still be allowed
         assert!(limiter.check_rate_limit(ip2));
         assert!(limiter.check_rate_limit(ip2));
