@@ -88,7 +88,6 @@ impl Default for ConnectionRateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
 
     #[test]
     fn rate_limiter_allows_within_limit() {

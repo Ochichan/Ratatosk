@@ -1,4 +1,4 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{fs, io, sync::Arc, time::Duration};
 
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
@@ -19,7 +19,7 @@ use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
     persistence::{
-        PersistenceRuntime, apply_server_persistence_config, flush_aof, load_startup_data,
+        PersistenceRuntime, apply_server_persistence_config, drain_bgsave_tasks, flush_aof, load_startup_data,
         start_bgsave,
     },
     rate_limiter::ConnectionRateLimiter,
@@ -72,6 +72,37 @@ fn is_expected_client_disconnect(error: &io::Error) -> bool {
             | io::ErrorKind::UnexpectedEof
     )
 }
+
+#[cfg(target_os = "linux")]
+fn linux_open_fd_metrics() -> Option<(u64, u64)> {
+    let open_fds = fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    let limits = fs::read_to_string("/proc/self/limits").ok()?;
+    let mut soft_limit = None;
+    for line in limits.lines() {
+        if !line.starts_with("Max open files") {
+            continue;
+        }
+
+        let rest = line.trim_start_matches("Max open files").trim();
+        let token = rest.split_whitespace().next()?;
+        if token.eq_ignore_ascii_case("unlimited") {
+            soft_limit = Some(u64::MAX);
+        } else {
+            soft_limit = token.parse::<u64>().ok();
+        }
+        break;
+    }
+
+    soft_limit.map(|limit| (open_fds, limit))
+}
+
+fn emit_fd_metrics() {
+    #[cfg(target_os = "linux")]
+    if let Some((open_fds, limit)) = linux_open_fd_metrics() {
+        crate::metrics::set_open_fds(open_fds, limit);
+    }
+}
+
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
@@ -216,6 +247,9 @@ async fn server_cron(
         }
     }
 
+    let memory_estimate_age_ticks = (*cron_tick).saturating_sub(server.stats.last_memory_estimate_tick());
+    crate::metrics::set_memory_estimate_age_ticks(memory_estimate_age_ticks);
+
     // 3. Ops/sec sampling
     *cron_tick = cron_tick.wrapping_add(1);
     if *cron_tick % ops_sec_interval == 0 {
@@ -233,6 +267,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             format!("binding TCP listener on {listen_addr}: {error}"),
         )
     })?;
+
+    emit_fd_metrics();
 
     // Lazy-free background thread for async deletion of large values
     const LAZY_FREE_CHANNEL_SIZE: usize = 4096;
@@ -318,6 +354,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut shutdown = Box::pin(wait_for_shutdown_signal());
     let mut client_tasks: JoinSet<()> = JoinSet::new();
     let mut accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+    let mut fatal_error: Option<io::Error> = None;
 
     // Connection rate limiter (10 connections per 10 seconds per IP)
     let mut rate_limiter = ConnectionRateLimiter::default();
@@ -392,10 +429,18 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     Err(error) => {
                         let kind = io_error_kind_label(&error);
                         crate::metrics::record_accept_error(&kind, false);
-                        return Err(io::Error::new(
+                        let wrapped = io::Error::new(
                             error.kind(),
                             format!("accepting TCP connection on {listen_addr}: {error}"),
-                        ));
+                        );
+                        tracing::error!(
+                            target = "ratatosk::network",
+                            error = %wrapped,
+                            kind = %kind,
+                            "fatal listener accept error; initiating graceful shutdown"
+                        );
+                        fatal_error = Some(wrapped);
+                        break;
                     }
                 };
 
@@ -404,6 +449,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 crate::metrics::set_rate_limiter_tracked_ips(rate_limiter.tracked_ips());
                 if !within_rate_limit {
                     crate::metrics::record_connection_rejected("rate_limited");
+                    crate::metrics::record_rate_limited_connection();
                     tracing::warn!(
                         target = "ratatosk::security",
                         remote_addr = %addr,
@@ -445,6 +491,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             }
             _ = cron_interval.tick() => {
                 crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
+                emit_fd_metrics();
                 server_cron(&server_state, &mut cron_tick, ops_sec_interval).await;
             }
             _ = sigusr1_recv => {
@@ -461,6 +508,22 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
     let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
     drain_client_tasks(&mut client_tasks, grace_period).await;
+
+    let (bgsave_completed, bgsave_aborted) = drain_bgsave_tasks(grace_period).await;
+    if bgsave_aborted > 0 {
+        tracing::warn!(
+            target = "ratatosk::shutdown",
+            completed = bgsave_completed,
+            aborted = bgsave_aborted,
+            "background save tasks exceeded shutdown deadline"
+        );
+    } else if bgsave_completed > 0 {
+        tracing::info!(
+            target = "ratatosk::shutdown",
+            completed = bgsave_completed,
+            "background save tasks drained"
+        );
+    }
 
     if config.appendonly {
         if let Err(error) = flush_aof(&persistence).await {
@@ -479,6 +542,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     lazy_free_monitor_handle.abort();
 
     tracing::info!("server shutdown complete");
+
+    if let Some(error) = fatal_error {
+        return Err(error);
+    }
 
     Ok(())
 }

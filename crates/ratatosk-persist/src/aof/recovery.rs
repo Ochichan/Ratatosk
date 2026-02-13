@@ -7,7 +7,7 @@ use ratatosk_engine::{
     command::{ClientState, execute},
     keyspace::ServerState,
 };
-use ratatosk_resp::parse;
+use ratatosk_resp::{frame::RespFrame, parse};
 
 use crate::error::PersistError;
 
@@ -102,7 +102,21 @@ impl AofRecovery {
             let bytes_before = buf.len();
             match parse(&mut buf) {
                 Ok(Some(frame)) => {
-                    let _outcome = execute(frame, state, &mut client);
+                    let outcome = execute(frame, state, &mut client);
+                    if let RespFrame::Error(message) = &outcome.response {
+                        let position = total_bytes.saturating_sub(buf.len());
+                        tracing::error!(
+                            target = "ratatosk::aof",
+                            byte_position = position,
+                            error = %String::from_utf8_lossy(message),
+                            "AOF replay command execution failed"
+                        );
+                        return Err(PersistError::corrupt(format!(
+                            "AOF replay command failed at byte {}: {}",
+                            position,
+                            String::from_utf8_lossy(message)
+                        )));
+                    }
                     commands_replayed += 1;
                 }
                 Ok(None) => {

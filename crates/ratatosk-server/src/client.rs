@@ -13,6 +13,7 @@ use tokio::{
     time::timeout,
 };
 
+use crate::breadcrumbs;
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
 use crate::metrics;
 use crate::persistence::{PersistenceRuntime, run_save, start_bgsave};
@@ -23,6 +24,8 @@ const PUBSUB_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const BLOCKING_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
+const AOF_LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(2);
+const AOF_APPEND_SLOW_THRESHOLD: Duration = Duration::from_secs(3);
 const OUTPUT_BUFFER_LIMIT_ERR: &str = "ERR output buffer limit exceeded";
 
 pub type SharedServerState = Arc<Mutex<ServerState>>;
@@ -148,6 +151,14 @@ async fn run_with_blocking_retry(
         })
         .unwrap_or_else(|| "UNKNOWN".to_string());
 
+    breadcrumbs::record_command(
+        client_state.id(),
+        &command_name,
+        first_db,
+        0,
+        "execute",
+    );
+
     let mut outcome = {
         let mut server = server_state.lock().await;
         execute(frame, &mut server, client_state)
@@ -210,6 +221,13 @@ async fn run_with_blocking_retry(
         };
 
         retry_attempts = retry_attempts.saturating_add(1);
+        breadcrumbs::record_command(
+            client_state.id(),
+            &command_name,
+            client_state.selected_db(),
+            retry_attempts,
+            "retry",
+        );
         metrics::record_blocking_retry_iteration(&command_name);
         metrics::record_blocking_retry_wait_ms(&command_name, wait_for.as_millis() as f64);
 
@@ -318,9 +336,65 @@ async fn apply_post_execute_persistence(
         return;
     };
 
-    let mut writer = writer.lock().await;
-    if let Err(error) = writer.append_command(selected_db, &argv) {
-        outcome.response = RespFrame::error_str(&format!("ERR AOF append failed: {error}"));
+    let fsync_policy = {
+        let server = server_state.lock().await;
+        String::from_utf8_lossy(server.config.appendfsync()).to_string()
+    };
+
+    let lock_start = std::time::Instant::now();
+    let mut writer = match timeout(AOF_LOCK_ACQUIRE_TIMEOUT, writer.lock()).await {
+        Ok(guard) => {
+            let wait_ms = lock_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::record_aof_lock_wait_ms(wait_ms);
+            guard
+        }
+        Err(_) => {
+            metrics::record_aof_append_timeout("lock");
+            outcome.response = RespFrame::error_str(
+                "ERR AOF append failed: timeout acquiring append lock",
+            );
+            tracing::error!(
+                target = "ratatosk::aof",
+                selected_db = selected_db,
+                command = %String::from_utf8_lossy(&argv[0]),
+                timeout_ms = AOF_LOCK_ACQUIRE_TIMEOUT.as_millis(),
+                "AOF append lock acquisition timed out"
+            );
+            return;
+        }
+    };
+
+    let append_start = std::time::Instant::now();
+    match writer.append_command(selected_db, &argv) {
+        Ok(()) => {
+            let elapsed_ms = append_start.elapsed().as_secs_f64() * 1000.0;
+            if append_start.elapsed() > AOF_APPEND_SLOW_THRESHOLD {
+                metrics::record_aof_append_timeout("append_slow");
+                tracing::warn!(
+                    target = "ratatosk::aof",
+                    selected_db = selected_db,
+                    command = %String::from_utf8_lossy(&argv[0]),
+                    elapsed_ms = elapsed_ms,
+                    threshold_ms = AOF_APPEND_SLOW_THRESHOLD.as_millis(),
+                    "AOF append exceeded slow threshold"
+                );
+            }
+            metrics::record_aof_write(&fsync_policy);
+            metrics::record_aof_append_duration_ms(elapsed_ms, "ok");
+        }
+        Err(error) => {
+            let elapsed_ms = append_start.elapsed().as_secs_f64() * 1000.0;
+            metrics::record_aof_append_duration_ms(elapsed_ms, "error");
+            outcome.response = RespFrame::error_str(&format!("ERR AOF append failed: {error}"));
+            tracing::error!(
+                target = "ratatosk::aof",
+                selected_db = selected_db,
+                command = %String::from_utf8_lossy(&argv[0]),
+                elapsed_ms = elapsed_ms,
+                error = %error,
+                "AOF append failed"
+            );
+        }
     }
 }
 

@@ -99,6 +99,11 @@ pub fn set_memory_used(bytes: u64) {
 }
 
 #[inline]
+pub fn set_memory_estimate_age_ticks(age_ticks: u64) {
+    metrics::gauge!("ratatosk_memory_estimate_age_ticks").set(age_ticks as f64);
+}
+
+#[inline]
 pub fn record_eviction_keys(count: u64, policy: &str) {
     metrics::counter!("ratatosk_eviction_keys_total", "policy" => policy.to_string())
         .increment(count);
@@ -114,6 +119,23 @@ pub fn record_aof_write(fsync_policy: &str) {
 #[inline]
 pub fn record_aof_write_error() {
     metrics::counter!("ratatosk_aof_write_errors_total").increment(1);
+}
+
+#[inline]
+pub fn record_aof_append_duration_ms(duration_ms: f64, status: &str) {
+    metrics::histogram!("ratatosk_aof_append_duration_ms", "status" => status.to_string())
+        .record(duration_ms);
+}
+
+#[inline]
+pub fn record_aof_lock_wait_ms(wait_ms: f64) {
+    metrics::histogram!("ratatosk_aof_lock_wait_ms").record(wait_ms);
+}
+
+#[inline]
+pub fn record_aof_append_timeout(stage: &str) {
+    metrics::counter!("ratatosk_aof_append_timeouts_total", "stage" => stage.to_string())
+        .increment(1);
 }
 
 #[inline]
@@ -179,6 +201,18 @@ pub fn record_rate_limited_connection() {
 #[inline]
 pub fn set_lazyfree_queue_utilization(utilization: f64) {
     metrics::gauge!("ratatosk_lazyfree_queue_utilization").set(utilization);
+}
+
+#[inline]
+pub fn set_open_fds(open_fds: u64, limit: u64) {
+    metrics::gauge!("ratatosk_process_open_fds").set(open_fds as f64);
+    metrics::gauge!("ratatosk_process_fd_limit").set(limit as f64);
+    let utilization = if limit == 0 {
+        0.0
+    } else {
+        open_fds as f64 / limit as f64
+    };
+    metrics::gauge!("ratatosk_process_fd_utilization").set(utilization);
 }
 
 #[inline]

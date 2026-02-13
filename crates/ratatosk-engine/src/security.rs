@@ -1,6 +1,12 @@
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::sync::{Mutex, OnceLock};
+use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+    sync::{Mutex, OnceLock},
+};
 
 const TOKEN_PREFIXES: [&[u8]; 5] = [b"ghp_", b"sk-", b"npm_", b"xox", b"AKIA"];
 const REDACTED: &str = "[REDACTED]";
@@ -156,10 +162,10 @@ fn should_redact_raw_token(raw: &[u8]) -> bool {
 
     false
 }
-
 fn uppercase_ascii(raw: &Bytes) -> Vec<u8> {
     raw.iter().map(|byte| byte.to_ascii_uppercase()).collect()
 }
+
 
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
@@ -184,7 +190,7 @@ pub(crate) struct AuditStamp {
     pub hash: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct AuditChainState {
     seq: u64,
     last_hash: [u8; 32],
@@ -192,13 +198,162 @@ struct AuditChainState {
 
 static AUDIT_CHAIN_STATE: OnceLock<Mutex<AuditChainState>> = OnceLock::new();
 
-fn audit_chain_state() -> &'static Mutex<AuditChainState> {
-    AUDIT_CHAIN_STATE.get_or_init(|| {
-        Mutex::new(AuditChainState {
+fn audit_state_path() -> PathBuf {
+    env::var("RATATOSK_AUDIT_CHAIN_STATE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/ratatosk-audit-chain.state"))
+}
+
+fn audit_log_path() -> PathBuf {
+    env::var("RATATOSK_AUDIT_LOG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp/ratatosk-audit.log"))
+}
+
+fn parse_env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn parse_env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn rotated_audit_log_path(path: &PathBuf, suffix: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{}", path.display(), suffix))
+}
+
+fn rotate_audit_log_if_needed(path: &PathBuf) {
+    let max_bytes = parse_env_u64("RATATOSK_AUDIT_LOG_MAX_BYTES", 32 * 1024 * 1024);
+    let max_files = parse_env_usize("RATATOSK_AUDIT_LOG_MAX_FILES", 4);
+
+    if max_files == 0 {
+        return;
+    }
+
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+
+    if metadata.len() < max_bytes {
+        return;
+    }
+
+    for idx in (1..=max_files).rev() {
+        let source = if idx == 1 {
+            path.clone()
+        } else {
+            rotated_audit_log_path(path, idx - 1)
+        };
+        if !source.exists() {
+            continue;
+        }
+
+        let destination = rotated_audit_log_path(path, idx);
+        if destination.exists() {
+            let _ = fs::remove_file(&destination);
+        }
+        let _ = fs::rename(source, destination);
+    }
+}
+
+fn parse_hash_hex(raw: &str) -> Option<[u8; 32]> {
+    if raw.len() != 64 {
+        return None;
+    }
+
+    let mut out = [0u8; 32];
+    for (idx, chunk) in raw.as_bytes().chunks(2).enumerate() {
+        let text = std::str::from_utf8(chunk).ok()?;
+        let value = u8::from_str_radix(text, 16).ok()?;
+        out[idx] = value;
+    }
+    Some(out)
+}
+
+fn load_audit_chain_state() -> AuditChainState {
+    let path = audit_state_path();
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return AuditChainState {
             seq: 0,
             last_hash: [0u8; 32],
-        })
-    })
+        };
+    };
+
+    let mut seq = 0u64;
+    let mut hash = [0u8; 32];
+    for line in contents.lines() {
+        if let Some(raw_seq) = line.strip_prefix("seq=") {
+            if let Ok(parsed) = raw_seq.parse::<u64>() {
+                seq = parsed;
+            }
+            continue;
+        }
+
+        if let Some(raw_hash) = line.strip_prefix("last_hash=") {
+            if let Some(parsed) = parse_hash_hex(raw_hash.trim()) {
+                hash = parsed;
+            }
+        }
+    }
+
+    AuditChainState {
+        seq,
+        last_hash: hash,
+    }
+}
+
+fn persist_audit_chain_state(state: &AuditChainState) {
+    let path = audit_state_path();
+    let tmp_path = path.with_extension("state.tmp");
+
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = fs::create_dir_all(parent);
+
+    let payload = format!("seq={}\nlast_hash={}\n", state.seq, bytes_to_hex(&state.last_hash));
+    if fs::write(&tmp_path, payload).is_ok() {
+        let _ = fs::rename(&tmp_path, path);
+    }
+}
+
+fn append_audit_event_log(stamp: &AuditStamp, event: &str, payload: &str) {
+    let path = audit_log_path();
+    let parent = path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = fs::create_dir_all(parent);
+
+    rotate_audit_log_if_needed(&path);
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+
+    let safe_payload = sanitize_acl_log_line(payload)
+        .replace('\n', " ")
+        .replace('\r', " ");
+
+    let _ = writeln!(
+        file,
+        "seq={}\tevent={}\tprev_hash={}\thash={}\tpayload={}",
+        stamp.seq, event, stamp.prev_hash, stamp.hash, safe_payload
+    );
+}
+
+fn audit_chain_state() -> &'static Mutex<AuditChainState> {
+    AUDIT_CHAIN_STATE.get_or_init(|| Mutex::new(load_audit_chain_state()))
 }
 
 pub(crate) fn next_audit_stamp(event: &str, payload: &str) -> AuditStamp {
@@ -222,13 +377,17 @@ pub(crate) fn next_audit_stamp(event: &str, payload: &str) -> AuditStamp {
     state.seq = state.seq.saturating_add(1);
     state.last_hash = next_hash;
 
-    AuditStamp {
+    let stamp = AuditStamp {
         seq: state.seq,
         prev_hash: bytes_to_hex(&prev_hash),
         hash: bytes_to_hex(&state.last_hash),
-    }
-}
+    };
 
+    append_audit_event_log(&stamp, event, payload);
+    persist_audit_chain_state(&state);
+
+    stamp
+}
 fn bytes_to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
