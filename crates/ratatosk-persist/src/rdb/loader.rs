@@ -1,10 +1,12 @@
 use std::collections::VecDeque;
+use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use ratatosk_engine::keyspace::{
-    HashFieldEntry, ServerState, SortedSet, StoredValue, StreamEntry, StreamId,
+    DbSnapshot, HashFieldEntry, ServerState, SortedSet, StoredValue, StreamEntry, StreamId,
 };
 
 use crate::error::PersistError;
@@ -16,6 +18,19 @@ use super::format::*;
 pub struct RdbLoader<R: Read> {
     reader: R,
     digest: Crc64Digest,
+}
+
+pub fn load(path: &Path) -> Result<DbSnapshot, PersistError> {
+    let file = File::open(path).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("opening RDB file '{}': {e}", path.display()),
+        )
+    })?;
+
+    let mut loaded = ServerState::with_default_dbs();
+    RdbLoader::new(file).load_into(&mut loaded)?;
+    Ok(loaded.snapshot_dbs())
 }
 
 impl<R: Read> RdbLoader<R> {
@@ -32,8 +47,20 @@ impl<R: Read> RdbLoader<R> {
     pub fn load_into(mut self, state: &mut ServerState) -> Result<(), PersistError> {
         state.clear_all_dbs();
 
-        self.read_header()?;
-        self.skip_aux_fields(state)?;
+        self.read_header().map_err(|e| match e {
+            PersistError::Io(io_err) => PersistError::Io(std::io::Error::new(
+                io_err.kind(),
+                format!("reading RDB header: {io_err}"),
+            )),
+            other => other,
+        })?;
+        self.skip_aux_fields(state).map_err(|e| match e {
+            PersistError::Io(io_err) => PersistError::Io(std::io::Error::new(
+                io_err.kind(),
+                format!("reading RDB body: {io_err}"),
+            )),
+            other => other,
+        })?;
 
         Ok(())
     }
@@ -494,6 +521,14 @@ mod tests {
     }
 
     #[test]
+    fn load_from_empty_reader_returns_error() {
+        let data: &[u8] = &[];
+        let mut state = ServerState::with_default_dbs();
+        let result = RdbLoader::new(data).load_into(&mut state);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn invalid_magic_returns_error() {
         let data = b"NOT_REDIS_DATA";
         let mut state = ServerState::with_default_dbs();
@@ -558,5 +593,38 @@ mod tests {
         assert_eq!(loaded_entries[0].id.seq, 0);
         assert_eq!(loaded_entries[0].fields.len(), 2);
         assert_eq!(loaded_entries[1].id.ms, 2000);
+    }
+
+    #[test]
+    fn file_roundtrip_save_load_snapshot() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("snapshot.rdb");
+
+        let mut state = ServerState::with_default_dbs();
+        state.db_mut(0).insert(
+            Bytes::from("k"),
+            StoredValue::string(Bytes::from("v"), None),
+        );
+        state.db_mut(1).insert(
+            Bytes::from("n"),
+            StoredValue::string(Bytes::from("1"), Some(5_000)),
+        );
+
+        crate::rdb::saver::save(&state.snapshot_dbs(), &path).expect("save snapshot");
+        let snapshot = crate::rdb::loader::load(&path).expect("load snapshot");
+
+        let mut loaded = ServerState::new(snapshot.len());
+        loaded.load_from_rdb(snapshot);
+
+        assert_eq!(loaded.db(0).len(), 1);
+        assert_eq!(loaded.db(1).len(), 1);
+        assert_eq!(
+            loaded.db(0).get(&Bytes::from("k")).and_then(|v| v.as_string()),
+            Some(&Bytes::from("v"))
+        );
+        assert_eq!(
+            loaded.db(1).get(&Bytes::from("n")).and_then(|v| v.as_string()),
+            Some(&Bytes::from("1"))
+        );
     }
 }

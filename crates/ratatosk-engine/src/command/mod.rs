@@ -3364,6 +3364,10 @@ impl ClientState {
         self.pubsub_subscriptions > 0
     }
 
+    pub fn selected_db(&self) -> usize {
+        self.selected_db
+    }
+
     pub fn set_pubsub_subscription_count(&mut self, count: i64) {
         self.pubsub_subscriptions = usize::try_from(count).unwrap_or(0);
     }
@@ -3561,7 +3565,7 @@ pub fn execute(
         b"LATENCY" => cmd_server::cmd_latency(args, server),
         b"WAIT" => cmd_generic::cmd_wait(args),
         b"WAITAOF" => cmd_generic::cmd_waitaof(args),
-        b"CONFIG" => cmd_server::cmd_config(args, server),
+        b"CONFIG" => cmd_server::cmd_config(args, server, client),
         b"SLOWLOG" => cmd_server::cmd_slowlog(args, server),
         b"MEMORY" => cmd_server::cmd_memory(args, server, client),
         b"LASTSAVE" => cmd_server::cmd_lastsave(args, server),
@@ -3910,6 +3914,20 @@ fn acl_required_categories(spec: CommandSpec) -> Vec<&'static [u8]> {
     }
 
     required
+}
+
+pub fn command_name(argv: &[Bytes]) -> Option<Bytes> {
+    let command = argv.first()?;
+    Some(Bytes::copy_from_slice(to_uppercase_stack(command).as_slice()))
+}
+
+pub fn is_write_command(argv: &[Bytes]) -> bool {
+    let Some(name) = command_name(argv) else {
+        return false;
+    };
+    COMMAND_SPEC_MAP
+        .get(name.as_ref())
+        .is_some_and(|spec| spec.flags.contains(&"write"))
 }
 
 fn validate_queued_command(
@@ -5350,6 +5368,76 @@ mod tests {
             RespFrame::Array(vec![
                 RespFrame::bulk_str("appendonly"),
                 RespFrame::bulk_str("yes")
+            ])
+        );
+
+        assert_eq!(
+            run(&["CONFIG", "GET", "dir"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("dir"),
+                RespFrame::bulk_str(".")
+            ])
+        );
+        assert_eq!(
+            run(&["CONFIG", "GET", "dbfilename"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("dbfilename"),
+                RespFrame::bulk_str("dump.rdb")
+            ])
+        );
+        assert_eq!(
+            run(&["CONFIG", "GET", "appendfsync"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("appendfsync"),
+                RespFrame::bulk_str("everysec")
+            ])
+        );
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "dir", "/tmp/ratatosk"],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["CONFIG", "GET", "dir"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("dir"),
+                RespFrame::bulk_str("/tmp/ratatosk")
+            ])
+        );
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "dbfilename", "backup.rdb"],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["CONFIG", "GET", "dbfilename"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("dbfilename"),
+                RespFrame::bulk_str("backup.rdb")
+            ])
+        );
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "appendfsync", "always"],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["CONFIG", "GET", "appendfsync"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("appendfsync"),
+                RespFrame::bulk_str("always")
             ])
         );
 
@@ -9206,5 +9294,106 @@ active:baseline
         }
 
         assert!(found_auth);
+    }
+
+    #[test]
+    fn info_stats_contains_real_counters() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        run(&["SET", "a", "1"], &mut server, &mut client);
+        run(&["SET", "b", "2"], &mut server, &mut client);
+        run(&["GET", "a"], &mut server, &mut client);
+        run(&["GET", "missing"], &mut server, &mut client);
+
+        let reply = run(&["INFO", "stats"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("total_commands_processed:5"),
+            "expected 5 processed commands (2 SET + 2 GET + 1 INFO), got: {text}"
+        );
+        assert!(
+            text.contains("keyspace_hits:1"),
+            "expected 1 hit from GET a, got: {text}"
+        );
+        assert!(
+            text.contains("keyspace_misses:1"),
+            "expected 1 miss from GET missing, got: {text}"
+        );
+        assert!(
+            !text.contains("instantaneous_ops_per_sec:0\r\n")
+                || text.contains("instantaneous_ops_per_sec:0"),
+            "ops/sec field present: {text}"
+        );
+        assert!(
+            text.contains("evicted_keys:0"),
+            "expected evicted_keys:0, got: {text}"
+        );
+        assert!(
+            text.contains("expired_keys:0"),
+            "expected expired_keys:0, got: {text}"
+        );
+    }
+
+    #[test]
+    fn info_clients_shows_zero_connected_for_engine_tests() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let reply = run(&["INFO", "clients"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("connected_clients:0"),
+            "engine-level test has no real connections: {text}"
+        );
+    }
+
+    #[test]
+    fn info_keyspace_shows_db_with_keys() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        run(&["SET", "x", "1"], &mut server, &mut client);
+        run(&["SET", "y", "2"], &mut server, &mut client);
+
+        let reply = run(&["INFO", "keyspace"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("db0:keys=2,"),
+            "expected db0 with 2 keys: {text}"
+        );
+    }
+
+    #[test]
+    fn info_persistence_shows_last_save() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let reply = run(&["INFO", "persistence"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("rdb_last_save_time:"),
+            "expected rdb_last_save_time field: {text}"
+        );
+        assert!(
+            text.contains("rdb_last_bgsave_status:ok"),
+            "expected rdb_last_bgsave_status:ok: {text}"
+        );
     }
 }

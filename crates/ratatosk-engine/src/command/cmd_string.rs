@@ -475,7 +475,10 @@ pub(super) fn cmd_set(
                     b"PX" => now.saturating_add(raw),
                     b"EXAT" => raw.saturating_mul(1000),
                     b"PXAT" => raw,
-                    _ => unreachable!(),
+                    _ => {
+                        debug_assert!(false, "SET expire option validated by outer match");
+                        return CommandOutcome::reply(err("ERR syntax error"));
+                    }
                 };
                 expire_policy = SetExpirePolicy::AtMs(at_ms);
                 idx += 2;
@@ -553,9 +556,14 @@ pub(super) fn cmd_get(
     let db = server.db_mut(client.selected_db);
     purge_expired_key(db, key, now);
 
-    let Some(entry) = db.get(key) else {
+    let found = db.contains_key(key);
+    if !found {
+        server.stats.mark_keyspace_miss();
         return CommandOutcome::reply(RespFrame::BulkString(None));
-    };
+    }
+
+    server.stats.mark_keyspace_hit();
+    let entry = &server.db(client.selected_db)[key];
     if !entry.is_string() {
         return wrong_type_response();
     }

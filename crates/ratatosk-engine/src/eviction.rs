@@ -209,6 +209,7 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
         evicted += 1;
     }
 
+    state.stats.add_evicted_keys(evicted as u64);
     evicted
 }
 

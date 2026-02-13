@@ -51,12 +51,14 @@ pub(super) fn cmd_info(
     let mut include_clients = false;
     let mut include_stats = false;
     let mut include_keyspace = false;
+    let mut include_persistence = false;
 
     if args.is_empty() {
         include_server = true;
         include_clients = true;
         include_stats = true;
         include_keyspace = true;
+        include_persistence = true;
     } else {
         for section in args {
             let upper = to_uppercase_bytes(section);
@@ -66,11 +68,13 @@ pub(super) fn cmd_info(
                     include_clients = true;
                     include_stats = true;
                     include_keyspace = true;
+                    include_persistence = true;
                 }
                 b"SERVER" => include_server = true,
                 b"CLIENTS" => include_clients = true,
                 b"STATS" => include_stats = true,
                 b"KEYSPACE" => include_keyspace = true,
+                b"PERSISTENCE" => include_persistence = true,
                 _ => {}
             }
         }
@@ -83,10 +87,13 @@ pub(super) fn cmd_info(
         append_info_server_section(&mut out, server, now);
     }
     if include_clients {
-        append_info_clients_section(&mut out);
+        append_info_clients_section(&mut out, server);
     }
     if include_stats {
         append_info_stats_section(&mut out, server);
+    }
+    if include_persistence {
+        append_info_persistence_section(&mut out, server);
     }
     if include_keyspace {
         append_info_keyspace_section(&mut out, server, now);
@@ -359,7 +366,11 @@ pub(super) fn cmd_latency(args: &[Bytes], server: &mut ServerState) -> CommandOu
     }
 }
 
-pub(super) fn cmd_config(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
+pub(super) fn cmd_config(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
     if args.is_empty() {
         return wrong_arity("config");
     }
@@ -367,7 +378,7 @@ pub(super) fn cmd_config(args: &[Bytes], server: &mut ServerState) -> CommandOut
     let subcommand = to_uppercase_bytes(&args[0]);
     match subcommand.as_slice() {
         b"GET" => cmd_config_get(&args[1..], server),
-        b"SET" => cmd_config_set(&args[1..], server),
+        b"SET" => cmd_config_set(&args[1..], server, client),
         b"REWRITE" => {
             if args.len() != 1 {
                 return wrong_arity("config");
@@ -404,6 +415,9 @@ pub(super) fn cmd_config(args: &[Bytes], server: &mut ServerState) -> CommandOut
 enum ConfigSetOp {
     Timeout(i64),
     AppendOnly(bool),
+    AppendFsync(Bytes),
+    DbFilename(String),
+    Dir(std::path::PathBuf),
     Save(Bytes),
     SlowlogLogSlowerThan(i64),
     SlowlogMaxLen(usize),
@@ -432,7 +446,11 @@ pub(super) fn cmd_config_get(args: &[Bytes], server: &ServerState) -> CommandOut
     CommandOutcome::reply(RespFrame::Array(rows))
 }
 
-pub(super) fn cmd_config_set(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
+pub(super) fn cmd_config_set(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
     if args.is_empty() || args.len() % 2 != 0 {
         return wrong_arity("config");
     }
@@ -442,7 +460,7 @@ pub(super) fn cmd_config_set(args: &[Bytes], server: &mut ServerState) -> Comman
     while idx < args.len() {
         let name = to_uppercase_bytes(&args[idx]);
         let value = &args[idx + 1];
-        let op = match name.as_slice() {
+        let (op, param) = match name.as_slice() {
             b"TIMEOUT" => {
                 let Some(parsed) = parse_i64(value) else {
                     return CommandOutcome::reply(err(
@@ -452,25 +470,46 @@ pub(super) fn cmd_config_set(args: &[Bytes], server: &mut ServerState) -> Comman
                 if parsed < 0 {
                     return CommandOutcome::reply(err("ERR value is out of range"));
                 }
-                ConfigSetOp::Timeout(parsed)
+                (ConfigSetOp::Timeout(parsed), "timeout")
             }
             b"APPENDONLY" => {
                 if value.eq_ignore_ascii_case(b"yes") {
-                    ConfigSetOp::AppendOnly(true)
+                    (ConfigSetOp::AppendOnly(true), "appendonly")
                 } else if value.eq_ignore_ascii_case(b"no") {
-                    ConfigSetOp::AppendOnly(false)
+                    (ConfigSetOp::AppendOnly(false), "appendonly")
                 } else {
                     return CommandOutcome::reply(err("ERR argument must be 'yes' or 'no'"));
                 }
             }
-            b"SAVE" => ConfigSetOp::Save(value.clone()),
+            b"APPENDFSYNC" => {
+                let text = String::from_utf8_lossy(value).to_ascii_lowercase();
+                match text.as_str() {
+                    "always" | "everysec" | "no" => {
+                        (ConfigSetOp::AppendFsync(Bytes::from(text)), "appendfsync")
+                    }
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR argument must be 'always', 'everysec', or 'no'",
+                        ));
+                    }
+                }
+            }
+            b"DBFILENAME" => {
+                let text = String::from_utf8_lossy(value).into_owned();
+                (ConfigSetOp::DbFilename(text), "dbfilename")
+            }
+            b"DIR" => {
+                let text = String::from_utf8_lossy(value).into_owned();
+                (ConfigSetOp::Dir(std::path::PathBuf::from(text)), "dir")
+            }
+            b"SAVE" => (ConfigSetOp::Save(value.clone()), "save"),
             b"SLOWLOG-LOG-SLOWER-THAN" => {
                 let Some(parsed) = parse_i64(value) else {
                     return CommandOutcome::reply(err(
                         "ERR value is not an integer or out of range",
                     ));
                 };
-                ConfigSetOp::SlowlogLogSlowerThan(parsed)
+                (ConfigSetOp::SlowlogLogSlowerThan(parsed), "slowlog-log-slower-than")
             }
             b"SLOWLOG-MAX-LEN" => {
                 let Some(parsed) = parse_i64(value) else {
@@ -481,7 +520,7 @@ pub(super) fn cmd_config_set(args: &[Bytes], server: &mut ServerState) -> Comman
                 if parsed < 0 {
                     return CommandOutcome::reply(err("ERR value is out of range"));
                 }
-                ConfigSetOp::SlowlogMaxLen(parsed as usize)
+                (ConfigSetOp::SlowlogMaxLen(parsed as usize), "slowlog-max-len")
             }
             b"DATABASES" => {
                 return CommandOutcome::reply(err("ERR Unsupported CONFIG parameter: databases"));
@@ -493,14 +532,22 @@ pub(super) fn cmd_config_set(args: &[Bytes], server: &mut ServerState) -> Comman
             }
         };
 
-        ops.push(op);
+        ops.push((op, param));
         idx += 2;
     }
 
-    for op in ops {
+    for (op, param) in ops {
+        tracing::info!(
+            client_id = client.id(),
+            param = param,
+            "CONFIG SET executed"
+        );
         match op {
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),
             ConfigSetOp::AppendOnly(value) => server.config.set_appendonly(value),
+            ConfigSetOp::AppendFsync(value) => server.config.set_appendfsync(value),
+            ConfigSetOp::DbFilename(value) => server.config.set_dbfilename(value),
+            ConfigSetOp::Dir(value) => server.config.set_dir(value),
             ConfigSetOp::Save(value) => server.config.set_save(value),
             ConfigSetOp::SlowlogLogSlowerThan(value) => {
                 server.stats.set_slowlog_log_slower_than_us(value)
@@ -523,8 +570,20 @@ pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
             }),
         ),
         (
+            Bytes::from_static(b"appendfsync"),
+            server.config.appendfsync().clone(),
+        ),
+        (
             Bytes::from_static(b"databases"),
             Bytes::from(server.db_count().to_string()),
+        ),
+        (
+            Bytes::from_static(b"dbfilename"),
+            Bytes::from(server.config.dbfilename().to_string()),
+        ),
+        (
+            Bytes::from_static(b"dir"),
+            Bytes::from(server.config.dir().to_string_lossy().into_owned()),
         ),
         (Bytes::from_static(b"save"), server.config.save().clone()),
         (
@@ -823,9 +882,12 @@ pub(super) fn append_info_server_section(out: &mut String, server: &ServerState,
     out.push_str("\r\n");
 }
 
-pub(super) fn append_info_clients_section(out: &mut String) {
+pub(super) fn append_info_clients_section(out: &mut String, server: &ServerState) {
     out.push_str("# Clients\r\n");
-    out.push_str("connected_clients:1\r\n");
+    out.push_str(&format!(
+        "connected_clients:{}\r\n",
+        server.stats.connected_clients()
+    ));
     out.push_str("blocked_clients:0\r\n");
     out.push_str("tracking_clients:0\r\n");
     out.push_str("\r\n");
@@ -841,9 +903,52 @@ pub(super) fn append_info_stats_section(out: &mut String, server: &ServerState) 
         "total_commands_processed:{}\r\n",
         server.stats.total_commands_processed()
     ));
-    out.push_str("instantaneous_ops_per_sec:0\r\n");
-    out.push_str("total_net_input_bytes:0\r\n");
-    out.push_str("total_net_output_bytes:0\r\n");
+    out.push_str(&format!(
+        "instantaneous_ops_per_sec:{}\r\n",
+        server.stats.instantaneous_ops_per_sec()
+    ));
+    out.push_str(&format!(
+        "total_net_input_bytes:{}\r\n",
+        server.stats.total_net_input_bytes()
+    ));
+    out.push_str(&format!(
+        "total_net_output_bytes:{}\r\n",
+        server.stats.total_net_output_bytes()
+    ));
+    out.push_str(&format!(
+        "evicted_keys:{}\r\n",
+        server.stats.evicted_keys()
+    ));
+    out.push_str(&format!(
+        "expired_keys:{}\r\n",
+        server.stats.expired_keys()
+    ));
+    out.push_str(&format!(
+        "keyspace_hits:{}\r\n",
+        server.stats.keyspace_hits()
+    ));
+    out.push_str(&format!(
+        "keyspace_misses:{}\r\n",
+        server.stats.keyspace_misses()
+    ));
+    out.push_str("\r\n");
+}
+
+pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerState) {
+    out.push_str("# Persistence\r\n");
+    out.push_str(&format!(
+        "rdb_last_save_time:{}\r\n",
+        server.stats.last_save_unix_sec()
+    ));
+    out.push_str(&format!(
+        "rdb_bgsave_in_progress:{}\r\n",
+        i32::from(server.rdb_save_in_progress())
+    ));
+    let status = match server.last_rdb_save_status() {
+        Some(Ok(())) | None => "ok",
+        Some(Err(_)) => "err",
+    };
+    out.push_str(&format!("rdb_last_bgsave_status:{status}\r\n"));
     out.push_str("\r\n");
 }
 
@@ -902,7 +1007,10 @@ pub(super) fn cmd_save(args: &[Bytes], server: &mut ServerState) -> CommandOutco
         return wrong_arity("save");
     }
 
-    server.stats.mark_last_save_now();
+    if server.rdb_save_in_progress() {
+        return CommandOutcome::reply(err("ERR Background save already in progress"));
+    }
+
     CommandOutcome::reply(RespFrame::ok())
 }
 
@@ -917,7 +1025,10 @@ pub(super) fn cmd_bgsave(args: &[Bytes], server: &mut ServerState) -> CommandOut
         }
     }
 
-    server.stats.mark_last_save_now();
+    if server.rdb_save_in_progress() {
+        return CommandOutcome::reply(err("ERR Background save already in progress"));
+    }
+
     CommandOutcome::reply(RespFrame::simple_str("Background saving started"))
 }
 

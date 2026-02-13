@@ -1,7 +1,28 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use bytes::Bytes;
 use rand::Rng;
+use ratatosk_core::time::now_ms;
 
 use crate::keyspace::ServerState;
+
+static LAST_WALL_CLOCK_MS: AtomicI64 = AtomicI64::new(0);
+
+pub fn detect_clock_jump() {
+    let current = now_ms();
+    let previous = LAST_WALL_CLOCK_MS.swap(current, Ordering::Relaxed);
+    
+    if previous > 0 {
+        let delta = current - previous;
+        if delta < -1000 {
+            tracing::warn!(
+                delta_ms = delta,
+                "wall-clock jumped backward (NTP correction or manual adjustment); \
+                 expiry deadlines may be affected"
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpireCondition {
@@ -146,6 +167,7 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
         }
     }
 
+    state.stats.add_expired_keys(total_expired as u64);
     total_expired
 }
 

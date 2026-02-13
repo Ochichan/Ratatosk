@@ -69,12 +69,18 @@ pub(super) fn cmd_exists(
     let now = now_ms();
     let db = server.db_mut(client.selected_db);
     let mut count = 0i64;
+    let total_keys = args.len() as u64;
     for key in args {
         purge_expired_key(db, key, now);
         if db.contains_key(key) {
             count += 1;
         }
     }
+
+    let hits = count as u64;
+    let misses = total_keys.saturating_sub(hits);
+    server.stats.add_keyspace_hits(hits);
+    server.stats.add_keyspace_misses(misses);
 
     CommandOutcome::reply(RespFrame::Integer(count))
 }
@@ -555,7 +561,12 @@ pub(super) fn cmd_object(
                 b"FREQ" => CommandOutcome::reply(err(
                     "ERR An LFU maxmemory policy is not selected, access frequency not tracked. Please note that when switching between policies at runtime LRU and LFU data will take some time to adjust.",
                 )),
-                _ => unreachable!(),
+                _ => {
+                    debug_assert!(false, "OBJECT subcommand validated by outer match");
+                    CommandOutcome::reply(err(
+                        "ERR Unknown subcommand or wrong number of arguments for 'OBJECT'. Try OBJECT HELP.",
+                    ))
+                }
             }
         }
         _ => CommandOutcome::reply(err(

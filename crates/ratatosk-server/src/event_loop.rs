@@ -3,7 +3,7 @@ use std::{io, sync::Arc, time::Duration};
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
     eviction::{EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction},
-    expiry::active_expire_cycle,
+    expiry::{active_expire_cycle, detect_clock_jump},
     keyspace::ServerState,
 };
 use tokio::{
@@ -16,10 +16,15 @@ use tokio::{
 use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
+    persistence::{
+        PersistenceRuntime, apply_server_persistence_config, flush_aof, load_startup_data,
+        start_bgsave,
+    },
 };
 
 const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
+const MEMORY_ESTIMATE_INTERVAL: u64 = 10;
 
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
@@ -139,7 +144,14 @@ fn build_eviction_config(state: &ServerState) -> EvictionConfig {
 ///
 /// 1. Active expiry cycle (sampling-based)
 /// 2. Eviction check (maxmemory)
-async fn server_cron(server_state: &Arc<Mutex<ServerState>>) {
+/// 3. Ops/sec sampling (every `ops_sec_interval` ticks)
+async fn server_cron(
+    server_state: &Arc<Mutex<ServerState>>,
+    cron_tick: &mut u64,
+    ops_sec_interval: u64,
+) {
+    detect_clock_jump();
+    
     let mut server = server_state.lock().await;
     let current_ms = now_ms();
 
@@ -149,10 +161,17 @@ async fn server_cron(server_state: &Arc<Mutex<ServerState>>) {
         tracing::debug!(expired, "active expiry cycle removed keys");
     }
 
-    // 2. Eviction check
+    // 2. Eviction check (with cached memory estimate)
     let eviction_config = build_eviction_config(&server);
     if eviction_config.maxmemory > 0 {
-        let used = estimate_used_memory(&server);
+        let used = if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
+            let estimate = estimate_used_memory(&server);
+            server.stats.set_cached_memory_estimate(estimate as u64, *cron_tick);
+            estimate
+        } else {
+            server.stats.cached_memory_estimate() as usize
+        };
+        
         if needs_eviction(used, &eviction_config) {
             let evicted = perform_eviction(&mut server, &eviction_config);
             if evicted > 0 {
@@ -163,6 +182,15 @@ async fn server_cron(server_state: &Arc<Mutex<ServerState>>) {
                 );
             }
         }
+    }
+
+    // 3. Ops/sec sampling
+    *cron_tick = cron_tick.wrapping_add(1);
+    if *cron_tick % ops_sec_interval == 0 {
+        let interval_secs = ops_sec_interval.saturating_mul(1000)
+            / u64::from(server.config.hz().max(1))
+            / 1000;
+        server.stats.sample_ops_per_sec(interval_secs.max(1));
     }
 }
 
@@ -191,9 +219,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut initial_state = ServerState::with_default_dbs();
     initial_state.set_lazy_free_sender(lazy_free_tx);
     let server_state = Arc::new(Mutex::new(initial_state));
+    apply_server_persistence_config(&server_state, &config).await;
+
+    let persistence = Arc::new(PersistenceRuntime::from_config(&config)?);
+    load_startup_data(&server_state, &persistence, config.appendonly).await?;
+
     let client_permits = Arc::new(Semaphore::new(config.max_clients));
     let io_limits = ClientIoLimits {
         output_buffer_limit_bytes: config.output_buffer_limit_bytes,
+        client_read_timeout_sec: config.client_timeout_sec,
     };
 
     let mut shutdown = Box::pin(wait_for_shutdown_signal());
@@ -208,6 +242,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let cron_period = Duration::from_millis(1000 / u64::from(cron_hz.max(1)));
     let mut cron_interval = tokio::time::interval(cron_period);
     cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cron_tick: u64 = 0;
+    let ops_sec_interval = u64::from(cron_hz.max(1));
 
     // SIGUSR1 signal handler (Unix only) for triggering RDB save
     #[cfg(unix)]
@@ -277,10 +313,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 };
 
                 let state = Arc::clone(&server_state);
+                let persistence = Arc::clone(&persistence);
                 let remote_addr = addr;
                 client_tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_client_with_limits(stream, state, io_limits).await {
+                    if let Err(error) = handle_client_with_limits(stream, state, persistence, io_limits).await {
                         if is_expected_client_disconnect(&error) {
                             tracing::debug!(remote_addr = %remote_addr, error = %error, "client disconnected");
                         } else {
@@ -290,10 +327,14 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 });
             }
             _ = cron_interval.tick() => {
-                server_cron(&server_state).await;
+                server_cron(&server_state, &mut cron_tick, ops_sec_interval).await;
             }
             _ = sigusr1_recv => {
-                tracing::info!("SIGUSR1 received: RDB save requested (persistence not yet implemented)");
+                if start_bgsave(Arc::clone(&server_state), persistence.rdb_path.clone()).await {
+                    tracing::info!("SIGUSR1 received: background RDB save started");
+                } else {
+                    tracing::warn!("SIGUSR1 received but RDB save already in progress");
+                }
             }
         }
     }
@@ -301,6 +342,13 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     client_permits.close();
     let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
     drain_client_tasks(&mut client_tasks, grace_period).await;
+
+    if config.appendonly {
+        if let Err(error) = flush_aof(&persistence).await {
+            tracing::warn!(error = %error, "failed to flush AOF before shutdown");
+        }
+    }
+    tracing::info!("persistence flushed before shutdown");
 
     // Shut down lazy-free background thread
     lazy_free_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
