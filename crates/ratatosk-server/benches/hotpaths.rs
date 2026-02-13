@@ -71,9 +71,10 @@ fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState,
     let group_name = bs(b"g");
     let consumer_name = bs(b"c1");
 
-    server
-        .db_mut(0)
-        .insert(key.clone(), StoredValue::stream(build_stream_entries(entry_count), None));
+    server.db_mut(0).insert(
+        key.clone(),
+        StoredValue::stream(build_stream_entries(entry_count), None),
+    );
 
     let Some(entry) = server.db_mut(0).get_mut(&key) else {
         panic!("stream not inserted");
@@ -157,20 +158,16 @@ fn bench_set_hotpaths(c: &mut Criterion) {
             bs(b"s2"),
             bs(b"s3"),
         ]);
-        group.bench_with_input(
-            BenchmarkId::new("sinterstore", size),
-            &size,
-            |b, &size| {
-                b.iter_batched(
-                    || setup_set_state(size),
-                    |(mut server, mut client)| {
-                        let outcome = execute(sinterstore_frame.clone(), &mut server, &mut client);
-                        black_box(outcome.response);
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("sinterstore", size), &size, |b, &size| {
+            b.iter_batched(
+                || setup_set_state(size),
+                |(mut server, mut client)| {
+                    let outcome = execute(sinterstore_frame.clone(), &mut server, &mut client);
+                    black_box(outcome.response);
+                },
+                BatchSize::SmallInput,
+            );
+        });
 
         let pick_count = (size / 4).max(1);
         let srandmember_neg_frame = cmd_frame(vec![
@@ -185,7 +182,8 @@ fn bench_set_hotpaths(c: &mut Criterion) {
                 b.iter_batched(
                     || setup_set_state(size),
                     |(mut server, mut client)| {
-                        let outcome = execute(srandmember_neg_frame.clone(), &mut server, &mut client);
+                        let outcome =
+                            execute(srandmember_neg_frame.clone(), &mut server, &mut client);
                         black_box(outcome.response);
                     },
                     BatchSize::SmallInput,

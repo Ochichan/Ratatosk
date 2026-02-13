@@ -117,7 +117,10 @@ pub fn notify_keyspace_event(
     }
 
     if flags.keyspace {
-        let channel = Bytes::from(format!("__keyspace@{db_idx}__:{}", String::from_utf8_lossy(key)));
+        let channel = Bytes::from(format!(
+            "__keyspace@{db_idx}__:{}",
+            String::from_utf8_lossy(key)
+        ));
         let payload = Bytes::copy_from_slice(event_name);
         pubsub.publish(&channel, &payload);
     }
@@ -207,22 +210,23 @@ mod tests {
         pubsub.subscribe_channel(2, event_channel.clone());
 
         // Emit notification
-        notify_keyspace_event(
-            &mut pubsub,
-            b"KEA",
-            b'$',
-            b"set",
-            0,
-            &Bytes::from("mykey"),
-        );
+        notify_keyspace_event(&mut pubsub, b"KEA", b'$', b"set", 0, &Bytes::from("mykey"));
 
         // Client 1 should receive keyspace notification
         let msgs1 = pubsub.drain_messages(1);
-        assert_eq!(msgs1.len(), 1, "client 1 should receive keyspace notification");
+        assert_eq!(
+            msgs1.len(),
+            1,
+            "client 1 should receive keyspace notification"
+        );
 
         // Client 2 should receive keyevent notification
         let msgs2 = pubsub.drain_messages(2);
-        assert_eq!(msgs2.len(), 1, "client 2 should receive keyevent notification");
+        assert_eq!(
+            msgs2.len(),
+            1,
+            "client 2 should receive keyevent notification"
+        );
     }
 
     #[test]
@@ -233,17 +237,14 @@ mod tests {
         pubsub.subscribe_channel(1, keyevent_channel);
 
         // Only K flag, no E
-        notify_keyspace_event(
-            &mut pubsub,
-            b"K$",
-            b'$',
-            b"set",
-            0,
-            &Bytes::from("mykey"),
-        );
+        notify_keyspace_event(&mut pubsub, b"K$", b'$', b"set", 0, &Bytes::from("mykey"));
 
         let msgs = pubsub.drain_messages(1);
-        assert_eq!(msgs.len(), 0, "keyevent channel should not receive when only K is set");
+        assert_eq!(
+            msgs.len(),
+            0,
+            "keyevent channel should not receive when only K is set"
+        );
     }
 
     #[test]

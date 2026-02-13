@@ -1,4 +1,4 @@
-use crc::{Crc, CRC_64_ECMA_182};
+use crc::{CRC_64_ECMA_182, Crc};
 
 /// CRC64 digest compatible with Redis RDB files.
 ///

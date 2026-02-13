@@ -22,6 +22,7 @@ pub struct ReplayResult {
     pub corruption_detected: bool,
     pub truncated_at: Option<usize>,
     pub version_mismatch: bool,
+    pub legacy_format: bool,
 }
 
 impl ReplayResult {
@@ -32,6 +33,7 @@ impl ReplayResult {
             corruption_detected: false,
             truncated_at: None,
             version_mismatch: false,
+            legacy_format: false,
         }
     }
 }
@@ -71,14 +73,18 @@ impl AofRecovery {
         reader
             .read_to_end(&mut raw)
             .map_err(|e| std::io::Error::new(e.kind(), format!("reading AOF data: {e}")))?;
-        
+
         let total_bytes = raw.len();
-        
+
         // Check for version header
-        let version_mismatch = if raw.starts_with(AOF_VERSION_HEADER) {
+        // Check for version header
+        let (version_mismatch, legacy_format) = if raw.starts_with(AOF_VERSION_HEADER) {
             // Skip header for parsing
             buf.extend_from_slice(&raw[AOF_VERSION_HEADER.len()..]);
-            false
+            (false, false)
+        } else if raw.is_empty() {
+            // Fresh AOF file created on first boot.
+            (false, false)
         } else if raw.starts_with(b"*") {
             // Old format without header - still valid but warn
             tracing::warn!(
@@ -86,7 +92,7 @@ impl AofRecovery {
                 "AOF file has no version header (legacy format)"
             );
             buf.extend_from_slice(&raw);
-            false
+            (false, true)
         } else {
             // Unknown format
             tracing::error!(
@@ -94,7 +100,7 @@ impl AofRecovery {
                 "AOF file has unknown format (neither version header nor RESP)"
             );
             buf.extend_from_slice(&raw);
-            true
+            (true, false)
         };
 
         // Parse and execute frames
@@ -138,7 +144,7 @@ impl AofRecovery {
                     // Parse error - record position and skip
                     let position = total_bytes - bytes_before;
                     corruption_positions.push(position);
-                    
+
                     // Try to recover by skipping to next RESP frame
                     if let Some(next_pos) = find_next_resp_frame(&buf) {
                         tracing::warn!(
@@ -160,13 +166,13 @@ impl AofRecovery {
                 }
             }
         }
-
         let result = ReplayResult {
             commands_replayed,
             bytes_processed: total_bytes - buf.len(),
             corruption_detected: !corruption_positions.is_empty(),
             truncated_at: corruption_positions.first().copied(),
             version_mismatch,
+            legacy_format,
         };
 
         // Log summary
@@ -207,8 +213,8 @@ fn find_next_resp_frame(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::aof::writer::{AofWriter, FsyncPolicy};
+    use bytes::Bytes;
 
     #[test]
     fn replay_restores_state() {
@@ -231,11 +237,7 @@ mod tests {
             writer
                 .append_command(
                     0,
-                    &[
-                        Bytes::from("SET"),
-                        Bytes::from("count"),
-                        Bytes::from("42"),
-                    ],
+                    &[Bytes::from("SET"), Bytes::from("count"), Bytes::from("42")],
                 )
                 .expect("append SET");
         }
@@ -249,7 +251,10 @@ mod tests {
         // Verify data
         let hello = state.db(0).get(&Bytes::from("hello"));
         assert!(hello.is_some());
-        assert_eq!(hello.and_then(|v| v.as_string()), Some(&Bytes::from("world")));
+        assert_eq!(
+            hello.and_then(|v| v.as_string()),
+            Some(&Bytes::from("world"))
+        );
 
         let count = state.db(0).get(&Bytes::from("count"));
         assert!(count.is_some());
@@ -289,6 +294,8 @@ mod tests {
         let mut state = ServerState::with_default_dbs();
         let result = AofRecovery::replay_file(&path, &mut state).expect("replay");
         assert_eq!(result.commands_replayed, 0);
+        assert!(!result.version_mismatch);
+        assert!(!result.legacy_format);
     }
 
     #[test]

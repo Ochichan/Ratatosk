@@ -57,7 +57,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `APPEND` | string | 2.0.0 | done | m1-kv-core | M1 string baseline implemented. |
 | `ASKING` | cluster | 3.0.0 | done | m5-advanced |  |
 | `AUTH` | connection | 1.0.0 | done | m0-foundation | M0 compatibility baseline implemented (accepts AUTH <username> <password>). |
-| `BGREWRITEAOF` | server | 1.0.0 | done | m0-foundation | M0 admin baseline implemented (accepts command and returns background rewrite started message). |
+| `BGREWRITEAOF` | server | 1.0.0 | done | m3-persistence | Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). |
 | `BGSAVE` | server | 1.0.0 | done | m3-persistence | M3 baseline implemented (non-blocking acknowledgement path with timestamp update). |
 | `BITCOUNT` | bitmap | 2.6.0 | done | m4-extended-types |  |
 | `BITFIELD` | bitmap | 3.2.0 | done | m4-extended-types |  |

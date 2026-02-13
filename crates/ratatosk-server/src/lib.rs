@@ -29,14 +29,23 @@ mod tests {
 
         assert!(!version.is_empty(), "version should not be empty");
         assert!(!git_hash.is_empty(), "git_hash should not be empty");
-        assert!(!build_unix_ts.is_empty(), "build_unix_ts should not be empty");
+        assert!(
+            !build_unix_ts.is_empty(),
+            "build_unix_ts should not be empty"
+        );
         assert!(
             build_unix_ts.parse::<u64>().is_ok(),
             "build_unix_ts should be numeric"
         );
 
         let version_string = format!("{} ({})", version, git_hash);
-        assert!(version_string.contains("("), "version string should contain git hash in parentheses");
-        assert!(version_string.contains(")"), "version string should contain closing parenthesis");
+        assert!(
+            version_string.contains("("),
+            "version string should contain git hash in parentheses"
+        );
+        assert!(
+            version_string.contains(")"),
+            "version string should contain closing parenthesis"
+        );
     }
 }

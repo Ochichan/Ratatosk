@@ -3,7 +3,10 @@
 //! Provides Prometheus-compatible metrics export on a configurable port.
 
 use metrics_exporter_prometheus::PrometheusBuilder;
+use std::env;
 use std::net::SocketAddr;
+
+pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9090";
 
 /// Initialize the metrics system with Prometheus exporter.
 ///
@@ -29,9 +32,13 @@ pub fn init_metrics(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+pub fn metrics_bind_addr_from_env() -> String {
+    env::var("RATATOSK_METRICS_BIND").unwrap_or_else(|_| DEFAULT_METRICS_BIND_ADDR.to_string())
+}
+
 /// Initialize metrics with default localhost binding.
 pub fn init_metrics_default() -> Result<(), Box<dyn std::error::Error>> {
-    init_metrics("127.0.0.1:9090")
+    init_metrics(DEFAULT_METRICS_BIND_ADDR)
 }
 
 /// Record a command execution metric.
@@ -122,6 +129,33 @@ pub fn record_aof_write_error() {
 }
 
 #[inline]
+pub fn record_aof_write_rejected(reason: &str) {
+    metrics::counter!("ratatosk_aof_write_rejected_total", "reason" => reason.to_string())
+        .increment(1);
+}
+
+#[inline]
+pub fn set_aof_write_latched(latched: bool) {
+    metrics::gauge!("ratatosk_aof_write_latched").set(if latched { 1.0 } else { 0.0 });
+}
+
+#[inline]
+pub fn set_aof_queue_depth(depth: usize) {
+    metrics::gauge!("ratatosk_aof_queue_depth").set(depth as f64);
+}
+
+#[inline]
+pub fn record_aof_worker_enqueue_timeout(operation: &str) {
+    metrics::counter!("ratatosk_aof_worker_enqueue_timeouts_total", "operation" => operation.to_string())
+        .increment(1);
+}
+
+#[inline]
+pub fn record_aof_rewrite(result: &str) {
+    metrics::counter!("ratatosk_aof_rewrites_total", "result" => result.to_string()).increment(1);
+}
+
+#[inline]
 pub fn record_aof_append_duration_ms(duration_ms: f64, status: &str) {
     metrics::histogram!("ratatosk_aof_append_duration_ms", "status" => status.to_string())
         .record(duration_ms);
@@ -166,9 +200,8 @@ pub fn record_pubsub_client_overflowed() {
 }
 
 #[inline]
-pub fn set_pubsub_pending_queue_size(client_id: i64, size: usize) {
-    metrics::gauge!("ratatosk_pubsub_pending_queue_size", "client_id" => client_id.to_string())
-        .set(size as f64);
+pub fn set_pubsub_pending_queue_size(size: usize) {
+    metrics::gauge!("ratatosk_pubsub_pending_queue_size").set(size as f64);
 }
 
 /// Record authentication metrics.
@@ -189,6 +222,26 @@ pub fn record_clock_jump(direction: &str) {
 #[inline]
 pub fn record_shutdown_clients_aborted(count: u64) {
     metrics::counter!("ratatosk_shutdown_clients_aborted_total").increment(count);
+}
+
+#[inline]
+pub fn record_bgsave_tasks_aborted(count: u64) {
+    metrics::counter!("ratatosk_bgsave_tasks_aborted_total").increment(count);
+}
+
+#[inline]
+pub fn record_bgsave_task_timeout() {
+    metrics::counter!("ratatosk_bgsave_task_timeouts_total").increment(1);
+}
+
+#[inline]
+pub fn record_bgrewriteaof_tasks_aborted(count: u64) {
+    metrics::counter!("ratatosk_bgrewriteaof_tasks_aborted_total").increment(count);
+}
+
+#[inline]
+pub fn record_bgrewriteaof_task_timeout() {
+    metrics::counter!("ratatosk_bgrewriteaof_task_timeouts_total").increment(1);
 }
 
 /// Record rate-limited connection attempts.
@@ -213,6 +266,18 @@ pub fn set_open_fds(open_fds: u64, limit: u64) {
         open_fds as f64 / limit as f64
     };
     metrics::gauge!("ratatosk_process_fd_utilization").set(utilization);
+}
+
+#[inline]
+pub fn record_server_state_lock_wait_ms(stage: &str, wait_ms: f64) {
+    metrics::histogram!("ratatosk_server_state_lock_wait_ms", "stage" => stage.to_string())
+        .record(wait_ms);
+}
+
+#[inline]
+pub fn record_server_state_lock_hold_ms(stage: &str, hold_ms: f64) {
+    metrics::histogram!("ratatosk_server_state_lock_hold_ms", "stage" => stage.to_string())
+        .record(hold_ms);
 }
 
 #[inline]

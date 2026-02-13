@@ -55,7 +55,8 @@ fn generate_health_report(server: &ServerState) -> String {
         "ok"
     };
 
-    let (disk_writable, disk_available_bytes, disk_error) = check_storage_health(server.config.dir());
+    let (disk_writable, disk_available_bytes, disk_error) =
+        check_storage_health(server.config.dir());
     let disk_status = if !disk_writable {
         "error"
     } else if disk_available_bytes < MIN_HEALTH_DISK_BYTES {
@@ -64,10 +65,22 @@ fn generate_health_report(server: &ServerState) -> String {
         "ok"
     };
 
+    let (aof_writable, aof_error) = check_aof_health(server.config.dir(), aof_enabled);
+    let aof_latched_error = server.aof_last_error().map(str::to_owned);
+    let aof_write_latched = aof_latched_error.is_some();
+    let aof_rewrite_in_progress = server.aof_rewrite_in_progress();
+    let aof_rewrite_status = match server.last_aof_rewrite_status() {
+        Some(Ok(())) => "ok",
+        Some(Err(_)) => "error",
+        None => "none",
+    };
+
     let status = if memory_status == "critical"
         || rdb_status == "error"
         || disk_status == "error"
         || disk_status == "low_space"
+        || (aof_enabled && (!aof_writable || aof_write_latched))
+        || aof_rewrite_status == "error"
     {
         "degraded"
     } else {
@@ -77,7 +90,7 @@ fn generate_health_report(server: &ServerState) -> String {
     let total_keys: usize = (0..server.db_count()).map(|idx| server.db(idx).len()).sum();
 
     let mut report = format!(
-        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
+        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|aof_writable:{}|aof_write_latched:{}|aof_rewrite_in_progress:{}|aof_rewrite_status:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
         env!("BUILD_UNIX_TS"),
@@ -85,6 +98,10 @@ fn generate_health_report(server: &ServerState) -> String {
         total_keys,
         server.rdb_save_in_progress(),
         aof_enabled,
+        aof_writable,
+        aof_write_latched,
+        aof_rewrite_in_progress,
+        aof_rewrite_status,
         memory_used,
         maxmemory,
         disk_writable,
@@ -94,6 +111,16 @@ fn generate_health_report(server: &ServerState) -> String {
 
     if let Some(error) = disk_error {
         report.push_str("|disk_error:");
+        report.push_str(&error.replace('|', "_"));
+    }
+
+    if let Some(error) = aof_error {
+        report.push_str("|aof_error:");
+        report.push_str(&error.replace('|', "_"));
+    }
+
+    if let Some(error) = aof_latched_error {
+        report.push_str("|aof_latched_error:");
         report.push_str(&error.replace('|', "_"));
     }
 
@@ -126,6 +153,19 @@ fn check_storage_health(dir: &Path) -> (bool, u64, Option<String>) {
         Err(error) => (false, available, Some(error.to_string())),
     }
 }
+
+fn check_aof_health(dir: &Path, aof_enabled: bool) -> (bool, Option<String>) {
+    if !aof_enabled {
+        return (true, None);
+    }
+
+    let aof_path = PathBuf::from(dir).join("appendonly.aof");
+    match OpenOptions::new().create(true).append(true).open(&aof_path) {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    }
+}
+
 pub(super) fn cmd_echo(args: &[Bytes]) -> CommandOutcome {
     match args {
         [message] => CommandOutcome::reply(RespFrame::BulkString(Some(message.clone()))),

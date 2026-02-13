@@ -3,7 +3,7 @@ pub mod format;
 pub mod loader;
 pub mod saver;
 
-pub use loader::load;
 pub use loader::RdbLoader;
-pub use saver::save;
+pub use loader::load;
 pub use saver::RdbSaver;
+pub use saver::save;

@@ -19,8 +19,8 @@ use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
     persistence::{
-        PersistenceRuntime, apply_server_persistence_config, drain_bgsave_tasks, flush_aof, load_startup_data,
-        start_bgsave,
+        PersistenceRuntime, apply_server_persistence_config, drain_bgrewriteaof_tasks,
+        drain_bgsave_tasks, flush_aof, load_startup_data, start_bgsave,
     },
     rate_limiter::ConnectionRateLimiter,
 };
@@ -28,6 +28,8 @@ use crate::{
 const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const MEMORY_ESTIMATE_INTERVAL: u64 = 10;
+const DEFAULT_CONN_RATE_LIMIT_WINDOW_SECS: u64 = 10;
+const DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
 
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
@@ -56,6 +58,23 @@ fn next_backoff(current: Duration) -> Duration {
         .checked_mul(2)
         .unwrap_or(ACCEPT_ERROR_BACKOFF_MAX)
         .min(ACCEPT_ERROR_BACKOFF_MAX)
+}
+
+fn connection_rate_limit_window_from_env() -> Duration {
+    std::env::var("RATATOSK_CONN_RATE_LIMIT_WINDOW_SEC")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(DEFAULT_CONN_RATE_LIMIT_WINDOW_SECS))
+}
+
+fn connection_rate_limit_max_attempts_from_env() -> usize {
+    std::env::var("RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS)
 }
 
 fn io_error_kind_label(error: &io::Error) -> String {
@@ -102,7 +121,6 @@ fn emit_fd_metrics() {
         crate::metrics::set_open_fds(open_fds, limit);
     }
 }
-
 
 #[cfg(unix)]
 async fn wait_for_shutdown_signal() -> io::Result<ShutdownSignal> {
@@ -247,7 +265,8 @@ async fn server_cron(
         }
     }
 
-    let memory_estimate_age_ticks = (*cron_tick).saturating_sub(server.stats.last_memory_estimate_tick());
+    let memory_estimate_age_ticks =
+        (*cron_tick).saturating_sub(server.stats.last_memory_estimate_tick());
     crate::metrics::set_memory_estimate_age_ticks(memory_estimate_age_ticks);
 
     // 3. Ops/sec sampling
@@ -356,8 +375,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
     let mut fatal_error: Option<io::Error> = None;
 
-    // Connection rate limiter (10 connections per 10 seconds per IP)
-    let mut rate_limiter = ConnectionRateLimiter::default();
+    let rate_limit_window = connection_rate_limit_window_from_env();
+    let rate_limit_max_attempts = connection_rate_limit_max_attempts_from_env();
+    let mut rate_limiter = ConnectionRateLimiter::new(rate_limit_window, rate_limit_max_attempts);
+    tracing::info!(
+        target = "ratatosk::startup",
+        rate_limit_window_sec = rate_limit_window.as_secs(),
+        rate_limit_max_attempts,
+        "connection rate limiter configured"
+    );
 
     // server_cron timer — default 10 Hz
     let cron_hz = {
@@ -417,7 +443,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         let kind = io_error_kind_label(&error);
                         crate::metrics::record_accept_error(&kind, true);
                         crate::metrics::record_accept_backoff(accept_backoff.as_millis() as f64);
-                        tracing::warn!(
+                        tracing::debug!(
                             error = %error,
                             backoff_ms = accept_backoff.as_millis(),
                             "transient accept error; retrying"
@@ -449,7 +475,6 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 crate::metrics::set_rate_limiter_tracked_ips(rate_limiter.tracked_ips());
                 if !within_rate_limit {
                     crate::metrics::record_connection_rejected("rate_limited");
-                    crate::metrics::record_rate_limited_connection();
                     tracing::warn!(
                         target = "ratatosk::security",
                         remote_addr = %addr,
@@ -522,6 +547,21 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             target = "ratatosk::shutdown",
             completed = bgsave_completed,
             "background save tasks drained"
+        );
+    }
+    let (rewrite_completed, rewrite_aborted) = drain_bgrewriteaof_tasks(grace_period).await;
+    if rewrite_aborted > 0 {
+        tracing::warn!(
+            target = "ratatosk::shutdown",
+            completed = rewrite_completed,
+            aborted = rewrite_aborted,
+            "background AOF rewrite tasks exceeded shutdown deadline"
+        );
+    } else if rewrite_completed > 0 {
+        tracing::info!(
+            target = "ratatosk::shutdown",
+            completed = rewrite_completed,
+            "background AOF rewrite tasks drained"
         );
     }
 

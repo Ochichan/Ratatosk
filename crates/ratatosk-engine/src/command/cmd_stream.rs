@@ -410,9 +410,9 @@ pub(super) fn cmd_xread(
     if out.is_empty() {
         if let Some(block_ms) = block_ms {
             let deadline_ms = blocking_deadline_ms_from_block(block_ms);
-            if deadline_ms.is_some_and(|deadline| {
-                ratatosk_core::time::monotonic_ms() as i64 >= deadline
-            }) {
+            if deadline_ms
+                .is_some_and(|deadline| ratatosk_core::time::monotonic_ms() as i64 >= deadline)
+            {
                 return CommandOutcome::reply(RespFrame::Null);
             }
 
@@ -1057,9 +1057,9 @@ pub(super) fn cmd_xreadgroup(
     if out.is_empty() {
         if let Some(block_ms) = block_ms {
             let deadline_ms = blocking_deadline_ms_from_block(block_ms);
-            if deadline_ms.is_some_and(|deadline| {
-                ratatosk_core::time::monotonic_ms() as i64 >= deadline
-            }) {
+            if deadline_ms
+                .is_some_and(|deadline| ratatosk_core::time::monotonic_ms() as i64 >= deadline)
+            {
                 return CommandOutcome::reply(RespFrame::Null);
             }
             let full_frame = build_blocking_frame("XREADGROUP", args);

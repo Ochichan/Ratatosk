@@ -59,11 +59,11 @@ pub struct AofWriter {
 
 impl AofWriter {
     /// Open or create an AOF file at the given path.
-    /// 
+    ///
     /// If the file is newly created, writes the version header.
     pub fn open(path: &Path, policy: FsyncPolicy) -> Result<Self, PersistError> {
         let is_new = !path.exists();
-        
+
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -76,7 +76,7 @@ impl AofWriter {
             })?;
 
         let mut writer = BufWriter::new(file);
-        
+
         // Write version header for new files
         if is_new {
             writer.write_all(AOF_VERSION_HEADER).map_err(|e| {
@@ -98,11 +98,7 @@ impl AofWriter {
     /// Append a command to the AOF file in RESP format.
     ///
     /// Automatically prepends a SELECT command if the database index changed.
-    pub fn append_command(
-        &mut self,
-        db_index: usize,
-        args: &[Bytes],
-    ) -> Result<(), PersistError> {
+    pub fn append_command(&mut self, db_index: usize, args: &[Bytes]) -> Result<(), PersistError> {
         if args.is_empty() {
             return Ok(());
         }
@@ -147,9 +143,10 @@ impl AofWriter {
                     self.writer.flush().map_err(|e| {
                         io::Error::new(e.kind(), format!("flushing AOF buffer: {e}"))
                     })?;
-                    self.writer.get_ref().sync_all().map_err(|e| {
-                        io::Error::new(e.kind(), format!("fsync AOF file: {e}"))
-                    })?;
+                    self.writer
+                        .get_ref()
+                        .sync_all()
+                        .map_err(|e| io::Error::new(e.kind(), format!("fsync AOF file: {e}")))?;
                     self.last_fsync = Instant::now();
                 }
             }
@@ -204,18 +201,20 @@ mod tests {
             writer
                 .append_command(
                     0,
-                    &[
-                        Bytes::from("SET"),
-                        Bytes::from("key"),
-                        Bytes::from("value"),
-                    ],
+                    &[Bytes::from("SET"), Bytes::from("key"), Bytes::from("value")],
                 )
                 .expect("append");
         }
 
         let content = fs::read_to_string(&path).expect("read");
-        assert!(content.starts_with(std::str::from_utf8(AOF_VERSION_HEADER).unwrap()), "AOF should start with version header");
-        assert!(content.contains("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"), "AOF should contain RESP command");
+        assert!(
+            content.starts_with(std::str::from_utf8(AOF_VERSION_HEADER).unwrap()),
+            "AOF should start with version header"
+        );
+        assert!(
+            content.contains("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"),
+            "AOF should contain RESP command"
+        );
     }
 
     #[test]

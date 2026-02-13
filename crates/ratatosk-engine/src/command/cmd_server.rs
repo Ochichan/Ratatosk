@@ -637,15 +637,27 @@ pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
         ),
         (
             Bytes::from_static(b"lazyfree-lazy-expire"),
-            Bytes::from(if server.config.lazyfree_lazy_expire() { "yes" } else { "no" }),
+            Bytes::from(if server.config.lazyfree_lazy_expire() {
+                "yes"
+            } else {
+                "no"
+            }),
         ),
         (
             Bytes::from_static(b"lazyfree-lazy-server-del"),
-            Bytes::from(if server.config.lazyfree_lazy_server_del() { "yes" } else { "no" }),
+            Bytes::from(if server.config.lazyfree_lazy_server_del() {
+                "yes"
+            } else {
+                "no"
+            }),
         ),
         (
             Bytes::from_static(b"lazyfree-lazy-user-del"),
-            Bytes::from(if server.config.lazyfree_lazy_user_del() { "yes" } else { "no" }),
+            Bytes::from(if server.config.lazyfree_lazy_user_del() {
+                "yes"
+            } else {
+                "no"
+            }),
         ),
         (
             Bytes::from_static(b"tcp-keepalive"),
@@ -928,10 +940,16 @@ pub(super) fn cmd_memory_purge(args: &[Bytes]) -> CommandOutcome {
 pub(super) fn append_info_server_section(out: &mut String, server: &ServerState, now_ms: i64) {
     let uptime_seconds = (now_ms.saturating_sub(server.started_at_ms()) / 1000).max(0);
     out.push_str("# Server\r\n");
-    out.push_str(&format!("redis_version:{}-ratatosk\r\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!(
+        "redis_version:{}-ratatosk\r\n",
+        env!("CARGO_PKG_VERSION")
+    ));
     out.push_str("redis_mode:standalone\r\n");
     out.push_str(&format!("ratatosk_git_hash:{}\r\n", env!("GIT_HASH")));
-    out.push_str(&format!("ratatosk_build_unix_ts:{}\r\n", env!("BUILD_UNIX_TS")));
+    out.push_str(&format!(
+        "ratatosk_build_unix_ts:{}\r\n",
+        env!("BUILD_UNIX_TS")
+    ));
     out.push_str(&format!("uptime_in_seconds:{uptime_seconds}\r\n"));
     out.push_str(&format!("uptime_in_days:{}\r\n", uptime_seconds / 86_400));
     out.push_str("\r\n");
@@ -1019,7 +1037,33 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
         "aof_enabled:{}\r\n",
         i32::from(server.aof_enabled())
     ));
-    out.push_str(&format!("aof_rewrite_in_progress:0\r\n"));
+    let aof_write_latched = server.aof_write_latched();
+    out.push_str(&format!(
+        "aof_write_latched:{}\r\n",
+        i32::from(aof_write_latched)
+    ));
+    if let Some(error) = server.aof_last_error() {
+        let sanitized = error.replace(['\r', '\n'], " ");
+        out.push_str(&format!("aof_last_error:{}\r\n", sanitized));
+    }
+    out.push_str(&format!("aof_rewrite_supported:1\r\n"));
+    out.push_str(&format!(
+        "aof_rewrite_in_progress:{}\r\n",
+        i32::from(server.aof_rewrite_in_progress())
+    ));
+    let (rewrite_status, rewrite_error) = match server.last_aof_rewrite_status() {
+        Some(Ok(())) => ("ok", None),
+        Some(Err(error)) => ("err", Some(error.as_str())),
+        None => ("none", None),
+    };
+    out.push_str(&format!("aof_last_rewrite_status:{rewrite_status}\r\n"));
+    if let Some(error) = rewrite_error {
+        let sanitized = error.replace(['\r', '\n'], " ");
+        out.push_str(&format!("aof_last_rewrite_error:{}\r\n", sanitized));
+    }
+    if let Some(time_ms) = server.last_aof_rewrite_time_ms() {
+        out.push_str(&format!("aof_last_rewrite_timestamp_ms:{time_ms}\r\n"));
+    }
     out.push_str(&format!("aof_current_size:0\r\n"));
     out.push_str(&format!("aof_base_size:0\r\n"));
 
@@ -1106,12 +1150,28 @@ pub(super) fn cmd_bgsave(args: &[Bytes], server: &mut ServerState) -> CommandOut
     CommandOutcome::reply(RespFrame::simple_str("Background saving started"))
 }
 
-pub(super) fn cmd_bgrewriteaof(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_bgrewriteaof(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("bgrewriteaof");
     }
 
-    CommandOutcome::reply(err("ERR BGREWRITEAOF is not implemented in this build"))
+    if !server.aof_enabled() {
+        metrics::counter!("ratatosk_bgrewriteaof_requests_total", "result" => "aof_disabled")
+            .increment(1);
+        return CommandOutcome::reply(err("ERR BGREWRITEAOF requires appendonly to be enabled"));
+    }
+
+    if server.aof_rewrite_in_progress() {
+        metrics::counter!("ratatosk_bgrewriteaof_requests_total", "result" => "in_progress")
+            .increment(1);
+        return CommandOutcome::reply(err("ERR Background AOF rewrite already in progress"));
+    }
+
+    server.set_aof_rewrite_in_progress(true);
+    metrics::counter!("ratatosk_bgrewriteaof_requests_total", "result" => "started").increment(1);
+    CommandOutcome::reply(RespFrame::simple_str(
+        "Background append only file rewriting started",
+    ))
 }
 
 pub(super) fn cmd_sflush(args: &[Bytes]) -> CommandOutcome {

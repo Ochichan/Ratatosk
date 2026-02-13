@@ -11,7 +11,7 @@ static LAST_WALL_CLOCK_MS: AtomicI64 = AtomicI64::new(0);
 pub fn detect_clock_jump() {
     let current = now_ms();
     let previous = LAST_WALL_CLOCK_MS.swap(current, Ordering::Relaxed);
-    
+
     if previous > 0 {
         let delta = current - previous;
         if delta < -1000 {

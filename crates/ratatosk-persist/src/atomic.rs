@@ -18,11 +18,9 @@ where
     file.sync_all()?;
 
     // Persist the rename
-    let tmp_path_ref = tmp_path.keep().map_err(|e| {
-        io::Error::other(
-            format!("failed to persist temp file: {e}"),
-        )
-    })?;
+    let tmp_path_ref = tmp_path
+        .keep()
+        .map_err(|e| io::Error::other(format!("failed to persist temp file: {e}")))?;
     fs::rename(&tmp_path_ref, target)?;
 
     // Sync parent directory (Unix best practice)
@@ -61,9 +59,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tmpdir");
         let target = dir.path().join("should_not_exist.rdb");
 
-        let result = atomic_write(&target, |_f| {
-            Err(io::Error::other("simulated error"))
-        });
+        let result = atomic_write(&target, |_f| Err(io::Error::other("simulated error")));
 
         assert!(result.is_err());
         // Target should not exist because we errored before rename
