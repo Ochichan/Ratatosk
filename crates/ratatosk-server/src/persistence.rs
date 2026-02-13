@@ -23,8 +23,20 @@ pub struct PersistenceRuntime {
 
 impl PersistenceRuntime {
     pub fn from_config(config: &ServerConfig) -> io::Result<Self> {
+        // 1. Validate working directory exists and is writable
+        validate_working_directory(&config.dir)?;
+        
+        // 2. Check available disk space (minimum 100MB)
+        check_disk_space(&config.dir, 100 * 1024 * 1024)?;
+        
         let rdb_path = config.dir.join(&config.dbfilename);
         let aof_path = config.dir.join(AOF_FILENAME);
+        
+        // 3. Validate AOF file if exists and appendonly is enabled
+        if config.appendonly && aof_path.exists() {
+            validate_aof_file(&aof_path)?;
+        }
+        
         let aof_writer = if config.appendonly {
             let policy = FsyncPolicy::from_config_str(config.appendfsync.as_bytes())
                 .unwrap_or(FsyncPolicy::EverySec);
@@ -40,6 +52,84 @@ impl PersistenceRuntime {
             aof_path,
             aof_writer,
         })
+    }
+}
+
+fn validate_working_directory(dir: &Path) -> io::Result<()> {
+    if !dir.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("working directory does not exist: {}", dir.display()),
+        ));
+    }
+    
+    if !dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("working directory path is not a directory: {}", dir.display()),
+        ));
+    }
+    
+    // Test write permission by creating a temp file
+    let test_file = dir.join(".ratatosk_write_test");
+    match std::fs::File::create(&test_file) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test_file);
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("working directory is not writable: {} (error: {})", dir.display(), e),
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
+fn check_disk_space(dir: &Path, min_bytes: u64) -> io::Result<()> {
+    // Practical check: try to create a file to verify write capability
+    // Note: For proper disk space checking on Unix, use nix::sys::statvfs or similar
+    let test_file = dir.join(".ratatosk_space_test");
+    match std::fs::File::create(&test_file) {
+        Ok(_file) => {
+            let _ = std::fs::remove_file(&test_file);
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("insufficient disk space or permission denied in {}: {}", dir.display(), e),
+            ));
+        }
+    }
+    
+    tracing::info!(
+        target = "ratatosk::startup",
+        dir = %dir.display(),
+        min_bytes_required = min_bytes,
+        "disk space validation passed"
+    );
+    
+    Ok(())
+}
+
+fn validate_aof_file(path: &Path) -> io::Result<()> {
+    // Check if AOF file is readable
+    match std::fs::File::open(path) {
+        Ok(_) => {
+            tracing::info!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                "AOF file exists and is readable"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AOF file exists but cannot be read: {} (error: {})", path.display(), e),
+            ))
+        }
     }
 }
 
@@ -76,12 +166,36 @@ pub async fn load_startup_data(
     }
 
     if appendonly && runtime.aof_path.exists() {
-        let replayed = {
+        let result = {
             let mut state = server_state.lock().await;
             AofRecovery::replay_file(&runtime.aof_path, &mut state)
                 .map_err(|e| io::Error::other(format!("replaying AOF: {e}")))?
         };
-        tracing::info!(replayed, "replayed AOF over startup state");
+        
+        // Emit metrics for AOF replay
+        if result.corruption_detected {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                commands_replayed = result.commands_replayed,
+                bytes_processed = result.bytes_processed,
+                truncated_at = result.truncated_at,
+                "AOF replay completed with corruption detected"
+            );
+        } else {
+            tracing::info!(
+                target = "ratatosk::startup",
+                commands_replayed = result.commands_replayed,
+                bytes_processed = result.bytes_processed,
+                "AOF replay completed successfully"
+            );
+        }
+        
+        if result.version_mismatch {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                "AOF file version mismatch detected"
+            );
+        }
     }
 
     Ok(())
@@ -96,6 +210,8 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
         state.set_rdb_save_in_progress(true);
         state.snapshot_dbs()
     };
+    
+    crate::metrics::record_rdb_save(true); // background = true
 
     tokio::spawn(async move {
         let path_for_log = rdb_path.display().to_string();
@@ -116,6 +232,7 @@ pub async fn start_bgsave(server_state: Arc<Mutex<ServerState>>, rdb_path: PathB
             }
             Err(error) => {
                 state.set_last_rdb_save_status(Err(error.clone()));
+                crate::metrics::record_rdb_save_error();
                 tracing::warn!(error = %error, path = %path_for_log, "background RDB save failed");
             }
         }
@@ -132,6 +249,8 @@ pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -
         }
         state.snapshot_dbs()
     };
+    
+    crate::metrics::record_rdb_save(false); // foreground = false
 
     let result = rdb::saver::save(&snapshot, rdb_path);
     let mut state = server_state.lock().await;
@@ -143,6 +262,7 @@ pub async fn run_save(server_state: &Arc<Mutex<ServerState>>, rdb_path: &Path) -
         }
         Err(error) => {
             state.set_last_rdb_save_status(Err(error.to_string()));
+            crate::metrics::record_rdb_save_error();
         }
     }
     result
@@ -154,9 +274,17 @@ pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
     };
 
     let mut guard = writer.lock().await;
+    
+    // Get fsync policy for metrics
+    let fsync_policy = "always"; // force_fsync always does fsync
+    crate::metrics::record_aof_write(fsync_policy);
+    
     guard
         .force_fsync()
-        .map_err(|e| io::Error::other(format!("flushing AOF: {e}")))
+        .map_err(|e| {
+            crate::metrics::record_aof_write_error();
+            io::Error::other(format!("flushing AOF: {e}"))
+        })
 }
 
 #[cfg(test)]

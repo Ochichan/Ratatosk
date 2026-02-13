@@ -15,10 +15,18 @@ pub fn detect_clock_jump() {
     if previous > 0 {
         let delta = current - previous;
         if delta < -1000 {
+            metrics::counter!("ratatosk_clock_jumps_total", "direction" => "backward").increment(1);
             tracing::warn!(
+                target = "ratatosk::time",
                 delta_ms = delta,
-                "wall-clock jumped backward (NTP correction or manual adjustment); \
-                 expiry deadlines may be affected"
+                "wall-clock jumped backward (NTP correction or manual adjustment); expiry deadlines may be affected"
+            );
+        } else if delta > 5000 {
+            metrics::counter!("ratatosk_clock_jumps_total", "direction" => "forward").increment(1);
+            tracing::warn!(
+                target = "ratatosk::time",
+                delta_ms = delta,
+                "wall-clock jumped forward; immediate expiry may occur"
             );
         }
     }

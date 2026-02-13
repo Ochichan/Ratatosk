@@ -189,6 +189,8 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
         return 0;
     }
 
+    let start = std::time::Instant::now();
+    let memory_before = estimate_used_memory(state);
     let mut evicted = 0usize;
     let mut rng = rand::thread_rng();
 
@@ -209,7 +211,31 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
         evicted += 1;
     }
 
+    let memory_after = estimate_used_memory(state);
+    let duration = start.elapsed();
+
     state.stats.add_evicted_keys(evicted as u64);
+    
+    // Record metrics
+    metrics::counter!("ratatosk_eviction_keys_total", "policy" => config.policy.as_str())
+        .increment(evicted as u64);
+    metrics::histogram!("ratatosk_eviction_duration_ms")
+        .record(duration.as_millis() as f64);
+    metrics::histogram!("ratatosk_eviction_memory_freed_bytes")
+        .record((memory_before.saturating_sub(memory_after)) as f64);
+
+    if evicted > 0 {
+        tracing::info!(
+            target = "ratatosk::eviction",
+            evicted_keys = evicted,
+            memory_before,
+            memory_after,
+            policy = config.policy.as_str(),
+            duration_ms = duration.as_millis(),
+            "eviction cycle completed"
+        );
+    }
+
     evicted
 }
 

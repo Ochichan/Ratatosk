@@ -20,6 +20,7 @@ use crate::{
         PersistenceRuntime, apply_server_persistence_config, flush_aof, load_startup_data,
         start_bgsave,
     },
+    rate_limiter::ConnectionRateLimiter,
 };
 
 const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
@@ -90,40 +91,57 @@ async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
         return;
     }
 
+    let start = std::time::Instant::now();
+    let initial_count = tasks.len();
+
     tracing::info!(
-        active_clients = tasks.len(),
+        target = "ratatosk::shutdown",
+        active_clients = initial_count,
         grace_ms = grace_period.as_millis(),
-        "waiting for active client handlers to drain"
+        "beginning client drain"
     );
 
     let drain = async {
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 if error.is_cancelled() {
-                    tracing::debug!("client task cancelled during shutdown");
+                    tracing::debug!(target = "ratatosk::shutdown", "client task cancelled during shutdown");
                 } else {
-                    tracing::warn!(error = %error, "client task join failure during shutdown");
+                    tracing::warn!(target = "ratatosk::shutdown", error = %error, "client task join failure during shutdown");
                 }
             }
         }
     };
 
     if timeout(grace_period, drain).await.is_ok() {
-        tracing::info!("all client handlers drained before shutdown deadline");
+        tracing::info!(
+            target = "ratatosk::shutdown",
+            drained_clients = initial_count,
+            elapsed_ms = start.elapsed().as_millis(),
+            "all client handlers drained successfully"
+        );
         return;
     }
 
     let remaining = tasks.len();
+    let aborted = initial_count - remaining;
+    
     tracing::warn!(
+        target = "ratatosk::shutdown",
         remaining_clients = remaining,
+        aborted_clients = aborted,
+        elapsed_ms = start.elapsed().as_millis(),
         "shutdown grace period expired; aborting remaining client handlers"
     );
+    
+    crate::metrics::record_shutdown_clients_aborted(remaining as u64);
+    
     tasks.abort_all();
 
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             if !error.is_cancelled() {
-                tracing::warn!(error = %error, "client task join failure after abort");
+                tracing::warn!(target = "ratatosk::shutdown", error = %error, "client task join failure after abort");
             }
         }
     }
@@ -167,6 +185,8 @@ async fn server_cron(
         let used = if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
             let estimate = estimate_used_memory(&server);
             server.stats.set_cached_memory_estimate(estimate as u64, *cron_tick);
+            // Record memory metric
+            crate::metrics::set_memory_used(estimate as u64);
             estimate
         } else {
             server.stats.cached_memory_estimate() as usize
@@ -176,6 +196,7 @@ async fn server_cron(
             let evicted = perform_eviction(&mut server, &eviction_config);
             if evicted > 0 {
                 tracing::info!(
+                    target = "ratatosk::eviction",
                     evicted,
                     policy = eviction_config.policy.as_str(),
                     "eviction cycle removed keys"
@@ -198,8 +219,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let listener = TcpListener::bind(config.listen_addr()).await?;
 
     // Lazy-free background thread for async deletion of large values
+    const LAZY_FREE_CHANNEL_SIZE: usize = 4096;
     let (lazy_free_tx, lazy_free_rx) =
-        crossbeam_channel::bounded::<ratatosk_engine::keyspace::StoredValue>(4096);
+        crossbeam_channel::bounded::<ratatosk_engine::keyspace::StoredValue>(LAZY_FREE_CHANNEL_SIZE);
     let lazy_free_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lazy_free_flag = Arc::clone(&lazy_free_shutdown);
     let lazy_free_handle = std::thread::spawn(move || {
@@ -213,6 +235,33 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         // Drain remaining values
         for value in lazy_free_rx.try_iter() {
             drop(value);
+        }
+    });
+    
+    // Spawn lazy-free channel monitor
+    let lazy_free_monitor_handle = tokio::spawn({
+        let lazy_free_tx = lazy_free_tx.clone();
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                
+                // Estimate channel utilization (approximate)
+                let capacity = LAZY_FREE_CHANNEL_SIZE as f64;
+                let available = lazy_free_tx.capacity().unwrap_or(0) as f64;
+                let utilization = 1.0 - (available / capacity);
+                
+                crate::metrics::set_lazyfree_queue_utilization(utilization);
+                
+                if utilization > 0.9 {
+                    tracing::warn!(
+                        target = "ratatosk::memory",
+                        utilization = utilization,
+                        capacity = LAZY_FREE_CHANNEL_SIZE,
+                        "lazy-free channel nearing capacity"
+                    );
+                }
+            }
         }
     });
 
@@ -233,6 +282,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let mut shutdown = Box::pin(wait_for_shutdown_signal());
     let mut client_tasks: JoinSet<()> = JoinSet::new();
     let mut accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+    
+    // Connection rate limiter (10 connections per 10 seconds per IP)
+    let mut rate_limiter = ConnectionRateLimiter::default();
 
     // server_cron timer — default 10 Hz
     let cron_hz = {
@@ -299,6 +351,17 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                     Err(error) => return Err(error),
                 };
 
+                // Rate limiting check
+                if !rate_limiter.check_rate_limit(addr.ip()) {
+                    tracing::warn!(
+                        target = "ratatosk::security",
+                        remote_addr = %addr,
+                        "rejecting connection: rate limit exceeded"
+                    );
+                    drop(stream);
+                    continue;
+                }
+
                 let permit: OwnedSemaphorePermit = match Arc::clone(&client_permits).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -355,6 +418,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     if let Err(error) = lazy_free_handle.join() {
         tracing::warn!("lazy-free thread panicked: {error:?}");
     }
+
+    // Abort lazy-free monitor task
+    lazy_free_monitor_handle.abort();
+
+    tracing::info!("server shutdown complete");
 
     Ok(())
 }

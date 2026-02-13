@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use ratatosk_engine::{
     command::{ClientState, execute},
     keyspace::ServerState,
@@ -10,6 +10,31 @@ use ratatosk_engine::{
 use ratatosk_resp::parse;
 
 use crate::error::PersistError;
+
+/// Expected AOF version header.
+const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
+
+/// Result of AOF replay with detailed status.
+#[derive(Debug, Clone)]
+pub struct ReplayResult {
+    pub commands_replayed: usize,
+    pub bytes_processed: usize,
+    pub corruption_detected: bool,
+    pub truncated_at: Option<usize>,
+    pub version_mismatch: bool,
+}
+
+impl ReplayResult {
+    pub fn success(commands: usize, bytes: usize) -> Self {
+        Self {
+            commands_replayed: commands,
+            bytes_processed: bytes,
+            corruption_detected: false,
+            truncated_at: None,
+            version_mismatch: false,
+        }
+    }
+}
 
 /// AOF recovery: replays an AOF file into a `ServerState`.
 ///
@@ -20,8 +45,8 @@ pub struct AofRecovery;
 impl AofRecovery {
     /// Replay an AOF file into the given server state.
     ///
-    /// Returns the number of commands replayed.
-    pub fn replay_file(path: &Path, state: &mut ServerState) -> Result<usize, PersistError> {
+    /// Returns detailed result including corruption detection.
+    pub fn replay_file(path: &Path, state: &mut ServerState) -> Result<ReplayResult, PersistError> {
         let file = File::open(path).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -31,24 +56,50 @@ impl AofRecovery {
         Self::replay_reader(BufReader::new(file), state)
     }
 
-    /// Replay from any reader.
+    /// Replay from any reader with version header validation.
     pub fn replay_reader<R: Read>(
         mut reader: R,
         state: &mut ServerState,
-    ) -> Result<usize, PersistError> {
+    ) -> Result<ReplayResult, PersistError> {
         let mut buf = BytesMut::with_capacity(64 * 1024);
         let mut client = ClientState::new(0);
         let mut commands_replayed = 0usize;
+        let mut corruption_positions = Vec::new();
 
         // Read all data into buffer
         let mut raw = Vec::new();
         reader
             .read_to_end(&mut raw)
             .map_err(|e| std::io::Error::new(e.kind(), format!("reading AOF data: {e}")))?;
-        buf.extend_from_slice(&raw);
+        
+        let total_bytes = raw.len();
+        
+        // Check for version header
+        let version_mismatch = if raw.starts_with(AOF_VERSION_HEADER) {
+            // Skip header for parsing
+            buf.extend_from_slice(&raw[AOF_VERSION_HEADER.len()..]);
+            false
+        } else if raw.starts_with(b"*") {
+            // Old format without header - still valid but warn
+            tracing::warn!(
+                target = "ratatosk::aof",
+                "AOF file has no version header (legacy format)"
+            );
+            buf.extend_from_slice(&raw);
+            false
+        } else {
+            // Unknown format
+            tracing::error!(
+                target = "ratatosk::aof",
+                "AOF file has unknown format (neither version header nor RESP)"
+            );
+            buf.extend_from_slice(&raw);
+            true
+        };
 
         // Parse and execute frames
         loop {
+            let bytes_before = buf.len();
             match parse(&mut buf) {
                 Ok(Some(frame)) => {
                     let _outcome = execute(frame, state, &mut client);
@@ -56,21 +107,87 @@ impl AofRecovery {
                 }
                 Ok(None) => {
                     // No more complete frames
+                    if !buf.is_empty() {
+                        // Truncated data at end
+                        let position = total_bytes - buf.len();
+                        corruption_positions.push(position);
+                        tracing::warn!(
+                            target = "ratatosk::aof",
+                            byte_position = position,
+                            remaining_bytes = buf.len(),
+                            "AOF truncated: incomplete command at end of file"
+                        );
+                    }
                     break;
                 }
                 Err(_) => {
-                    // Skip malformed data — truncated AOF files are common
-                    tracing::warn!(
-                        remaining_bytes = buf.len(),
-                        "AOF parse error: skipping remaining data"
-                    );
-                    break;
+                    // Parse error - record position and skip
+                    let position = total_bytes - bytes_before;
+                    corruption_positions.push(position);
+                    
+                    // Try to recover by skipping to next RESP frame
+                    if let Some(next_pos) = find_next_resp_frame(&buf) {
+                        tracing::warn!(
+                            target = "ratatosk::aof",
+                            byte_position = position,
+                            skipped_bytes = next_pos,
+                            "AOF parse error: skipping to next valid frame"
+                        );
+                        buf.advance(next_pos);
+                    } else {
+                        tracing::warn!(
+                            target = "ratatosk::aof",
+                            byte_position = position,
+                            remaining_bytes = buf.len(),
+                            "AOF parse error: no valid frame found, truncating"
+                        );
+                        break;
+                    }
                 }
             }
         }
 
-        Ok(commands_replayed)
+        let result = ReplayResult {
+            commands_replayed,
+            bytes_processed: total_bytes - buf.len(),
+            corruption_detected: !corruption_positions.is_empty(),
+            truncated_at: corruption_positions.first().copied(),
+            version_mismatch,
+        };
+
+        // Log summary
+        if result.corruption_detected {
+            tracing::warn!(
+                target = "ratatosk::aof",
+                commands_replayed,
+                bytes_processed = result.bytes_processed,
+                total_bytes,
+                corruption_points = corruption_positions.len(),
+                "AOF replay completed with corruption detected"
+            );
+        } else {
+            tracing::info!(
+                target = "ratatosk::aof",
+                commands_replayed,
+                bytes_processed = result.bytes_processed,
+                "AOF replay completed successfully"
+            );
+        }
+
+        Ok(result)
     }
+}
+
+/// Find the position of the next potential RESP frame start.
+fn find_next_resp_frame(buf: &[u8]) -> Option<usize> {
+    // RESP frames start with: * (array), + (simple string), - (error), : (integer), $ (bulk string)
+    for i in 1..buf.len() {
+        match buf[i] {
+            b'*' | b'+' | b'-' | b':' | b'$' => return Some(i),
+            _ => continue,
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -111,8 +228,9 @@ mod tests {
 
         // Replay into fresh state
         let mut state = ServerState::with_default_dbs();
-        let replayed = AofRecovery::replay_file(&path, &mut state).expect("replay");
-        assert_eq!(replayed, 2);
+        let result = AofRecovery::replay_file(&path, &mut state).expect("replay");
+        assert_eq!(result.commands_replayed, 2);
+        assert!(!result.corruption_detected);
 
         // Verify data
         let hello = state.db(0).get(&Bytes::from("hello"));
@@ -140,9 +258,9 @@ mod tests {
         }
 
         let mut state = ServerState::with_default_dbs();
-        let replayed = AofRecovery::replay_file(&path, &mut state).expect("replay");
+        let result = AofRecovery::replay_file(&path, &mut state).expect("replay");
         // 3 commands: SET a 0, SELECT 1, SET b 1
-        assert_eq!(replayed, 3);
+        assert_eq!(result.commands_replayed, 3);
 
         assert!(state.db(0).get(&Bytes::from("a")).is_some());
         assert!(state.db(1).get(&Bytes::from("b")).is_some());
@@ -155,8 +273,8 @@ mod tests {
         std::fs::write(&path, b"").expect("create");
 
         let mut state = ServerState::with_default_dbs();
-        let replayed = AofRecovery::replay_file(&path, &mut state).expect("replay");
-        assert_eq!(replayed, 0);
+        let result = AofRecovery::replay_file(&path, &mut state).expect("replay");
+        assert_eq!(result.commands_replayed, 0);
     }
 
     #[test]
@@ -202,9 +320,10 @@ mod tests {
             .expect("write truncated");
 
         let mut state = ServerState::with_default_dbs();
-        let replayed = AofRecovery::replay_file(&path, &mut state).expect("replay");
+        let result = AofRecovery::replay_file(&path, &mut state).expect("replay");
         // Should replay at least the first command
-        assert!(replayed >= 1);
+        assert!(result.commands_replayed >= 1);
+        assert!(result.corruption_detected); // Should detect corruption
         assert!(state.db(0).get(&Bytes::from("ok")).is_some());
     }
 }

@@ -17,4 +17,5 @@ argon2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 glob-match = { workspace = true }
