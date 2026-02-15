@@ -3325,9 +3325,44 @@ impl CommandOutcome {
 
 #[derive(Debug, Clone)]
 struct WatchedKey {
-    db_index: usize,
-    key: Bytes,
     version: u64,
+}
+
+// ---------------------------------------------------------------------------
+// TransactionState — explicit state machine for MULTI/EXEC transactions
+// ---------------------------------------------------------------------------
+
+/// Represents the state of a client's transaction.
+#[derive(Debug, Clone, Default)]
+pub enum TransactionState {
+    /// Normal operation - not in a transaction
+    #[default]
+    Normal,
+    /// In a MULTI/EXEC transaction block
+    InTransaction {
+        queue: Vec<Vec<Bytes>>,
+        has_error: bool,
+    },
+}
+
+impl TransactionState {
+    /// Returns true if currently in a transaction block
+    pub fn in_multi(&self) -> bool {
+        matches!(self, TransactionState::InTransaction { .. })
+    }
+
+    /// Returns the number of queued commands, or 0 if not in a transaction
+    pub fn queue_len(&self) -> usize {
+        match self {
+            TransactionState::InTransaction { queue, .. } => queue.len(),
+            TransactionState::Normal => 0,
+        }
+    }
+
+    /// Returns true if the transaction has an error flag set
+    pub fn has_error(&self) -> bool {
+        matches!(self, TransactionState::InTransaction { has_error: true, .. })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3337,10 +3372,8 @@ pub struct ClientState {
     name: Option<Bytes>,
     authenticated: bool,
     acl_user: Bytes,
-    in_multi: bool,
-    tx_queue: Vec<Vec<Bytes>>,
-    tx_error: bool,
-    watched: Vec<WatchedKey>,
+    tx_state: TransactionState,
+    watched: hashbrown::HashMap<(usize, Bytes), WatchedKey>,
     created_at_ms: i64,
     last_interaction_ms: i64,
     last_command: Bytes,
@@ -3380,10 +3413,8 @@ impl ClientState {
             name: None,
             authenticated: false,
             acl_user: Bytes::from_static(b"default"),
-            in_multi: false,
-            tx_queue: Vec::new(),
-            tx_error: false,
-            watched: Vec::new(),
+            tx_state: TransactionState::default(),
+            watched: hashbrown::HashMap::new(),
             created_at_ms: now_ms,
             last_interaction_ms: now_ms,
             last_command: Bytes::new(),
@@ -3404,9 +3435,7 @@ impl ClientState {
         self.name = None;
         self.authenticated = false;
         self.acl_user = Bytes::from_static(b"default");
-        self.in_multi = false;
-        self.tx_queue.clear();
-        self.tx_error = false;
+        self.tx_state = TransactionState::default();
         self.watched.clear();
         self.last_interaction_ms = now_ms();
         self.last_command = Bytes::new();
@@ -3479,23 +3508,26 @@ pub fn execute(
 
     const MAX_TX_QUEUE_SIZE: usize = 65536;
 
-    if client.in_multi
+    if client.tx_state.in_multi()
         && !matches!(
             command.as_slice(),
             b"EXEC" | b"DISCARD" | b"MULTI" | b"WATCH" | b"UNWATCH"
         )
     {
         if let Err(response) = validate_queued_command(&argv, server, client) {
-            client.tx_error = true;
+            if let TransactionState::InTransaction { has_error, .. } = &mut client.tx_state {
+                *has_error = true;
+            }
             return CommandOutcome::reply(response);
         }
 
-        if client.tx_queue.len() >= MAX_TX_QUEUE_SIZE {
-            client.tx_error = true;
-            return CommandOutcome::reply(err("ERR transaction queue limit reached"));
+        if let TransactionState::InTransaction { queue, has_error } = &mut client.tx_state {
+            if queue.len() >= MAX_TX_QUEUE_SIZE {
+                *has_error = true;
+                return CommandOutcome::reply(err("ERR transaction queue limit reached"));
+            }
+            queue.push(argv);
         }
-
-        client.tx_queue.push(argv);
         return CommandOutcome::reply(RespFrame::queued());
     }
 
@@ -4022,7 +4054,7 @@ fn maybe_track_write_version(
         while idx < argv.len() {
             if argv[idx].eq_ignore_ascii_case(b"STORE") {
                 if let Some(dest_key) = argv.get(idx + 1) {
-                    server.touch_key_version(client.selected_db, dest_key);
+                    server.touch_key_version(client.selected_db, dest_key.clone());
                 }
                 break;
             }
@@ -4048,18 +4080,18 @@ fn maybe_track_write_version(
                 }
                 idx += 1;
             }
-            server.touch_key_version(target_db, target_key);
+            server.touch_key_version(target_db, target_key.clone());
         }
         return;
     }
 
     if command == b"MOVE" {
         if let Some(key) = argv.get(1) {
-            server.touch_key_version(client.selected_db, key);
+            server.touch_key_version(client.selected_db, key.clone());
             if let Some(target_db_raw) = argv.get(2) {
                 if let Some(target_db) = parse_usize(target_db_raw) {
                     if target_db < server.db_count() {
-                        server.touch_key_version(target_db, key);
+                        server.touch_key_version(target_db, key.clone());
                     }
                 }
             }
@@ -4080,7 +4112,7 @@ fn maybe_track_write_version(
             if idx >= argv.len() {
                 break;
             }
-            server.touch_key_version(client.selected_db, &argv[idx]);
+            server.touch_key_version(client.selected_db, argv[idx].clone());
             idx = idx.saturating_add(2);
         }
         return;
@@ -4089,7 +4121,7 @@ fn maybe_track_write_version(
     if let Some(positions) = cmd_connection::extract_command_key_positions(spec, argv.len()) {
         for pos in positions {
             if let Some(key) = argv.get(pos) {
-                server.touch_key_version(client.selected_db, key);
+                server.touch_key_version(client.selected_db, key.clone());
             }
         }
     }
@@ -4268,13 +4300,13 @@ fn err(message: &str) -> RespFrame {
     RespFrame::error_str(&sanitized)
 }
 
-enum UpperBuf {
+pub(super) enum UpperBuf {
     Stack([u8; 32], usize),
     Heap(Vec<u8>),
 }
 
 impl UpperBuf {
-    fn as_slice(&self) -> &[u8] {
+    pub(super) fn as_slice(&self) -> &[u8] {
         match self {
             Self::Stack(buf, len) => &buf[..*len],
             Self::Heap(vec) => vec.as_slice(),
@@ -4282,7 +4314,7 @@ impl UpperBuf {
     }
 }
 
-fn to_uppercase_stack(input: &Bytes) -> UpperBuf {
+pub(super) fn to_uppercase_stack(input: &Bytes) -> UpperBuf {
     if input.len() <= 32 {
         let mut buf = [0u8; 32];
         for (i, &b) in input.iter().enumerate() {

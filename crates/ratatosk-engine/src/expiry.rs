@@ -162,7 +162,7 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
 
             if is_expired {
                 state.db_mut(db_idx).remove(key);
-                state.touch_key_version(db_idx, key);
+                state.touch_key_version(db_idx, key.clone());
                 expired += 1;
             }
         }

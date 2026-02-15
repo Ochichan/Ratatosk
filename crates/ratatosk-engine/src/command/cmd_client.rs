@@ -1,3 +1,5 @@
+use std::fmt::Write;
+
 use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
@@ -5,7 +7,7 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::ServerState;
 use crate::security::should_reject_shell_metacharacters;
 
-use super::{ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity};
+use super::{ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_stack, wrong_arity};
 
 pub(super) fn cmd_client(
     args: &[Bytes],
@@ -16,7 +18,7 @@ pub(super) fn cmd_client(
         return wrong_arity("client");
     }
 
-    let subcommand = to_uppercase_bytes(&args[0]);
+    let subcommand = to_uppercase_stack(&args[0]);
     match subcommand.as_slice() {
         b"ID" => {
             if args.len() != 1 {
@@ -144,7 +146,7 @@ pub(super) fn validate_client_name(name: &Bytes) -> Result<(), RespFrame> {
 
 fn is_client_kill_option(raw: &Bytes) -> bool {
     matches!(
-        to_uppercase_bytes(raw).as_slice(),
+        to_uppercase_stack(raw).as_slice(),
         b"ID" | b"TYPE" | b"USER" | b"ADDR" | b"LADDR" | b"SKIPME" | b"MAXAGE"
     )
 }
@@ -162,7 +164,7 @@ fn cmd_client_kill(args: &[Bytes], client: &ClientState) -> CommandOutcome {
     let mut id_filter: Option<i64> = None;
     let mut idx = 0usize;
     while idx < args.len() {
-        let option = to_uppercase_bytes(&args[idx]);
+        let option = to_uppercase_stack(&args[idx]);
         match option.as_slice() {
             b"ID" => {
                 if idx + 1 >= args.len() {
@@ -220,7 +222,7 @@ fn cmd_client_pause(args: &[Bytes]) -> CommandOutcome {
         if rest.len() != 1 {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
-        let mode = to_uppercase_bytes(&rest[0]);
+        let mode = to_uppercase_stack(&rest[0]);
         if !matches!(mode.as_slice(), b"WRITE" | b"ALL") {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
@@ -251,7 +253,7 @@ fn cmd_client_unblock(args: &[Bytes], _client: &ClientState) -> CommandOutcome {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
 
-        let option = to_uppercase_bytes(&rest[0]);
+        let option = to_uppercase_stack(&rest[0]);
         if !matches!(option.as_slice(), b"TIMEOUT" | b"ERROR") {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
@@ -261,7 +263,7 @@ fn cmd_client_unblock(args: &[Bytes], _client: &ClientState) -> CommandOutcome {
 }
 
 fn parse_on_off(arg: &Bytes) -> Option<bool> {
-    let upper = to_uppercase_bytes(arg);
+    let upper = to_uppercase_stack(arg);
     match upper.as_slice() {
         b"ON" | b"YES" => Some(true),
         b"OFF" | b"NO" => Some(false),
@@ -274,7 +276,7 @@ fn cmd_client_tracking(args: &[Bytes], client: &mut ClientState) -> CommandOutco
         return wrong_arity("client");
     }
 
-    let first = to_uppercase_bytes(&args[0]);
+    let first = to_uppercase_stack(&args[0]);
     match first.as_slice() {
         b"ON" => client.tracking_enabled = true,
         b"OFF" => {
@@ -290,7 +292,7 @@ fn cmd_client_tracking(args: &[Bytes], client: &mut ClientState) -> CommandOutco
 
     let mut idx = 1usize;
     while idx < args.len() {
-        let option = to_uppercase_bytes(&args[idx]);
+        let option = to_uppercase_stack(&args[idx]);
         match option.as_slice() {
             b"REDIRECT" => {
                 if idx + 1 >= args.len() {
@@ -364,7 +366,7 @@ fn cmd_client_setinfo(args: &[Bytes]) -> CommandOutcome {
         return wrong_arity("client");
     };
 
-    let upper = to_uppercase_bytes(field);
+    let upper = to_uppercase_stack(field);
     if !matches!(upper.as_slice(), b"LIB-NAME" | b"LIB-VER") {
         return CommandOutcome::reply(err("ERR syntax error"));
     }
@@ -399,12 +401,16 @@ fn cmd_client_reply(args: &[Bytes], client: &mut ClientState) -> CommandOutcome 
         return wrong_arity("client");
     };
 
-    let upper = to_uppercase_bytes(mode);
-    if !matches!(upper.as_slice(), b"ON" | b"OFF" | b"SKIP") {
-        return CommandOutcome::reply(err("ERR syntax error"));
-    }
+    // Use case-insensitive comparison for validation
+    let upper = to_uppercase_stack(mode);
+    let mode_str = match upper.as_slice() {
+        b"ON" => b"on" as &[u8],
+        b"OFF" => b"off",
+        b"SKIP" => b"skip",
+        _ => return CommandOutcome::reply(err("ERR syntax error")),
+    };
 
-    client.reply_mode = Bytes::from(upper.to_ascii_lowercase());
+    client.reply_mode = Bytes::from_static(mode_str);
     CommandOutcome::reply(RespFrame::ok())
 }
 
@@ -413,14 +419,14 @@ fn parse_client_list_filter(args: &[Bytes], client_id: i64) -> Result<bool, Resp
     let mut idx = 0usize;
 
     while idx < args.len() {
-        let option = to_uppercase_bytes(&args[idx]);
+        let option = to_uppercase_stack(&args[idx]);
         match option.as_slice() {
             b"TYPE" => {
                 if idx + 1 >= args.len() {
                     return Err(err("ERR syntax error"));
                 }
 
-                let type_filter = to_uppercase_bytes(&args[idx + 1]);
+                let type_filter = to_uppercase_stack(&args[idx + 1]);
                 include_current &= matches!(type_filter.as_slice(), b"NORMAL");
                 idx += 2;
             }
@@ -444,28 +450,44 @@ fn parse_client_list_filter(args: &[Bytes], client_id: i64) -> Result<bool, Resp
 }
 
 pub(super) fn format_client_info_line(client: &ClientState) -> String {
+    const ESTIMATED_CAPACITY: usize = 256;
+    let mut out = String::with_capacity(ESTIMATED_CAPACITY);
+
     let now = now_ms();
     let age = (now.saturating_sub(client.created_at_ms) / 1000).max(0);
     let idle = (now.saturating_sub(client.last_interaction_ms) / 1000).max(0);
-    let name = client
-        .name
-        .as_ref()
-        .map(|value| String::from_utf8_lossy(value).into_owned())
-        .unwrap_or_default();
-    let cmd = if client.last_command.is_empty() {
+
+    // ASCII fast path for name
+    let name = client.name.as_ref().map(|v| {
+        std::str::from_utf8(v).map(|s| s.to_string())
+            .unwrap_or_else(|_| String::from_utf8_lossy(v).into_owned())
+    }).unwrap_or_default();
+
+    // ASCII fast path for command
+    let cmd: String = if client.last_command.is_empty() {
         "NULL".to_string()
     } else {
-        String::from_utf8_lossy(&client.last_command).to_ascii_lowercase()
+        // For display, convert to lowercase; try ASCII fast path first
+        std::str::from_utf8(&client.last_command)
+            .map(|s| s.to_ascii_lowercase())
+            .unwrap_or_else(|_| String::from_utf8_lossy(&client.last_command).into_owned())
     };
-    let user = String::from_utf8_lossy(&client.acl_user).into_owned();
-    let multi = if client.in_multi {
-        client.tx_queue.len() as i64
+
+    // ASCII fast path for user
+    let user = std::str::from_utf8(&client.acl_user)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| String::from_utf8_lossy(&client.acl_user).into_owned());
+
+    let multi = if client.tx_state.in_multi() {
+        client.tx_state.queue_len() as i64
     } else {
         -1
     };
 
-    format!(
-        "id={} addr=127.0.0.1:0 laddr=127.0.0.1:0 fd=-1 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={user} redir=-1 resp=2",
-        client.id, name, age, idle, client.selected_db, multi, cmd
-    )
+    let _ = write!(
+        out,
+        "id={} addr=127.0.0.1:0 laddr=127.0.0.1:0 fd=-1 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp=2",
+        client.id, name, age, idle, client.selected_db, multi, cmd, user
+    );
+    out
 }

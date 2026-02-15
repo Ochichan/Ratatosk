@@ -121,17 +121,33 @@ impl SortedSet {
         self.by_member.is_empty()
     }
 
+    /// Insert a member with a score into the sorted set.
+    ///
+    /// Returns `true` if this is a new member, `false` if the score was updated
+    /// for an existing member. Rejects NaN and infinite scores.
     pub fn insert(&mut self, member: Bytes, score: f64) -> bool {
+        // 1. Score validity check (must be first - reject NaN/Inf)
+        if !score.is_finite() {
+            return false;
+        }
+
         let new_score = SortedSetScore(score);
+
+        // 2. If existing member has same score, no change needed
         if let Some(old_score) = self.by_member.get(&member).copied() {
             if old_score == new_score {
                 return false;
             }
+            // 3. Remove old entry from by_score BEFORE modifying by_member
+            // This ensures if we panic after by_member update, we haven't
+            // lost the by_score reference yet
             self.by_score.remove(&SortedSetEntry {
                 score: old_score,
                 member: member.clone(),
             });
         }
+
+        // 4. Insert new entry (by_member first, then by_score)
         let is_new = self.by_member.insert(member.clone(), new_score).is_none();
         self.by_score.insert(
             SortedSetEntry {
@@ -143,16 +159,21 @@ impl SortedSet {
         is_new
     }
 
+    /// Remove a member from the sorted set.
+    ///
+    /// Returns `true` if the member was present and removed, `false` otherwise.
     pub fn remove(&mut self, member: &Bytes) -> bool {
-        if let Some(score) = self.by_member.remove(member) {
-            self.by_score.remove(&SortedSetEntry {
-                score,
-                member: member.clone(),
-            });
-            true
-        } else {
-            false
-        }
+        // 1. Remove from by_member first and get the score
+        let Some(score) = self.by_member.remove(member) else {
+            return false;
+        };
+
+        // 2. Remove from by_score using the obtained score
+        self.by_score.remove(&SortedSetEntry {
+            score,
+            member: member.clone(),
+        });
+        true
     }
 
     pub fn score(&self, member: &Bytes) -> Option<f64> {
@@ -188,6 +209,26 @@ pub enum LexBound {
     PosInf,
     Inclusive(Bytes),
     Exclusive(Bytes),
+}
+
+// ---------------------------------------------------------------------------
+// AofWriteState — explicit state machine for AOF write latch
+// ---------------------------------------------------------------------------
+
+/// Represents the state of AOF (Append-Only File) writes.
+///
+/// When a write error occurs, the AOF enters a "latched" state where
+/// further writes are blocked until the error is cleared.
+#[derive(Debug, Clone, Default)]
+pub enum AofWriteState {
+    /// Normal operation - writes are allowed
+    #[default]
+    Normal,
+    /// Latched state - writes blocked due to error
+    Latched {
+        last_error: String,
+        latched_at_ms: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1719,13 +1760,30 @@ pub struct ServerState {
     last_rdb_save_status: Option<Result<(), String>>,
     last_rdb_save_time_ms: Option<i64>,
     aof_enabled: bool,
-    aof_last_error: Option<String>,
+    aof_write_state: AofWriteState,
     aof_rewrite_in_progress: bool,
     last_aof_rewrite_status: Option<Result<(), String>>,
     last_aof_rewrite_time_ms: Option<i64>,
 }
 
 impl ServerState {
+    /// Maximum safe client ID before we risk wraparound.
+    /// Using i64::MAX / 2 provides a large safety margin while still
+    /// allowing billions of connections.
+    const MAX_CLIENT_ID: i64 = i64::MAX / 2;
+
+    /// Debug-only invariant check: ensures dbs and key_versions stay synchronized.
+    #[cfg(debug_assertions)]
+    fn assert_invariants(&self) {
+        assert_eq!(
+            self.dbs.len(),
+            self.key_versions.len(),
+            "dbs and key_versions must have same length ({} vs {})",
+            self.dbs.len(),
+            self.key_versions.len()
+        );
+    }
+
     pub fn new(db_count: usize) -> Self {
         let mut dbs = Vec::with_capacity(db_count);
         let mut key_versions = Vec::with_capacity(db_count);
@@ -1735,7 +1793,7 @@ impl ServerState {
         }
 
         let node_id = generate_cluster_node_id();
-        Self {
+        let result = Self {
             dbs,
             key_versions,
             next_client_id: 1,
@@ -1752,11 +1810,14 @@ impl ServerState {
             last_rdb_save_status: None,
             last_rdb_save_time_ms: None,
             aof_enabled: false,
-            aof_last_error: None,
+            aof_write_state: AofWriteState::default(),
             aof_rewrite_in_progress: false,
             last_aof_rewrite_status: None,
             last_aof_rewrite_time_ms: None,
-        }
+        };
+        #[cfg(debug_assertions)]
+        result.assert_invariants();
+        result
     }
 
     pub fn with_default_dbs() -> Self {
@@ -1764,8 +1825,14 @@ impl ServerState {
     }
 
     pub fn alloc_client_id(&mut self) -> i64 {
+        if self.next_client_id >= Self::MAX_CLIENT_ID {
+            panic!(
+                "client ID pool exhausted (reached {}), restart server to reset",
+                Self::MAX_CLIENT_ID
+            );
+        }
         let id = self.next_client_id;
-        self.next_client_id = self.next_client_id.wrapping_add(1);
+        self.next_client_id += 1;
         id
     }
 
@@ -1811,6 +1878,8 @@ impl ServerState {
     pub fn load_from_rdb(&mut self, data: DbSnapshot) {
         self.dbs = data;
         self.key_versions = (0..self.dbs.len()).map(|_| HashMap::new()).collect();
+        #[cfg(debug_assertions)]
+        self.assert_invariants();
     }
 
     pub fn started_at_ms(&self) -> i64 {
@@ -1827,10 +1896,10 @@ impl ServerState {
         self.key_versions[db_idx].get(key).copied().unwrap_or(0)
     }
 
-    pub fn touch_key_version(&mut self, db_idx: usize, key: &Bytes) {
+    pub fn touch_key_version(&mut self, db_idx: usize, key: Bytes) {
         let version = self.next_key_version;
         self.next_key_version = self.next_key_version.wrapping_add(1);
-        self.key_versions[db_idx].insert(key.clone(), version);
+        self.key_versions[db_idx].insert(key, version);
     }
 
     /// Set the lazy-free sender channel. Called once during server startup.
@@ -1845,7 +1914,7 @@ impl ServerState {
         let Some(value) = self.dbs[db_idx].remove(key) else {
             return false;
         };
-        self.touch_key_version(db_idx, key);
+        self.touch_key_version(db_idx, key.clone());
 
         if let Some(ref tx) = self.lazy_free_tx {
             if should_lazy_free(&value) {
@@ -1909,19 +1978,33 @@ impl ServerState {
     }
 
     pub fn aof_last_error(&self) -> Option<&str> {
-        self.aof_last_error.as_deref()
+        match &self.aof_write_state {
+            AofWriteState::Latched { last_error, .. } => Some(last_error),
+            AofWriteState::Normal => None,
+        }
     }
 
     pub fn set_aof_last_error(&mut self, error: impl Into<String>) {
-        self.aof_last_error = Some(error.into());
+        self.aof_write_state = AofWriteState::Latched {
+            last_error: error.into(),
+            latched_at_ms: unix_ms_now(),
+        };
     }
 
     pub fn clear_aof_last_error(&mut self) {
-        self.aof_last_error = None;
+        self.aof_write_state = AofWriteState::Normal;
     }
 
     pub fn aof_write_latched(&self) -> bool {
-        self.aof_last_error.is_some()
+        matches!(self.aof_write_state, AofWriteState::Latched { .. })
+    }
+
+    /// Returns the timestamp when AOF was latched, if currently latched.
+    pub fn aof_latched_at_ms(&self) -> Option<i64> {
+        match &self.aof_write_state {
+            AofWriteState::Latched { latched_at_ms, .. } => Some(*latched_at_ms),
+            AofWriteState::Normal => None,
+        }
     }
 
     pub fn aof_rewrite_in_progress(&self) -> bool {
