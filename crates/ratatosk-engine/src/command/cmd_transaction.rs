@@ -4,7 +4,9 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, purge_expired_key};
 
-use super::{ClientState, CommandOutcome, TransactionState, WatchedKey, err, execute, now_ms, wrong_arity};
+use super::{
+    ClientState, CommandOutcome, TransactionState, WatchedKey, err, execute, now_ms, wrong_arity,
+};
 
 pub(super) fn cmd_multi(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
     if !args.is_empty() {
@@ -116,7 +118,9 @@ pub(super) fn cmd_watch(
 
     for key in args {
         let version = server.key_version(db_index, key);
-        client.watched.insert((db_index, key.clone()), WatchedKey { version });
+        client
+            .watched
+            .insert((db_index, key.clone()), WatchedKey { version });
     }
 
     CommandOutcome::reply(RespFrame::ok())

@@ -25,17 +25,17 @@ use cmd_key::{
 };
 
 use std::sync::LazyLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use hashbrown::HashMap as HashBrownMap;
+use smallvec::SmallVec;
 
 use ratatosk_resp::frame::RespFrame;
 
 use crate::{
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
     keyspace::ServerState,
-    object::now_us,
     security::sanitize_error_message,
 };
 
@@ -3361,7 +3361,13 @@ impl TransactionState {
 
     /// Returns true if the transaction has an error flag set
     pub fn has_error(&self) -> bool {
-        matches!(self, TransactionState::InTransaction { has_error: true, .. })
+        matches!(
+            self,
+            TransactionState::InTransaction {
+                has_error: true,
+                ..
+            }
+        )
     }
 }
 
@@ -3406,7 +3412,7 @@ impl ClientState {
     }
 
     pub fn new(id: i64) -> Self {
-        let now_ms = now_ms();
+        let now_ms = now_client_clock_ms();
         Self {
             id,
             selected_db: 0,
@@ -3437,7 +3443,7 @@ impl ClientState {
         self.acl_user = Bytes::from_static(b"default");
         self.tx_state = TransactionState::default();
         self.watched.clear();
-        self.last_interaction_ms = now_ms();
+        self.last_interaction_ms = now_client_clock_ms();
         self.last_command = Bytes::new();
         self.subscribed_channels.clear();
         self.subscribed_patterns.clear();
@@ -3488,7 +3494,10 @@ pub fn execute(
         return CommandOutcome::reply(err("NOAUTH Authentication required."));
     }
 
-    if client.authenticated && !allow_without_auth {
+    if client.authenticated
+        && !allow_without_auth
+        && !(client.acl_user.as_ref() == b"default" && server.acl.default_user_has_full_access())
+    {
         if let Some(candidate) = spec {
             let required_mask = acl_required_category_mask(candidate);
             if !server
@@ -3503,8 +3512,12 @@ pub fn execute(
     }
 
     server.stats.mark_command_processed();
-    client.last_interaction_ms = now_ms();
-    client.last_command = command_raw.clone();
+    if !matches!(command.as_slice(), b"PING" | b"ECHO") {
+        client.last_interaction_ms = now_client_clock_ms();
+    }
+    if client.last_command.as_ref() != command_raw.as_ref() {
+        client.last_command = command_raw.clone();
+    }
 
     const MAX_TX_QUEUE_SIZE: usize = 65536;
 
@@ -3526,13 +3539,47 @@ pub fn execute(
                 *has_error = true;
                 return CommandOutcome::reply(err("ERR transaction queue limit reached"));
             }
-            queue.push(argv);
+            queue.push(argv.into_vec());
         }
         return CommandOutcome::reply(RespFrame::queued());
     }
 
     let args = &argv[1..];
-    let started_us = now_us();
+    let track_slowlog = should_track_slowlog(server, command.as_slice());
+    let track_latency = should_track_latency(server, command.as_slice());
+    let started = if track_slowlog || track_latency {
+        Some(Instant::now())
+    } else {
+        None
+    };
+
+    // Fast dispatch for ultra-hot readonly commands to avoid large match fan-out.
+    if command.as_slice() == b"PING" {
+        let outcome = cmd_connection::cmd_ping(args, server);
+        if let Some(started) = started {
+            let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+            if track_slowlog {
+                maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
+            }
+            if track_latency {
+                maybe_track_latency(server, command.as_slice(), elapsed_us);
+            }
+        }
+        return outcome;
+    }
+    if command.as_slice() == b"ECHO" {
+        let outcome = cmd_connection::cmd_echo(args);
+        if let Some(started) = started {
+            let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+            if track_slowlog {
+                maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
+            }
+            if track_latency {
+                maybe_track_latency(server, command.as_slice(), elapsed_us);
+            }
+        }
+        return outcome;
+    }
 
     let outcome = match command.as_slice() {
         b"PING" => cmd_connection::cmd_ping(args, server),
@@ -3858,17 +3905,28 @@ pub fn execute(
         }
     };
 
-    let elapsed_us = now_us().saturating_sub(started_us);
-    maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
-    maybe_track_latency(server, command.as_slice(), elapsed_us);
-    maybe_track_write_version(
-        server,
-        client,
-        command.as_slice(),
-        &argv,
-        &outcome.response,
-        spec,
-    );
+    if let Some(started) = started {
+        let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+        if track_slowlog {
+            maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
+        }
+        if track_latency {
+            maybe_track_latency(server, command.as_slice(), elapsed_us);
+        }
+    }
+
+    if let Some(spec) = spec {
+        if spec.flags.contains(&"write") {
+            maybe_track_write_version(
+                server,
+                client,
+                command.as_slice(),
+                &argv,
+                &outcome.response,
+                spec,
+            );
+        }
+    }
     outcome
 }
 
@@ -3887,6 +3945,14 @@ fn maybe_track_latency(server: &mut ServerState, command: &[u8], duration_us: i6
 
     let ms = (duration_us / 1000).max(0);
     server.stats.record_latency_sample(command, ms);
+}
+
+fn should_track_slowlog(server: &ServerState, command: &[u8]) -> bool {
+    command != b"SLOWLOG" && server.stats.slowlog_tracking_enabled()
+}
+
+fn should_track_latency(server: &ServerState, command: &[u8]) -> bool {
+    !matches!(command, b"LATENCY" | b"SLOWLOG") && server.stats.latency_tracking_enabled()
 }
 
 const ACL_CATEGORY_ADMIN: u8 = 1 << 0;
@@ -4003,17 +4069,9 @@ fn maybe_track_write_version(
     command: &[u8],
     argv: &[Bytes],
     response: &RespFrame,
-    spec: Option<CommandSpec>,
+    spec: CommandSpec,
 ) {
     if matches!(response, RespFrame::Error(_)) {
-        return;
-    }
-
-    let Some(spec) = spec else {
-        return;
-    };
-
-    if !spec.flags.contains(&"write") {
         return;
     }
 
@@ -4046,6 +4104,13 @@ fn maybe_track_write_version(
     };
 
     if !should_mark {
+        return;
+    }
+
+    if command == b"SET" {
+        if let Some(key) = argv.get(1) {
+            server.touch_key_version(client.selected_db, key.clone());
+        }
         return;
     }
 
@@ -4118,21 +4183,19 @@ fn maybe_track_write_version(
         return;
     }
 
-    if let Some(positions) = cmd_connection::extract_command_key_positions(spec, argv.len()) {
-        for pos in positions {
-            if let Some(key) = argv.get(pos) {
-                server.touch_key_version(client.selected_db, key.clone());
-            }
+    cmd_connection::for_each_command_key_position(spec, argv.len(), |pos| {
+        if let Some(key) = argv.get(pos) {
+            server.touch_key_version(client.selected_db, key.clone());
         }
-    }
+    });
 }
 
-fn frame_to_argv(frame: RespFrame) -> Result<Vec<Bytes>, RespFrame> {
+fn frame_to_argv(frame: RespFrame) -> Result<SmallVec<[Bytes; 16]>, RespFrame> {
     let RespFrame::Array(items) = frame else {
         return Err(err("ERR protocol error: expected array command frame"));
     };
 
-    let mut out = Vec::with_capacity(items.len());
+    let mut out = SmallVec::<[Bytes; 16]>::with_capacity(items.len());
     for item in items {
         match item {
             RespFrame::BulkString(Some(value)) => out.push(value),
@@ -4281,6 +4344,10 @@ fn now_ms() -> i64 {
     }
 }
 
+pub(super) fn now_client_clock_ms() -> i64 {
+    i64::try_from(ratatosk_core::time::monotonic_ms()).unwrap_or(i64::MAX)
+}
+
 fn parse_i64(raw: &Bytes) -> Option<i64> {
     crate::object::parse_i64(raw)
 }
@@ -4300,21 +4367,28 @@ fn err(message: &str) -> RespFrame {
     RespFrame::error_str(&sanitized)
 }
 
-pub(super) enum UpperBuf {
+pub(super) enum UpperBuf<'a> {
+    Borrowed(&'a [u8]),
     Stack([u8; 32], usize),
     Heap(Vec<u8>),
 }
 
-impl UpperBuf {
+impl UpperBuf<'_> {
     pub(super) fn as_slice(&self) -> &[u8] {
         match self {
+            Self::Borrowed(slice) => slice,
             Self::Stack(buf, len) => &buf[..*len],
             Self::Heap(vec) => vec.as_slice(),
         }
     }
 }
 
-pub(super) fn to_uppercase_stack(input: &Bytes) -> UpperBuf {
+pub(super) fn to_uppercase_stack(input: &Bytes) -> UpperBuf<'_> {
+    // Fast path: most clients already send uppercase commands.
+    if !input.iter().any(u8::is_ascii_lowercase) {
+        return UpperBuf::Borrowed(input.as_ref());
+    }
+
     if input.len() <= 32 {
         let mut buf = [0u8; 32];
         for (i, &b) in input.iter().enumerate() {
@@ -5581,6 +5655,15 @@ active:baseline
     fn latency_baseline_commands() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "latency-tracking", "yes"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
 
         let help = run(&["LATENCY", "HELP"], &mut server, &mut client);
         let RespFrame::Array(help_rows) = help else {

@@ -1079,6 +1079,7 @@ pub struct StatsState {
     last_save_unix_sec: i64,
     slowlog_log_slower_than_us: i64,
     slowlog_max_len: usize,
+    latency_tracking_enabled: bool,
     slowlog_entries: VecDeque<SlowlogEntry>,
     next_slowlog_id: i64,
     latency_events: HashMap<Vec<u8>, VecDeque<(i64, i64)>>,
@@ -1104,8 +1105,10 @@ impl Default for StatsState {
         Self {
             total_commands_processed: 0,
             last_save_unix_sec: unix_sec_now(),
-            slowlog_log_slower_than_us: 10_000,
+            // Disabled by default on hot path; enable explicitly with CONFIG SET.
+            slowlog_log_slower_than_us: -1,
             slowlog_max_len: 128,
+            latency_tracking_enabled: false,
             slowlog_entries: VecDeque::new(),
             next_slowlog_id: 0,
             latency_events: HashMap::new(),
@@ -1253,6 +1256,10 @@ impl StatsState {
         self.slowlog_max_len
     }
 
+    pub fn slowlog_tracking_enabled(&self) -> bool {
+        self.slowlog_log_slower_than_us >= 0 && self.slowlog_max_len > 0
+    }
+
     pub fn set_slowlog_max_len(&mut self, value: usize) {
         self.slowlog_max_len = value;
         while self.slowlog_entries.len() > self.slowlog_max_len {
@@ -1298,16 +1305,40 @@ impl StatsState {
     }
 
     pub fn record_latency_sample(&mut self, event: &[u8], latency_ms: i64) {
+        if !self.latency_tracking_enabled {
+            return;
+        }
+
+        let now_sec = unix_sec_now();
+        let sample_ms = latency_ms.max(0);
         let history = self
             .latency_events
             .raw_entry_mut()
             .from_key(event)
             .or_insert_with(|| (event.to_ascii_lowercase(), VecDeque::new()))
             .1;
-        history.push_back((unix_sec_now(), latency_ms.max(0)));
+        // Keep one zero-latency sample per event per second to reduce churn
+        // on fast command loops while preserving LATENCY visibility.
+        if sample_ms == 0
+            && history
+                .back()
+                .is_some_and(|(last_ts, last_ms)| *last_ts == now_sec && *last_ms == 0)
+        {
+            return;
+        }
+
+        history.push_back((now_sec, sample_ms));
         while history.len() > 160 {
             history.pop_front();
         }
+    }
+
+    pub fn latency_tracking_enabled(&self) -> bool {
+        self.latency_tracking_enabled
+    }
+
+    pub fn set_latency_tracking_enabled(&mut self, enabled: bool) {
+        self.latency_tracking_enabled = enabled;
     }
 
     pub fn latency_latest(&self) -> Vec<(Bytes, i64, i64, i64)> {
@@ -1448,6 +1479,12 @@ impl AclState {
         self.users
             .get(b"default" as &[u8])
             .is_some_and(|user| user.enabled && user.nopass)
+    }
+
+    pub fn default_user_has_full_access(&self) -> bool {
+        self.users
+            .get(b"default" as &[u8])
+            .is_some_and(|user| user.enabled && user.allow_all_commands)
     }
 
     pub fn command_allowed(&self, username: &Bytes, required_categories: &[&[u8]]) -> bool {
