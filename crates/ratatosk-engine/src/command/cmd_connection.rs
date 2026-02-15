@@ -507,30 +507,24 @@ pub(super) fn cmd_command_getkeys(args: &[Bytes], with_flags: bool) -> CommandOu
         )));
     };
 
-    let argv_len = args.len();
-    let Some(positions) = extract_command_key_positions(spec, argv_len) else {
-        return CommandOutcome::reply(RespFrame::Array(vec![]));
-    };
-
-    let keys: Vec<RespFrame> = positions
-        .into_iter()
-        .filter_map(|pos| {
-            args.get(pos).map(|key| {
-                if with_flags {
-                    RespFrame::Array(vec![
-                        RespFrame::BulkString(Some(key.clone())),
-                        RespFrame::Array(vec![
-                            RespFrame::bulk_str("RW"),
-                            RespFrame::bulk_str("access"),
-                            RespFrame::bulk_str("update"),
-                        ]),
-                    ])
-                } else {
-                    RespFrame::BulkString(Some(key.clone()))
-                }
-            })
-        })
-        .collect();
+    let mut keys = Vec::new();
+    for_each_command_key_position(spec, args.len(), |pos| {
+        let Some(key) = args.get(pos) else {
+            return;
+        };
+        if with_flags {
+            keys.push(RespFrame::Array(vec![
+                RespFrame::BulkString(Some(key.clone())),
+                RespFrame::Array(vec![
+                    RespFrame::bulk_str("RW"),
+                    RespFrame::bulk_str("access"),
+                    RespFrame::bulk_str("update"),
+                ]),
+            ]));
+        } else {
+            keys.push(RespFrame::BulkString(Some(key.clone())));
+        }
+    });
 
     CommandOutcome::reply(RespFrame::Array(keys))
 }
@@ -543,12 +537,13 @@ pub(super) fn command_arity_matches(arity: i16, argc: usize) -> bool {
     }
 }
 
-pub(super) fn extract_command_key_positions(
+pub(super) fn for_each_command_key_position(
     spec: CommandSpec,
     argv_len: usize,
-) -> Option<Vec<usize>> {
+    mut f: impl FnMut(usize),
+) {
     if spec.first_key == 0 {
-        return None;
+        return;
     }
 
     let first = spec.first_key as usize;
@@ -559,14 +554,15 @@ pub(super) fn extract_command_key_positions(
     };
     let step = spec.key_step.max(1) as usize;
 
-    let mut positions = Vec::new();
-    let mut pos = first;
-    while pos <= last && pos < argv_len {
-        positions.push(pos);
-        pos += step;
+    if first >= argv_len {
+        return;
     }
 
-    Some(positions)
+    let mut pos = first;
+    while pos <= last && pos < argv_len {
+        f(pos);
+        pos += step;
+    }
 }
 
 fn command_full_reply() -> RespFrame {

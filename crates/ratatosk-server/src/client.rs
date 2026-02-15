@@ -1,4 +1,8 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use bytes::{Bytes, BytesMut};
 use ratatosk_engine::{
@@ -30,6 +34,8 @@ const AOF_APPEND_SLOW_THRESHOLD: Duration = Duration::from_secs(3);
 const OUTPUT_BUFFER_LIMIT_ERR: &str = "ERR output buffer limit exceeded";
 const AOF_WRITE_LATCH_ERR_PREFIX: &str =
     "MISCONF writes are blocked because AOF persistence is in an error state";
+const READONLY_BATCH_ENV: &str = "RATATOSK_PIPELINE_READONLY_BATCH_LOCK";
+static READONLY_BATCH_ENABLED: OnceLock<bool> = OnceLock::new();
 
 pub type SharedServerState = Arc<Mutex<ServerState>>;
 
@@ -80,6 +86,90 @@ fn next_retry_backoff(current: Duration) -> Duration {
         .checked_mul(2)
         .unwrap_or(BLOCKING_RETRY_BACKOFF_MAX)
         .min(BLOCKING_RETRY_BACKOFF_MAX)
+}
+
+fn readonly_batch_enabled() -> bool {
+    *READONLY_BATCH_ENABLED.get_or_init(|| match std::env::var(READONLY_BATCH_ENV) {
+        Ok(value) => {
+            !(value == "0"
+                || value.eq_ignore_ascii_case("false")
+                || value.eq_ignore_ascii_case("no")
+                || value.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    })
+}
+
+fn is_readonly_batch_command(command: &[u8]) -> bool {
+    command.eq_ignore_ascii_case(b"PING")
+        || command.eq_ignore_ascii_case(b"ECHO")
+        || command.eq_ignore_ascii_case(b"TIME")
+        || command.eq_ignore_ascii_case(b"DBSIZE")
+}
+
+async fn try_run_readonly_batch(
+    frames: Vec<RespFrame>,
+    server_state: &SharedServerState,
+    client_state: &mut ClientState,
+) -> Result<Vec<CommandOutcome>, Vec<RespFrame>> {
+    if !readonly_batch_enabled() || frames.len() < 2 {
+        return Err(frames);
+    }
+
+    let mut command_names = Vec::with_capacity(frames.len());
+    for frame in &frames {
+        let Some(argv) = frame_to_argv_for_persistence(frame) else {
+            return Err(frames);
+        };
+        let Some(command) = argv.first() else {
+            return Err(frames);
+        };
+        if is_write_command(&argv) || !is_readonly_batch_command(command) {
+            return Err(frames);
+        }
+        command_names.push(String::from_utf8_lossy(command).to_ascii_uppercase());
+    }
+
+    let lock_wait_start = std::time::Instant::now();
+    let mut server = server_state.lock().await;
+    metrics::record_server_state_lock_wait_ms(
+        "batch_execute_readonly",
+        lock_wait_start.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    let lock_hold_start = std::time::Instant::now();
+    let mut outcomes = Vec::with_capacity(command_names.len());
+    for (frame, command_name) in frames.into_iter().zip(command_names.iter()) {
+        breadcrumbs::record_command(
+            client_state.id(),
+            command_name,
+            client_state.selected_db(),
+            0,
+            "batch_execute",
+        );
+
+        let start = std::time::Instant::now();
+        let outcome = execute(frame, &mut server, client_state);
+        let duration = start.elapsed();
+        let success = !matches!(outcome.response, ratatosk_resp::RespFrame::Error(_));
+        metrics::record_command(command_name, success, duration.as_secs_f64());
+
+        if duration.as_millis() > 1 {
+            tracing::debug!(
+                target = "ratatosk::slow_command",
+                command = %command_name,
+                duration_ms = duration.as_micros() as f64 / 1000.0,
+                "slow command detected in readonly batch"
+            );
+        }
+        outcomes.push(outcome);
+    }
+    metrics::record_server_state_lock_hold_ms(
+        "batch_execute_readonly",
+        lock_hold_start.elapsed().as_secs_f64() * 1000.0,
+    );
+
+    Ok(outcomes)
 }
 
 fn aof_write_latch_error(detail: &str) -> RespFrame {
@@ -693,10 +783,10 @@ async fn handle_client_inner(
             return Ok(());
         }
 
-        let mut should_close = false;
+        let mut parsed_frames = Vec::new();
         loop {
-            let frame = match parse(&mut input) {
-                Ok(Some(frame)) => frame,
+            match parse(&mut input) {
+                Ok(Some(frame)) => parsed_frames.push(frame),
                 Ok(None) => break,
                 Err(error) => {
                     tracing::warn!(
@@ -710,26 +800,41 @@ async fn handle_client_inner(
                     write_all_with_timeout(&mut stream, &response).await?;
                     return Ok(());
                 }
+            }
+        }
+
+        let outcomes =
+            match try_run_readonly_batch(parsed_frames, server_state, &mut client_state).await {
+                Ok(outcomes) => outcomes,
+                Err(frames) => {
+                    let mut outcomes = Vec::with_capacity(frames.len());
+                    for frame in frames {
+                        let outcome = run_with_blocking_retry(
+                            frame,
+                            server_state,
+                            persistence,
+                            &mut client_state,
+                            &stream,
+                        )
+                        .await
+                        .map_err(|error| {
+                            io::Error::new(
+                                error.kind(),
+                                format!(
+                                    "executing command pipeline for client_id={}: {}",
+                                    client_state.id(),
+                                    error
+                                ),
+                            )
+                        })?;
+                        outcomes.push(outcome);
+                    }
+                    outcomes
+                }
             };
 
-            let outcome = run_with_blocking_retry(
-                frame,
-                server_state,
-                persistence,
-                &mut client_state,
-                &stream,
-            )
-            .await
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "executing command pipeline for client_id={}: {}",
-                        client_state.id(),
-                        error
-                    ),
-                )
-            })?;
+        let mut should_close = false;
+        for outcome in outcomes {
             if !append_encoded_frame(
                 &mut output,
                 &outcome.response,

@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Index - Criterion.rs</title>
+    <style type="text/css">
+        body {
+            font: 14px Helvetica Neue;
+            text-rendering: optimizelegibility;
+        }
+
+        .body {
+            width: 960px;
+            margin: auto;
+        }
+
+        a:link {
+            color: #1F78B4;
+            text-decoration: none;
+        }
+
+        h2 {
+            font-size: 36px;
+            font-weight: 300;
+        }
+
+        h3 {
+            font-size: 24px;
+            font-weight: 300;
+        }
+
+        #footer {
+            height: 40px;
+            background: #888;
+            color: white;
+            font-size: larger;
+            font-weight: 300;
+        }
+
+        #footer a {
+            color: white;
+            text-decoration: underline;
+        }
+
+        #footer p {
+            text-align: center
+        }
+
+        table {
+            border-collapse: collapse;
+        }
+
+        table,
+        th,
+        td {
+            border: 1px solid #888;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="body">
+        <h2>Criterion.rs Benchmark Index</h2>
+        See individual benchmark pages below for more details.
+        <ul>
+            <li><a href="../engine_comprehensive_connection_server/report/index.html">engine_comprehensive_connection_server</a></li>
+            
+            <ul>
+                <li><a href="../engine_comprehensive_connection_server/dbsize/report/index.html">dbsize</a></li>
+                <li><a href="../engine_comprehensive_connection_server/info_server/report/index.html">info_server</a></li>
+                <li><a href="../engine_comprehensive_connection_server/ping/report/index.html">ping</a></li>
+                <li><a href="../engine_comprehensive_connection_server/time/report/index.html">time</a></li>
+            </ul>
+            <li><a href="../engine_comprehensive_key_scan_pubsub/report/index.html">engine_comprehensive_key_scan_pubsub</a></li>
+            
+            <ul>
+                <li><a href="../engine_comprehensive_key_scan_pubsub/exists_32/report/index.html">exists_32</a></li>
+                <li><a href="../engine_comprehensive_key_scan_pubsub/publish_1sub/report/index.html">publish_1sub</a></li>
+                <li><a href="../engine_comprehensive_key_scan_pubsub/pubsub_numsub_16/report/index.html">pubsub_numsub_16</a></li>
+                <li>scan_match_count100</li>
+            </ul>
+            <li><a href="../engine_comprehensive_list_zset/report/index.html">engine_comprehensive_list_zset</a></li>
+            
+            <ul>
+                <li><a href="../engine_comprehensive_list_zset/list_lindex_middle/report/index.html">list_lindex_middle</a></li>
+                <li>list_lrange_100</li>
+                <li>zset_zrange_100</li>
+                <li><a href="../engine_comprehensive_list_zset/zset_zscore_middle/report/index.html">zset_zscore_middle</a></li>
+            </ul>
+            <li><a href="../engine_comprehensive_string_hash/report/index.html">engine_comprehensive_string_hash</a></li>
+            
+            <ul>
+                <li>hash_hget</li>
+                <li><a href="../engine_comprehensive_string_hash/hash_hgetall_512/report/index.html">hash_hgetall_512</a></li>
+                <li><a href="../engine_comprehensive_string_hash/hash_hmget_16/report/index.html">hash_hmget_16</a></li>
+                <li>string_get</li>
+                <li><a href="../engine_comprehensive_string_hash/string_mget_16/report/index.html">string_mget_16</a></li>
+                <li><a href="../engine_comprehensive_string_hash/string_set_overwrite/report/index.html">string_set_overwrite</a></li>
+            </ul>
+            <li><a href="../engine_set_hotpaths_execute/report/index.html">engine_set_hotpaths_execute</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th><a href="../engine_set_hotpaths_execute/sinter/report/index.html">sinter</a></th>
+                            <th><a href="../engine_set_hotpaths_execute/sinterstore/report/index.html">sinterstore</a></th>
+                            <th><a href="../engine_set_hotpaths_execute/srandmember_neg/report/index.html">srandmember_neg</a></th>
+                        </tr>
+                        <tr>
+                            <th><a href="../engine_set_hotpaths_execute/1024/report/index.html">1024</a></th>
+                            <td><a href="../engine_set_hotpaths_execute/sinter/1024/report/index.html">engine_set_hotpaths_execute/sinter/1024</a></td>
+                            <td><a href="../engine_set_hotpaths_execute/sinterstore/1024/report/index.html">engine_set_hotpaths_execute/sinterstore/1024</a></td>
+                            <td><a href="../engine_set_hotpaths_execute/srandmember_neg/1024/report/index.html">engine_set_hotpaths_execute/srandmember_neg/1024</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../engine_set_hotpaths_execute/4096/report/index.html">4096</a></th>
+                            <td><a href="../engine_set_hotpaths_execute/sinter/4096/report/index.html">engine_set_hotpaths_execute/sinter/4096</a></td>
+                            <td><a href="../engine_set_hotpaths_execute/sinterstore/4096/report/index.html">engine_set_hotpaths_execute/sinterstore/4096</a></td>
+                            <td><a href="../engine_set_hotpaths_execute/srandmember_neg/4096/report/index.html">engine_set_hotpaths_execute/srandmember_neg/4096</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../engine_stream_hotpaths_execute/report/index.html">engine_stream_hotpaths_execute</a></li>
+            
+            <ul>
+                <li>
+                    <table>
+                        <tr>
+                            <th></th>
+                            <th><a href="../engine_stream_hotpaths_execute/xautoclaim_128/report/index.html">xautoclaim_128</a></th>
+                            <th><a href="../engine_stream_hotpaths_execute/xclaim_128/report/index.html">xclaim_128</a></th>
+                            <th><a href="../engine_stream_hotpaths_execute/xreadgroup/report/index.html">xreadgroup</a></th>
+                        </tr>
+                        <tr>
+                            <th><a href="../engine_stream_hotpaths_execute/2048/report/index.html">2048</a></th>
+                            <td><a href="../engine_stream_hotpaths_execute/xautoclaim_128/2048/report/index.html">engine_stream_hotpaths_execute/xautoclaim_128/2048</a></td>
+                            <td><a href="../engine_stream_hotpaths_execute/xclaim_128/2048/report/index.html">engine_stream_hotpaths_execute/xclaim_128/2048</a></td>
+                            <td><a href="../engine_stream_hotpaths_execute/xreadgroup/2048/report/index.html">engine_stream_hotpaths_execute/xreadgroup/2048</a></td>
+                        </tr>
+                        <tr>
+                            <th><a href="../engine_stream_hotpaths_execute/8192/report/index.html">8192</a></th>
+                            <td><a href="../engine_stream_hotpaths_execute/xautoclaim_128/8192/report/index.html">engine_stream_hotpaths_execute/xautoclaim_128/8192</a></td>
+                            <td><a href="../engine_stream_hotpaths_execute/xclaim_128/8192/report/index.html">engine_stream_hotpaths_execute/xclaim_128/8192</a></td>
+                            <td><a href="../engine_stream_hotpaths_execute/xreadgroup/8192/report/index.html">engine_stream_hotpaths_execute/xreadgroup/8192</a></td>
+                        </tr>
+                    </table>
+                </li>
+            </ul>
+            <li><a href="../pipeline_ping_encode_only/report/index.html">pipeline_ping_encode_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_ping_encode_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_ping_encode_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_ping_encode_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_ping_encode_only/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_ping_execute_only/report/index.html">pipeline_ping_execute_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_ping_execute_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_ping_execute_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_ping_execute_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_ping_execute_only/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_ping_parse_execute_encode/report/index.html">pipeline_ping_parse_execute_encode</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_ping_parse_execute_encode/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_ping_parse_execute_encode/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_ping_parse_execute_encode/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_ping_parse_execute_encode/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_ping_parse_only/report/index.html">pipeline_ping_parse_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_ping_parse_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_ping_parse_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_ping_parse_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_ping_parse_only/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_set_encode_only/report/index.html">pipeline_set_encode_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_set_encode_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_set_encode_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_set_encode_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_set_encode_only/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_set_execute_only/report/index.html">pipeline_set_execute_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_set_execute_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_set_execute_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_set_execute_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_set_execute_only/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_set_parse_execute_encode/report/index.html">pipeline_set_parse_execute_encode</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_set_parse_execute_encode/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_set_parse_execute_encode/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_set_parse_execute_encode/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_set_parse_execute_encode/1024/report/index.html">1024</a></li>
+            </ul>
+            <li><a href="../pipeline_set_parse_only/report/index.html">pipeline_set_parse_only</a></li>
+            
+            <ul>
+                <li><a href="../pipeline_set_parse_only/1/report/index.html">1</a></li>
+                <li><a href="../pipeline_set_parse_only/32/report/index.html">32</a></li>
+                <li><a href="../pipeline_set_parse_only/256/report/index.html">256</a></li>
+                <li><a href="../pipeline_set_parse_only/1024/report/index.html">1024</a></li>
+            </ul>
+        </ul>
+    </div>
+    <div id="footer">
+        <p>This report was generated by
+            <a href="https://github.com/bheisler/criterion.rs">Criterion.rs</a>, a statistics-driven benchmarking
+            library in Rust.</p>
+    </div>
+</body>
+</html>

@@ -105,19 +105,13 @@ impl AofWriter {
 
         // Emit SELECT if DB changed
         if db_index != self.current_db {
-            self.write_resp_array(&[
-                &Bytes::from_static(b"SELECT"),
-                &Bytes::from(db_index.to_string()),
-            ])
-            .map_err(|e| {
+            self.write_select_command(db_index).map_err(|e| {
                 io::Error::new(e.kind(), format!("appending AOF SELECT db {db_index}: {e}"))
             })?;
             self.current_db = db_index;
         }
 
-        // Encode args as RESP array
-        let refs: Vec<&Bytes> = args.iter().collect();
-        self.write_resp_array(&refs)
+        self.write_resp_array_bytes(args)
             .map_err(|e| io::Error::new(e.kind(), format!("appending AOF command: {e}")))?;
 
         self.maybe_fsync()?;
@@ -173,7 +167,17 @@ impl AofWriter {
         Ok(())
     }
 
-    fn write_resp_array(&mut self, args: &[&Bytes]) -> io::Result<()> {
+    fn write_select_command(&mut self, db_index: usize) -> io::Result<()> {
+        write!(
+            self.writer,
+            "*2\r\n$6\r\nSELECT\r\n${}\r\n",
+            decimal_len_usize(db_index)
+        )?;
+        write!(self.writer, "{db_index}\r\n")?;
+        Ok(())
+    }
+
+    fn write_resp_array_bytes(&mut self, args: &[Bytes]) -> io::Result<()> {
         // *<count>\r\n
         write!(self.writer, "*{}\r\n", args.len())?;
         for arg in args {
@@ -184,6 +188,15 @@ impl AofWriter {
         }
         Ok(())
     }
+}
+
+fn decimal_len_usize(mut value: usize) -> usize {
+    let mut digits = 1usize;
+    while value >= 10 {
+        value /= 10;
+        digits = digits.saturating_add(1);
+    }
+    digits
 }
 
 #[cfg(test)]

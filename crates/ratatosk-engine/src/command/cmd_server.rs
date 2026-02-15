@@ -425,6 +425,7 @@ enum ConfigSetOp {
     Save(Bytes),
     SlowlogLogSlowerThan(i64),
     SlowlogMaxLen(usize),
+    LatencyTracking(bool),
 }
 
 pub(super) fn cmd_config_get(args: &[Bytes], server: &ServerState) -> CommandOutcome {
@@ -532,6 +533,15 @@ pub(super) fn cmd_config_set(
                     "slowlog-max-len",
                 )
             }
+            b"LATENCY-TRACKING" => {
+                if value.eq_ignore_ascii_case(b"yes") {
+                    (ConfigSetOp::LatencyTracking(true), "latency-tracking")
+                } else if value.eq_ignore_ascii_case(b"no") {
+                    (ConfigSetOp::LatencyTracking(false), "latency-tracking")
+                } else {
+                    return CommandOutcome::reply(err("ERR argument must be 'yes' or 'no'"));
+                }
+            }
             b"DATABASES" => {
                 return CommandOutcome::reply(err("ERR Unsupported CONFIG parameter: databases"));
             }
@@ -570,6 +580,7 @@ pub(super) fn cmd_config_set(
                 server.stats.set_slowlog_log_slower_than_us(value)
             }
             ConfigSetOp::SlowlogMaxLen(value) => server.stats.set_slowlog_max_len(value),
+            ConfigSetOp::LatencyTracking(value) => server.stats.set_latency_tracking_enabled(value),
         }
     }
 
@@ -610,6 +621,14 @@ pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
         (
             Bytes::from_static(b"slowlog-max-len"),
             Bytes::from(server.stats.slowlog_max_len().to_string()),
+        ),
+        (
+            Bytes::from_static(b"latency-tracking"),
+            Bytes::from(if server.stats.latency_tracking_enabled() {
+                "yes"
+            } else {
+                "no"
+            }),
         ),
         (
             Bytes::from_static(b"timeout"),
@@ -1379,6 +1398,16 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "slowlog-max-len {}", server.stats.slowlog_max_len())
         .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "latency-tracking {}",
+        if server.stats.latency_tracking_enabled() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
 
     // Flush and close file
     drop(file);

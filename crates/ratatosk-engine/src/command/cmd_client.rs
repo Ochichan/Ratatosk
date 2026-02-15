@@ -7,7 +7,10 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::ServerState;
 use crate::security::should_reject_shell_metacharacters;
 
-use super::{ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_stack, wrong_arity};
+use super::{
+    ClientState, CommandOutcome, err, now_client_clock_ms, parse_i64, to_uppercase_stack,
+    wrong_arity,
+};
 
 pub(super) fn cmd_client(
     args: &[Bytes],
@@ -453,15 +456,20 @@ pub(super) fn format_client_info_line(client: &ClientState) -> String {
     const ESTIMATED_CAPACITY: usize = 256;
     let mut out = String::with_capacity(ESTIMATED_CAPACITY);
 
-    let now = now_ms();
+    let now = now_client_clock_ms();
     let age = (now.saturating_sub(client.created_at_ms) / 1000).max(0);
     let idle = (now.saturating_sub(client.last_interaction_ms) / 1000).max(0);
 
     // ASCII fast path for name
-    let name = client.name.as_ref().map(|v| {
-        std::str::from_utf8(v).map(|s| s.to_string())
-            .unwrap_or_else(|_| String::from_utf8_lossy(v).into_owned())
-    }).unwrap_or_default();
+    let name = client
+        .name
+        .as_ref()
+        .map(|v| {
+            std::str::from_utf8(v)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| String::from_utf8_lossy(v).into_owned())
+        })
+        .unwrap_or_default();
 
     // ASCII fast path for command
     let cmd: String = if client.last_command.is_empty() {
