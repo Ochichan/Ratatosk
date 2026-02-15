@@ -4,20 +4,21 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, purge_expired_key};
 
-use super::{ClientState, CommandOutcome, WatchedKey, err, execute, now_ms, wrong_arity};
+use super::{ClientState, CommandOutcome, TransactionState, WatchedKey, err, execute, now_ms, wrong_arity};
 
 pub(super) fn cmd_multi(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("multi");
     }
 
-    if client.in_multi {
+    if client.tx_state.in_multi() {
         return CommandOutcome::reply(err("ERR MULTI calls can not be nested"));
     }
 
-    client.in_multi = true;
-    client.tx_queue.clear();
-    client.tx_error = false;
+    client.tx_state = TransactionState::InTransaction {
+        queue: Vec::new(),
+        has_error: false,
+    };
     CommandOutcome::reply(RespFrame::ok())
 }
 
@@ -30,14 +31,12 @@ pub(super) fn cmd_exec(
         return wrong_arity("exec");
     }
 
-    if !client.in_multi {
+    if !client.tx_state.in_multi() {
         return CommandOutcome::reply(err("ERR EXEC without MULTI"));
     }
 
-    if client.tx_error {
-        client.in_multi = false;
-        client.tx_queue.clear();
-        client.tx_error = false;
+    if client.tx_state.has_error() {
+        client.tx_state = TransactionState::default();
         client.watched.clear();
         return CommandOutcome::reply(err(
             "EXECABORT Transaction discarded because of previous errors.",
@@ -47,11 +46,13 @@ pub(super) fn cmd_exec(
     let watched_dirty = client
         .watched
         .iter()
-        .any(|watch| server.key_version(watch.db_index, &watch.key) != watch.version);
+        .any(|((db_index, key), watch)| server.key_version(*db_index, key) != watch.version);
 
-    let queued = std::mem::take(&mut client.tx_queue);
-    client.in_multi = false;
-    client.tx_error = false;
+    let queued = match std::mem::take(&mut client.tx_state) {
+        TransactionState::InTransaction { queue, .. } => queue,
+        TransactionState::Normal => Vec::new(),
+    };
+    client.tx_state = TransactionState::default();
     client.watched.clear();
 
     if watched_dirty {
@@ -82,13 +83,11 @@ pub(super) fn cmd_discard(args: &[Bytes], client: &mut ClientState) -> CommandOu
         return wrong_arity("discard");
     }
 
-    if !client.in_multi {
+    if !client.tx_state.in_multi() {
         return CommandOutcome::reply(err("ERR DISCARD without MULTI"));
     }
 
-    client.in_multi = false;
-    client.tx_queue.clear();
-    client.tx_error = false;
+    client.tx_state = TransactionState::default();
     client.watched.clear();
     CommandOutcome::reply(RespFrame::ok())
 }
@@ -102,7 +101,7 @@ pub(super) fn cmd_watch(
         return wrong_arity("watch");
     }
 
-    if client.in_multi {
+    if client.tx_state.in_multi() {
         return CommandOutcome::reply(err("ERR WATCH inside MULTI is not allowed"));
     }
 
@@ -117,19 +116,7 @@ pub(super) fn cmd_watch(
 
     for key in args {
         let version = server.key_version(db_index, key);
-        if let Some(existing) = client
-            .watched
-            .iter_mut()
-            .find(|entry| entry.db_index == db_index && entry.key == *key)
-        {
-            existing.version = version;
-        } else {
-            client.watched.push(WatchedKey {
-                db_index,
-                key: key.clone(),
-                version,
-            });
-        }
+        client.watched.insert((db_index, key.clone()), WatchedKey { version });
     }
 
     CommandOutcome::reply(RespFrame::ok())

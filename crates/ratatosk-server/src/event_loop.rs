@@ -297,7 +297,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     let lazy_free_shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lazy_free_flag = Arc::clone(&lazy_free_shutdown);
     let lazy_free_handle = std::thread::spawn(move || {
-        while !lazy_free_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        while !lazy_free_flag.load(std::sync::atomic::Ordering::Acquire) {
             match lazy_free_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(value) => drop(value),
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
@@ -573,7 +573,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     tracing::info!("persistence flushed before shutdown");
 
     // Shut down lazy-free background thread
-    lazy_free_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    lazy_free_shutdown.store(true, std::sync::atomic::Ordering::Release);
     if let Err(error) = lazy_free_handle.join() {
         tracing::warn!("lazy-free thread panicked: {error:?}");
     }

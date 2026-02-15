@@ -208,7 +208,7 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
         };
 
         state.db_mut(db_idx).remove(&key);
-        state.touch_key_version(db_idx, &key);
+        state.touch_key_version(db_idx, key);
         evicted += 1;
     }
 
