@@ -240,6 +240,11 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
 }
 
 /// Select the best eviction candidate via sampling.
+///
+/// Uses a two-pass approach to avoid allocating a Vec of all keys:
+/// 1. Count candidate keys (all or volatile-only based on policy)
+/// 2. Pick random sample indices and collect only those keys
+/// 3. Score and return the best candidate
 fn select_eviction_candidate(
     state: &ServerState,
     config: &EvictionConfig,
@@ -255,28 +260,64 @@ fn select_eviction_candidate(
             continue;
         }
 
-        let keys: Vec<&Bytes> = db.keys().collect();
-        if keys.is_empty() {
+        // First pass: count candidate keys without allocating
+        let candidate_count = if config.policy.is_volatile() {
+            db.iter()
+                .filter(|(_, v)| v.expire_at_ms.is_some())
+                .count()
+        } else {
+            db.len()
+        };
+
+        if candidate_count == 0 {
             continue;
         }
 
-        for _ in 0..samples {
-            let idx = rng.gen_range(0..keys.len());
-            let key = keys[idx];
+        // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
+        // where k = samples_to_take, instead of O(n) for the full index array
+        let samples_to_take = samples.min(candidate_count);
+        let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
+        for i in samples_to_take..candidate_count {
+            let j = rng.gen_range(0..i + 1);
+            if j < samples_to_take {
+                sample_indices[j] = i;
+            }
+        }
+        sample_indices.sort_unstable();
 
-            let Some(value) = db.get(key) else {
-                continue;
-            };
+        // Second pass: collect only sampled keys (small, bounded allocation)
+        let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
+        let mut candidate_idx = 0;
+        let mut sample_cursor = 0;
 
+        for (key, value) in db.iter() {
             // For volatile policies, skip keys without TTL
             if config.policy.is_volatile() && value.expire_at_ms.is_none() {
                 continue;
             }
 
+            if sample_cursor < sample_indices.len()
+                && candidate_idx == sample_indices[sample_cursor]
+            {
+                sampled_keys.push(key.clone());
+                sample_cursor += 1;
+                if sample_cursor >= sample_indices.len() {
+                    break;
+                }
+            }
+            candidate_idx += 1;
+        }
+
+        // Score sampled keys and track the best
+        for key in sampled_keys {
+            let Some(value) = db.get(&key) else {
+                continue;
+            };
+
             let score = eviction_score(value, &config.policy);
             if best_key.is_none() || score > best_score {
                 best_score = score;
-                best_key = Some((db_idx, key.clone()));
+                best_key = Some((db_idx, key));
             }
         }
     }

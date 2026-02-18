@@ -136,33 +136,57 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
             continue;
         }
 
-        // Collect keys that have TTL set
-        let volatile_keys: Vec<Bytes> = db
+        // First pass: count volatile keys without allocating
+        let volatile_count = db
             .iter()
             .filter(|(_, v)| v.expire_at_ms.is_some())
-            .map(|(k, _)| k.clone())
-            .collect();
+            .count();
 
-        if volatile_keys.is_empty() {
+        if volatile_count == 0 {
             continue;
         }
 
+        // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
+        // where k = samples_to_take, instead of O(n) for the full index array
+        let samples_to_take = ACTIVE_EXPIRE_CYCLE_LOOKUPS.min(volatile_count);
+        let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
+        for i in samples_to_take..volatile_count {
+            let j = rng.gen_range(0..i + 1);
+            if j < samples_to_take {
+                sample_indices[j] = i;
+            }
+        }
+        sample_indices.sort_unstable();
+
+        // Second pass: collect only sampled keys (small, bounded allocation)
+        let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
+        let mut volatile_idx = 0;
+        let mut sample_cursor = 0;
+        for (key, value) in db.iter() {
+            if value.expire_at_ms.is_none() {
+                continue;
+            }
+            if sample_cursor < sample_indices.len() && volatile_idx == sample_indices[sample_cursor] {
+                sampled_keys.push(key.clone());
+                sample_cursor += 1;
+                if sample_cursor >= sample_indices.len() {
+                    break;
+                }
+            }
+            volatile_idx += 1;
+        }
+
+        // Process sampled keys
         let mut expired = 0usize;
-        let mut sampled = 0usize;
-
-        while sampled < ACTIVE_EXPIRE_CYCLE_LOOKUPS {
-            let idx = rng.gen_range(0..volatile_keys.len());
-            let key = &volatile_keys[idx];
-            sampled += 1;
-
+        for key in sampled_keys {
             let is_expired = state
                 .db(db_idx)
-                .get(key)
+                .get(&key)
                 .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms));
 
             if is_expired {
-                state.db_mut(db_idx).remove(key);
-                state.touch_key_version(db_idx, key.clone());
+                state.db_mut(db_idx).remove(&key);
+                state.touch_key_version(db_idx, key);
                 expired += 1;
             }
         }
@@ -170,6 +194,7 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
         total_expired += expired;
 
         // Stop early if few keys are expiring (save CPU)
+        let sampled = samples_to_take;
         if sampled > 0 && (expired as f64 / sampled as f64) < ACTIVE_EXPIRE_CYCLE_THRESHOLD {
             continue;
         }
