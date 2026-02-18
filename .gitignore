@@ -33,3 +33,5 @@ Thumbs.db
 # Python cache
 __pycache__/
 *.pyc
+.cargo-home/
+.cargo-install/
