@@ -1,0 +1,234 @@
+[package]
+name = "server_fn"
+authors = ["Greg Johnston", "Ben Wishovich"]
+license = "MIT"
+repository = "https://github.com/leptos-rs/leptos"
+description = "RPC for any web framework."
+readme = "../README.md"
+version = { workspace = true }
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+throw_error = { workspace = true }
+server_fn_macro_default = { workspace = true }
+# used for hashing paths in #[server] macro
+const_format = "0.2.33"
+xxhash-rust = { version = "0.8.12", features = ["const_xxh64"] }
+# used across multiple features
+serde = { version = "1.0", features = ["derive"] }
+send_wrapper = { version = "0.6.0", features = ["futures"], optional = true }
+thiserror = "2.0"
+
+# registration system
+inventory = { version = "0.3.15", optional = true }
+dashmap = "6.1"
+once_cell = "1.20"
+
+## servers
+# actix
+actix-web = { version = "4.9", optional = true }
+
+# axum
+axum = { version = "0.7.9", optional = true, default-features = false, features = [
+  "multipart",
+] }
+tower = { version = "0.5.1", optional = true }
+tower-layer = { version = "0.3.3", optional = true }
+
+## input encodings
+serde_qs = { version = "0.13.0", optional = true }
+multer = { version = "3.1", optional = true }
+
+## output encodings
+# serde
+serde_json = { workspace = true }
+serde-lite = { version = "0.5.0", features = ["derive"], optional = true }
+futures = "0.3.31"
+http = { version = "1.1" }
+ciborium = { version = "0.2.2", optional = true }
+postcard = { version = "1", features = ["alloc"], optional = true }
+hyper = { version = "1.5", optional = true }
+bytes = "1.9"
+http-body-util = { version = "0.1.2", optional = true }
+rkyv = { version = "0.8.9", optional = true }
+rmp-serde = { version = "1.3.0", optional = true }
+
+# client
+gloo-net = { version = "0.6.0", optional = true }
+js-sys = { version = "0.3.74", optional = true }
+wasm-bindgen = { version = "0.2.100", optional = true }
+wasm-bindgen-futures = { version = "0.4.50", optional = true }
+wasm-streams = { version = "0.4.2", optional = true }
+web-sys = { version = "0.3.72", optional = true, features = [
+  "console",
+  "ReadableStream",
+  "ReadableStreamDefaultReader",
+  "AbortController",
+  "AbortSignal",
+] }
+
+# reqwest client
+reqwest = { version = "0.12.9", default-features = false, optional = true, features = [
+  "multipart",
+  "stream",
+] }
+url = "2"
+pin-project-lite = "0.2.15"
+
+[features]
+default = ["json"]
+axum-no-default = [
+  "ssr",
+  "generic",
+  "dep:axum",
+  "dep:hyper",
+  "dep:http-body-util",
+  "dep:tower",
+  "dep:tower-layer",
+]
+form-redirects = []
+actix = ["ssr", "dep:actix-web", "dep:send_wrapper"]
+axum = ["axum/default", "axum-no-default"]
+browser = [
+  "dep:gloo-net",
+  "dep:js-sys",
+  "dep:send_wrapper",
+  "dep:wasm-bindgen",
+  "dep:web-sys",
+  "dep:wasm-streams",
+  "dep:wasm-bindgen-futures",
+]
+json = []
+serde-lite = ["dep:serde-lite"]
+multipart = ["browser", "dep:multer"]
+url = ["dep:serde_qs"]
+cbor = ["dep:ciborium"]
+rkyv = ["dep:rkyv"]
+msgpack = ["dep:rmp-serde"]
+postcard = ["dep:postcard"]
+default-tls = ["reqwest?/default-tls"]
+rustls = ["reqwest?/rustls-tls"]
+reqwest = ["dep:reqwest"]
+ssr = ["inventory"]
+generic = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--generate-link-to-definition"]
+
+# disables some feature combos for testing in CI
+[package.metadata.cargo-all-features]
+denylist = [
+  "rustls",
+  "default-tls",
+  "form-redirects",
+  "gloo-net",
+  "js-sys",
+  "wasm-bindgen",
+  "web-sys",
+  "tower",
+  "tower-layer",
+  "send_wrapper",
+  "ciborium",
+  "hyper",
+  "inventory",
+  "rkyv",
+]
+skip_feature_sets = [
+  [
+    "actix",
+    "axum",
+  ],
+  [
+    "actix",
+    "generic",
+  ],
+  [
+    "browser",
+    "actix",
+  ],
+  [
+    "browser",
+    "axum",
+  ],
+  [
+    "browser",
+    "reqwest",
+  ],
+  [
+    "browser",
+    "generic",
+  ],
+  [
+    "default-tls",
+    "rustls",
+  ],
+  [
+    "browser",
+    "ssr",
+  ],
+  [
+    "axum-no-default",
+    "actix",
+  ],
+  [
+    "axum-no-default",
+    "browser",
+  ],
+  [
+    "axum-no-default",
+    "generic",
+  ],
+  [
+    "rkyv",
+    "json",
+  ],
+  [
+    "rkyv",
+    "cbor",
+  ],
+  [
+    "rkyv",
+    "url",
+  ],
+  [
+    "rkyv",
+    "serde-lite",
+  ],
+  [
+    "url",
+    "json",
+  ],
+  [
+    "url",
+    "cbor",
+  ],
+  [
+    "url",
+    "serde-lite",
+  ],
+  [
+    "postcard",
+    "json",
+  ],
+  [
+    "postcard",
+    "cbor",
+  ],
+  [
+    "postcard",
+    "url",
+  ],
+  [
+    "postcard",
+    "serde-lite",
+  ],
+  [
+    "postcard",
+    "rkyv",
+  ],
+]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(leptos_debuginfo)'] }

@@ -1,0 +1,18 @@
+[package]
+name = "either_of"
+version = "0.1.6"
+authors = ["Greg Johnston"]
+license = "MIT"
+readme = "../README.md"
+repository = "https://github.com/leptos-rs/leptos"
+description = "Utilities for working with enumerated types that contain one of 2..n other types."
+rust-version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pin-project-lite = "0.2.16"
+paste = "1.0.15"
+
+[features]
+default = ["no_std"]
+no_std = []

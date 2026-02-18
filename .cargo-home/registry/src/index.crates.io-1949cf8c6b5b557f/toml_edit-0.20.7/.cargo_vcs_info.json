@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "d5676a86b25695ffc39094a11babfe3611a2fb5d"
+  },
+  "path_in_vcs": "crates/toml_edit"
+}

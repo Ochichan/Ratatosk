@@ -1,0 +1,36 @@
+[package]
+name = "any_spawner"
+version = "0.2.0"
+authors = ["Greg Johnston"]
+license = "MIT"
+readme = "../README.md"
+repository = "https://github.com/leptos-rs/leptos"
+description = "Spawn asynchronous tasks in an executor-independent way."
+edition.workspace = true
+
+[dependencies]
+async-executor = { version = "1.13.1", optional = true }
+futures = "0.3.31"
+glib = { version = "0.20.6", optional = true }
+thiserror = "2.0"
+tokio = { version = "1.41", optional = true, default-features = false, features = [
+  "rt",
+] }
+tracing = { version = "0.1.40", optional = true }
+wasm-bindgen-futures = { version = "0.4.45", optional = true }
+
+[features]
+async-executor = ["dep:async-executor"]
+tracing = ["dep:tracing"]
+tokio = ["dep:tokio"]
+glib = ["dep:glib"]
+wasm-bindgen = ["dep:wasm-bindgen-futures"]
+futures-executor = ["futures/thread-pool", "futures/executor"]
+
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-all-features]
+denylist = ["tracing"]

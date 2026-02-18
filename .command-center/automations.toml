@@ -3,7 +3,7 @@
 [[automations]]
 id = "fmt"
 title = "fmt"
-command = "nix develop . --command cargo fmt"
+command = "cargo fmt"
 trigger = "manual"
 confirm = true
 timeout_sec = 600
@@ -11,7 +11,7 @@ timeout_sec = 600
 [[automations]]
 id = "clippy"
 title = "clippy (all targets)"
-command = "nix develop . --command cargo clippy --all-targets --all-features -D warnings"
+command = "cargo clippy --all-targets --all-features -- -D warnings"
 trigger = "on_phase_diff"
 only_if_dirty = true
 confirm = false
@@ -21,7 +21,7 @@ max_parallel = 1
 [[automations]]
 id = "test"
 title = "tests"
-command = "nix develop . --command cargo test"
+command = "cargo test"
 trigger = "on_phase_apply"
 confirm = false
 timeout_sec = 1200
@@ -30,7 +30,7 @@ max_parallel = 1
 [[automations]]
 id = "check"
 title = "check (workspace)"
-command = "nix develop . --command cargo check --all-targets"
+command = "cargo check --all-targets"
 trigger = "on_stream_end"
 only_if_dirty = true
 confirm = false
