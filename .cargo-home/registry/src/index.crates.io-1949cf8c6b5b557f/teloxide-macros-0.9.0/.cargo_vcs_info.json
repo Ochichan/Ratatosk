@@ -1,6 +1,0 @@
-{
-  "git": {
-    "sha1": "5afd75f54b5b5ed8f389d845a232a976467dfc85"
-  },
-  "path_in_vcs": "crates/teloxide-macros"
-}
