@@ -4,7 +4,7 @@ use std::{
     env,
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
@@ -229,7 +229,7 @@ fn parse_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn rotated_audit_log_path(path: &PathBuf, suffix: usize) -> PathBuf {
+fn rotated_audit_log_path(path: &Path, suffix: usize) -> PathBuf {
     PathBuf::from(format!("{}.{}", path.display(), suffix))
 }
 
@@ -376,8 +376,7 @@ fn append_audit_event_log(stamp: &AuditStamp, event: &str, payload: &str) {
     };
 
     let safe_payload = sanitize_acl_log_line(payload)
-        .replace('\n', " ")
-        .replace('\r', " ");
+        .replace(['\n', '\r'], " ");
 
     if let Err(error) = writeln!(
         file,

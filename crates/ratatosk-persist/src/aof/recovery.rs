@@ -201,8 +201,8 @@ impl AofRecovery {
 /// Find the position of the next potential RESP frame start.
 fn find_next_resp_frame(buf: &[u8]) -> Option<usize> {
     // RESP frames start with: * (array), + (simple string), - (error), : (integer), $ (bulk string)
-    for i in 1..buf.len() {
-        match buf[i] {
+    for (i, &byte) in buf.iter().enumerate().skip(1) {
+        match byte {
             b'*' | b'+' | b'-' | b':' | b'$' => return Some(i),
             _ => continue,
         }

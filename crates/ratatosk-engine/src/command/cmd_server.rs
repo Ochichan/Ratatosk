@@ -1065,7 +1065,7 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
         let sanitized = error.replace(['\r', '\n'], " ");
         out.push_str(&format!("aof_last_error:{}\r\n", sanitized));
     }
-    out.push_str(&format!("aof_rewrite_supported:1\r\n"));
+    out.push_str("aof_rewrite_supported:1\r\n");
     out.push_str(&format!(
         "aof_rewrite_in_progress:{}\r\n",
         i32::from(server.aof_rewrite_in_progress())
@@ -1083,8 +1083,8 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
     if let Some(time_ms) = server.last_aof_rewrite_time_ms() {
         out.push_str(&format!("aof_last_rewrite_timestamp_ms:{time_ms}\r\n"));
     }
-    out.push_str(&format!("aof_current_size:0\r\n"));
-    out.push_str(&format!("aof_base_size:0\r\n"));
+    out.push_str("aof_current_size:0\r\n");
+    out.push_str("aof_base_size:0\r\n");
 
     out.push_str("\r\n");
 }
