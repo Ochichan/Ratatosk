@@ -1098,6 +1098,7 @@ dependencies = [
  "fs2",
  "glob-match",
  "hashbrown 0.15.5",
+ "itoa",
  "metrics",
  "parking_lot",
  "rand",

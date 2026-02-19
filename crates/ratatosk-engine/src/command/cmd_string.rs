@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use itoa::Buffer;
 
 use ratatosk_resp::frame::RespFrame;
 
@@ -8,7 +9,7 @@ use crate::object::{format_f64_for_redis, normalize_range, parse_f64};
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_command_expire_at_ms, parse_getex_policy,
-    parse_i64, to_uppercase_bytes, wrong_arity, wrong_type_response,
+    parse_i64, wrong_arity, wrong_type_response,
 };
 
 pub(super) fn cmd_append(
@@ -24,20 +25,24 @@ pub(super) fn cmd_append(
     let db = server.db_mut(client.selected_db);
     purge_expired_key(db, key, now);
 
-    let (mut value, expire_at_ms) = if let Some(existing) = db.get(key) {
+    let (value, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
             return wrong_type_response();
         };
-        (s.to_vec(), existing.expire_at_ms)
+        (s.clone(), existing.expire_at_ms)
     } else {
-        (Vec::new(), None)
+        (Bytes::new(), None)
     };
-    value.extend_from_slice(append);
 
-    let new_len = value.len();
+    // Pre-allocate exact capacity for concatenated result
+    let new_len = value.len() + append.len();
+    let mut combined = Vec::with_capacity(new_len);
+    combined.extend_from_slice(&value);
+    combined.extend_from_slice(append);
+
     db.insert(
         key.clone(),
-        StoredValue::string(Bytes::from(value), expire_at_ms),
+        StoredValue::string(Bytes::from(combined), expire_at_ms),
     );
 
     CommandOutcome::reply(RespFrame::Integer(new_len as i64))
@@ -374,12 +379,10 @@ pub(super) fn cmd_incrbyfloat(
     }
 
     let encoded = format_f64_for_redis(next);
-    db.insert(
-        key.clone(),
-        StoredValue::string(encoded.clone(), expire_at_ms),
-    );
+    let encoded_for_reply = encoded.clone();
+    db.insert(key.clone(), StoredValue::string(encoded, expire_at_ms));
 
-    CommandOutcome::reply(RespFrame::BulkString(Some(encoded)))
+    CommandOutcome::reply(RespFrame::BulkString(Some(encoded_for_reply)))
 }
 
 pub(super) fn cmd_incr_decr_with_delta(
@@ -408,9 +411,10 @@ pub(super) fn cmd_incr_decr_with_delta(
         return CommandOutcome::reply(err("ERR increment or decrement would overflow"));
     };
 
+    let mut buf = Buffer::new();
     db.insert(
         key.clone(),
-        StoredValue::string(Bytes::from(next.to_string()), expire_at_ms),
+        StoredValue::string(Bytes::copy_from_slice(buf.format(next).as_bytes()), expire_at_ms),
     );
     CommandOutcome::reply(RespFrame::Integer(next))
 }
@@ -435,55 +439,54 @@ pub(super) fn cmd_set(
 
     let mut idx = 2usize;
     while idx < args.len() {
-        let option = to_uppercase_bytes(&args[idx]);
-        match option.as_slice() {
-            b"NX" => {
-                nx = true;
-                idx += 1;
+        let option = &args[idx];
+        if option.eq_ignore_ascii_case(b"NX") {
+            nx = true;
+            idx += 1;
+        } else if option.eq_ignore_ascii_case(b"XX") {
+            xx = true;
+            idx += 1;
+        } else if option.eq_ignore_ascii_case(b"GET") {
+            get_old = true;
+            idx += 1;
+        } else if option.eq_ignore_ascii_case(b"KEEPTTL") {
+            if !matches!(expire_policy, SetExpirePolicy::None) {
+                return CommandOutcome::reply(err("ERR syntax error"));
             }
-            b"XX" => {
-                xx = true;
-                idx += 1;
+            expire_policy = SetExpirePolicy::KeepTtl;
+            idx += 1;
+        } else if option.eq_ignore_ascii_case(b"EX")
+            || option.eq_ignore_ascii_case(b"PX")
+            || option.eq_ignore_ascii_case(b"EXAT")
+            || option.eq_ignore_ascii_case(b"PXAT")
+        {
+            if idx + 1 >= args.len() || !matches!(expire_policy, SetExpirePolicy::None) {
+                return CommandOutcome::reply(err("ERR syntax error"));
             }
-            b"GET" => {
-                get_old = true;
-                idx += 1;
-            }
-            b"KEEPTTL" => {
-                if !matches!(expire_policy, SetExpirePolicy::None) {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
-                expire_policy = SetExpirePolicy::KeepTtl;
-                idx += 1;
-            }
-            b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
-                if idx + 1 >= args.len() || !matches!(expire_policy, SetExpirePolicy::None) {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
 
-                let Some(raw) = parse_i64(&args[idx + 1]) else {
-                    return CommandOutcome::reply(err(
-                        "ERR value is not an integer or out of range",
-                    ));
-                };
-                if raw <= 0 {
-                    return CommandOutcome::reply(err("ERR invalid expire time in 'set' command"));
-                }
-
-                let at_ms = match option.as_slice() {
-                    b"EX" => now.saturating_add(raw.saturating_mul(1000)),
-                    b"PX" => now.saturating_add(raw),
-                    b"EXAT" => raw.saturating_mul(1000),
-                    b"PXAT" => raw,
-                    _ => {
-                        debug_assert!(false, "SET expire option validated by outer match");
-                        return CommandOutcome::reply(err("ERR syntax error"));
-                    }
-                };
-                expire_policy = SetExpirePolicy::AtMs(at_ms);
-                idx += 2;
+            let Some(raw) = parse_i64(&args[idx + 1]) else {
+                return CommandOutcome::reply(err(
+                    "ERR value is not an integer or out of range",
+                ));
+            };
+            if raw <= 0 {
+                return CommandOutcome::reply(err("ERR invalid expire time in 'set' command"));
             }
-            _ => return CommandOutcome::reply(err("ERR syntax error")),
+
+            let at_ms = if option.eq_ignore_ascii_case(b"EX") {
+                now.saturating_add(raw.saturating_mul(1000))
+            } else if option.eq_ignore_ascii_case(b"PX") {
+                now.saturating_add(raw)
+            } else if option.eq_ignore_ascii_case(b"EXAT") {
+                raw.saturating_mul(1000)
+            } else {
+                // PXAT
+                raw
+            };
+            expire_policy = SetExpirePolicy::AtMs(at_ms);
+            idx += 2;
+        } else {
+            return CommandOutcome::reply(err("ERR syntax error"));
         }
     }
 
@@ -556,19 +559,24 @@ pub(super) fn cmd_get(
     let db = server.db_mut(client.selected_db);
     purge_expired_key(db, key, now);
 
-    let found = db.contains_key(key);
-    if !found {
-        server.stats.mark_keyspace_miss();
-        return CommandOutcome::reply(RespFrame::BulkString(None));
-    }
+    // Single lookup: extract result and release borrow before accessing stats
+    let result = match db.get(key) {
+        None => Err(false), // not found
+        Some(entry) if !entry.is_string() => Err(true), // wrong type
+        Some(entry) => Ok(entry.as_string().cloned()),
+    };
 
-    server.stats.mark_keyspace_hit();
-    let entry = &server.db(client.selected_db)[key];
-    if !entry.is_string() {
-        return wrong_type_response();
+    match result {
+        Err(false) => {
+            server.stats.mark_keyspace_miss();
+            CommandOutcome::reply(RespFrame::BulkString(None))
+        }
+        Err(true) => wrong_type_response(),
+        Ok(value) => {
+            server.stats.mark_keyspace_hit();
+            CommandOutcome::reply(RespFrame::BulkString(value))
+        }
     }
-
-    CommandOutcome::reply(RespFrame::BulkString(entry.as_string().cloned()))
 }
 
 pub(super) fn cmd_setex_with_mode(

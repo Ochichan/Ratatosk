@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 hashbrown = { workspace = true }
 smallvec = { workspace = true }
 rand = { workspace = true }
+itoa = { workspace = true }
 argon2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
