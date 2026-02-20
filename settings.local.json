@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(lsof:*)",
+      "Bash(perl -i -p0e:*)",
+      "Skill(check)",
+      "Bash(git checkout:*)",
+      "Bash(nix develop:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(cargo tree:*)",
+      "Bash(ls:*)",
+      "Bash(nix flake show:*)",
+      "Bash(cargo build:*)",
+      "Bash(git stash:*)",
+      "Bash(echo:*)",
+      "Bash(ln:*)",
+      "Bash(cmd --help:*)",
+      "Bash(ollama list:*)",
+      "Bash(curl:*)",
+      "Bash(python3:*)",
+      "Bash(cat:*)",
+      "Bash(/home/niriochi/.cargo/bin/ironclaw:*)",
+      "Bash(chmod:*)",
+      "Bash(rustc:*)",
+      "Bash(cargo rustc:*)",
+      "Bash(cargo check:*)",
+      "Bash(~/.cargo/bin/cargo check:*)",
+      "Bash(PATH=\"/home/niriochi/.cargo/bin:$PATH\" which cargo:*)",
+      "Bash(nix-shell -p cargo --run:*)",
+      "Bash(pkg-config:*)",
+      "Bash(dpkg -l:*)",
+      "Bash(pacman -Q:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo install:*)",
+      "Bash(fish -c:*)"
+    ]
+  }
+}
