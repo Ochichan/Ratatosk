@@ -15,6 +15,8 @@ hashbrown = { workspace = true }
 crc = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = "0.4"
 
 [dev-dependencies]
 rand = { workspace = true }

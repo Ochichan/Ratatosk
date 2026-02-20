@@ -4,6 +4,7 @@ use argon2::password_hash::{
 };
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
+use smallvec::SmallVec;
 
 use crate::security::{sanitize_acl_log_line, sanitize_slowlog_argv};
 use ratatosk_core::time::{now_ms as unix_ms_now, now_sec as unix_sec_now};
@@ -133,30 +134,41 @@ impl SortedSet {
 
         let new_score = SortedSetScore(score);
 
-        // 2. If existing member has same score, no change needed
-        if let Some(old_score) = self.by_member.get(&member).copied() {
-            if old_score == new_score {
-                return false;
+        // Single hash probe via entry API (one fewer probe than get + insert).
+        match self.by_member.entry(member) {
+            hashbrown::hash_map::Entry::Occupied(mut occ) => {
+                let old_score = *occ.get();
+                if old_score == new_score {
+                    return false;
+                }
+                // Remove old by_score entry before updating by_member.
+                self.by_score.remove(&SortedSetEntry {
+                    score: old_score,
+                    member: occ.key().clone(),
+                });
+                self.by_score.insert(
+                    SortedSetEntry {
+                        score: new_score,
+                        member: occ.key().clone(),
+                    },
+                    (),
+                );
+                *occ.get_mut() = new_score;
+                false
             }
-            // 3. Remove old entry from by_score BEFORE modifying by_member
-            // This ensures if we panic after by_member update, we haven't
-            // lost the by_score reference yet
-            self.by_score.remove(&SortedSetEntry {
-                score: old_score,
-                member: member.clone(),
-            });
+            hashbrown::hash_map::Entry::Vacant(vac) => {
+                let member_clone = vac.key().clone();
+                vac.insert(new_score);
+                self.by_score.insert(
+                    SortedSetEntry {
+                        score: new_score,
+                        member: member_clone,
+                    },
+                    (),
+                );
+                true
+            }
         }
-
-        // 4. Insert new entry (by_member first, then by_score)
-        let is_new = self.by_member.insert(member.clone(), new_score).is_none();
-        self.by_score.insert(
-            SortedSetEntry {
-                score: new_score,
-                member,
-            },
-            (),
-        );
-        is_new
     }
 
     /// Remove a member from the sorted set.
@@ -176,7 +188,7 @@ impl SortedSet {
         true
     }
 
-    pub fn score(&self, member: &Bytes) -> Option<f64> {
+    pub fn score(&self, member: &[u8]) -> Option<f64> {
         self.by_member.get(member).map(|s| s.value())
     }
 
@@ -192,6 +204,28 @@ impl SortedSet {
     pub fn rev_rank(&self, member: &Bytes) -> Option<usize> {
         self.rank(member)
             .map(|r| self.len().saturating_sub(1).saturating_sub(r))
+    }
+
+    /// Remove all members whose score is in `[min, max]` (inclusive).
+    ///
+    /// Uses `BTreeMap::range` to seek to `min` in O(log n), avoiding a full
+    /// linear scan of all entries.  Returns the number of removed members.
+    pub fn remove_range_by_score(&mut self, min: f64, max: f64) -> usize {
+        let min_bound = SortedSetEntry {
+            score: SortedSetScore(min),
+            member: Bytes::new(),
+        };
+        let members: SmallVec<[Bytes; 16]> = self
+            .by_score
+            .range(min_bound..)
+            .take_while(|(e, _)| e.score.value() <= max)
+            .map(|(e, _)| e.member.clone()) // Bytes clone = ref-count incr
+            .collect();
+        let count = members.len();
+        for member in &members {
+            self.remove(member);
+        }
+        count
     }
 }
 
@@ -859,10 +893,10 @@ impl PubSubState {
     pub fn publish(&mut self, channel: &Bytes, payload: &Bytes) -> i64 {
         let mut receivers = 0i64;
 
-        let direct_subscribers = self
+        let direct_subscribers: SmallVec<[i64; 8]> = self
             .channels
             .get(channel)
-            .map(|set| set.iter().copied().collect::<Vec<_>>())
+            .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
 
         for client_id in direct_subscribers {
@@ -877,32 +911,34 @@ impl PubSubState {
             }
         }
 
-        let channel_text = String::from_utf8_lossy(channel);
-        let patterns = self
-            .patterns
-            .iter()
-            .filter(|(pattern, _)| {
-                glob_match::glob_match(&String::from_utf8_lossy(pattern), &channel_text)
-            })
-            .map(|(pattern, subscribers)| {
-                (
-                    pattern.clone(),
-                    subscribers.iter().copied().collect::<Vec<_>>(),
-                )
-            })
-            .collect::<Vec<_>>();
+        if !self.patterns.is_empty() {
+            let channel_text = String::from_utf8_lossy(channel);
+            let patterns: SmallVec<[(Bytes, SmallVec<[i64; 8]>); 4]> = self
+                .patterns
+                .iter()
+                .filter(|(pattern, _)| {
+                    glob_match::glob_match(
+                        std::str::from_utf8(pattern).unwrap_or(""),
+                        &channel_text,
+                    )
+                })
+                .map(|(pattern, subscribers)| {
+                    (pattern.clone(), subscribers.iter().copied().collect())
+                })
+                .collect();
 
-        for (pattern, subscribers) in patterns {
-            for client_id in subscribers {
-                if self.enqueue_pending(
-                    client_id,
-                    PubSubMessage::PMessage {
-                        pattern: pattern.clone(),
-                        channel: channel.clone(),
-                        payload: payload.clone(),
-                    },
-                ) {
-                    receivers += 1;
+            for (pattern, subscribers) in patterns {
+                for client_id in subscribers {
+                    if self.enqueue_pending(
+                        client_id,
+                        PubSubMessage::PMessage {
+                            pattern: pattern.clone(),
+                            channel: channel.clone(),
+                            payload: payload.clone(),
+                        },
+                    ) {
+                        receivers += 1;
+                    }
                 }
             }
         }
@@ -913,10 +949,10 @@ impl PubSubState {
     pub fn publish_shard(&mut self, channel: &Bytes, payload: &Bytes) -> i64 {
         let mut receivers = 0i64;
 
-        let direct_subscribers = self
+        let direct_subscribers: SmallVec<[i64; 8]> = self
             .shard_channels
             .get(channel)
-            .map(|set| set.iter().copied().collect::<Vec<_>>())
+            .map(|set| set.iter().copied().collect())
             .unwrap_or_default();
 
         for client_id in direct_subscribers {
@@ -1073,6 +1109,13 @@ impl PubSubState {
 // StatsState — slowlog, latency tracking, command counters
 // ---------------------------------------------------------------------------
 
+/// Per-event latency history with a cached running maximum to avoid O(n) scans.
+#[derive(Debug, Default)]
+struct LatencyHistory {
+    samples: VecDeque<(i64, i64)>,
+    max_ms: i64,
+}
+
 #[derive(Debug)]
 pub struct StatsState {
     total_commands_processed: u64,
@@ -1082,7 +1125,7 @@ pub struct StatsState {
     latency_tracking_enabled: bool,
     slowlog_entries: VecDeque<SlowlogEntry>,
     next_slowlog_id: i64,
-    latency_events: HashMap<Vec<u8>, VecDeque<(i64, i64)>>,
+    latency_events: HashMap<Bytes, LatencyHistory>,
     connected_clients: u64,
     total_net_input_bytes: u64,
     total_net_output_bytes: u64,
@@ -1309,27 +1352,43 @@ impl StatsState {
             return;
         }
 
+        // Normalize to lowercase on a stack buffer — command names are always short.
+        // This ensures a caller passing "GET" hits the same stored "get" entry.
+        let len = event.len().min(32);
+        let mut buf = [0u8; 32];
+        for (i, &b) in event[..len].iter().enumerate() {
+            buf[i] = b.to_ascii_lowercase();
+        }
+        let lower = &buf[..len];
+
         let now_sec = unix_sec_now();
         let sample_ms = latency_ms.max(0);
         let history = self
             .latency_events
             .raw_entry_mut()
-            .from_key(event)
-            .or_insert_with(|| (event.to_ascii_lowercase(), VecDeque::new()))
+            .from_key(lower)
+            .or_insert_with(|| (Bytes::copy_from_slice(lower), LatencyHistory::default()))
             .1;
         // Keep one zero-latency sample per event per second to reduce churn
         // on fast command loops while preserving LATENCY visibility.
         if sample_ms == 0
             && history
+                .samples
                 .back()
                 .is_some_and(|(last_ts, last_ms)| *last_ts == now_sec && *last_ms == 0)
         {
             return;
         }
 
-        history.push_back((now_sec, sample_ms));
-        while history.len() > 160 {
-            history.pop_front();
+        history.samples.push_back((now_sec, sample_ms));
+        if sample_ms > history.max_ms {
+            history.max_ms = sample_ms;
+        }
+        while history.samples.len() > 160 {
+            let (_, evicted_ms) = history.samples.pop_front().unwrap();
+            if evicted_ms == history.max_ms {
+                history.max_ms = history.samples.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
+            }
         }
     }
 
@@ -1343,12 +1402,11 @@ impl StatsState {
 
     pub fn latency_latest(&self) -> Vec<(Bytes, i64, i64, i64)> {
         let mut out = Vec::new();
-        for (event, samples) in &self.latency_events {
-            let Some((latest_ts, latest_ms)) = samples.back().copied() else {
+        for (event, history) in &self.latency_events {
+            let Some((latest_ts, latest_ms)) = history.samples.back().copied() else {
                 continue;
             };
-            let max_ms = samples.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
-            out.push((Bytes::from(event.clone()), latest_ts, latest_ms, max_ms));
+            out.push((event.clone(), latest_ts, latest_ms, history.max_ms));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -1357,7 +1415,7 @@ impl StatsState {
     pub fn latency_history(&self, event: &Bytes) -> Vec<(i64, i64)> {
         self.latency_events
             .get(event.as_ref())
-            .map(|samples| samples.iter().copied().collect())
+            .map(|h| h.samples.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -1381,7 +1439,7 @@ impl StatsState {
         let mut names = self
             .latency_events
             .keys()
-            .map(|k| Bytes::from(k.clone()))
+            .cloned()
             .collect::<Vec<_>>();
         names.sort();
         names
@@ -2082,10 +2140,8 @@ impl ServerState {
 // ---------------------------------------------------------------------------
 
 pub fn purge_expired_key(db: &mut HashMap<Bytes, StoredValue>, key: &Bytes, now_ms: i64) {
-    if let hashbrown::hash_map::Entry::Occupied(entry) = db.entry(key.clone()) {
-        if entry.get().expire_at_ms.is_some_and(|at| at <= now_ms) {
-            entry.remove();
-        }
+    if db.get(key.as_ref()).is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms)) {
+        db.remove(key.as_ref());
     }
 }
 
@@ -2439,5 +2495,15 @@ mod tests {
 
         assert_eq!(stats.cached_memory_estimate(), 67890);
         assert_eq!(stats.last_memory_estimate_tick(), 100);
+    }
+
+    #[test]
+    fn latency_sample_case_insensitive_dedup() {
+        let mut stats = StatsState::default();
+        stats.set_latency_tracking_enabled(true);
+        stats.record_latency_sample(b"GET", 5);
+        stats.record_latency_sample(b"GET", 10);
+        assert_eq!(stats.latency_event_names().len(), 1);
+        assert_eq!(stats.latency_event_names()[0].as_ref(), b"get");
     }
 }

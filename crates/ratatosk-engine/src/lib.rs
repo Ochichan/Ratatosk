@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod command;
+pub mod direct;
 pub mod eviction;
 pub mod expiry;
 pub mod hll;
