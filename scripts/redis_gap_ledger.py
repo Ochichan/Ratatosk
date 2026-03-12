@@ -25,11 +25,19 @@ VALID_STATUSES = (
     "done",
     "excluded",
 )
+VALID_CAPABILITY_TIERS = (
+    "unsupported",
+    "syntax_only",
+    "baseline_local",
+    "behavioral_subset",
+    "distributed_parity",
+)
 
 DEFAULT_STATUS = "planned"
+DEFAULT_CAPABILITY_TIER = "unsupported"
 DEFAULT_MILESTONE = "backlog"
 
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -151,9 +159,9 @@ def _validate_catalog(catalog_data: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _validate_ledger(ledger_data: dict[str, Any]) -> list[dict[str, Any]]:
     schema_version = ledger_data.get("schema_version")
-    if schema_version != LEDGER_SCHEMA_VERSION:
+    if schema_version not in (1, LEDGER_SCHEMA_VERSION):
         raise ValueError(
-            f"Unsupported ledger schema_version={schema_version}; expected {LEDGER_SCHEMA_VERSION}"
+            f"Unsupported ledger schema_version={schema_version}; expected 1 or {LEDGER_SCHEMA_VERSION}"
         )
 
     commands = ledger_data.get("commands")
@@ -179,7 +187,283 @@ def _validate_ledger(ledger_data: dict[str, Any]) -> list[dict[str, Any]]:
         if not str(item["milestone"]).strip():
             raise ValueError(f"Empty milestone for command `{name}`")
 
+        capability_tier = str(
+            item.get(
+                "capability_tier",
+                _infer_capability_tier(status, name, str(item.get("notes", ""))),
+            )
+        )
+        if capability_tier not in VALID_CAPABILITY_TIERS:
+            raise ValueError(
+                f"Invalid capability_tier `{capability_tier}` for command `{name}`"
+            )
+
     return sorted(commands, key=lambda x: str(x["name"]))
+
+
+def _is_prefixed_command(name: str, prefix: str) -> bool:
+    return name == prefix or name.startswith(f"{prefix} ")
+
+
+def _infer_capability_tier(status: str, name: str, notes: str) -> str:
+    if status != "done":
+        return DEFAULT_CAPABILITY_TIER
+
+    upper_name = " ".join(name.split()).upper()
+    lower_notes = notes.lower()
+
+    unsupported_commands = {
+        "SYNC",
+        "SENTINEL",
+        "EVAL",
+        "EVALSHA",
+        "EVAL_RO",
+        "EVALSHA_RO",
+        "FCALL",
+        "FCALL_RO",
+        "FUNCTION LOAD",
+        "FUNCTION DELETE",
+        "FUNCTION RESTORE",
+    }
+    syntax_only_commands = {
+        "ASKING",
+        "READONLY",
+        "READWRITE",
+        "MONITOR",
+        "ROLE",
+        "WAIT",
+        "WAITAOF",
+        "CLIENT PAUSE",
+        "CLIENT UNPAUSE",
+        "CLIENT UNBLOCK",
+        "CLIENT SETINFO",
+        "CLIENT REPLY",
+        "HOTKEYS",
+        "HOTKEYS GET",
+        "HOTKEYS RESET",
+        "HOTKEYS START",
+        "HOTKEYS STOP",
+        "FUNCTION",
+        "FUNCTION HELP",
+        "FUNCTION LIST",
+        "FUNCTION DUMP",
+        "FUNCTION FLUSH",
+        "FUNCTION STATS",
+        "SCRIPT",
+        "SCRIPT HELP",
+        "SCRIPT FLUSH",
+        "ACL LOAD",
+        "ACL SAVE",
+        "ACL DRYRUN",
+        "LOLWUT",
+        "TRIMSLOTS",
+    }
+    baseline_local_commands = {
+        "REPLCONF",
+        "PSYNC",
+        "REPLICAOF",
+        "SLAVEOF",
+        "CLIENT",
+        "CLIENT CACHING",
+        "CLIENT GETREDIR",
+        "CLIENT INFO",
+        "CLIENT KILL",
+        "CLIENT LIST",
+        "CLIENT NO-EVICT",
+        "CLIENT NO-TOUCH",
+        "CLIENT TRACKING",
+        "CLIENT TRACKINGINFO",
+        "CLUSTER",
+        "CLUSTER COUNTKEYSINSLOT",
+        "CLUSTER GETKEYSINSLOT",
+        "CLUSTER HELP",
+        "CLUSTER INFO",
+        "CLUSTER KEYSLOT",
+        "CLUSTER MYID",
+        "CONFIG",
+        "CONFIG GET",
+        "CONFIG HELP",
+        "CONFIG RESETSTAT",
+        "CONFIG REWRITE",
+        "CONFIG SET",
+        "INFO",
+        "LATENCY",
+        "LATENCY DOCTOR",
+        "LATENCY GRAPH",
+        "LATENCY HELP",
+        "LATENCY HISTOGRAM",
+        "LATENCY HISTORY",
+        "LATENCY LATEST",
+        "LATENCY RESET",
+        "MEMORY",
+        "MEMORY DOCTOR",
+        "MEMORY HELP",
+        "MEMORY MALLOC-STATS",
+        "MEMORY PURGE",
+        "MEMORY STATS",
+        "MEMORY USAGE",
+    }
+    behavioral_subset_commands = {
+        "BGSAVE",
+        "BGREWRITEAOF",
+        "BLMOVE",
+        "BLMPOP",
+        "BLPOP",
+        "BRPOP",
+        "BRPOPLPUSH",
+        "FLUSHALL",
+        "FLUSHDB",
+        "FUNCTION KILL",
+        "SAVE",
+        "XREAD",
+        "XREADGROUP",
+    }
+
+    if upper_name in unsupported_commands:
+        return "unsupported"
+    if _is_prefixed_command(upper_name, "SENTINEL"):
+        return "syntax_only" if upper_name == "SENTINEL HELP" else "unsupported"
+    if _is_prefixed_command(upper_name, "CLUSTER") and upper_name not in {
+        "CLUSTER COUNTKEYSINSLOT",
+        "CLUSTER GETKEYSINSLOT",
+        "CLUSTER HELP",
+        "CLUSTER INFO",
+        "CLUSTER KEYSLOT",
+        "CLUSTER MYID",
+    }:
+        return "unsupported"
+    if upper_name in syntax_only_commands:
+        return "syntax_only"
+    if upper_name in baseline_local_commands:
+        return "baseline_local"
+    if upper_name in behavioral_subset_commands:
+        return "behavioral_subset"
+
+    unsupported_markers = (
+        "not supported",
+        "unsupported",
+        "support disabled",
+        "not configured as a sentinel",
+    )
+    syntax_only_markers = (
+        "no-op",
+        "deterministic 0",
+        "standalone wait parsing",
+        "standalone waitaof parsing",
+        "syntax/arity validation",
+        "static ascii-text",
+        "returns empty sample list",
+        "coarse latency",
+        "event summary graph",
+        "single-connection",
+    )
+    baseline_markers = (
+        "local state toggle",
+        "client-tracking baseline",
+        "standalone baseline",
+        "in-memory acknowledge path",
+        "single-connection info string",
+    )
+    subset_markers = (
+        "polling",
+        "core baseline",
+        "background",
+        "fanout",
+        "implemented.",
+    )
+
+    if any(marker in lower_notes for marker in unsupported_markers):
+        return "unsupported"
+    if any(marker in lower_notes for marker in syntax_only_markers):
+        return "syntax_only"
+    if any(marker in lower_notes for marker in baseline_markers):
+        return "baseline_local"
+    if any(marker in lower_notes for marker in subset_markers):
+        return "behavioral_subset"
+
+    return "behavioral_subset"
+
+
+def _split_markdown_row(line: str) -> list[str]:
+    if not line.startswith("|") or not line.endswith("|"):
+        raise ValueError(f"Invalid markdown table row: {line}")
+
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for ch in line[1:-1]:
+        if escaped:
+            current.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "|":
+            cells.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    cells.append("".join(current).strip())
+    return cells
+
+
+def _parse_markdown_ledger(markdown_path: Path) -> dict[str, Any]:
+    lines = markdown_path.read_text(encoding="utf-8").splitlines()
+    header_kind: str | None = None
+    start = 0
+
+    for idx, line in enumerate(lines):
+        if line.startswith("| Command | Group | Since | Status | Milestone | Notes |"):
+            header_kind = "legacy"
+            start = idx + 2
+            break
+        if line.startswith(
+            "| Command | Group | Since | Status | Tier | Milestone | Notes |"
+        ):
+            header_kind = "tiered"
+            start = idx + 2
+            break
+
+    if header_kind is None:
+        raise ValueError(
+            f"Could not find command ledger table in markdown file {markdown_path}"
+        )
+
+    commands: list[dict[str, Any]] = []
+    for line in lines[start:]:
+        if not line.startswith("|"):
+            break
+        cells = _split_markdown_row(line)
+        if header_kind == "legacy":
+            if len(cells) != 6:
+                raise ValueError(f"Expected 6 cells in legacy row: {line}")
+            command, group, since, status, milestone, notes = cells
+            capability_tier = _infer_capability_tier(status, command.strip("`"), notes)
+        else:
+            if len(cells) != 7:
+                raise ValueError(f"Expected 7 cells in tiered row: {line}")
+            command, group, since, status, capability_tier, milestone, notes = cells
+
+        commands.append(
+            {
+                "name": command.strip().strip("`"),
+                "group": group,
+                "since": since,
+                "status": status,
+                "capability_tier": capability_tier,
+                "milestone": milestone,
+                "owner": "",
+                "notes": notes.replace("<br>", "\n"),
+            }
+        )
+
+    return {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "status_values": list(VALID_STATUSES),
+        "capability_tiers": list(VALID_CAPABILITY_TIERS),
+        "commands": commands,
+    }
 
 
 def _merge_ledger(
@@ -199,6 +483,15 @@ def _merge_ledger(
         status = str(prev.get("status", DEFAULT_STATUS))
         if status not in VALID_STATUSES:
             status = DEFAULT_STATUS
+        notes = str(prev.get("notes", ""))
+        capability_tier = str(
+            prev.get(
+                "capability_tier",
+                _infer_capability_tier(status, name, notes),
+            )
+        )
+        if capability_tier not in VALID_CAPABILITY_TIERS:
+            capability_tier = _infer_capability_tier(status, name, notes)
 
         merged_commands.append(
             {
@@ -209,15 +502,17 @@ def _merge_ledger(
                 "path": str(command["path"]),
                 "summary": str(command["summary"]),
                 "status": status,
+                "capability_tier": capability_tier,
                 "milestone": str(prev.get("milestone", DEFAULT_MILESTONE)),
                 "owner": str(prev.get("owner", "")),
-                "notes": str(prev.get("notes", "")),
+                "notes": notes,
             }
         )
 
     return {
         "schema_version": LEDGER_SCHEMA_VERSION,
         "status_values": list(VALID_STATUSES),
+        "capability_tiers": list(VALID_CAPABILITY_TIERS),
         "commands": sorted(merged_commands, key=lambda x: str(x["name"])),
     }
 
@@ -234,9 +529,12 @@ def _render_markdown(ledger_data: dict[str, Any]) -> str:
     total = len(commands)
 
     by_status = Counter(str(c["status"]) for c in commands)
+    by_tier = Counter(str(c["capability_tier"]) for c in commands)
     by_group: dict[str, Counter[str]] = defaultdict(Counter)
+    by_group_tier: dict[str, Counter[str]] = defaultdict(Counter)
     for c in commands:
         by_group[str(c["group"])][str(c["status"])] += 1
+        by_group_tier[str(c["group"])][str(c["capability_tier"])] += 1
 
     lines: list[str] = []
     lines.append("# Redis Gap Ledger")
@@ -246,6 +544,13 @@ def _render_markdown(ledger_data: dict[str, Any]) -> str:
         "원본은 `docs/redis-gap-ledger.json`, 이 문서는 `scripts/redis_gap_ledger.py`로 생성된다."
     )
     lines.append("")
+    lines.append("상태(`status`)와 동작 등급(`capability_tier`)은 다르다.")
+    lines.append("")
+    lines.append("- `status`: 구현 추적 상태 (`planned`, `partial`, `done` 등)")
+    lines.append(
+        "- `capability_tier`: Redis 의미론 대비 수준 (`unsupported`, `syntax_only`, `baseline_local`, `behavioral_subset`, `distributed_parity`)"
+    )
+    lines.append("")
     lines.append("## Summary")
     lines.append("")
     lines.append("| Metric | Value |")
@@ -253,6 +558,13 @@ def _render_markdown(ledger_data: dict[str, Any]) -> str:
     lines.append(f"| Total commands | {total} |")
     for status in VALID_STATUSES:
         lines.append(f"| {status} | {by_status.get(status, 0)} |")
+    lines.append("")
+    lines.append("## Capability Tier Summary")
+    lines.append("")
+    lines.append("| Tier | Value |")
+    lines.append("| --- | ---: |")
+    for tier in VALID_CAPABILITY_TIERS:
+        lines.append(f"| {tier} | {by_tier.get(tier, 0)} |")
     lines.append("")
     lines.append("## Group Progress")
     lines.append("")
@@ -267,15 +579,31 @@ def _render_markdown(ledger_data: dict[str, Any]) -> str:
             f"{counter.get('planned', 0)} | {counter.get('excluded', 0)} | {group_total} |"
         )
     lines.append("")
+    lines.append("## Group Capability Tiers")
+    lines.append("")
+    lines.append(
+        "| Group | distributed_parity | behavioral_subset | baseline_local | syntax_only | unsupported | total |"
+    )
+    lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+    for group in sorted(by_group_tier):
+        counter = by_group_tier[group]
+        group_total = sum(counter.values())
+        lines.append(
+            f"| {_esc_md_cell(group)} | {counter.get('distributed_parity', 0)} | "
+            f"{counter.get('behavioral_subset', 0)} | {counter.get('baseline_local', 0)} | "
+            f"{counter.get('syntax_only', 0)} | {counter.get('unsupported', 0)} | {group_total} |"
+        )
+    lines.append("")
     lines.append("## Command Ledger")
     lines.append("")
-    lines.append("| Command | Group | Since | Status | Milestone | Notes |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
+    lines.append("| Command | Group | Since | Status | Tier | Milestone | Notes |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for cmd in commands:
         lines.append(
             f"| `{_esc_md_cell(cmd['name'])}` | {_esc_md_cell(cmd['group'])} | "
             f"{_esc_md_cell(cmd['since'])} | {_esc_md_cell(cmd['status'])} | "
-            f"{_esc_md_cell(cmd['milestone'])} | {_esc_md_cell(cmd.get('notes', ''))} |"
+            f"{_esc_md_cell(cmd['capability_tier'])} | {_esc_md_cell(cmd['milestone'])} | "
+            f"{_esc_md_cell(cmd.get('notes', ''))} |"
         )
     lines.append("")
     return "\n".join(lines)
@@ -318,6 +646,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     existing_ledger: dict[str, Any] | None = None
     if ledger_path.exists():
         existing_ledger = _json_load(ledger_path)
+    elif markdown_path.exists():
+        existing_ledger = _parse_markdown_ledger(markdown_path)
 
     merged_ledger = _merge_ledger(catalog_commands, existing_ledger)
     markdown_text = _render_markdown(merged_ledger)
@@ -327,14 +657,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
     markdown_path.write_text(markdown_text, encoding="utf-8")
 
     status_counts = Counter(str(c["status"]) for c in merged_ledger["commands"])
+    tier_counts = Counter(str(c["capability_tier"]) for c in merged_ledger["commands"])
     summary = ", ".join(
         f"{status}={status_counts.get(status, 0)}" for status in VALID_STATUSES
+    )
+    tier_summary = ", ".join(
+        f"{tier}={tier_counts.get(tier, 0)}" for tier in VALID_CAPABILITY_TIERS
     )
     print(
         f"[sync] commands={len(merged_ledger['commands'])} "
         f"ledger={ledger_path} markdown={markdown_path}"
     )
     print(f"[sync] status_counts: {summary}")
+    print(f"[sync] capability_tiers: {tier_summary}")
     return 0
 
 
@@ -383,10 +718,14 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 1
 
     status_counts = Counter(str(c["status"]) for c in ledger_commands)
+    tier_counts = Counter(str(c["capability_tier"]) for c in ledger_commands)
     summary = ", ".join(
         f"{status}={status_counts.get(status, 0)}" for status in VALID_STATUSES
     )
-    print(f"[check] OK: commands={len(ledger_commands)}; {summary}")
+    tier_summary = ", ".join(
+        f"{tier}={tier_counts.get(tier, 0)}" for tier in VALID_CAPABILITY_TIERS
+    )
+    print(f"[check] OK: commands={len(ledger_commands)}; {summary}; {tier_summary}")
     return 0
 
 

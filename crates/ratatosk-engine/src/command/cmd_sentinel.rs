@@ -25,6 +25,9 @@ fn sentinel_help() -> CommandOutcome {
         RespFrame::BulkString(Some(Bytes::from_static(
             b"SENTINEL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
         ))),
+        RespFrame::BulkString(Some(Bytes::from_static(
+            b"This instance is not a Sentinel; HELP is informational and other subcommands are unsupported.",
+        ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"MASTERS"))),
         RespFrame::BulkString(Some(Bytes::from_static(
             b"    Show a list of monitored masters and their state.",

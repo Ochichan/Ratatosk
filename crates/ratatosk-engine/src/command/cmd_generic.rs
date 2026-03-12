@@ -92,7 +92,7 @@ pub(super) fn cmd_keys(
     CommandOutcome::reply(RespFrame::Array(frames))
 }
 
-pub(super) fn cmd_wait(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_wait(args: &[Bytes], server: &ServerState) -> CommandOutcome {
     let [num_replicas_raw, timeout_raw] = args else {
         return wrong_arity("wait");
     };
@@ -107,10 +107,11 @@ pub(super) fn cmd_wait(args: &[Bytes]) -> CommandOutcome {
         return CommandOutcome::reply(err("ERR value is out of range"));
     }
 
-    CommandOutcome::reply(RespFrame::Integer(0))
+    let acked = server.replication_acked_replicas(server.replication_offset()) as i64;
+    CommandOutcome::reply(RespFrame::Integer(acked.min(num_replicas)))
 }
 
-pub(super) fn cmd_waitaof(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_waitaof(args: &[Bytes], server: &ServerState) -> CommandOutcome {
     let [num_local_raw, num_replicas_raw, timeout_raw] = args else {
         return wrong_arity("waitaof");
     };
@@ -129,9 +130,15 @@ pub(super) fn cmd_waitaof(args: &[Bytes]) -> CommandOutcome {
         return CommandOutcome::reply(err("ERR value is out of range"));
     }
 
+    let local_ack = if server.aof_enabled() && !server.aof_write_latched() {
+        1
+    } else {
+        0
+    };
+    let replica_ack = server.replication_acked_replicas(server.replication_offset()) as i64;
     CommandOutcome::reply(RespFrame::Array(vec![
-        RespFrame::Integer(0),
-        RespFrame::Integer(0),
+        RespFrame::Integer(local_ack.min(num_local)),
+        RespFrame::Integer(replica_ack.min(num_replicas)),
     ]))
 }
 

@@ -9,7 +9,7 @@
 - Runtime model: tokio TCP accept loop + per-client task + server_cron timer
 - Shared state: `Arc<tokio::sync::Mutex<ServerState>>`
 - Protocol: RESP2/RESP3 호환 파싱 경로
-- Command coverage: `420 / 420 done` (source: `docs/redis-gap-ledger.json`)
+- Command catalog: `420` entries. 구현 상태와 Redis 의미론 tier는 `docs/redis-gap-ledger.json` / `docs/redis-gap-ledger.md`를 함께 봐야 한다.
 - Persistence: RDB snapshot + AOF append-only file
 - Eviction: 8가지 maxmemory 정책 (LRU/LFU/random/TTL)
 
@@ -276,8 +276,9 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 
 ## Compatibility Notes
 
-- `docs/redis-gap-ledger.json` 기준 명령 커버리지는 420/420 `done`.
-- 단, 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
+- `docs/redis-gap-ledger.json` 기준 명령 카탈로그는 420개 엔트리이며, 현재 ledger는 status와 별도로 `capability_tier`를 기록한다.
+- 현재 tier summary는 `unsupported=64`, `syntax_only=30`, `baseline_local=45`, `behavioral_subset=281`, `distributed_parity=0`이다.
+- 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
   - 예: `SAVE`/`BGSAVE`는 현재 통계 timestamp 갱신 중심.
   - 예: 복제/클러스터 계열은 standalone 호환 응답 중심.
 

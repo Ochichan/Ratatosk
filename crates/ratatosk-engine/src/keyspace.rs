@@ -266,6 +266,65 @@ pub enum AofWriteState {
 }
 
 // ---------------------------------------------------------------------------
+// ReplicationState — standalone replication metadata skeleton
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ReplicationMode {
+    #[default]
+    Master,
+    Replica {
+        master_host: Bytes,
+        master_port: i64,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplicaClientState {
+    pub listening_port: Option<i64>,
+    pub ip_address: Option<Bytes>,
+    pub capabilities: HashSet<Bytes>,
+    pub ack_offset: i64,
+    pub ack_time_ms: Option<i64>,
+    pub handshake_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaClientInfo {
+    pub client_id: i64,
+    pub listening_port: i64,
+    pub ip_address: Bytes,
+    pub ack_offset: i64,
+    pub lag_seconds: i64,
+    pub state: &'static str,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicationState {
+    mode: ReplicationMode,
+    primary_replid: Bytes,
+    master_repl_offset: i64,
+    replicas: HashMap<i64, ReplicaClientState>,
+}
+
+impl Default for ReplicationState {
+    fn default() -> Self {
+        Self {
+            mode: ReplicationMode::Master,
+            primary_replid: generate_cluster_node_id(),
+            master_repl_offset: 0,
+            replicas: HashMap::new(),
+        }
+    }
+}
+
+impl ReplicationState {
+    fn replica_entry_mut(&mut self, client_id: i64) -> &mut ReplicaClientState {
+        self.replicas.entry(client_id).or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HashFieldEntry — hash field with optional per-field TTL
 // ---------------------------------------------------------------------------
 
@@ -1436,11 +1495,7 @@ impl StatsState {
     }
 
     pub fn latency_event_names(&self) -> Vec<Bytes> {
-        let mut names = self
-            .latency_events
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut names = self.latency_events.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
     }
@@ -1850,6 +1905,7 @@ pub struct ServerState {
     pub config: ConfigState,
     pub script_cache: ScriptCache,
     pub cluster_node_id: Bytes,
+    replication: ReplicationState,
     lazy_free_tx: Option<LazyFreeSender>,
     rdb_save_in_progress: bool,
     last_rdb_save_status: Option<Result<(), String>>,
@@ -1900,6 +1956,7 @@ impl ServerState {
             config: ConfigState::default(),
             script_cache: ScriptCache::default(),
             cluster_node_id: node_id,
+            replication: ReplicationState::default(),
             lazy_free_tx: None,
             rdb_save_in_progress: false,
             last_rdb_save_status: None,
@@ -1979,6 +2036,112 @@ impl ServerState {
 
     pub fn started_at_ms(&self) -> i64 {
         self.started_at_ms
+    }
+
+    pub fn replication_mode(&self) -> &ReplicationMode {
+        &self.replication.mode
+    }
+
+    pub fn replication_primary_replid(&self) -> &Bytes {
+        &self.replication.primary_replid
+    }
+
+    pub fn replication_offset(&self) -> i64 {
+        self.replication.master_repl_offset
+    }
+
+    pub fn advance_replication_offset(&mut self) {
+        self.replication.master_repl_offset = self.replication.master_repl_offset.saturating_add(1);
+    }
+
+    pub fn replication_connected_replicas(&self) -> usize {
+        self.replication.replicas.len()
+    }
+
+    pub fn replication_acked_replicas(&self, target_offset: i64) -> usize {
+        self.replication
+            .replicas
+            .values()
+            .filter(|replica| replica.handshake_complete && replica.ack_offset >= target_offset)
+            .count()
+    }
+
+    pub fn replication_replica_infos(&self, now_ms: i64) -> Vec<ReplicaClientInfo> {
+        let mut infos = self
+            .replication
+            .replicas
+            .iter()
+            .map(|(client_id, replica)| {
+                let lag_seconds = replica
+                    .ack_time_ms
+                    .map(|ack_time| ((now_ms - ack_time).max(0)) / 1000)
+                    .unwrap_or(-1);
+                ReplicaClientInfo {
+                    client_id: *client_id,
+                    listening_port: replica.listening_port.unwrap_or(0),
+                    ip_address: replica
+                        .ip_address
+                        .clone()
+                        .unwrap_or_else(|| Bytes::from_static(b"unknown")),
+                    ack_offset: replica.ack_offset,
+                    lag_seconds,
+                    state: if replica.handshake_complete {
+                        "online"
+                    } else {
+                        "handshake"
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        infos.sort_by_key(|info| info.client_id);
+        infos
+    }
+
+    pub fn replication_configure_master(&mut self) {
+        self.replication.mode = ReplicationMode::Master;
+        self.replication.primary_replid = generate_cluster_node_id();
+    }
+
+    pub fn replication_configure_replica(&mut self, master_host: Bytes, master_port: i64) {
+        self.replication.mode = ReplicationMode::Replica {
+            master_host,
+            master_port,
+        };
+    }
+
+    pub fn replication_set_listening_port(&mut self, client_id: i64, port: i64) {
+        self.replication.replica_entry_mut(client_id).listening_port = Some(port);
+    }
+
+    pub fn replication_set_ip_address(&mut self, client_id: i64, ip_address: Bytes) {
+        self.replication.replica_entry_mut(client_id).ip_address = Some(ip_address);
+    }
+
+    pub fn replication_set_capabilities<I>(&mut self, client_id: i64, capabilities: I)
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        self.replication.replica_entry_mut(client_id).capabilities =
+            capabilities.into_iter().collect();
+    }
+
+    pub fn replication_set_ack_offset(&mut self, client_id: i64, ack_offset: i64) {
+        let replica = self.replication.replica_entry_mut(client_id);
+        replica.ack_offset = ack_offset;
+        replica.ack_time_ms = Some(unix_ms_now());
+        replica.handshake_complete = true;
+    }
+
+    pub fn replication_mark_psync(&mut self, client_id: i64) {
+        let current_offset = self.replication.master_repl_offset;
+        let replica = self.replication.replica_entry_mut(client_id);
+        replica.handshake_complete = true;
+        replica.ack_offset = current_offset;
+        replica.ack_time_ms = Some(unix_ms_now());
+    }
+
+    pub fn replication_remove_client(&mut self, client_id: i64) {
+        self.replication.replicas.remove(&client_id);
     }
 
     /// Returns the server uptime in seconds.
@@ -2140,7 +2303,10 @@ impl ServerState {
 // ---------------------------------------------------------------------------
 
 pub fn purge_expired_key(db: &mut HashMap<Bytes, StoredValue>, key: &Bytes, now_ms: i64) {
-    if db.get(key.as_ref()).is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms)) {
+    if db
+        .get(key.as_ref())
+        .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms))
+    {
         db.remove(key.as_ref());
     }
 }

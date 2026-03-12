@@ -137,10 +137,7 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
         }
 
         // First pass: count volatile keys without allocating
-        let volatile_count = db
-            .iter()
-            .filter(|(_, v)| v.expire_at_ms.is_some())
-            .count();
+        let volatile_count = db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count();
 
         if volatile_count == 0 {
             continue;
@@ -166,7 +163,8 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
             if value.expire_at_ms.is_none() {
                 continue;
             }
-            if sample_cursor < sample_indices.len() && volatile_idx == sample_indices[sample_cursor] {
+            if sample_cursor < sample_indices.len() && volatile_idx == sample_indices[sample_cursor]
+            {
                 sampled_keys.push(key.clone());
                 sample_cursor += 1;
                 if sample_cursor >= sample_indices.len() {

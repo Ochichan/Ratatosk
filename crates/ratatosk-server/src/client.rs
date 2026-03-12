@@ -675,6 +675,7 @@ pub async fn handle_client_with_limits(
     {
         let mut server = server_state.lock().await;
         server.pubsub.remove_client(client_id);
+        server.replication_remove_client(client_id);
         server.stats.mark_client_disconnected();
         let active = server.stats.connected_clients();
         metrics::set_active_connections(active as usize);
@@ -1200,10 +1201,12 @@ mod tests {
     #[tokio::test]
     async fn write_commands_append_to_aof() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let mut config = crate::config::ServerConfig::default();
-        config.dir = dir.path().to_path_buf();
-        config.appendonly = true;
-        config.appendfsync = "always".to_string();
+        let config = crate::config::ServerConfig {
+            dir: dir.path().to_path_buf(),
+            appendonly: true,
+            appendfsync: "always".to_string(),
+            ..crate::config::ServerConfig::default()
+        };
         let persistence = Arc::new(PersistenceRuntime::from_config(&config).expect("runtime"));
 
         let (mut client, server_task) =

@@ -864,10 +864,12 @@ mod tests {
     #[tokio::test]
     async fn startup_load_replays_rdb_then_aof() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let mut config = ServerConfig::default();
-        config.dir = dir.path().to_path_buf();
-        config.appendonly = true;
-        config.appendfsync = "always".to_string();
+        let config = ServerConfig {
+            dir: dir.path().to_path_buf(),
+            appendonly: true,
+            appendfsync: "always".to_string(),
+            ..ServerConfig::default()
+        };
 
         let runtime = PersistenceRuntime::from_config(&config).expect("runtime");
 
@@ -916,10 +918,12 @@ mod tests {
     #[tokio::test]
     async fn rewrite_aof_via_worker_keeps_writer_usable() {
         let dir = tempfile::tempdir().expect("tmpdir");
-        let mut config = ServerConfig::default();
-        config.dir = dir.path().to_path_buf();
-        config.appendonly = true;
-        config.appendfsync = "always".to_string();
+        let config = ServerConfig {
+            dir: dir.path().to_path_buf(),
+            appendonly: true,
+            appendfsync: "always".to_string(),
+            ..ServerConfig::default()
+        };
 
         let runtime = PersistenceRuntime::from_config(&config).expect("runtime");
 

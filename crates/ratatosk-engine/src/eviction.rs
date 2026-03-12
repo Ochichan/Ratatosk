@@ -262,9 +262,7 @@ fn select_eviction_candidate(
 
         // First pass: count candidate keys without allocating
         let candidate_count = if config.policy.is_volatile() {
-            db.iter()
-                .filter(|(_, v)| v.expire_at_ms.is_some())
-                .count()
+            db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count()
         } else {
             db.len()
         };

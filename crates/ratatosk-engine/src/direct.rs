@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
-use crate::keyspace::{purge_expired_key, HashFieldEntry, ServerState, SortedSet, StoredValue};
+use crate::keyspace::{HashFieldEntry, ServerState, SortedSet, StoredValue, purge_expired_key};
 use ratatosk_core::time::now_ms;
 
 /// Maximum number of items to return in range operations by default.
@@ -118,9 +118,15 @@ impl DirectDb<'_> {
                     let existing_score = zset.score(&member);
                     match existing_score {
                         Some(old_score) => {
-                            if opts.nx { return 0; }
-                            if opts.gt && score <= old_score { return 0; }
-                            if opts.lt && score >= old_score { return 0; }
+                            if opts.nx {
+                                return 0;
+                            }
+                            if opts.gt && score <= old_score {
+                                return 0;
+                            }
+                            if opts.lt && score >= old_score {
+                                return 0;
+                            }
                             if (score - old_score).abs() > f64::EPSILON
                                 || score.to_bits() != old_score.to_bits()
                             {
@@ -131,7 +137,9 @@ impl DirectDb<'_> {
                             }
                         }
                         None => {
-                            if opts.xx { return 0; }
+                            if opts.xx {
+                                return 0;
+                            }
                             zset.insert(member, score);
                             1
                         }
@@ -149,8 +157,12 @@ impl DirectDb<'_> {
 
         let (removed, is_empty) = {
             let db = self.server.db_mut(self.db_idx);
-            let Some(entry) = db.get_mut(&key) else { return false; };
-            let Some(zset) = entry.as_sorted_set_mut() else { return false; };
+            let Some(entry) = db.get_mut(&key) else {
+                return false;
+            };
+            let Some(zset) = entry.as_sorted_set_mut() else {
+                return false;
+            };
             let removed = zset.remove(&member);
             (removed, zset.is_empty())
         };
@@ -169,8 +181,12 @@ impl DirectDb<'_> {
 
         let (removed, is_empty) = {
             let db = self.server.db_mut(self.db_idx);
-            let Some(entry) = db.get_mut(&key) else { return 0 };
-            let Some(zset) = entry.as_sorted_set_mut() else { return 0 };
+            let Some(entry) = db.get_mut(&key) else {
+                return 0;
+            };
+            let Some(zset) = entry.as_sorted_set_mut() else {
+                return 0;
+            };
             let removed = zset.remove_range_by_score(min, max) as i64;
             (removed, zset.is_empty())
         };
@@ -245,7 +261,11 @@ impl DirectDb<'_> {
             return Vec::new();
         }
 
-        let start_idx = if start < 0 { (start + len).max(0) as usize } else { start as usize };
+        let start_idx = if start < 0 {
+            (start + len).max(0) as usize
+        } else {
+            start as usize
+        };
         let stop_idx = if stop < 0 {
             (stop + len).max(0) as usize
         } else {
@@ -266,7 +286,12 @@ impl DirectDb<'_> {
     }
 
     /// Get members within a rank range in reverse order.
-    pub fn zrevrange_with_scores(&mut self, key: &[u8], start: i64, stop: i64) -> Vec<(Bytes, f64)> {
+    pub fn zrevrange_with_scores(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Vec<(Bytes, f64)> {
         self.zrevrange_with_scores_limit(key, start, stop, DEFAULT_MAX_RANGE)
     }
 
@@ -295,7 +320,11 @@ impl DirectDb<'_> {
         }
 
         let len_i64 = len as i64;
-        let start_idx = if start < 0 { (start + len_i64).max(0) as usize } else { start as usize };
+        let start_idx = if start < 0 {
+            (start + len_i64).max(0) as usize
+        } else {
+            start as usize
+        };
         let stop_idx = if stop < 0 {
             (stop + len_i64).max(0) as usize
         } else {
@@ -479,8 +508,12 @@ impl DirectDb<'_> {
 
         let (removed, is_empty) = {
             let db = self.server.db_mut(self.db_idx);
-            let Some(entry) = db.get_mut(&key) else { return false; };
-            let Some(hash) = entry.as_hash_mut() else { return false; };
+            let Some(entry) = db.get_mut(&key) else {
+                return false;
+            };
+            let Some(hash) = entry.as_hash_mut() else {
+                return false;
+            };
             let removed = hash.remove(&field).is_some();
             (removed, hash.is_empty())
         };
@@ -689,8 +722,12 @@ impl DirectDb<'_> {
 
         let (removed, is_empty) = {
             let db = self.server.db_mut(self.db_idx);
-            let Some(entry) = db.get_mut(&key) else { return false; };
-            let Some(set) = entry.as_set_mut() else { return false; };
+            let Some(entry) = db.get_mut(&key) else {
+                return false;
+            };
+            let Some(set) = entry.as_set_mut() else {
+                return false;
+            };
             let removed = set.remove(&member);
             (removed, set.is_empty())
         };
@@ -790,7 +827,9 @@ impl DirectDb<'_> {
 impl DirectDb<'_> {
     fn set_inner(&mut self, key: Bytes, value: Bytes, now: i64) {
         self.purge_if_expired_write(&key, now);
-        self.server.db_mut(self.db_idx).insert(key.clone(), StoredValue::string(value, None));
+        self.server
+            .db_mut(self.db_idx)
+            .insert(key.clone(), StoredValue::string(value, None));
         self.touch_version(&key);
     }
 
@@ -823,7 +862,10 @@ impl DirectDb<'_> {
         let value_bytes = Bytes::copy_from_slice(value);
         let now = now_ms();
         self.purge_if_expired_write(&key_bytes, now);
-        self.server.db_mut(self.db_idx).insert(key_bytes.clone(), StoredValue::string(value_bytes, expire_at_ms));
+        self.server.db_mut(self.db_idx).insert(
+            key_bytes.clone(),
+            StoredValue::string(value_bytes, expire_at_ms),
+        );
         self.touch_version(&key_bytes);
     }
 
@@ -1093,13 +1135,21 @@ impl ZaddOptions {
 #[derive(Debug, Clone)]
 pub enum BatchOp {
     /// Add to sorted set
-    ZAdd { key: Bytes, score: f64, member: Bytes },
+    ZAdd {
+        key: Bytes,
+        score: f64,
+        member: Bytes,
+    },
     /// Remove from sorted set
     ZRem { key: Bytes, member: Bytes },
     /// Remove by score range
     ZRemRangeByScore { key: Bytes, min: f64, max: f64 },
     /// Set hash field
-    HSet { key: Bytes, field: Bytes, value: Bytes },
+    HSet {
+        key: Bytes,
+        field: Bytes,
+        value: Bytes,
+    },
     /// Delete hash field
     HDel { key: Bytes, field: Bytes },
     /// Add to set
@@ -1136,7 +1186,9 @@ impl BatchBuilder {
 
     /// Create a new batch builder pre-sized for `n` operations.
     pub fn with_capacity(n: usize) -> Self {
-        Self { ops: Vec::with_capacity(n) }
+        Self {
+            ops: Vec::with_capacity(n),
+        }
     }
 
     /// Add a ZADD operation.
@@ -1231,7 +1283,8 @@ impl BatchBuilder {
         for op in self.ops {
             match op {
                 BatchOp::ZAdd { key, score, member } => {
-                    let added = db.zadd_opts_inner(key.clone(), score, member, ZaddOptions::default(), now);
+                    let added =
+                        db.zadd_opts_inner(key.clone(), score, member, ZaddOptions::default(), now);
                     result.added += added;
                     touched.push(key);
                 }

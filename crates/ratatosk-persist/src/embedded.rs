@@ -25,8 +25,8 @@ use std::io::{self, Read, Write};
 
 use bytes::Bytes;
 use ratatosk_engine::keyspace::{
-    Encoding, HashFieldEntry, ServerState, SortedSet, StreamConsumer, StreamEntry, StreamGroup,
-    StreamId, StoredValue, ValueData,
+    Encoding, HashFieldEntry, ServerState, SortedSet, StoredValue, StreamConsumer, StreamEntry,
+    StreamGroup, StreamId, ValueData,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,18 +62,18 @@ impl EmbeddedPersistence {
         hasher.update(MAGIC);
 
         writer.write_all(&VERSION.to_le_bytes())?;
-        hasher.update(&VERSION.to_le_bytes());
+        hasher.update(VERSION.to_le_bytes());
 
         let db_count = server.db_count() as u64;
         writer.write_all(&db_count.to_le_bytes())?;
-        hasher.update(&db_count.to_le_bytes());
+        hasher.update(db_count.to_le_bytes());
 
         // Write each database
         for db_idx in 0..server.db_count() {
             let db = server.db(db_idx);
             let key_count = db.len() as u64;
             writer.write_all(&key_count.to_le_bytes())?;
-            hasher.update(&key_count.to_le_bytes());
+            hasher.update(key_count.to_le_bytes());
 
             for (key, value) in db {
                 // Write key
@@ -105,7 +105,10 @@ impl EmbeddedPersistence {
     }
 
     /// Load a server state from a reader.
-    pub fn load_from_reader(server: &mut ServerState, mut reader: impl Read) -> Result<(), PersistError> {
+    pub fn load_from_reader(
+        server: &mut ServerState,
+        mut reader: impl Read,
+    ) -> Result<(), PersistError> {
         let mut hasher = Sha256::new();
 
         // Read and verify header
@@ -114,7 +117,7 @@ impl EmbeddedPersistence {
         if &magic != MAGIC {
             return Err(PersistError::corrupt("Invalid magic bytes"));
         }
-        hasher.update(&magic);
+        hasher.update(magic);
 
         let mut version_bytes = [0u8; 4];
         reader.read_exact(&mut version_bytes)?;
@@ -125,12 +128,12 @@ impl EmbeddedPersistence {
                 version
             )));
         }
-        hasher.update(&version_bytes);
+        hasher.update(version_bytes);
 
         let mut db_count_bytes = [0u8; 8];
         reader.read_exact(&mut db_count_bytes)?;
         let db_count = u64::from_le_bytes(db_count_bytes) as usize;
-        hasher.update(&db_count_bytes);
+        hasher.update(db_count_bytes);
 
         // Read each database
         let mut dbs = Vec::with_capacity(db_count);
@@ -138,7 +141,7 @@ impl EmbeddedPersistence {
             let mut key_count_bytes = [0u8; 8];
             reader.read_exact(&mut key_count_bytes)?;
             let key_count = u64::from_le_bytes(key_count_bytes) as usize;
-            hasher.update(&key_count_bytes);
+            hasher.update(key_count_bytes);
 
             let mut db = hashbrown::HashMap::with_capacity(key_count);
             for _ in 0..key_count {
@@ -168,7 +171,7 @@ impl EmbeddedPersistence {
 
     /// Load a server state from bytes.
     pub fn load_from_bytes(server: &mut ServerState, bytes: &[u8]) -> Result<(), PersistError> {
-        Self::load_from_reader(server, &bytes[..])
+        Self::load_from_reader(server, bytes)
     }
 
     // --- Helper functions for writing ---
@@ -180,7 +183,7 @@ impl EmbeddedPersistence {
     ) -> io::Result<()> {
         let len = data.len() as u64;
         writer.write_all(&len.to_le_bytes())?;
-        hasher.update(&len.to_le_bytes());
+        hasher.update(len.to_le_bytes());
         writer.write_all(data)?;
         hasher.update(data);
         Ok(())
@@ -194,75 +197,75 @@ impl EmbeddedPersistence {
         // Write expire_at_ms
         let expire = value.expire_at_ms.unwrap_or(-1i64);
         writer.write_all(&expire.to_le_bytes())?;
-        hasher.update(&expire.to_le_bytes());
+        hasher.update(expire.to_le_bytes());
 
         // Write type tag and data
         match &value.data {
             ValueData::String(s) => {
                 writer.write_all(&[0u8])?;
-                hasher.update(&[0u8]);
+                hasher.update([0u8]);
                 Self::write_bytes_with_hash(writer, hasher, s)?;
             }
             ValueData::Hash(h) => {
                 writer.write_all(&[1u8])?;
-                hasher.update(&[1u8]);
+                hasher.update([1u8]);
                 let len = h.len() as u64;
                 writer.write_all(&len.to_le_bytes())?;
-                hasher.update(&len.to_le_bytes());
+                hasher.update(len.to_le_bytes());
                 for (field, entry) in h {
                     Self::write_bytes_with_hash(writer, hasher, field)?;
                     Self::write_bytes_with_hash(writer, hasher, &entry.value)?;
                     let field_expire = entry.expire_at_ms.unwrap_or(-1i64);
                     writer.write_all(&field_expire.to_le_bytes())?;
-                    hasher.update(&field_expire.to_le_bytes());
+                    hasher.update(field_expire.to_le_bytes());
                 }
             }
             ValueData::List(l) => {
                 writer.write_all(&[2u8])?;
-                hasher.update(&[2u8]);
+                hasher.update([2u8]);
                 let len = l.len() as u64;
                 writer.write_all(&len.to_le_bytes())?;
-                hasher.update(&len.to_le_bytes());
+                hasher.update(len.to_le_bytes());
                 for item in l {
                     Self::write_bytes_with_hash(writer, hasher, item)?;
                 }
             }
             ValueData::Set(s) => {
                 writer.write_all(&[3u8])?;
-                hasher.update(&[3u8]);
+                hasher.update([3u8]);
                 let len = s.len() as u64;
                 writer.write_all(&len.to_le_bytes())?;
-                hasher.update(&len.to_le_bytes());
+                hasher.update(len.to_le_bytes());
                 for item in s {
                     Self::write_bytes_with_hash(writer, hasher, item)?;
                 }
             }
             ValueData::SortedSet(zset) => {
                 writer.write_all(&[4u8])?;
-                hasher.update(&[4u8]);
+                hasher.update([4u8]);
                 let len = zset.len() as u64;
                 writer.write_all(&len.to_le_bytes())?;
-                hasher.update(&len.to_le_bytes());
+                hasher.update(len.to_le_bytes());
                 for entry in zset.by_score.keys() {
                     Self::write_bytes_with_hash(writer, hasher, &entry.member)?;
                     writer.write_all(&entry.score.value().to_le_bytes())?;
-                    hasher.update(&entry.score.value().to_le_bytes());
+                    hasher.update(entry.score.value().to_le_bytes());
                 }
             }
             ValueData::Stream { entries, groups } => {
                 writer.write_all(&[5u8])?;
-                hasher.update(&[5u8]);
+                hasher.update([5u8]);
                 let entries_len = entries.len() as u64;
                 writer.write_all(&entries_len.to_le_bytes())?;
-                hasher.update(&entries_len.to_le_bytes());
+                hasher.update(entries_len.to_le_bytes());
                 for entry in entries {
                     writer.write_all(&entry.id.ms.to_le_bytes())?;
-                    hasher.update(&entry.id.ms.to_le_bytes());
+                    hasher.update(entry.id.ms.to_le_bytes());
                     writer.write_all(&entry.id.seq.to_le_bytes())?;
-                    hasher.update(&entry.id.seq.to_le_bytes());
+                    hasher.update(entry.id.seq.to_le_bytes());
                     let fields_len = entry.fields.len() as u64;
                     writer.write_all(&fields_len.to_le_bytes())?;
-                    hasher.update(&fields_len.to_le_bytes());
+                    hasher.update(fields_len.to_le_bytes());
                     for (field, value) in &entry.fields {
                         Self::write_bytes_with_hash(writer, hasher, field)?;
                         Self::write_bytes_with_hash(writer, hasher, value)?;
@@ -270,30 +273,30 @@ impl EmbeddedPersistence {
                 }
                 let groups_len = groups.len() as u64;
                 writer.write_all(&groups_len.to_le_bytes())?;
-                hasher.update(&groups_len.to_le_bytes());
+                hasher.update(groups_len.to_le_bytes());
                 for (name, group) in groups {
                     Self::write_bytes_with_hash(writer, hasher, name)?;
                     writer.write_all(&group.last_delivered_id.ms.to_le_bytes())?;
-                    hasher.update(&group.last_delivered_id.ms.to_le_bytes());
+                    hasher.update(group.last_delivered_id.ms.to_le_bytes());
                     writer.write_all(&group.last_delivered_id.seq.to_le_bytes())?;
-                    hasher.update(&group.last_delivered_id.seq.to_le_bytes());
+                    hasher.update(group.last_delivered_id.seq.to_le_bytes());
                     // Consumers
                     let consumers_len = group.consumers.len() as u64;
                     writer.write_all(&consumers_len.to_le_bytes())?;
-                    hasher.update(&consumers_len.to_le_bytes());
+                    hasher.update(consumers_len.to_le_bytes());
                     for (consumer_name, consumer) in &group.consumers {
                         Self::write_bytes_with_hash(writer, hasher, consumer_name)?;
                         writer.write_all(&consumer.seen_time_ms.to_le_bytes())?;
-                        hasher.update(&consumer.seen_time_ms.to_le_bytes());
+                        hasher.update(consumer.seen_time_ms.to_le_bytes());
                         // Pending IDs
                         let pending_len = consumer.pending.len() as u64;
                         writer.write_all(&pending_len.to_le_bytes())?;
-                        hasher.update(&pending_len.to_le_bytes());
+                        hasher.update(pending_len.to_le_bytes());
                         for id in &consumer.pending {
                             writer.write_all(&id.ms.to_le_bytes())?;
-                            hasher.update(&id.ms.to_le_bytes());
+                            hasher.update(id.ms.to_le_bytes());
                             writer.write_all(&id.seq.to_le_bytes())?;
-                            hasher.update(&id.seq.to_le_bytes());
+                            hasher.update(id.seq.to_le_bytes());
                         }
                     }
                 }
@@ -305,11 +308,14 @@ impl EmbeddedPersistence {
 
     // --- Helper functions for reading ---
 
-    fn read_bytes_with_hash(reader: &mut impl Read, hasher: &mut Sha256) -> Result<Bytes, PersistError> {
+    fn read_bytes_with_hash(
+        reader: &mut impl Read,
+        hasher: &mut Sha256,
+    ) -> Result<Bytes, PersistError> {
         let mut len_bytes = [0u8; 8];
         reader.read_exact(&mut len_bytes)?;
         let len = u64::from_le_bytes(len_bytes) as usize;
-        hasher.update(&len_bytes);
+        hasher.update(len_bytes);
 
         if len > 1024 * 1024 * 1024 {
             // 1GB limit
@@ -323,18 +329,21 @@ impl EmbeddedPersistence {
         Ok(Bytes::from(buffer))
     }
 
-    fn read_stored_value(reader: &mut impl Read, hasher: &mut Sha256) -> Result<StoredValue, PersistError> {
+    fn read_stored_value(
+        reader: &mut impl Read,
+        hasher: &mut Sha256,
+    ) -> Result<StoredValue, PersistError> {
         // Read expire_at_ms
         let mut expire_bytes = [0u8; 8];
         reader.read_exact(&mut expire_bytes)?;
         let expire = i64::from_le_bytes(expire_bytes);
-        hasher.update(&expire_bytes);
+        hasher.update(expire_bytes);
         let expire_at_ms = if expire < 0 { None } else { Some(expire) };
 
         // Read type tag
         let mut type_tag = [0u8; 1];
         reader.read_exact(&mut type_tag)?;
-        hasher.update(&type_tag);
+        hasher.update(type_tag);
 
         let data = match type_tag[0] {
             0 => {
@@ -347,7 +356,7 @@ impl EmbeddedPersistence {
                 let mut len_bytes = [0u8; 8];
                 reader.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
-                hasher.update(&len_bytes);
+                hasher.update(len_bytes);
 
                 let mut hash = hashbrown::HashMap::with_capacity(len);
                 for _ in 0..len {
@@ -356,7 +365,7 @@ impl EmbeddedPersistence {
                     let mut field_expire_bytes = [0u8; 8];
                     reader.read_exact(&mut field_expire_bytes)?;
                     let field_expire = i64::from_le_bytes(field_expire_bytes);
-                    hasher.update(&field_expire_bytes);
+                    hasher.update(field_expire_bytes);
 
                     let entry = if field_expire < 0 {
                         HashFieldEntry::new(value)
@@ -372,7 +381,7 @@ impl EmbeddedPersistence {
                 let mut len_bytes = [0u8; 8];
                 reader.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
-                hasher.update(&len_bytes);
+                hasher.update(len_bytes);
 
                 let mut list = std::collections::VecDeque::with_capacity(len);
                 for _ in 0..len {
@@ -385,7 +394,7 @@ impl EmbeddedPersistence {
                 let mut len_bytes = [0u8; 8];
                 reader.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
-                hasher.update(&len_bytes);
+                hasher.update(len_bytes);
 
                 let mut set = hashbrown::HashSet::with_capacity(len);
                 for _ in 0..len {
@@ -398,7 +407,7 @@ impl EmbeddedPersistence {
                 let mut len_bytes = [0u8; 8];
                 reader.read_exact(&mut len_bytes)?;
                 let len = u64::from_le_bytes(len_bytes) as usize;
-                hasher.update(&len_bytes);
+                hasher.update(len_bytes);
 
                 let mut zset = SortedSet::default();
                 for _ in 0..len {
@@ -406,7 +415,7 @@ impl EmbeddedPersistence {
                     let mut score_bytes = [0u8; 8];
                     reader.read_exact(&mut score_bytes)?;
                     let score = f64::from_le_bytes(score_bytes);
-                    hasher.update(&score_bytes);
+                    hasher.update(score_bytes);
                     zset.insert(member, score);
                 }
                 ValueData::SortedSet(zset)
@@ -416,24 +425,24 @@ impl EmbeddedPersistence {
                 let mut entries_len_bytes = [0u8; 8];
                 reader.read_exact(&mut entries_len_bytes)?;
                 let entries_len = u64::from_le_bytes(entries_len_bytes) as usize;
-                hasher.update(&entries_len_bytes);
+                hasher.update(entries_len_bytes);
 
                 let mut entries = Vec::with_capacity(entries_len);
                 for _ in 0..entries_len {
                     let mut ms_bytes = [0u8; 8];
                     reader.read_exact(&mut ms_bytes)?;
                     let ms = i64::from_le_bytes(ms_bytes);
-                    hasher.update(&ms_bytes);
+                    hasher.update(ms_bytes);
 
                     let mut seq_bytes = [0u8; 8];
                     reader.read_exact(&mut seq_bytes)?;
                     let seq = i64::from_le_bytes(seq_bytes);
-                    hasher.update(&seq_bytes);
+                    hasher.update(seq_bytes);
 
                     let mut fields_len_bytes = [0u8; 8];
                     reader.read_exact(&mut fields_len_bytes)?;
                     let fields_len = u64::from_le_bytes(fields_len_bytes) as usize;
-                    hasher.update(&fields_len_bytes);
+                    hasher.update(fields_len_bytes);
 
                     let mut fields = Vec::with_capacity(fields_len);
                     for _ in 0..fields_len {
@@ -451,7 +460,7 @@ impl EmbeddedPersistence {
                 let mut groups_len_bytes = [0u8; 8];
                 reader.read_exact(&mut groups_len_bytes)?;
                 let groups_len = u64::from_le_bytes(groups_len_bytes) as usize;
-                hasher.update(&groups_len_bytes);
+                hasher.update(groups_len_bytes);
 
                 let mut groups = hashbrown::HashMap::with_capacity(groups_len);
                 for _ in 0..groups_len {
@@ -460,17 +469,17 @@ impl EmbeddedPersistence {
                     let mut ms_bytes = [0u8; 8];
                     reader.read_exact(&mut ms_bytes)?;
                     let ms = i64::from_le_bytes(ms_bytes);
-                    hasher.update(&ms_bytes);
+                    hasher.update(ms_bytes);
 
                     let mut seq_bytes = [0u8; 8];
                     reader.read_exact(&mut seq_bytes)?;
                     let seq = i64::from_le_bytes(seq_bytes);
-                    hasher.update(&seq_bytes);
+                    hasher.update(seq_bytes);
 
                     let mut consumers_len_bytes = [0u8; 8];
                     reader.read_exact(&mut consumers_len_bytes)?;
                     let consumers_len = u64::from_le_bytes(consumers_len_bytes) as usize;
-                    hasher.update(&consumers_len_bytes);
+                    hasher.update(consumers_len_bytes);
 
                     let mut consumers = hashbrown::HashMap::with_capacity(consumers_len);
                     for _ in 0..consumers_len {
@@ -479,24 +488,27 @@ impl EmbeddedPersistence {
                         let mut seen_time_bytes = [0u8; 8];
                         reader.read_exact(&mut seen_time_bytes)?;
                         let seen_time_ms = i64::from_le_bytes(seen_time_bytes);
-                        hasher.update(&seen_time_bytes);
+                        hasher.update(seen_time_bytes);
 
                         let mut pending_len_bytes = [0u8; 8];
                         reader.read_exact(&mut pending_len_bytes)?;
                         let pending_len = u64::from_le_bytes(pending_len_bytes) as usize;
-                        hasher.update(&pending_len_bytes);
+                        hasher.update(pending_len_bytes);
 
                         let mut pending = hashbrown::HashSet::with_capacity(pending_len);
                         for _ in 0..pending_len {
                             reader.read_exact(&mut ms_bytes)?;
                             let p_ms = i64::from_le_bytes(ms_bytes);
-                            hasher.update(&ms_bytes);
+                            hasher.update(ms_bytes);
 
                             reader.read_exact(&mut seq_bytes)?;
                             let p_seq = i64::from_le_bytes(seq_bytes);
-                            hasher.update(&seq_bytes);
+                            hasher.update(seq_bytes);
 
-                            pending.insert(StreamId { ms: p_ms, seq: p_seq });
+                            pending.insert(StreamId {
+                                ms: p_ms,
+                                seq: p_seq,
+                            });
                         }
 
                         consumers.insert(
@@ -521,10 +533,7 @@ impl EmbeddedPersistence {
                 ValueData::Stream { entries, groups }
             }
             tag => {
-                return Err(PersistError::corrupt(format!(
-                    "Unknown type tag: {}",
-                    tag
-                )));
+                return Err(PersistError::corrupt(format!("Unknown type tag: {}", tag)));
             }
         };
 
