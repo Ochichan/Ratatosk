@@ -12,6 +12,13 @@ use super::{
     wrong_type_response,
 };
 
+fn blocking_watch_keys(client: &ClientState, keys: &[Bytes]) -> Vec<(usize, Bytes)> {
+    keys.iter()
+        .cloned()
+        .map(|key| (client.selected_db(), key))
+        .collect()
+}
+
 const MAX_LIST_POP_COUNT: usize = 100_000;
 const MAX_LIST_NUMKEYS: usize = 10_000;
 
@@ -193,7 +200,12 @@ pub(super) fn cmd_bpop(
     }
 
     let full_frame = build_blocking_frame(command_name, args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, keys),
+    )
 }
 
 fn build_blocking_frame(command_name: &str, args: &[Bytes]) -> RespFrame {
@@ -533,7 +545,12 @@ pub(super) fn cmd_brpoplpush(
     }
 
     let full_frame = build_blocking_frame("BRPOPLPUSH", args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, std::slice::from_ref(source)),
+    )
 }
 
 pub(super) fn cmd_blmove(
@@ -570,7 +587,12 @@ pub(super) fn cmd_blmove(
     }
 
     let full_frame = build_blocking_frame("BLMOVE", args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, std::slice::from_ref(source)),
+    )
 }
 
 pub(super) fn cmd_lmpop(
@@ -681,7 +703,12 @@ pub(super) fn cmd_lmpop_inner(
     }
 
     let full_frame = build_blocking_frame("BLMPOP", args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, &keys),
+    )
 }
 
 pub(super) fn try_lmpop_once(

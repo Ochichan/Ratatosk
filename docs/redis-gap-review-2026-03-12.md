@@ -32,7 +32,7 @@ Ratatosk는 1번은 넓게 커버하지만, 2번은 특히 분산/운영 영역�
 - Replication 관련 명령은 대부분 상태 변화 없이 `OK`, 고정 `FULLRESYNC`, 또는 `0`을 반환한다.
 - Cluster 관련 명령은 슬롯 해시 계산 정도만 실제 구현되어 있고, 나머지는 `cluster support disabled` 에러 또는 무상태 `OK`다.
 - Sentinel은 `HELP`만 구현되어 있고 나머지는 모두 "Sentinel 아님" 오류를 반환한다.
-- `CLIENT TRACKING`, `CLIENT PAUSE`, `CLIENT UNBLOCK`, `MONITOR` 같은 운영 명령은 실제 서버 동작을 제어하지 않는다.
+- `CLIENT TRACKING`은 이제 direct invalidation push를 넘어 `BCAST`/`PREFIX`/`NOLOOP`까지 처리하지만, `CLIENT PAUSE`, `CLIENT UNBLOCK`, `MONITOR` 같은 운영 명령은 여전히 실제 서버 동작을 충분히 제어하지 않는다.
 - `INFO`도 Redis 운영자가 기대하는 replication/cluster/sentinel 관찰면을 제공하지 않는다.
 
 ## Structural Findings
@@ -141,16 +141,21 @@ Redis의 운영 표면에는 단순 응답 이상의 부작용이 있다. `MONIT
   - `MONITOR`: `crates/ratatosk-engine/src/command/cmd_server.rs:106-112`
   - `CLIENT` command family: `crates/ratatosk-engine/src/command/cmd_client.rs:15-418`
   - client tracking state fields는 `ClientState`에만 존재: `crates/ratatosk-engine/src/command/mod.rs:3380-3456`
-  - `INFO Clients`는 항상 `blocked_clients:0`, `tracking_clients:0`: `crates/ratatosk-engine/src/command/cmd_server.rs:977-985`
+  - runtime은 live client snapshot registry를 유지하고 `INFO Clients`/`CLIENT LIST`가 이를 읽는다: `crates/ratatosk-engine/src/keyspace.rs`, `crates/ratatosk-server/src/client.rs`, `crates/ratatosk-engine/src/command/cmd_client.rs`
 
 - 관찰
   - `MONITOR`는 아무 monitor 모드 전환 없이 단순 `OK`를 반환한다.
-  - `CLIENT TRACKING`은 `tracking_enabled`, `tracking_redirect` 필드만 토글한다. invalidation message 발행 경로가 없다.
-  - `CLIENT TRACKINGINFO`도 prefix 목록을 항상 빈 배열로 반환한다.
+  - `CLIENT TRACKING`은 direct-key invalidation registry에 더해 `BCAST`/`PREFIX`/`NOLOOP` registry와 async invalidate push를 사용한다.
+  - `CLIENT TRACKINGINFO`는 redirect, flags, prefix 목록을 실제 tracking state로 보여준다.
+  - `CLIENT CACHING YES|NO`는 `OPTIN`/`OPTOUT` 모드에서 다음 read 1회에만 적용되는 gating으로 동작한다.
+  - redirect target은 이제 notifier 기반으로 깨어나 invalidate push를 받을 수 있고, 연결되지 않은 target은 `REDIRECT` 단계에서 거부된다.
+  - dead target으로의 stale invalidate enqueue는 막혔고, target disconnect 뒤에는 `broken_redirect` marking과 RESP3 `tracking-redir-broken` push, tracker direct fallback이 동작한다.
+  - 다만 unsupported 조합 처리와 fallback semantics 전체까지 Redis full contract는 아니다.
   - `CLIENT PAUSE`/`UNPAUSE`는 입력 검증 후 `OK`만 반환한다.
   - `CLIENT UNBLOCK`은 대상 client를 찾거나 상태를 바꾸지 않고 항상 `0`을 반환한다.
   - `CLIENT KILL`도 사실상 현재 client id와 일치하는지 정도만 본다.
-  - `CLIENT LIST`는 전체 연결 목록이 아니라 현재 연결 정보 한 줄만 반환한다.
+  - `CLIENT LIST`와 `INFO Clients`는 이제 live connection inventory, blocked client count, tracking client count를 반영한다. 다만 Redis의 전체 필드 충실도에는 아직 못 미친다.
+  - list/sorted-set/stream blocking commands는 이제 blocked wait registry와 producer-side wakeup을 사용하지만, `CLIENT UNBLOCK`나 Redis식 fairness scheduler까지는 올라오지 않았다.
 
 - 갭의 의미
   - Redis tooling은 이 명령들을 운영 제어면으로 사용한다.
@@ -170,7 +175,7 @@ Redis의 운영 표면에는 단순 응답 이상의 부작용이 있다. `MONIT
 
 - 관찰
   - `INFO replication`, `INFO cluster`, `INFO modules`, `INFO cpu`, `INFO commandstats`, `INFO errorstats` 등 Redis 운영에서 자주 보는 섹션이 없다.
-  - `INFO Clients`는 실제 추적/블로킹 상태와 무관하게 `blocked_clients:0`, `tracking_clients:0` 고정이다.
+- `INFO Clients`는 이제 실제 blocked/tracking client 수를 반영하지만, pause/unblock/monitor 같은 더 강한 운영 제어까지는 아니다.
   - `INFO Persistence`도 `aof_current_size:0`, `aof_base_size:0` 같은 고정값을 쓴다.
 
 - 영향
@@ -204,7 +209,7 @@ Redis의 운영 표면에는 단순 응답 이상의 부작용이 있다. `MONIT
 
 ## Dependency Graph Issues
 
-- `CLIENT TRACKING`, `PAUSE`, `UNBLOCK`, `MONITOR`가 모두 per-client 로컬 상태 또는 immediate reply로 끝난다
+- `CLIENT TRACKING`은 direct invalidation push를 넘어 `BCAST`/`PREFIX`/`NOLOOP`까지 올라왔지만, `PAUSE`, `UNBLOCK`, `MONITOR`는 여전히 per-client 로컬 상태 또는 immediate reply로 끝난다
   - 관련 코드: `crates/ratatosk-engine/src/command/cmd_client.rs:212-377`, `crates/ratatosk-engine/src/command/cmd_server.rs:106-112`
   - 서버 런타임과 연결된 제어 경로가 없다.
 
@@ -238,7 +243,7 @@ Redis의 운영 표면에는 단순 응답 이상의 부작용이 있다. `MONIT
 2. 분산 기능을 목표로 할지, standalone 고도화를 목표로 할지 먼저 결정한다.
    - 둘을 동시에 잡으면 문서와 구현이 계속 어긋난다.
 3. standalone 전략이면 다음을 명확히 한다.
-   - replication / cluster / sentinel / client tracking invalidation 명령은 `unsupported`로 낮춘다.
+   - cluster / sentinel은 `unsupported`로 낮추고, replication / client tracking은 standalone-local tier로 문서화한다.
    - misleading help text와 command metadata를 줄인다.
 4. distributed 전략이면 다음 순서가 맞다.
    - replication state machine
@@ -247,6 +252,40 @@ Redis의 운영 표면에는 단순 응답 이상의 부작용이 있다. `MONIT
    - cluster slot ownership + MOVED/ASK
    - replica read routing + ASKING/READONLY 상태
    - Sentinel 또는 외부 failover provider 연동
+
+## Next Workstreams
+
+### 1. Redirect wakeup / tracking delivery
+
+- 권장 순서:
+  1. redirect lifecycle 표를 먼저 고정
+     - target disconnect 시 auto-detach
+     - reconnect 시 explicit rebind only
+     - stale pending invalidation drop
+  2. tracker config와 target delivery capability를 server-wide registry로 정규화
+  3. direct/bcast/prefix/noloop/optin/optout/redirect 조합별 behavior matrix를 테스트와 에러 메시지까지 같이 고정
+  4. `TRACKINGINFO`, `CLIENT LIST`, disconnect cleanup을 같은 source-of-truth로 묶기
+- release gate:
+  - redirect target disconnect에서 stale state가 남지 않아야 한다.
+  - redirected invalidation이 polling tick 의존 없이 도착해야 한다.
+  - unsupported 조합은 문서와 에러 메시지가 일치해야 한다.
+  - reconnect한 새 client id는 이전 redirect binding을 암묵적으로 승계하지 않아야 한다.
+
+### 2. Persistence/runtime redesign
+
+- 권장 순서:
+  1. `ratatosk-server`와 `ratatosk-persist`의 ownership 경계 문서화
+  2. full clone snapshot을 iterable serialization view로 치환
+  3. AOF rewrite를 current-state materialization + incremental tail로 교체
+  4. multipart manifest의 rewrite switch/rotation을 atomic transaction으로 연결
+  5. `INFO persistence`와 background job observability 보강
+- release gate:
+  - runtime이 단일 `appendonly.aof` 경로 가정을 직접 들고 있지 않아야 한다.
+  - `BGSAVE`/`BGREWRITEAOF` 시작 시 메모리 증폭과 pause cost가 측정 가능해야 한다.
+  - crash/restart/recovery integration test가 manifest swap까지 고정해야 한다.
+  - failed switch 이후에도 startup이 old manifest 또는 validated candidate 중 하나로만 부팅되어야 한다.
+  - server crate가 filename/rotation 정책을 직접 소유하지 않아야 한다.
+  - `ratatosk-persist`의 manifest candidate validation / cleanup helper가 BASE materialization + full switch transaction까지 확장되어야 한다.
 
 ## Bottom Line
 

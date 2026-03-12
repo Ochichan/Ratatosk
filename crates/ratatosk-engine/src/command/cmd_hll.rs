@@ -13,6 +13,7 @@ use super::{ClientState, CommandOutcome, err, now_ms, wrong_arity, wrong_type_re
 
 /// Extract HLL bytes from a stored value, verifying the string type and magic.
 /// Returns `Ok(bytes_ref)` on success, or an appropriate error `CommandOutcome`.
+#[allow(clippy::result_large_err)]
 fn extract_hll_bytes(entry: &StoredValue) -> Result<&Bytes, CommandOutcome> {
     let Some(s) = entry.as_string() else {
         return Err(wrong_type_response());

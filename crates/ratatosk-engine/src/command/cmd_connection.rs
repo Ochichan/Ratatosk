@@ -245,6 +245,8 @@ pub(super) fn cmd_hello(
         ));
     }
 
+    client.set_protocol_version(proto);
+
     let response = RespFrame::Map(vec![
         (
             RespFrame::bulk_str("server"),

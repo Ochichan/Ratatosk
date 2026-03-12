@@ -4,17 +4,14 @@ use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::ServerState;
+use crate::keyspace::{ClientSnapshot, ServerState};
 use crate::security::should_reject_shell_metacharacters;
 
-use super::{
-    ClientState, CommandOutcome, err, now_client_clock_ms, parse_i64, to_uppercase_stack,
-    wrong_arity,
-};
+use super::{ClientState, CommandOutcome, err, parse_i64, to_uppercase_stack, wrong_arity};
 
 pub(super) fn cmd_client(
     args: &[Bytes],
-    _server: &mut ServerState,
+    server: &mut ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
     if args.is_empty() {
@@ -52,19 +49,42 @@ pub(super) fn cmd_client(
             if args.len() != 1 {
                 return wrong_arity("client");
             }
-            let line = format_client_info_line(client);
+            let line = server
+                .client_snapshot(client.id())
+                .map(|snapshot| {
+                    format_client_snapshot_line(snapshot, server.client_is_blocked(snapshot.id))
+                })
+                .unwrap_or_else(|| format_client_info_line(client));
             CommandOutcome::reply(RespFrame::bulk_str(&line))
         }
         b"LIST" => {
-            let include_current = match parse_client_list_filter(&args[1..], client.id) {
-                Ok(include_current) => include_current,
+            let filter = match parse_client_list_filter(&args[1..]) {
+                Ok(filter) => filter,
                 Err(response) => return CommandOutcome::reply(response),
             };
 
             let mut payload = String::new();
-            if include_current {
-                payload.push_str(&format_client_info_line(client));
-                payload.push('\n');
+            let snapshots = server.client_snapshots();
+            if snapshots.is_empty() {
+                if client_snapshot_matches_filter(
+                    &filter,
+                    &client.snapshot(
+                        Bytes::from_static(b"127.0.0.1:0"),
+                        Bytes::from_static(b"127.0.0.1:0"),
+                    ),
+                    false,
+                ) {
+                    payload.push_str(&format_client_info_line(client));
+                    payload.push('\n');
+                }
+            } else {
+                for snapshot in snapshots {
+                    let blocked = server.client_is_blocked(snapshot.id);
+                    if client_snapshot_matches_filter(&filter, &snapshot, blocked) {
+                        payload.push_str(&format_client_snapshot_line(&snapshot, blocked));
+                        payload.push('\n');
+                    }
+                }
             }
             CommandOutcome::reply(RespFrame::bulk_str(&payload))
         }
@@ -72,10 +92,10 @@ pub(super) fn cmd_client(
         b"PAUSE" => cmd_client_pause(&args[1..]),
         b"UNPAUSE" => cmd_client_unpause(&args[1..]),
         b"UNBLOCK" => cmd_client_unblock(&args[1..], client),
-        b"TRACKING" => cmd_client_tracking(&args[1..], client),
-        b"TRACKINGINFO" => cmd_client_trackinginfo(&args[1..], client),
+        b"TRACKING" => cmd_client_tracking(&args[1..], server, client),
+        b"TRACKINGINFO" => cmd_client_trackinginfo(&args[1..], server, client),
         b"CACHING" => cmd_client_caching(&args[1..], client),
-        b"GETREDIR" => cmd_client_getredir(&args[1..], client),
+        b"GETREDIR" => cmd_client_getredir(&args[1..], server, client),
         b"SETINFO" => cmd_client_setinfo(&args[1..]),
         b"NO-EVICT" => cmd_client_no_evict(&args[1..], client),
         b"NO-TOUCH" => cmd_client_no_touch(&args[1..], client),
@@ -105,7 +125,7 @@ pub(super) fn cmd_client(
                     "UNBLOCK <id> [TIMEOUT|ERROR] -- Unblock client (baseline no-op).",
                 ),
                 RespFrame::bulk_str(
-                    "TRACKING ON|OFF [REDIRECT <id> ...] -- Client-side caching tracking controls.",
+                    "TRACKING ON|OFF [REDIRECT <id>] [BCAST [PREFIX <prefix> ...]] [NOLOOP|OPTIN|OPTOUT] -- Client-side caching tracking controls.",
                 ),
                 RespFrame::bulk_str(
                     "TRACKINGINFO -- Return tracking state for current connection.",
@@ -274,25 +294,42 @@ fn parse_on_off(arg: &Bytes) -> Option<bool> {
     }
 }
 
-fn cmd_client_tracking(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
+fn cmd_client_tracking(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if args.is_empty() {
         return wrong_arity("client");
     }
 
     let first = to_uppercase_stack(&args[0]);
     match first.as_slice() {
-        b"ON" => client.tracking_enabled = true,
+        b"ON" => {}
         b"OFF" => {
             if args.len() != 1 {
                 return CommandOutcome::reply(err("ERR syntax error"));
             }
+            server.tracking_clear_tracker(client.id());
             client.tracking_enabled = false;
             client.tracking_redirect = -1;
+            client.tracking_broadcast = false;
+            client.tracking_no_loop = false;
+            client.tracking_optin = false;
+            client.tracking_optout = false;
+            client.tracking_prefixes.clear();
+            client.set_tracking_caching(true);
             return CommandOutcome::reply(RespFrame::ok());
         }
         _ => return CommandOutcome::reply(err("ERR syntax error")),
     }
 
+    let mut tracking_redirect = -1;
+    let mut tracking_broadcast = false;
+    let mut tracking_no_loop = false;
+    let mut tracking_optin = false;
+    let mut tracking_optout = false;
+    let mut tracking_prefixes = Vec::new();
     let mut idx = 1usize;
     while idx < args.len() {
         let option = to_uppercase_stack(&args[idx]);
@@ -306,41 +343,133 @@ fn cmd_client_tracking(args: &[Bytes], client: &mut ClientState) -> CommandOutco
                         "ERR value is not an integer or out of range",
                     ));
                 };
-                client.tracking_redirect = id;
+                if id < 0 {
+                    return CommandOutcome::reply(err("ERR redirect id is out of range"));
+                }
+                tracking_redirect = id;
                 idx += 2;
             }
-            b"BCAST" | b"OPTIN" | b"OPTOUT" | b"NOLOOP" => idx += 1,
+            b"BCAST" => {
+                tracking_broadcast = true;
+                idx += 1;
+            }
+            b"NOLOOP" => {
+                tracking_no_loop = true;
+                idx += 1;
+            }
+            b"OPTIN" => {
+                tracking_optin = true;
+                idx += 1;
+            }
+            b"OPTOUT" => {
+                tracking_optout = true;
+                idx += 1;
+            }
             b"PREFIX" => {
                 if idx + 1 >= args.len() {
                     return CommandOutcome::reply(err("ERR syntax error"));
                 }
+                tracking_prefixes.push(args[idx + 1].clone());
                 idx += 2;
             }
             _ => return CommandOutcome::reply(err("ERR syntax error")),
         }
     }
 
+    if !tracking_broadcast && !tracking_prefixes.is_empty() {
+        return CommandOutcome::reply(err(
+            "ERR PREFIX option requires BCAST in this Ratatosk baseline",
+        ));
+    }
+    if tracking_optin && tracking_optout {
+        return CommandOutcome::reply(err("ERR OPTIN and OPTOUT are mutually exclusive"));
+    }
+    if tracking_redirect >= 0
+        && tracking_redirect != client.id()
+        && server.client_snapshot(tracking_redirect).is_none()
+    {
+        return CommandOutcome::reply(err(
+            "ERR CLIENT TRACKING REDIRECT target client is not connected",
+        ));
+    }
+
+    server.tracking_clear_tracker(client.id());
+    client.tracking_enabled = true;
+    client.tracking_redirect = tracking_redirect;
+    client.tracking_broadcast = tracking_broadcast;
+    client.tracking_no_loop = tracking_no_loop;
+    client.tracking_optin = tracking_optin;
+    client.tracking_optout = tracking_optout;
+    client.tracking_prefixes = tracking_prefixes;
+    client.reset_tracking_caching_mode();
+
+    if client.tracking_broadcast {
+        server.tracking_configure_broadcast(
+            client.id(),
+            server.tracking_target_client_id(client.id(), client.tracking_redirect),
+            client.tracking_no_loop,
+            client.tracking_prefixes.clone(),
+        );
+    }
+
     CommandOutcome::reply(RespFrame::ok())
 }
 
-fn cmd_client_trackinginfo(args: &[Bytes], client: &ClientState) -> CommandOutcome {
+fn cmd_client_trackinginfo(
+    args: &[Bytes],
+    server: &ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("client");
     }
 
-    let flags = if client.tracking_enabled {
+    let mut flags = if client.tracking_enabled {
         vec![RespFrame::bulk_str("on")]
     } else {
         vec![RespFrame::bulk_str("off")]
+    };
+    if client.tracking_broadcast {
+        flags.push(RespFrame::bulk_str("bcast"));
+    }
+    if client.tracking_no_loop {
+        flags.push(RespFrame::bulk_str("noloop"));
+    }
+    if client.tracking_optin {
+        flags.push(RespFrame::bulk_str("optin"));
+    }
+    if client.tracking_optout {
+        flags.push(RespFrame::bulk_str("optout"));
+    }
+    if server.tracking_redirect_broken(client.id()) {
+        flags.push(RespFrame::bulk_str("broken_redirect"));
+    }
+
+    let redirect = if !client.tracking_enabled {
+        -1
+    } else if client.tracking_redirect < 0 {
+        0
+    } else {
+        client.tracking_redirect
     };
 
     CommandOutcome::reply(RespFrame::Map(vec![
         (RespFrame::bulk_str("flags"), RespFrame::Array(flags)),
         (
             RespFrame::bulk_str("redirect"),
-            RespFrame::Integer(client.tracking_redirect),
+            RespFrame::Integer(redirect),
         ),
-        (RespFrame::bulk_str("prefixes"), RespFrame::Array(vec![])),
+        (
+            RespFrame::bulk_str("prefixes"),
+            RespFrame::Array(
+                client
+                    .tracking_prefixes
+                    .iter()
+                    .cloned()
+                    .map(|prefix| RespFrame::BulkString(Some(prefix)))
+                    .collect(),
+            ),
+        ),
     ]))
 }
 
@@ -349,19 +478,38 @@ fn cmd_client_caching(args: &[Bytes], client: &mut ClientState) -> CommandOutcom
         return wrong_arity("client");
     };
 
+    if !client.tracking_accepts_caching_toggle() {
+        return CommandOutcome::reply(err(
+            "ERR CLIENT CACHING is only valid with CLIENT TRACKING in OPTIN or OPTOUT mode",
+        ));
+    }
+
     let Some(enabled) = parse_on_off(mode) else {
         return CommandOutcome::reply(err("ERR syntax error"));
     };
-    client.caching_enabled = enabled;
+    client.set_tracking_caching(enabled);
     CommandOutcome::reply(RespFrame::ok())
 }
 
-fn cmd_client_getredir(args: &[Bytes], client: &ClientState) -> CommandOutcome {
+fn cmd_client_getredir(
+    args: &[Bytes],
+    server: &ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("client");
     }
 
-    CommandOutcome::reply(RespFrame::Integer(client.tracking_redirect))
+    let _ = server;
+    let redirect = if !client.tracking_enabled {
+        -1
+    } else if client.tracking_redirect < 0 {
+        0
+    } else {
+        client.tracking_redirect
+    };
+
+    CommandOutcome::reply(RespFrame::Integer(redirect))
 }
 
 fn cmd_client_setinfo(args: &[Bytes]) -> CommandOutcome {
@@ -417,8 +565,14 @@ fn cmd_client_reply(args: &[Bytes], client: &mut ClientState) -> CommandOutcome 
     CommandOutcome::reply(RespFrame::ok())
 }
 
-fn parse_client_list_filter(args: &[Bytes], client_id: i64) -> Result<bool, RespFrame> {
-    let mut include_current = true;
+#[derive(Default)]
+struct ClientListFilter {
+    type_filter: Option<Bytes>,
+    id_filter: Option<i64>,
+}
+
+fn parse_client_list_filter(args: &[Bytes]) -> Result<ClientListFilter, RespFrame> {
+    let mut filter = ClientListFilter::default();
     let mut idx = 0usize;
 
     while idx < args.len() {
@@ -430,7 +584,7 @@ fn parse_client_list_filter(args: &[Bytes], client_id: i64) -> Result<bool, Resp
                 }
 
                 let type_filter = to_uppercase_stack(&args[idx + 1]);
-                include_current &= matches!(type_filter.as_slice(), b"NORMAL");
+                filter.type_filter = Some(Bytes::copy_from_slice(type_filter.as_slice()));
                 idx += 2;
             }
             b"ID" => {
@@ -442,60 +596,91 @@ fn parse_client_list_filter(args: &[Bytes], client_id: i64) -> Result<bool, Resp
                     return Err(err("ERR value is not an integer or out of range"));
                 };
 
-                include_current &= id_filter == client_id;
+                filter.id_filter = Some(id_filter);
                 idx += 2;
             }
             _ => return Err(err("ERR syntax error")),
         }
     }
 
-    Ok(include_current)
+    Ok(filter)
+}
+
+fn client_snapshot_matches_filter(
+    filter: &ClientListFilter,
+    snapshot: &ClientSnapshot,
+    _blocked: bool,
+) -> bool {
+    if let Some(id_filter) = filter.id_filter {
+        if snapshot.id != id_filter {
+            return false;
+        }
+    }
+
+    if let Some(type_filter) = &filter.type_filter {
+        match type_filter.as_ref() {
+            b"NORMAL" => {
+                if snapshot.sub > 0 {
+                    return false;
+                }
+            }
+            b"PUBSUB" => {
+                if snapshot.sub == 0 {
+                    return false;
+                }
+            }
+            b"MASTER" | b"REPLICA" => return false,
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 pub(super) fn format_client_info_line(client: &ClientState) -> String {
+    let snapshot = client.snapshot(
+        Bytes::from_static(b"127.0.0.1:0"),
+        Bytes::from_static(b"127.0.0.1:0"),
+    );
+    format_client_snapshot_line(&snapshot, false)
+}
+
+pub(super) fn format_client_snapshot_line(snapshot: &ClientSnapshot, blocked: bool) -> String {
     const ESTIMATED_CAPACITY: usize = 256;
     let mut out = String::with_capacity(ESTIMATED_CAPACITY);
 
-    let now = now_client_clock_ms();
-    let age = (now.saturating_sub(client.created_at_ms) / 1000).max(0);
-    let idle = (now.saturating_sub(client.last_interaction_ms) / 1000).max(0);
-
-    // ASCII fast path for name
-    let name = client
+    let name = snapshot
         .name
         .as_ref()
-        .map(|v| {
-            std::str::from_utf8(v)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| String::from_utf8_lossy(v).into_owned())
-        })
+        .map(|v| String::from_utf8_lossy(v).into_owned())
         .unwrap_or_default();
-
-    // ASCII fast path for command
-    let cmd: String = if client.last_command.is_empty() {
-        "NULL".to_string()
-    } else {
-        // For display, convert to lowercase; try ASCII fast path first
-        std::str::from_utf8(&client.last_command)
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_else(|_| String::from_utf8_lossy(&client.last_command).into_owned())
-    };
-
-    // ASCII fast path for user
-    let user = std::str::from_utf8(&client.acl_user)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| String::from_utf8_lossy(&client.acl_user).into_owned());
-
-    let multi = if client.tx_state.in_multi() {
-        client.tx_state.queue_len() as i64
-    } else {
-        -1
-    };
+    let mut flags = snapshot.flags.to_vec();
+    if blocked && !flags.contains(&b'b') {
+        flags.push(b'b');
+    }
+    let flags = String::from_utf8_lossy(&flags).into_owned();
+    let cmd = String::from_utf8_lossy(&snapshot.cmd).to_ascii_lowercase();
+    let user = String::from_utf8_lossy(&snapshot.user).into_owned();
 
     let _ = write!(
         out,
-        "id={} addr=127.0.0.1:0 laddr=127.0.0.1:0 fd=-1 name={} age={} idle={} flags=N db={} sub=0 psub=0 ssub=0 multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir=-1 resp=2",
-        client.id, name, age, idle, client.selected_db, multi, cmd, user
+        "id={} addr={} laddr={} fd=-1 name={} age={} idle={} flags={} db={} sub={} psub={} ssub={} multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir={} resp={}",
+        snapshot.id,
+        String::from_utf8_lossy(&snapshot.addr),
+        String::from_utf8_lossy(&snapshot.laddr),
+        name,
+        snapshot.age_seconds,
+        snapshot.idle_seconds,
+        flags,
+        snapshot.db,
+        snapshot.sub,
+        snapshot.psub,
+        snapshot.ssub,
+        snapshot.multi,
+        cmd,
+        user,
+        snapshot.redir,
+        snapshot.resp
     );
     out
 }

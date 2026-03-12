@@ -35,7 +35,7 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::{
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
-    keyspace::ServerState,
+    keyspace::{ClientSnapshot, ServerState},
     security::sanitize_error_message,
 };
 
@@ -3295,6 +3295,7 @@ pub struct CommandOutcome {
 pub struct BlockingRetry {
     pub deadline_ms: Option<i64>,
     pub frame: RespFrame,
+    pub watch_keys: Vec<(usize, Bytes)>,
 }
 
 impl CommandOutcome {
@@ -3314,11 +3315,20 @@ impl CommandOutcome {
         }
     }
 
-    fn blocking(response: RespFrame, deadline_ms: Option<i64>, frame: RespFrame) -> Self {
+    fn blocking(
+        response: RespFrame,
+        deadline_ms: Option<i64>,
+        frame: RespFrame,
+        watch_keys: Vec<(usize, Bytes)>,
+    ) -> Self {
         Self {
             response,
             close: false,
-            retry_blocking: Some(BlockingRetry { deadline_ms, frame }),
+            retry_blocking: Some(BlockingRetry {
+                deadline_ms,
+                frame,
+                watch_keys,
+            }),
         }
     }
 }
@@ -3388,6 +3398,12 @@ pub struct ClientState {
     pubsub_subscriptions: usize,
     tracking_enabled: bool,
     tracking_redirect: i64,
+    tracking_broadcast: bool,
+    tracking_no_loop: bool,
+    tracking_optin: bool,
+    tracking_optout: bool,
+    tracking_prefixes: Vec<Bytes>,
+    protocol_version: i64,
     caching_enabled: bool,
     no_evict: bool,
     no_touch: bool,
@@ -3407,8 +3423,148 @@ impl ClientState {
         self.selected_db
     }
 
+    pub fn tracking_enabled(&self) -> bool {
+        self.tracking_enabled
+    }
+
+    pub fn tracking_target_client_id(&self) -> i64 {
+        if self.tracking_redirect >= 0 {
+            self.tracking_redirect
+        } else {
+            self.id
+        }
+    }
+
+    pub fn tracking_broadcast(&self) -> bool {
+        self.tracking_broadcast
+    }
+
+    pub fn tracking_redirect(&self) -> i64 {
+        self.tracking_redirect
+    }
+
+    pub fn protocol_version(&self) -> i64 {
+        self.protocol_version
+    }
+
+    pub fn set_protocol_version(&mut self, protocol_version: i64) {
+        self.protocol_version = protocol_version;
+    }
+
+    pub fn tracking_no_loop(&self) -> bool {
+        self.tracking_no_loop
+    }
+
+    pub fn tracking_prefixes(&self) -> &[Bytes] {
+        &self.tracking_prefixes
+    }
+
+    pub fn tracking_optin(&self) -> bool {
+        self.tracking_optin
+    }
+
+    pub fn tracking_optout(&self) -> bool {
+        self.tracking_optout
+    }
+
+    pub fn tracking_should_record_reads(&self) -> bool {
+        if !self.tracking_enabled || self.tracking_broadcast {
+            return false;
+        }
+
+        if self.tracking_optin || self.tracking_optout {
+            self.caching_enabled
+        } else {
+            true
+        }
+    }
+
+    pub fn tracking_accepts_caching_toggle(&self) -> bool {
+        self.tracking_enabled && (self.tracking_optin || self.tracking_optout)
+    }
+
+    pub fn set_tracking_caching(&mut self, enabled: bool) {
+        self.caching_enabled = enabled;
+    }
+
+    pub fn reset_tracking_caching_mode(&mut self) {
+        self.caching_enabled = !self.tracking_optin;
+    }
+
+    pub fn finish_tracking_command(&mut self, command: &[u8], argv: &[Bytes]) {
+        if !self.tracking_accepts_caching_toggle() {
+            return;
+        }
+
+        if command == b"CLIENT"
+            && argv
+                .get(1)
+                .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case(b"CACHING"))
+        {
+            return;
+        }
+
+        self.reset_tracking_caching_mode();
+    }
+
     pub fn set_pubsub_subscription_count(&mut self, count: i64) {
         self.pubsub_subscriptions = usize::try_from(count).unwrap_or(0);
+    }
+
+    pub fn snapshot(&self, addr: Bytes, laddr: Bytes) -> ClientSnapshot {
+        self.snapshot_with_redirect(addr, laddr, self.tracking_redirect)
+    }
+
+    pub fn snapshot_with_redirect(
+        &self,
+        addr: Bytes,
+        laddr: Bytes,
+        active_redirect: i64,
+    ) -> ClientSnapshot {
+        let age_seconds = (now_client_clock_ms().saturating_sub(self.created_at_ms) / 1000).max(0);
+        let idle_seconds =
+            (now_client_clock_ms().saturating_sub(self.last_interaction_ms) / 1000).max(0);
+
+        let mut flags = Vec::with_capacity(4);
+        if self.has_pubsub_subscriptions() {
+            flags.push(b'P');
+        } else {
+            flags.push(b'N');
+        }
+        if self.tx_state.in_multi() {
+            flags.push(b'x');
+        }
+        if self.tracking_enabled {
+            flags.push(b't');
+        }
+
+        ClientSnapshot {
+            id: self.id,
+            addr,
+            laddr,
+            name: self.name.clone(),
+            age_seconds,
+            idle_seconds,
+            flags: Bytes::from(flags),
+            db: self.selected_db,
+            sub: self.pubsub_subscriptions,
+            psub: self.subscribed_patterns.len(),
+            ssub: self.subscribed_channels.len(),
+            multi: if self.tx_state.in_multi() {
+                self.tx_state.queue_len() as i64
+            } else {
+                -1
+            },
+            cmd: if self.last_command.is_empty() {
+                Bytes::from_static(b"NULL")
+            } else {
+                Bytes::copy_from_slice(self.last_command.as_ref())
+            },
+            user: self.acl_user.clone(),
+            redir: active_redirect,
+            tracking_enabled: self.tracking_enabled,
+            resp: self.protocol_version,
+        }
     }
 
     pub fn new(id: i64) -> Self {
@@ -3429,6 +3585,12 @@ impl ClientState {
             pubsub_subscriptions: 0,
             tracking_enabled: false,
             tracking_redirect: -1,
+            tracking_broadcast: false,
+            tracking_no_loop: false,
+            tracking_optin: false,
+            tracking_optout: false,
+            tracking_prefixes: Vec::new(),
+            protocol_version: 2,
             caching_enabled: true,
             no_evict: false,
             no_touch: false,
@@ -3450,6 +3612,12 @@ impl ClientState {
         self.pubsub_subscriptions = 0;
         self.tracking_enabled = false;
         self.tracking_redirect = -1;
+        self.tracking_broadcast = false;
+        self.tracking_no_loop = false;
+        self.tracking_optin = false;
+        self.tracking_optout = false;
+        self.tracking_prefixes.clear();
+        self.protocol_version = 2;
         self.caching_enabled = true;
         self.no_evict = false;
         self.no_touch = false;
@@ -3629,7 +3797,7 @@ pub fn execute(
         b"ACL" => cmd_acl::cmd_acl(args, server, client),
         b"AUTH" => cmd_acl::cmd_auth(args, server, client),
         b"CLIENT" => cmd_client::cmd_client(args, server, client),
-        b"RESET" => cmd_acl::cmd_reset(args, client),
+        b"RESET" => cmd_acl::cmd_reset(args, server, client),
         b"DBSIZE" => cmd_server::cmd_dbsize(args, server, client),
         b"TIME" => cmd_server::cmd_time(args),
         b"INFO" => cmd_server::cmd_info(args, server, client),
@@ -3925,9 +4093,52 @@ pub fn execute(
                 &outcome.response,
                 spec,
             );
+        } else if spec.flags.contains(&"readonly") {
+            maybe_track_client_tracking_access(server, client, &argv, &outcome.response, spec);
         }
     }
+    client.finish_tracking_command(command.as_slice(), &argv);
     outcome
+}
+
+fn maybe_track_client_tracking_access(
+    server: &mut ServerState,
+    client: &ClientState,
+    argv: &[Bytes],
+    response: &RespFrame,
+    spec: CommandSpec,
+) {
+    if !client.tracking_should_record_reads() || matches!(response, RespFrame::Error(_)) {
+        return;
+    }
+
+    let target_client_id = server.tracking_target_client_id(client.id(), client.tracking_redirect);
+    cmd_connection::for_each_command_key_position(spec, argv.len(), |pos| {
+        if let Some(key) = argv.get(pos) {
+            server.tracking_register_key(
+                client.id(),
+                target_client_id,
+                client.tracking_no_loop(),
+                client.selected_db,
+                key.clone(),
+            );
+        }
+    });
+}
+
+fn invalidate_tracked_keys(
+    server: &mut ServerState,
+    writer_client_id: i64,
+    touched_keys: Vec<(usize, Bytes)>,
+) {
+    let mut keys_by_db = HashBrownMap::<usize, Vec<Bytes>>::new();
+    for (db_idx, key) in touched_keys {
+        keys_by_db.entry(db_idx).or_default().push(key);
+    }
+    for (db_idx, keys) in keys_by_db {
+        server.notify_blocked_clients(db_idx, keys.clone());
+        server.tracking_invalidate_keys(writer_client_id, db_idx, keys);
+    }
 }
 
 fn maybe_track_slowlog(server: &mut ServerState, command: &[u8], argv: &[Bytes], duration_us: i64) {
@@ -4107,10 +4318,14 @@ fn maybe_track_write_version(
         return;
     }
 
+    let mut touched_keys = Vec::<(usize, Bytes)>::new();
+
     if command == b"SET" {
         if let Some(key) = argv.get(1) {
             server.touch_key_version(client.selected_db, key.clone());
+            touched_keys.push((client.selected_db, key.clone()));
         }
+        invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
         return;
     }
@@ -4121,11 +4336,13 @@ fn maybe_track_write_version(
             if argv[idx].eq_ignore_ascii_case(b"STORE") {
                 if let Some(dest_key) = argv.get(idx + 1) {
                     server.touch_key_version(client.selected_db, dest_key.clone());
+                    touched_keys.push((client.selected_db, dest_key.clone()));
                 }
                 break;
             }
             idx += 1;
         }
+        invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
         return;
     }
@@ -4148,7 +4365,9 @@ fn maybe_track_write_version(
                 idx += 1;
             }
             server.touch_key_version(target_db, target_key.clone());
+            touched_keys.push((target_db, target_key.clone()));
         }
+        invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
         return;
     }
@@ -4156,14 +4375,17 @@ fn maybe_track_write_version(
     if command == b"MOVE" {
         if let Some(key) = argv.get(1) {
             server.touch_key_version(client.selected_db, key.clone());
+            touched_keys.push((client.selected_db, key.clone()));
             if let Some(target_db_raw) = argv.get(2) {
                 if let Some(target_db) = parse_usize(target_db_raw) {
                     if target_db < server.db_count() {
                         server.touch_key_version(target_db, key.clone());
+                        touched_keys.push((target_db, key.clone()));
                     }
                 }
             }
         }
+        invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
         return;
     }
@@ -4182,8 +4404,10 @@ fn maybe_track_write_version(
                 break;
             }
             server.touch_key_version(client.selected_db, argv[idx].clone());
+            touched_keys.push((client.selected_db, argv[idx].clone()));
             idx = idx.saturating_add(2);
         }
+        invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
         return;
     }
@@ -4191,8 +4415,10 @@ fn maybe_track_write_version(
     cmd_connection::for_each_command_key_position(spec, argv.len(), |pos| {
         if let Some(key) = argv.get(pos) {
             server.touch_key_version(client.selected_db, key.clone());
+            touched_keys.push((client.selected_db, key.clone()));
         }
     });
+    invalidate_tracked_keys(server, client.id(), touched_keys);
     server.advance_replication_offset();
 }
 
@@ -4430,6 +4656,8 @@ mod tests {
 
     use bytes::Bytes;
     use ratatosk_resp::frame::RespFrame;
+
+    use crate::keyspace::PubSubMessage;
 
     use super::{ClientState, CommandOutcome, ServerState, command_spec_count, execute, now_ms};
 
@@ -5076,6 +5304,12 @@ mod tests {
 
         assert_eq!(run(&["MONITOR"], &mut server, &mut client), RespFrame::ok());
 
+        server.upsert_client_snapshot(ClientState::new(42).snapshot(
+            Bytes::from_static(b"127.0.0.1:42"),
+            Bytes::from_static(b"127.0.0.1:6379"),
+        ));
+        let _ = server.pubsub.register_client(42);
+
         assert_eq!(
             run(
                 &["CLIENT", "TRACKING", "ON", "REDIRECT", "42"],
@@ -5094,6 +5328,44 @@ mod tests {
             panic!("CLIENT TRACKINGINFO should return map");
         };
         assert!(!entries.is_empty());
+
+        let mut tracking_target = ClientState::new(42);
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "REDIRECT", "42"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["SET", "tracked-key", "v1"],
+                &mut server,
+                &mut tracking_target
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut client),
+            RespFrame::bulk_str("v1")
+        );
+        assert_eq!(
+            run(
+                &["SET", "tracked-key", "v2"],
+                &mut server,
+                &mut tracking_target
+            ),
+            RespFrame::ok()
+        );
+        let pending_tracking = server.pubsub.drain_messages(42);
+        assert_eq!(pending_tracking.len(), 1);
+        match &pending_tracking[0] {
+            PubSubMessage::Invalidate { keys } => {
+                assert_eq!(keys, &vec![Bytes::from_static(b"tracked-key")]);
+            }
+            other => panic!("expected invalidate push, got {other:?}"),
+        }
 
         assert_eq!(
             run(&["CLIENT", "CACHING", "NO"], &mut server, &mut client),
@@ -9649,5 +9921,289 @@ active:baseline
             text.contains("rdb_last_bgsave_status:ok"),
             "expected rdb_last_bgsave_status:ok: {text}"
         );
+    }
+
+    #[test]
+    fn client_tracking_bcast_prefix_invalidates_matching_keys() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(1);
+        let mut writer = ClientState::new(2);
+        let _ = server.pubsub.register_client(1);
+
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "BCAST", "PREFIX", "user:"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::ok()
+        );
+
+        let tracking_info = run(&["CLIENT", "TRACKINGINFO"], &mut server, &mut tracker);
+        let RespFrame::Map(entries) = tracking_info else {
+            panic!("CLIENT TRACKINGINFO should return map");
+        };
+        assert!(entries.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("flags")
+                && matches!(
+                    value,
+                    RespFrame::Array(flags)
+                        if flags.contains(&RespFrame::bulk_str("on"))
+                            && flags.contains(&RespFrame::bulk_str("bcast"))
+                )
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("prefixes")
+                && *value == RespFrame::Array(vec![RespFrame::bulk_str("user:")])
+        }));
+
+        assert_eq!(
+            run(&["SET", "user:1", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "other:1", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+
+        let pending_tracking = server.pubsub.drain_messages(1);
+        assert_eq!(pending_tracking.len(), 1);
+        match &pending_tracking[0] {
+            PubSubMessage::Invalidate { keys } => {
+                assert_eq!(keys, &vec![Bytes::from_static(b"user:1")]);
+            }
+            other => panic!("expected invalidate push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_tracking_noloop_suppresses_self_invalidations() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(7);
+        let mut writer = ClientState::new(8);
+
+        assert_eq!(
+            run(&["SET", "tracked-key", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "NOLOOP"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v1")
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v2"], &mut server, &mut tracker),
+            RespFrame::ok()
+        );
+
+        let pending_tracking = server.pubsub.drain_messages(7);
+        assert!(pending_tracking.is_empty(), "{pending_tracking:?}");
+    }
+
+    #[test]
+    fn client_tracking_optin_requires_client_caching_yes() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(11);
+        let mut writer = ClientState::new(12);
+        let _ = server.pubsub.register_client(11);
+
+        assert_eq!(
+            run(&["SET", "tracked-key", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "OPTIN"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v1")
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v2"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert!(server.pubsub.drain_messages(11).is_empty());
+
+        assert_eq!(
+            run(&["CLIENT", "CACHING", "YES"], &mut server, &mut tracker),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v2")
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v3"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+
+        let pending_tracking = server.pubsub.drain_messages(11);
+        assert_eq!(pending_tracking.len(), 1);
+        match &pending_tracking[0] {
+            PubSubMessage::Invalidate { keys } => {
+                assert_eq!(keys, &vec![Bytes::from_static(b"tracked-key")]);
+            }
+            other => panic!("expected invalidate push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_tracking_optout_respects_client_caching_no() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(21);
+        let mut writer = ClientState::new(22);
+        let _ = server.pubsub.register_client(21);
+
+        assert_eq!(
+            run(&["SET", "tracked-key", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "OPTOUT"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v1")
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v2"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(server.pubsub.drain_messages(21).len(), 1);
+
+        assert_eq!(
+            run(&["CLIENT", "CACHING", "NO"], &mut server, &mut tracker),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v2")
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v3"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert!(server.pubsub.drain_messages(21).is_empty());
+    }
+
+    #[test]
+    fn client_tracking_redirect_requires_connected_target() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(31);
+
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "REDIRECT", "999"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::error_str("ERR CLIENT TRACKING REDIRECT target client is not connected")
+        );
+    }
+
+    #[test]
+    fn client_tracking_getredir_reports_self_redirection_as_zero() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(35);
+
+        assert_eq!(
+            run(&["CLIENT", "TRACKING", "ON"], &mut server, &mut tracker),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["CLIENT", "GETREDIR"], &mut server, &mut tracker),
+            RespFrame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn client_tracking_redirect_disconnect_marks_broken_redirect_and_falls_back() {
+        let mut server = ServerState::with_default_dbs();
+        let mut tracker = ClientState::new(41);
+        let target = ClientState::new(42);
+        let mut writer = ClientState::new(43);
+        let _ = server.pubsub.register_client(41);
+        let _ = server.pubsub.register_client(42);
+        server.upsert_client_snapshot(target.snapshot(
+            Bytes::from_static(b"127.0.0.1:42"),
+            Bytes::from_static(b"127.0.0.1:6379"),
+        ));
+
+        assert_eq!(
+            run(
+                &["CLIENT", "TRACKING", "ON", "REDIRECT", "42"],
+                &mut server,
+                &mut tracker
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v1"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "tracked-key"], &mut server, &mut tracker),
+            RespFrame::bulk_str("v1")
+        );
+
+        server.pubsub.remove_client(42);
+        server.tracking_remove_client(42);
+        server.remove_client_snapshot(42);
+
+        assert_eq!(
+            run(&["CLIENT", "GETREDIR"], &mut server, &mut tracker),
+            RespFrame::Integer(42)
+        );
+        let tracking_info = run(&["CLIENT", "TRACKINGINFO"], &mut server, &mut tracker);
+        let RespFrame::Map(entries) = tracking_info else {
+            panic!("CLIENT TRACKINGINFO should return map");
+        };
+        assert!(entries.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("redirect") && *value == RespFrame::Integer(42)
+        }));
+        assert!(entries.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("flags")
+                && matches!(
+                    value,
+                    RespFrame::Array(flags)
+                        if flags.contains(&RespFrame::bulk_str("on"))
+                            && flags.contains(&RespFrame::bulk_str("broken_redirect"))
+                )
+        }));
+
+        assert_eq!(
+            run(&["SET", "tracked-key", "v2"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "tracked-key", "v3"], &mut server, &mut writer),
+            RespFrame::ok()
+        );
+        let tracker_messages = server.pubsub.drain_messages(41);
+        assert_eq!(tracker_messages.len(), 1);
+        match &tracker_messages[0] {
+            PubSubMessage::Invalidate { keys } => {
+                assert_eq!(keys, &vec![Bytes::from_static(b"tracked-key")]);
+            }
+            other => panic!("expected invalidate push, got {other:?}"),
+        }
+        assert!(server.pubsub.drain_messages(42).is_empty());
     }
 }

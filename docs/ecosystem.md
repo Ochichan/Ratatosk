@@ -26,7 +26,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 | RDB snapshot | 완료 | save/load + CRC64 + atomic write |
 | AOF writer | 완료 | RESP append + fsync 정책 |
 | AOF recovery | 완료 | RESP 파싱 → execute 재생 |
-| AOF manifest | 부분 구현 | 자료구조는 있으나 runtime multipart lifecycle과는 아직 미연결 |
+| AOF manifest | 부분 구현 | save/load, bootstrap/recovery, manifest switch helper, rewrite 후 새 INCR rotation은 연결됐지만 BASE materialization과 runtime full atomic switch는 아직 없음 |
 | Background save | 완료 | background snapshot worker 연결 |
 | AOF rewrite | 완료 | background rewrite worker 연결, 다만 Redis식 current-state compaction은 아님 |
 | AOF 서버 통합 | 완료 | write 명령 후 자동 append 경로 존재 |

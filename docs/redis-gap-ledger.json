@@ -338,7 +338,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout)."
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout)."
     },
     {
       "name": "BLMPOP",
@@ -351,7 +351,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout)."
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout)."
     },
     {
       "name": "BLPOP",
@@ -364,7 +364,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout)."
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout)."
     },
     {
       "name": "BRPOP",
@@ -377,7 +377,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout)."
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout)."
     },
     {
       "name": "BRPOPLPUSH",
@@ -390,7 +390,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout)."
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout)."
     },
     {
       "name": "BZMPOP",
@@ -403,7 +403,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback)."
     },
     {
       "name": "BZPOPMAX",
@@ -416,7 +416,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback)."
     },
     {
       "name": "BZPOPMIN",
@@ -429,7 +429,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": "M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback)."
     },
     {
       "name": "CLIENT",
@@ -481,7 +481,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 client-tracking baseline implemented: returns tracking redirect client id."
+      "notes": "M0 client-tracking baseline implemented: returns configured tracking redirect id (`0` for self-redirection while enabled, `-1` when tracking is off) and cooperates with `broken_redirect` tracking state."
     },
     {
       "name": "CLIENT HELP",
@@ -637,7 +637,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 client-tracking baseline implemented: ON/OFF with REDIRECT and option parsing."
+      "notes": "M0 client-tracking baseline implemented with direct-key invalidation, BCAST/PREFIX/NOLOOP registry, OPTIN/OPTOUT next-command gating, async invalidate push, connected-target REDIRECT validation, target wakeup delivery, `broken_redirect` marking, and RESP3 `tracking-redir-broken` push."
     },
     {
       "name": "CLIENT TRACKINGINFO",
@@ -650,7 +650,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 client-tracking baseline implemented: flags/redirect/prefixes map response."
+      "notes": "M0 client-tracking baseline implemented: flags/redirect/prefix state plus current direct-key/BCAST tracking metadata surface, configured redirect visibility, and `broken_redirect` state reporting."
     },
     {
       "name": "CLIENT UNBLOCK",
@@ -4667,7 +4667,7 @@
       "capability_tier": "syntax_only",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking wait registry."
+      "notes": "M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking timeout semantics."
     },
     {
       "name": "WAITAOF",
@@ -5005,7 +5005,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, non-blocking immediate return)."
+      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback)."
     },
     {
       "name": "XREADGROUP",
@@ -5018,7 +5018,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path)."
+      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback)."
     },
     {
       "name": "XREVRANGE",

@@ -450,11 +450,16 @@ pub(super) fn cmd_auth(
     result
 }
 
-pub(super) fn cmd_reset(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
+pub(super) fn cmd_reset(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("reset");
     }
 
+    server.tracking_remove_client(client.id());
     client.reset_for_connection();
     CommandOutcome::reply(RespFrame::simple_str("RESET"))
 }

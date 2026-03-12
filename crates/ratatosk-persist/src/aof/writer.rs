@@ -9,7 +9,7 @@ use crate::error::PersistError;
 
 /// AOF file format version header.
 /// Format: "REDIS-AOF-001\n" followed by RESP commands.
-const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
+pub(crate) const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
 
 // ---------------------------------------------------------------------------
 // FsyncPolicy
