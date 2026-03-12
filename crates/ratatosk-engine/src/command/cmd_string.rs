@@ -414,7 +414,10 @@ pub(super) fn cmd_incr_decr_with_delta(
     let mut buf = Buffer::new();
     db.insert(
         key.clone(),
-        StoredValue::string(Bytes::copy_from_slice(buf.format(next).as_bytes()), expire_at_ms),
+        StoredValue::string(
+            Bytes::copy_from_slice(buf.format(next).as_bytes()),
+            expire_at_ms,
+        ),
     );
     CommandOutcome::reply(RespFrame::Integer(next))
 }
@@ -465,9 +468,7 @@ pub(super) fn cmd_set(
             }
 
             let Some(raw) = parse_i64(&args[idx + 1]) else {
-                return CommandOutcome::reply(err(
-                    "ERR value is not an integer or out of range",
-                ));
+                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
             if raw <= 0 {
                 return CommandOutcome::reply(err("ERR invalid expire time in 'set' command"));
@@ -561,7 +562,7 @@ pub(super) fn cmd_get(
 
     // Single lookup: extract result and release borrow before accessing stats
     let result = match db.get(key) {
-        None => Err(false), // not found
+        None => Err(false),                             // not found
         Some(entry) if !entry.is_string() => Err(true), // wrong type
         Some(entry) => Ok(entry.as_string().cloned()),
     };

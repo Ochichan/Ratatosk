@@ -146,6 +146,9 @@ fn cluster_help() -> CommandOutcome {
         RespFrame::BulkString(Some(Bytes::from_static(
             b"CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
         ))),
+        RespFrame::BulkString(Some(Bytes::from_static(
+            b"Only INFO, MYID, KEYSLOT, COUNTKEYSINSLOT, GETKEYSINSLOT, and HELP are available in standalone mode.",
+        ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"COUNTKEYSINSLOT <slot>"))),
         RespFrame::BulkString(Some(Bytes::from_static(
             b"    Return the number of keys in <slot>.",

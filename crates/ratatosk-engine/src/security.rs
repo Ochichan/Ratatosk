@@ -375,8 +375,7 @@ fn append_audit_event_log(stamp: &AuditStamp, event: &str, payload: &str) {
         }
     };
 
-    let safe_payload = sanitize_acl_log_line(payload)
-        .replace(['\n', '\r'], " ");
+    let safe_payload = sanitize_acl_log_line(payload).replace(['\n', '\r'], " ");
 
     if let Err(error) = writeln!(
         file,

@@ -3634,16 +3634,16 @@ pub fn execute(
         b"TIME" => cmd_server::cmd_time(args),
         b"INFO" => cmd_server::cmd_info(args, server, client),
         b"MONITOR" => cmd_server::cmd_monitor(args),
-        b"ROLE" => cmd_server::cmd_role(args),
-        b"REPLCONF" => cmd_server::cmd_replconf(args),
+        b"ROLE" => cmd_server::cmd_role(args, server),
+        b"REPLCONF" => cmd_server::cmd_replconf(args, server, client),
         b"SYNC" => cmd_server::cmd_sync(args),
-        b"PSYNC" => cmd_server::cmd_psync(args),
-        b"REPLICAOF" => cmd_server::cmd_replicaof(args),
-        b"SLAVEOF" => cmd_server::cmd_replicaof(args),
+        b"PSYNC" => cmd_server::cmd_psync(args, server, client),
+        b"REPLICAOF" => cmd_server::cmd_replicaof(args, server),
+        b"SLAVEOF" => cmd_server::cmd_replicaof(args, server),
         b"RESTORE-ASKING" => cmd_generic::cmd_restore(args, server, client),
         b"LATENCY" => cmd_server::cmd_latency(args, server),
-        b"WAIT" => cmd_generic::cmd_wait(args),
-        b"WAITAOF" => cmd_generic::cmd_waitaof(args),
+        b"WAIT" => cmd_generic::cmd_wait(args, server),
+        b"WAITAOF" => cmd_generic::cmd_waitaof(args, server),
         b"CONFIG" => cmd_server::cmd_config(args, server, client),
         b"SLOWLOG" => cmd_server::cmd_slowlog(args, server),
         b"MEMORY" => cmd_server::cmd_memory(args, server, client),
@@ -4111,6 +4111,7 @@ fn maybe_track_write_version(
         if let Some(key) = argv.get(1) {
             server.touch_key_version(client.selected_db, key.clone());
         }
+        server.advance_replication_offset();
         return;
     }
 
@@ -4125,6 +4126,7 @@ fn maybe_track_write_version(
             }
             idx += 1;
         }
+        server.advance_replication_offset();
         return;
     }
 
@@ -4147,6 +4149,7 @@ fn maybe_track_write_version(
             }
             server.touch_key_version(target_db, target_key.clone());
         }
+        server.advance_replication_offset();
         return;
     }
 
@@ -4161,6 +4164,7 @@ fn maybe_track_write_version(
                 }
             }
         }
+        server.advance_replication_offset();
         return;
     }
 
@@ -4180,6 +4184,7 @@ fn maybe_track_write_version(
             server.touch_key_version(client.selected_db, argv[idx].clone());
             idx = idx.saturating_add(2);
         }
+        server.advance_replication_offset();
         return;
     }
 
@@ -4188,6 +4193,7 @@ fn maybe_track_write_version(
             server.touch_key_version(client.selected_db, key.clone());
         }
     });
+    server.advance_replication_offset();
 }
 
 fn frame_to_argv(frame: RespFrame) -> Result<SmallVec<[Bytes; 16]>, RespFrame> {
@@ -4325,6 +4331,18 @@ static COMMAND_SPEC_MAP: LazyLock<HashBrownMap<&'static [u8], CommandSpec>> = La
 fn find_command_spec(name: &Bytes) -> Option<CommandSpec> {
     let upper = to_uppercase_stack(name);
     COMMAND_SPEC_MAP.get(upper.as_slice()).copied()
+}
+
+fn find_command_spec_parts(parts: &[Bytes]) -> Option<CommandSpec> {
+    let mut name = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if idx > 0 {
+            name.push(b' ');
+        }
+        let upper = to_uppercase_stack(part);
+        name.extend_from_slice(upper.as_slice());
+    }
+    COMMAND_SPEC_MAP.get(name.as_slice()).copied()
 }
 
 fn expire_condition_matches(condition: ExpireCondition, current: Option<i64>, target: i64) -> bool {
@@ -5162,19 +5180,20 @@ mod tests {
             RespFrame::ok()
         );
 
-        assert_eq!(
-            run(&["ROLE"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("master"),
-                RespFrame::Integer(0),
-                RespFrame::Array(vec![]),
-            ])
-        );
+        let mut replica_client = ClientState::new(42);
         assert_eq!(
             run(
                 &["REPLCONF", "listening-port", "6379"],
                 &mut server,
-                &mut client
+                &mut replica_client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["REPLCONF", "ip-address", "10.0.0.2"],
+                &mut server,
+                &mut replica_client
             ),
             RespFrame::ok()
         );
@@ -5182,12 +5201,28 @@ mod tests {
             run(
                 &["REPLCONF", "capa", "psync2", "eof"],
                 &mut server,
-                &mut client
+                &mut replica_client
             ),
             RespFrame::ok()
         );
         assert_eq!(
-            run(&["REPLCONF", "getack", "*"], &mut server, &mut client),
+            run(&["ROLE"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("master"),
+                RespFrame::Integer(0),
+                RespFrame::Array(vec![RespFrame::Array(vec![
+                    RespFrame::bulk_str("10.0.0.2"),
+                    RespFrame::Integer(6379),
+                    RespFrame::Integer(0),
+                ])]),
+            ])
+        );
+        assert_eq!(
+            run(
+                &["REPLCONF", "getack", "*"],
+                &mut server,
+                &mut replica_client
+            ),
             RespFrame::Array(vec![
                 RespFrame::bulk_str("REPLCONF"),
                 RespFrame::bulk_str("ACK"),
@@ -5195,13 +5230,54 @@ mod tests {
             ])
         );
         assert_eq!(
-            run(&["PSYNC", "?", "-1"], &mut server, &mut client),
-            RespFrame::simple_str("FULLRESYNC 0000000000000000000000000000000000000000 0")
+            run(&["PSYNC", "?", "-1"], &mut server, &mut replica_client),
+            RespFrame::simple_str(&format!(
+                "FULLRESYNC {} 0",
+                String::from_utf8_lossy(server.replication_primary_replid())
+            ))
         );
         assert_eq!(
             run(&["SYNC"], &mut server, &mut client),
             RespFrame::error_str("ERR SYNC is not supported in standalone mode")
         );
+        assert_eq!(
+            run(
+                &["SET", "replication-key", "value"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["WAIT", "1", "100"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        assert_eq!(
+            run(&["REPLCONF", "ack", "1"], &mut server, &mut replica_client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["WAIT", "1", "100"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["WAITAOF", "1", "1", "100"], &mut server, &mut client),
+            RespFrame::Array(vec![RespFrame::Integer(0), RespFrame::Integer(1)])
+        );
+
+        let replication_info = run(&["INFO", "replication"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(replication_info_body)) = replication_info else {
+            panic!("INFO replication should return bulk string");
+        };
+        let replication_info_text =
+            std::str::from_utf8(&replication_info_body).expect("valid INFO replication utf8");
+        assert!(replication_info_text.contains("role:master"));
+        assert!(replication_info_text.contains("connected_slaves:1"));
+        assert!(
+            replication_info_text.contains("slave0:ip=10.0.0.2,port=6379,state=online,offset=1")
+        );
+        assert!(replication_info_text.contains("master_repl_offset:1"));
+
         assert_eq!(
             run(
                 &["REPLICAOF", "127.0.0.1", "6380"],
@@ -5211,9 +5287,25 @@ mod tests {
             RespFrame::ok()
         );
         assert_eq!(
+            run(&["ROLE"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("slave"),
+                RespFrame::bulk_str("127.0.0.1"),
+                RespFrame::Integer(6380),
+                RespFrame::bulk_str("connected"),
+                RespFrame::Integer(1),
+            ])
+        );
+        assert_eq!(
             run(&["SLAVEOF", "NO", "ONE"], &mut server, &mut client),
             RespFrame::ok()
         );
+        let promoted_role = run(&["ROLE"], &mut server, &mut client);
+        let RespFrame::Array(promoted_role_entries) = promoted_role else {
+            panic!("ROLE after SLAVEOF NO ONE should return array");
+        };
+        assert_eq!(promoted_role_entries[0], RespFrame::bulk_str("master"));
+        assert_eq!(promoted_role_entries[1], RespFrame::Integer(1));
 
         let dumped2 = run(&["DUMP", "foo"], &mut server, &mut client);
         let RespFrame::BulkString(Some(payload2)) = dumped2 else {
@@ -5332,6 +5424,54 @@ mod tests {
         };
         assert_eq!(doc_entries.len(), 1);
         assert_eq!(doc_entries[0].0, RespFrame::bulk_str("get"));
+        let RespFrame::Map(get_docs) = &doc_entries[0].1 else {
+            panic!("COMMAND DOCS entry should return map");
+        };
+        assert!(get_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("behavioral_subset")
+        }));
+
+        let cluster_info = run(
+            &["COMMAND", "INFO", "CLUSTER", "SLOTS"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(cluster_info_entries) = cluster_info else {
+            panic!("COMMAND INFO CLUSTER SLOTS should return array");
+        };
+        assert_eq!(cluster_info_entries.len(), 1);
+        assert_eq!(
+            cluster_info_entries[0],
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("cluster slots"),
+                RespFrame::Integer(2),
+                RespFrame::Array(vec![
+                    RespFrame::bulk_str("admin"),
+                    RespFrame::bulk_str("readonly"),
+                ]),
+                RespFrame::Integer(0),
+                RespFrame::Integer(0),
+                RespFrame::Integer(0),
+            ])
+        );
+
+        let cluster_docs = run(
+            &["COMMAND", "DOCS", "CLUSTER", "SLOTS"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(cluster_doc_entries) = cluster_docs else {
+            panic!("COMMAND DOCS CLUSTER SLOTS should return map");
+        };
+        assert_eq!(cluster_doc_entries.len(), 1);
+        let RespFrame::Map(cluster_slots_docs) = &cluster_doc_entries[0].1 else {
+            panic!("COMMAND DOCS CLUSTER SLOTS entry should return map");
+        };
+        assert!(cluster_slots_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("unsupported")
+        }));
 
         let debug_help = run(&["DEBUG", "HELP"], &mut server, &mut client);
         let RespFrame::Array(debug_help_rows) = debug_help else {

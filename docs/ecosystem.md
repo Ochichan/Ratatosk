@@ -7,15 +7,17 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 기준 파일: `docs/redis-gap-ledger.json`
 
-- 전체 명령: `420 / 420 done` (`100%`)
-- 그룹 진행률: bitmap/cluster/connection/generic/geo/hash/hll/list/pubsub/scripting/sentinel/server/set/sorted_set/stream/string/transactions 모두 done
+- 명령 카탈로그: `420` entries
+- status summary: `done=420`
+- capability tier summary: `unsupported=64`, `syntax_only=30`, `baseline_local=45`, `behavioral_subset=281`, `distributed_parity=0`
+- 즉, "명령 이름 존재"와 "Redis 행동 parity"는 같은 뜻이 아니다.
 
 ### 인프라 구현 상태
 
 | 서브시스템 | 상태 | 설명 |
 |-----------|------|------|
 | RESP2/3 파서 | 완료 | zero-copy incremental parser |
-| 420 명령 핸들러 | 완료 | standalone baseline semantics |
+| 420 명령 엔트리 | 완료 | status 기준으로는 모두 `done`, 다만 parity tier는 명령별로 다름 |
 | Eviction (8 정책) | 완료 | LRU/LFU/random/TTL 샘플링 |
 | Active expiry | 완료 | server_cron 10Hz 샘플링 기반 |
 | server_cron | 완료 | tokio interval timer |
@@ -24,15 +26,15 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 | RDB snapshot | 완료 | save/load + CRC64 + atomic write |
 | AOF writer | 완료 | RESP append + fsync 정책 |
 | AOF recovery | 완료 | RESP 파싱 → execute 재생 |
-| AOF manifest | 완료 | BASE + INCR 파일 관리 |
-| Background save | 미구현 | fork/thread 기반 snapshot |
-| AOF rewrite | 미구현 | compact AOF 생성 |
-| AOF 서버 통합 | 미구현 | write 명령 후 자동 append |
-| Replication | 미구현 | REPLCONF, PSYNC 등 |
-| Cluster | 미구현 | CLUSTER 명령 실동작 |
+| AOF manifest | 부분 구현 | 자료구조는 있으나 runtime multipart lifecycle과는 아직 미연결 |
+| Background save | 완료 | background snapshot worker 연결 |
+| AOF rewrite | 완료 | background rewrite worker 연결, 다만 Redis식 current-state compaction은 아님 |
+| AOF 서버 통합 | 완료 | write 명령 후 자동 append 경로 존재 |
+| Replication | 부분 구현 | role 전이, logical repl offset, replica ACK accounting은 있으나 backlog/network stream/failover는 아직 없음 |
+| Cluster | 미구현 | 해시 슬롯 helper 일부만 존재, distributed routing 없음 |
 
 중요:
-- 명령 surface는 100%지만, 일부 운영/복제/클러스터 명령은 standalone baseline 응답 중심이다.
+- 명령 surface는 넓지만, 일부 운영/복제/클러스터 명령은 `unsupported` 또는 `syntax_only`/`baseline_local` tier다.
 - 통합 시에는 "명령 존재"와 "행동 parity"를 분리해서 검증해야 한다.
 
 ## Ratatosk가 맡는 역할

@@ -13,7 +13,8 @@ use crate::keyspace::ServerState;
 
 use super::{
     ClientState, CommandOutcome, CommandSpec, all_command_specs, cmd_client, command_spec_count,
-    err, find_command_spec, parse_i64, parse_usize, to_uppercase_bytes, wrong_arity,
+    err, find_command_spec, find_command_spec_parts, parse_i64, parse_usize, to_uppercase_bytes,
+    wrong_arity,
 };
 
 pub(super) fn cmd_ping(args: &[Bytes], server: &ServerState) -> CommandOutcome {
@@ -300,7 +301,7 @@ pub(super) fn cmd_command(args: &[Bytes]) -> CommandOutcome {
                     "INFO command-name [command-name ...] -- Return command details.",
                 ),
                 RespFrame::bulk_str(
-                    "DOCS [command-name ...] -- Return command docs map for command names.",
+                    "DOCS [command-name ...] -- Return command docs map including Ratatosk capability tier.",
                 ),
                 RespFrame::bulk_str("HELP -- Show this help."),
             ]))
@@ -315,8 +316,8 @@ fn cmd_command_info(args: &[Bytes]) -> CommandOutcome {
     }
 
     let mut frames = Vec::with_capacity(args.len());
-    for name in args {
-        if let Some(spec) = find_command_spec(name) {
+    for spec in requested_command_specs(args) {
+        if let Some(spec) = spec {
             frames.push(command_spec_frame(spec));
         } else {
             frames.push(RespFrame::Null);
@@ -330,17 +331,15 @@ fn cmd_command_docs(args: &[Bytes]) -> CommandOutcome {
     let specs = if args.is_empty() {
         all_command_specs().collect::<Vec<_>>()
     } else {
-        let mut out = Vec::with_capacity(args.len());
-        for name in args {
-            if let Some(spec) = find_command_spec(name) {
-                out.push(spec);
-            }
-        }
-        out
+        requested_command_specs(args)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
     };
 
     let mut rows = Vec::with_capacity(specs.len());
     for spec in specs {
+        let capability_tier = command_capability_tier(spec);
         let flags = spec
             .flags
             .iter()
@@ -351,18 +350,220 @@ fn cmd_command_docs(args: &[Bytes]) -> CommandOutcome {
             RespFrame::Map(vec![
                 (
                     RespFrame::bulk_str("summary"),
-                    RespFrame::bulk_str("Baseline command metadata in Ratatosk."),
+                    RespFrame::bulk_str(command_capability_summary(capability_tier)),
                 ),
                 (
                     RespFrame::bulk_str("arity"),
                     RespFrame::Integer(i64::from(spec.arity)),
                 ),
                 (RespFrame::bulk_str("flags"), RespFrame::Array(flags)),
+                (
+                    RespFrame::bulk_str("ratatosk_capability_tier"),
+                    RespFrame::bulk_str(capability_tier),
+                ),
             ]),
         ));
     }
 
     CommandOutcome::reply(RespFrame::Map(rows))
+}
+
+fn requested_command_specs(args: &[Bytes]) -> Vec<Option<CommandSpec>> {
+    let max_name_parts = all_command_specs()
+        .map(|spec| spec.name.split(' ').count())
+        .max()
+        .unwrap_or(1);
+
+    let mut specs = Vec::with_capacity(args.len());
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let remaining = args.len() - idx;
+        let mut matched = None;
+        for len in (1..=remaining.min(max_name_parts)).rev() {
+            if let Some(spec) = find_command_spec_parts(&args[idx..idx + len]) {
+                matched = Some((len, spec));
+                break;
+            }
+        }
+
+        if let Some((len, spec)) = matched {
+            specs.push(Some(spec));
+            idx += len;
+        } else {
+            specs.push(find_command_spec(&args[idx]));
+            idx += 1;
+        }
+    }
+
+    specs
+}
+
+fn command_capability_tier(spec: CommandSpec) -> &'static str {
+    let name = spec.name;
+
+    if matches!(
+        name,
+        "SYNC"
+            | "SENTINEL"
+            | "EVAL"
+            | "EVALSHA"
+            | "EVAL_RO"
+            | "EVALSHA_RO"
+            | "FCALL"
+            | "FCALL_RO"
+            | "FUNCTION LOAD"
+            | "FUNCTION DELETE"
+            | "FUNCTION RESTORE"
+    ) {
+        return "unsupported";
+    }
+
+    if name == "SENTINEL HELP" {
+        return "syntax_only";
+    }
+    if name.starts_with("SENTINEL ") {
+        return "unsupported";
+    }
+
+    if name.starts_with("CLUSTER ")
+        && !matches!(
+            name,
+            "CLUSTER COUNTKEYSINSLOT"
+                | "CLUSTER GETKEYSINSLOT"
+                | "CLUSTER HELP"
+                | "CLUSTER INFO"
+                | "CLUSTER KEYSLOT"
+                | "CLUSTER MYID"
+        )
+    {
+        return "unsupported";
+    }
+
+    if matches!(
+        name,
+        "ASKING"
+            | "READONLY"
+            | "READWRITE"
+            | "MONITOR"
+            | "CLIENT PAUSE"
+            | "CLIENT UNPAUSE"
+            | "CLIENT UNBLOCK"
+            | "CLIENT SETINFO"
+            | "CLIENT REPLY"
+            | "HOTKEYS"
+            | "HOTKEYS GET"
+            | "HOTKEYS RESET"
+            | "HOTKEYS START"
+            | "HOTKEYS STOP"
+            | "FUNCTION"
+            | "FUNCTION HELP"
+            | "FUNCTION LIST"
+            | "FUNCTION DUMP"
+            | "FUNCTION FLUSH"
+            | "FUNCTION STATS"
+            | "SCRIPT"
+            | "SCRIPT HELP"
+            | "SCRIPT FLUSH"
+            | "ACL LOAD"
+            | "ACL SAVE"
+            | "ACL DRYRUN"
+            | "LOLWUT"
+            | "TRIMSLOTS"
+    ) {
+        return "syntax_only";
+    }
+
+    if matches!(
+        name,
+        "ROLE"
+            | "REPLCONF"
+            | "PSYNC"
+            | "REPLICAOF"
+            | "SLAVEOF"
+            | "WAIT"
+            | "WAITAOF"
+            | "CLIENT"
+            | "CLIENT CACHING"
+            | "CLIENT GETREDIR"
+            | "CLIENT INFO"
+            | "CLIENT KILL"
+            | "CLIENT LIST"
+            | "CLIENT NO-EVICT"
+            | "CLIENT NO-TOUCH"
+            | "CLIENT TRACKING"
+            | "CLIENT TRACKINGINFO"
+            | "CLUSTER"
+            | "CLUSTER COUNTKEYSINSLOT"
+            | "CLUSTER GETKEYSINSLOT"
+            | "CLUSTER HELP"
+            | "CLUSTER INFO"
+            | "CLUSTER KEYSLOT"
+            | "CLUSTER MYID"
+            | "CONFIG"
+            | "CONFIG GET"
+            | "CONFIG HELP"
+            | "CONFIG RESETSTAT"
+            | "CONFIG REWRITE"
+            | "CONFIG SET"
+            | "INFO"
+            | "LATENCY"
+            | "LATENCY DOCTOR"
+            | "LATENCY GRAPH"
+            | "LATENCY HELP"
+            | "LATENCY HISTOGRAM"
+            | "LATENCY HISTORY"
+            | "LATENCY LATEST"
+            | "LATENCY RESET"
+            | "MEMORY"
+            | "MEMORY DOCTOR"
+            | "MEMORY HELP"
+            | "MEMORY MALLOC-STATS"
+            | "MEMORY PURGE"
+            | "MEMORY STATS"
+            | "MEMORY USAGE"
+    ) {
+        return "baseline_local";
+    }
+
+    if matches!(
+        name,
+        "BGSAVE"
+            | "BGREWRITEAOF"
+            | "BLMOVE"
+            | "BLMPOP"
+            | "BLPOP"
+            | "BRPOP"
+            | "BRPOPLPUSH"
+            | "FLUSHALL"
+            | "FLUSHDB"
+            | "FUNCTION KILL"
+            | "SAVE"
+            | "XREAD"
+            | "XREADGROUP"
+    ) {
+        return "behavioral_subset";
+    }
+
+    "behavioral_subset"
+}
+
+fn command_capability_summary(capability_tier: &str) -> &'static str {
+    match capability_tier {
+        "unsupported" => "Not supported in the current Ratatosk build.",
+        "syntax_only" => {
+            "Parses or acknowledges syntax in standalone mode without full Redis side effects."
+        }
+        "baseline_local" => {
+            "Implements a standalone-local baseline and does not claim distributed Redis parity."
+        }
+        "behavioral_subset" => {
+            "Implements useful Redis-compatible behavior, but may omit some edge semantics or distributed contracts."
+        }
+        "distributed_parity" => {
+            "Implements the expected Redis behavior including distributed contracts."
+        }
+        _ => "Capability tier is unknown.",
+    }
 }
 
 pub(super) fn cmd_debug(args: &[Bytes]) -> CommandOutcome {
