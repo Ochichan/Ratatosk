@@ -109,6 +109,13 @@ fn build_blocking_frame(command_name: &str, args: &[Bytes]) -> RespFrame {
     RespFrame::Array(parts)
 }
 
+fn blocking_watch_keys(client: &ClientState, keys: &[Bytes]) -> Vec<(usize, Bytes)> {
+    keys.iter()
+        .cloned()
+        .map(|key| (client.selected_db(), key))
+        .collect()
+}
+
 pub(super) fn cmd_xadd(
     args: &[Bytes],
     server: &mut ServerState,
@@ -425,7 +432,12 @@ pub(super) fn cmd_xread(
             }
 
             let full_frame = build_blocking_frame("XREAD", &blocking_args);
-            CommandOutcome::blocking(RespFrame::Null, deadline_ms, full_frame)
+            CommandOutcome::blocking(
+                RespFrame::Null,
+                deadline_ms,
+                full_frame,
+                blocking_watch_keys(client, keys),
+            )
         } else {
             CommandOutcome::reply(RespFrame::Null)
         }
@@ -1063,7 +1075,12 @@ pub(super) fn cmd_xreadgroup(
                 return CommandOutcome::reply(RespFrame::Null);
             }
             let full_frame = build_blocking_frame("XREADGROUP", args);
-            CommandOutcome::blocking(RespFrame::Null, deadline_ms, full_frame)
+            CommandOutcome::blocking(
+                RespFrame::Null,
+                deadline_ms,
+                full_frame,
+                blocking_watch_keys(client, keys),
+            )
         } else {
             CommandOutcome::reply(RespFrame::Null)
         }

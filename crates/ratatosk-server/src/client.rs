@@ -13,7 +13,7 @@ use ratatosk_resp::{RespFrame, encode, encode_to_vec, encoded_len, parse};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::Mutex,
+    sync::{Mutex, Notify},
     time::timeout,
 };
 
@@ -26,7 +26,6 @@ use crate::persistence::{
 
 const QUERY_BUFFER_LIMIT: usize = 1024 * 1024;
 const OUTPUT_BUFFER_FLUSH_THRESHOLD: usize = 16 * 1024;
-const PUBSUB_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const BLOCKING_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const BLOCKING_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
@@ -49,6 +48,34 @@ fn is_benign_disconnect(error: &io::Error) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::UnexpectedEof
     )
+}
+
+fn socket_addr_bytes(stream: &TcpStream) -> (Bytes, Bytes) {
+    let addr = stream
+        .peer_addr()
+        .map(|addr| Bytes::from(addr.to_string()))
+        .unwrap_or_else(|_| Bytes::from_static(b"127.0.0.1:0"));
+    let laddr = stream
+        .local_addr()
+        .map(|addr| Bytes::from(addr.to_string()))
+        .unwrap_or_else(|_| Bytes::from_static(b"127.0.0.1:0"));
+    (addr, laddr)
+}
+
+async fn refresh_client_snapshot(
+    server_state: &SharedServerState,
+    client_state: &ClientState,
+    addr: &Bytes,
+    laddr: &Bytes,
+    blocked: bool,
+) {
+    let mut server = server_state.lock().await;
+    server.upsert_client_snapshot(client_state.snapshot_with_redirect(
+        addr.clone(),
+        laddr.clone(),
+        client_state.tracking_redirect(),
+    ));
+    server.set_client_blocked(client_state.id(), blocked);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,41 +235,58 @@ async fn clear_aof_write_latch_if_set(server_state: &SharedServerState) {
     }
 }
 
-async fn wait_for_disconnect_or_timeout(
+async fn wait_for_blocking_ready(
     stream: &TcpStream,
     wait_for: Duration,
+    notifier: &Notify,
 ) -> io::Result<bool> {
     if wait_for.is_zero() {
         return Ok(false);
     }
 
-    match timeout(wait_for, stream.readable()).await {
-        Err(_) => Ok(false),
-        Ok(Ok(())) => {
-            let mut probe = [0u8; 1];
-            match stream.peek(&mut probe).await {
-                Ok(0) => Ok(true),
-                Ok(_) => Ok(false),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    Ok(false)
+    let sleep = tokio::time::sleep(wait_for);
+    tokio::pin!(sleep);
+    tokio::select! {
+        _ = notifier.notified() => Ok(false),
+        _ = &mut sleep => Ok(false),
+        result = stream.readable() => match result {
+            Ok(()) => {
+                let mut probe = [0u8; 1];
+                match stream.peek(&mut probe).await {
+                    Ok(0) => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
             }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error),
         }
-        Ok(Err(error))
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) =>
-        {
-            Ok(false)
-        }
-        Ok(Err(error)) => Err(error),
+    }
+}
+
+async fn wait_for_async_push_or_input(
+    stream: &mut TcpStream,
+    input: &mut BytesMut,
+    notifier: &Notify,
+) -> io::Result<usize> {
+    tokio::select! {
+        _ = notifier.notified() => Ok(0),
+        result = stream.read_buf(input) => result,
     }
 }
 
@@ -260,12 +304,15 @@ async fn write_all_with_timeout(stream: &mut TcpStream, payload: &[u8]) -> io::R
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_with_blocking_retry(
     frame: RespFrame,
     server_state: &SharedServerState,
     persistence: &Arc<PersistenceRuntime>,
     client_state: &mut ClientState,
     stream: &TcpStream,
+    addr: &Bytes,
+    laddr: &Bytes,
 ) -> io::Result<CommandOutcome> {
     let start = std::time::Instant::now();
     let first_argv = frame_to_argv_for_persistence(&frame);
@@ -340,7 +387,14 @@ async fn run_with_blocking_retry(
             &mut outcome,
         )
         .await;
+        refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
         return Ok(outcome);
+    };
+
+    refresh_client_snapshot(server_state, client_state, addr, laddr, true).await;
+    let mut notifier = {
+        let mut server = server_state.lock().await;
+        server.register_blocked_client(client_state.id(), retry.watch_keys.clone())
     };
 
     let deadline_ms = retry.deadline_ms;
@@ -356,6 +410,11 @@ async fn run_with_blocking_retry(
             if now_ms >= deadline_u64 {
                 metrics::record_blocking_retry_deadline_exhausted(&command_name);
                 metrics::record_blocking_retry_completed(&command_name, retry_attempts);
+                {
+                    let mut server = server_state.lock().await;
+                    server.clear_blocked_client(client_state.id());
+                }
+                refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
                 return Ok(CommandOutcome {
                     response: last_response,
                     close: false,
@@ -383,7 +442,7 @@ async fn run_with_blocking_retry(
         metrics::record_blocking_retry_iteration(&command_name);
         metrics::record_blocking_retry_wait_ms(&command_name, wait_for.as_millis() as f64);
 
-        if wait_for_disconnect_or_timeout(stream, wait_for)
+        if wait_for_blocking_ready(stream, wait_for, notifier.as_ref())
             .await
             .map_err(|error| {
                 io::Error::new(
@@ -444,10 +503,19 @@ async fn run_with_blocking_retry(
 
         let Some(retry) = outcome.retry_blocking else {
             metrics::record_blocking_retry_completed(&command_name, retry_attempts);
+            {
+                let mut server = server_state.lock().await;
+                server.clear_blocked_client(client_state.id());
+            }
+            refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
             return Ok(outcome);
         };
         last_response = outcome.response;
         frame = retry.frame;
+        notifier = {
+            let mut server = server_state.lock().await;
+            server.register_blocked_client(client_state.id(), retry.watch_keys.clone())
+        };
         backoff = next_retry_backoff(backoff);
     }
 }
@@ -572,6 +640,7 @@ fn encode_pubsub_messages(
     messages: Vec<PubSubMessage>,
     output: &mut Vec<u8>,
     output_limit_bytes: usize,
+    protocol_version: i64,
 ) -> bool {
     for message in messages {
         let frame = match message {
@@ -595,6 +664,27 @@ fn encode_pubsub_messages(
                 RespFrame::BulkString(Some(channel)),
                 RespFrame::BulkString(Some(payload)),
             ]),
+            PubSubMessage::Invalidate { keys } => RespFrame::Array(vec![
+                RespFrame::bulk_str("invalidate"),
+                RespFrame::Array(
+                    keys.into_iter()
+                        .map(|key| RespFrame::BulkString(Some(key)))
+                        .collect(),
+                ),
+            ]),
+            PubSubMessage::TrackingRedirectBroken { redirect_client_id } => {
+                if protocol_version >= 3 {
+                    RespFrame::Push(vec![
+                        RespFrame::bulk_str("tracking-redir-broken"),
+                        RespFrame::Integer(redirect_client_id),
+                    ])
+                } else {
+                    RespFrame::Array(vec![
+                        RespFrame::bulk_str("tracking-redir-broken"),
+                        RespFrame::Integer(redirect_client_id),
+                    ])
+                }
+            }
         };
         if !append_encoded_frame(output, &frame, output_limit_bytes) {
             return false;
@@ -676,6 +766,8 @@ pub async fn handle_client_with_limits(
         let mut server = server_state.lock().await;
         server.pubsub.remove_client(client_id);
         server.replication_remove_client(client_id);
+        server.tracking_remove_client(client_id);
+        server.remove_client_snapshot(client_id);
         server.stats.mark_client_disconnected();
         let active = server.stats.connected_clients();
         metrics::set_active_connections(active as usize);
@@ -706,20 +798,21 @@ async fn handle_client_inner(
     let mut input = BytesMut::with_capacity(4096);
     let mut output = Vec::with_capacity(4096);
     let mut client_state = ClientState::new(client_id);
-    let mut poll_pubsub_pending = false;
-
+    let (addr, laddr) = socket_addr_bytes(&stream);
+    let async_push_notifier = {
+        let mut server = server_state.lock().await;
+        server.pubsub.register_client(client_id)
+    };
+    refresh_client_snapshot(server_state, &client_state, &addr, &laddr, false).await;
     loop {
-        let client_has_subscriptions = client_state.has_pubsub_subscriptions();
-        let (pending_overflow, pending) = if client_has_subscriptions || poll_pubsub_pending {
+        let client_accepts_async_push =
+            client_state.has_pubsub_subscriptions() || client_state.tracking_enabled();
+        let (pending_overflow, pending) = {
             let mut server = server_state.lock().await;
-            (
-                server.pubsub.take_overflowed_client(client_state.id()),
-                server.pubsub.drain_messages(client_state.id()),
-            )
-        } else {
-            (false, Vec::new())
+            let pending_overflow = server.pubsub.take_overflowed_client(client_state.id());
+            let pending = server.pubsub.drain_messages(client_state.id());
+            (pending_overflow, pending)
         };
-        poll_pubsub_pending = client_has_subscriptions || pending_overflow || !pending.is_empty();
         if pending_overflow {
             tracing::warn!(
                 client_id = client_state.id(),
@@ -733,7 +826,12 @@ async fn handle_client_inner(
         }
 
         if !pending.is_empty() {
-            if !encode_pubsub_messages(pending, &mut output, io_limits.output_buffer_limit_bytes) {
+            if !encode_pubsub_messages(
+                pending,
+                &mut output,
+                io_limits.output_buffer_limit_bytes,
+                client_state.protocol_version(),
+            ) {
                 tracing::warn!(
                     client_id = client_state.id(),
                     output_limit_bytes = io_limits.output_buffer_limit_bytes,
@@ -747,26 +845,34 @@ async fn handle_client_inner(
             output.clear();
         }
 
-        let read = if client_has_subscriptions {
-            match timeout(PUBSUB_POLL_INTERVAL, stream.read_buf(&mut input)).await {
-                Ok(result) => result?,
-                Err(_) => continue,
-            }
-        } else if io_limits.client_read_timeout_sec > 0 {
+        let read = if io_limits.client_read_timeout_sec > 0 && !client_accepts_async_push {
             let idle_duration = Duration::from_secs(io_limits.client_read_timeout_sec);
-            match timeout(idle_duration, stream.read_buf(&mut input)).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    tracing::debug!(
-                        client_id = client_id,
-                        timeout_sec = io_limits.client_read_timeout_sec,
-                        "disconnecting idle client: read timeout"
-                    );
-                    return Ok(());
+            let read = tokio::select! {
+                _ = async_push_notifier.notified() => 0,
+                result = timeout(idle_duration, stream.read_buf(&mut input)) => match result {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        tracing::debug!(
+                            client_id = client_id,
+                            timeout_sec = io_limits.client_read_timeout_sec,
+                            "disconnecting idle client: read timeout"
+                        );
+                        return Ok(());
+                    }
                 }
+            };
+            if read == 0 && input.is_empty() {
+                continue;
             }
+            read
         } else {
-            stream.read_buf(&mut input).await?
+            let read =
+                wait_for_async_push_or_input(&mut stream, &mut input, async_push_notifier.as_ref())
+                    .await?;
+            if read == 0 && input.is_empty() {
+                continue;
+            }
+            read
         };
 
         if read == 0 {
@@ -816,6 +922,8 @@ async fn handle_client_inner(
                             persistence,
                             &mut client_state,
                             &stream,
+                            &addr,
+                            &laddr,
                         )
                         .await
                         .map_err(|error| {
@@ -865,11 +973,14 @@ async fn handle_client_inner(
             }
         }
 
-        let should_poll_pubsub = poll_pubsub_pending || client_state.has_pubsub_subscriptions();
+        let should_poll_pubsub =
+            client_state.has_pubsub_subscriptions() || client_state.tracking_enabled();
         if should_poll_pubsub {
-            let pending = {
+            let (pending, still_has_pending) = {
                 let mut server = server_state.lock().await;
-                server.pubsub.drain_messages(client_state.id())
+                let pending = server.pubsub.drain_messages(client_state.id());
+                let still_has_pending = server.pubsub.has_pending_messages(client_state.id());
+                (pending, still_has_pending)
             };
             let had_pending = !pending.is_empty();
             if had_pending
@@ -877,6 +988,7 @@ async fn handle_client_inner(
                     pending,
                     &mut output,
                     io_limits.output_buffer_limit_bytes,
+                    client_state.protocol_version(),
                 )
             {
                 tracing::warn!(
@@ -888,9 +1000,7 @@ async fn handle_client_inner(
                 write_all_with_timeout(&mut stream, &response).await?;
                 return Ok(());
             }
-            poll_pubsub_pending = client_state.has_pubsub_subscriptions() || had_pending;
-        } else {
-            poll_pubsub_pending = false;
+            let _had_pending_or_remaining = had_pending || still_has_pending;
         }
 
         if !output.is_empty() {
@@ -900,6 +1010,8 @@ async fn handle_client_inner(
             let mut server = server_state.lock().await;
             server.stats.add_net_output_bytes(out_len);
         }
+
+        refresh_client_snapshot(server_state, &client_state, &addr, &laddr, false).await;
 
         if should_close {
             return Ok(());
@@ -978,6 +1090,14 @@ mod tests {
             .expect("read reply");
         buf.truncate(n);
         buf
+    }
+
+    fn parse_integer_reply(reply: &[u8]) -> i64 {
+        let text = std::str::from_utf8(reply).expect("valid integer reply utf8");
+        text.trim_start_matches(':')
+            .trim()
+            .parse::<i64>()
+            .expect("integer reply")
     }
 
     async fn read_exact_reply(stream: &mut TcpStream, expected_len: usize) -> Vec<u8> {
@@ -1173,6 +1293,555 @@ mod tests {
         let _ = read_reply(&mut sub).await;
         pubc.write_all(b"QUIT\r\n").await.expect("quit pub");
         let _ = read_reply(&mut pubc).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_tracking_pushes_invalidation_cross_client() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_tracker, _) = listener.accept().await.expect("accept tracker");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+
+            let shared_tracker = Arc::clone(&shared_for_accept);
+            let task_tracker = tokio::spawn(async move {
+                handle_client(sock_tracker, shared_tracker)
+                    .await
+                    .expect("handle tracker");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+
+            task_tracker.await.expect("join tracker");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut tracker = TcpStream::connect(addr).await.expect("connect tracker");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv1\r\n")
+            .await
+            .expect("seed tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        tracker
+            .write_all(b"*3\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n")
+            .await
+            .expect("enable tracking");
+        assert_eq!(read_reply(&mut tracker).await, b"+OK\r\n");
+
+        tracker
+            .write_all(b"*2\r\n$3\r\nGET\r\n$7\r\ntracked\r\n")
+            .await
+            .expect("read tracked key");
+        assert_eq!(read_reply(&mut tracker).await, b"$2\r\nv1\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv2\r\n")
+            .await
+            .expect("update tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        let invalidation = read_reply(&mut tracker).await;
+        assert!(
+            invalidation
+                .windows(b"invalidate".len())
+                .any(|w| w == b"invalidate"),
+            "expected invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+        assert!(
+            invalidation
+                .windows(b"tracked".len())
+                .any(|w| w == b"tracked"),
+            "expected tracked key in invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+
+        tracker.write_all(b"QUIT\r\n").await.expect("quit tracker");
+        let _ = read_reply(&mut tracker).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_tracking_bcast_prefix_pushes_matching_invalidation() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_tracker, _) = listener.accept().await.expect("accept tracker");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+
+            let shared_tracker = Arc::clone(&shared_for_accept);
+            let task_tracker = tokio::spawn(async move {
+                handle_client(sock_tracker, shared_tracker)
+                    .await
+                    .expect("handle tracker");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+
+            task_tracker.await.expect("join tracker");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut tracker = TcpStream::connect(addr).await.expect("connect tracker");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        tracker
+            .write_all(
+                b"*6\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n$5\r\nBCAST\r\n$6\r\nPREFIX\r\n$5\r\nuser:\r\n",
+            )
+            .await
+            .expect("enable bcast prefix tracking");
+        assert_eq!(read_reply(&mut tracker).await, b"+OK\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$6\r\nother:\r\n$2\r\nv1\r\n")
+            .await
+            .expect("write non matching key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$6\r\nuser:1\r\n$2\r\nv2\r\n")
+            .await
+            .expect("write matching key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        let invalidation = read_reply(&mut tracker).await;
+        assert!(
+            invalidation
+                .windows(b"invalidate".len())
+                .any(|w| w == b"invalidate"),
+            "expected invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+        assert!(
+            invalidation
+                .windows(b"user:1".len())
+                .any(|w| w == b"user:1"),
+            "expected matching key in invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+        assert!(
+            !invalidation
+                .windows(b"other:".len())
+                .any(|w| w == b"other:"),
+            "unexpected non-matching key in invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+
+        tracker.write_all(b"QUIT\r\n").await.expect("quit tracker");
+        let _ = read_reply(&mut tracker).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_tracking_redirect_pushes_invalidation_to_target() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_tracker, _) = listener.accept().await.expect("accept tracker");
+            let (sock_target, _) = listener.accept().await.expect("accept target");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+
+            let shared_tracker = Arc::clone(&shared_for_accept);
+            let task_tracker = tokio::spawn(async move {
+                handle_client(sock_tracker, shared_tracker)
+                    .await
+                    .expect("handle tracker");
+            });
+            let shared_target = Arc::clone(&shared_for_accept);
+            let task_target = tokio::spawn(async move {
+                handle_client(sock_target, shared_target)
+                    .await
+                    .expect("handle target");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+
+            task_tracker.await.expect("join tracker");
+            task_target.await.expect("join target");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut tracker = TcpStream::connect(addr).await.expect("connect tracker");
+        let mut target = TcpStream::connect(addr).await.expect("connect target");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        target
+            .write_all(b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n")
+            .await
+            .expect("request target id");
+        let target_id = parse_integer_reply(&read_reply(&mut target).await);
+
+        let tracking_command = format!(
+            "*5\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n$8\r\nREDIRECT\r\n${}\r\n{}\r\n",
+            target_id.to_string().len(),
+            target_id
+        );
+        tracker
+            .write_all(tracking_command.as_bytes())
+            .await
+            .expect("enable redirect tracking");
+        assert_eq!(read_reply(&mut tracker).await, b"+OK\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv1\r\n")
+            .await
+            .expect("seed tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        tracker
+            .write_all(b"*2\r\n$3\r\nGET\r\n$7\r\ntracked\r\n")
+            .await
+            .expect("read tracked key");
+        assert_eq!(read_reply(&mut tracker).await, b"$2\r\nv1\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv2\r\n")
+            .await
+            .expect("update tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        let invalidation = read_reply(&mut target).await;
+        assert!(
+            invalidation
+                .windows(b"invalidate".len())
+                .any(|w| w == b"invalidate"),
+            "expected invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+        assert!(
+            invalidation
+                .windows(b"tracked".len())
+                .any(|w| w == b"tracked"),
+            "expected tracked key in invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+
+        tracker.write_all(b"QUIT\r\n").await.expect("quit tracker");
+        let _ = read_reply(&mut tracker).await;
+        target.write_all(b"QUIT\r\n").await.expect("quit target");
+        let _ = read_reply(&mut target).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_tracking_redirect_disconnect_marks_broken_redirect_and_falls_back() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_tracker, _) = listener.accept().await.expect("accept tracker");
+            let (sock_target, _) = listener.accept().await.expect("accept target");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+
+            let shared_tracker = Arc::clone(&shared_for_accept);
+            let task_tracker = tokio::spawn(async move {
+                handle_client(sock_tracker, shared_tracker)
+                    .await
+                    .expect("handle tracker");
+            });
+            let shared_target = Arc::clone(&shared_for_accept);
+            let task_target = tokio::spawn(async move {
+                handle_client(sock_target, shared_target)
+                    .await
+                    .expect("handle target");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+
+            task_tracker.await.expect("join tracker");
+            task_target.await.expect("join target");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut tracker = TcpStream::connect(addr).await.expect("connect tracker");
+        let mut target = TcpStream::connect(addr).await.expect("connect target");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        tracker
+            .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            .await
+            .expect("switch tracker to resp3");
+        let hello = read_reply(&mut tracker).await;
+        assert!(
+            hello.windows(b"proto".len()).any(|w| w == b"proto"),
+            "expected HELLO map, got {:?}",
+            String::from_utf8_lossy(&hello)
+        );
+
+        target
+            .write_all(b"*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n")
+            .await
+            .expect("request target id");
+        let target_id = parse_integer_reply(&read_reply(&mut target).await);
+
+        let tracking_command = format!(
+            "*5\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n$8\r\nREDIRECT\r\n${}\r\n{}\r\n",
+            target_id.to_string().len(),
+            target_id
+        );
+        tracker
+            .write_all(tracking_command.as_bytes())
+            .await
+            .expect("enable redirect tracking");
+        assert_eq!(read_reply(&mut tracker).await, b"+OK\r\n");
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv1\r\n")
+            .await
+            .expect("seed tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        tracker
+            .write_all(b"*2\r\n$3\r\nGET\r\n$7\r\ntracked\r\n")
+            .await
+            .expect("read tracked key");
+        assert_eq!(read_reply(&mut tracker).await, b"$2\r\nv1\r\n");
+
+        target.write_all(b"QUIT\r\n").await.expect("quit target");
+        let _ = read_reply(&mut target).await;
+        let target_id_text = target_id.to_string();
+        let broken_redirect = read_reply(&mut tracker).await;
+        assert_eq!(broken_redirect.first().copied(), Some(b'>'));
+        assert!(
+            broken_redirect
+                .windows(b"tracking-redir-broken".len())
+                .any(|w| w == b"tracking-redir-broken"),
+            "expected tracking-redir-broken push, got {:?}",
+            String::from_utf8_lossy(&broken_redirect)
+        );
+        assert!(
+            broken_redirect
+                .windows(target_id_text.len())
+                .any(|w| w == target_id_text.as_bytes()),
+            "expected broken redirect id in push, got {:?}",
+            String::from_utf8_lossy(&broken_redirect)
+        );
+
+        tracker
+            .write_all(b"*2\r\n$6\r\nCLIENT\r\n$8\r\nGETREDIR\r\n")
+            .await
+            .expect("request active redirect");
+        assert_eq!(
+            read_reply(&mut tracker).await,
+            format!(":{}\r\n", target_id).as_bytes()
+        );
+
+        writer
+            .write_all(b"*3\r\n$3\r\nSET\r\n$7\r\ntracked\r\n$2\r\nv2\r\n")
+            .await
+            .expect("update tracked key");
+        assert_eq!(read_reply(&mut writer).await, b"+OK\r\n");
+
+        let invalidation = read_reply(&mut tracker).await;
+        assert!(
+            invalidation
+                .windows(b"invalidate".len())
+                .any(|w| w == b"invalidate"),
+            "expected invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+        assert!(
+            invalidation
+                .windows(b"tracked".len())
+                .any(|w| w == b"tracked"),
+            "expected tracked key in invalidate push, got {:?}",
+            String::from_utf8_lossy(&invalidation)
+        );
+
+        tracker.write_all(b"QUIT\r\n").await.expect("quit tracker");
+        let _ = read_reply(&mut tracker).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn client_registry_reports_blocked_and_tracking_clients() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_blocked, _) = listener.accept().await.expect("accept blocked");
+            let (sock_observer, _) = listener.accept().await.expect("accept observer");
+
+            let shared_blocked = Arc::clone(&shared_for_accept);
+            let task_blocked = tokio::spawn(async move {
+                handle_client(sock_blocked, shared_blocked)
+                    .await
+                    .expect("handle blocked");
+            });
+            let shared_observer = Arc::clone(&shared_for_accept);
+            let task_observer = tokio::spawn(async move {
+                handle_client(sock_observer, shared_observer)
+                    .await
+                    .expect("handle observer");
+            });
+
+            task_blocked.await.expect("join blocked");
+            task_observer.await.expect("join observer");
+        });
+
+        let mut blocked = TcpStream::connect(addr).await.expect("connect blocked");
+        let mut observer = TcpStream::connect(addr).await.expect("connect observer");
+
+        observer
+            .write_all(b"*3\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n")
+            .await
+            .expect("enable tracking");
+        assert_eq!(read_reply(&mut observer).await, b"+OK\r\n");
+
+        blocked
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$7\r\nmissing\r\n$1\r\n1\r\n")
+            .await
+            .expect("start blocking pop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        observer
+            .write_all(b"*2\r\n$4\r\nINFO\r\n$7\r\nclients\r\n")
+            .await
+            .expect("info clients");
+        let info = read_reply(&mut observer).await;
+        let info_text = String::from_utf8_lossy(&info);
+        assert!(info_text.contains("connected_clients:2"), "{info_text}");
+        assert!(info_text.contains("blocked_clients:1"), "{info_text}");
+        assert!(info_text.contains("tracking_clients:1"), "{info_text}");
+
+        observer
+            .write_all(b"*2\r\n$6\r\nCLIENT\r\n$4\r\nLIST\r\n")
+            .await
+            .expect("client list");
+        let list = read_reply(&mut observer).await;
+        let list_text = String::from_utf8_lossy(&list);
+        assert!(list_text.contains("flags=Nt"), "{list_text}");
+        assert!(list_text.contains("flags=Nb"), "{list_text}");
+
+        let blocked_reply = read_reply(&mut blocked).await;
+        assert!(
+            blocked_reply == b"*-1\r\n" || blocked_reply == b"$-1\r\n",
+            "unexpected BLPOP timeout reply: {:?}",
+            String::from_utf8_lossy(&blocked_reply)
+        );
+
+        blocked.write_all(b"QUIT\r\n").await.expect("quit blocked");
+        let _ = read_reply(&mut blocked).await;
+        observer
+            .write_all(b"QUIT\r\n")
+            .await
+            .expect("quit observer");
+        let _ = read_reply(&mut observer).await;
+
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn blocking_list_pop_wakes_on_matching_write() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_blocked, _) = listener.accept().await.expect("accept blocked");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+
+            let shared_blocked = Arc::clone(&shared_for_accept);
+            let task_blocked = tokio::spawn(async move {
+                handle_client(sock_blocked, shared_blocked)
+                    .await
+                    .expect("handle blocked");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+
+            task_blocked.await.expect("join blocked");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut blocked = TcpStream::connect(addr).await.expect("connect blocked");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        blocked
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$7\r\nwake-me\r\n$1\r\n5\r\n")
+            .await
+            .expect("start blocking pop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        writer
+            .write_all(b"*3\r\n$5\r\nLPUSH\r\n$7\r\nwake-me\r\n$7\r\npayload\r\n")
+            .await
+            .expect("push payload");
+        assert_eq!(read_reply(&mut writer).await, b":1\r\n");
+
+        let reply = read_reply(&mut blocked).await;
+        let reply_text = String::from_utf8_lossy(&reply);
+        assert!(reply_text.contains("wake-me"), "{reply_text}");
+        assert!(reply_text.contains("payload"), "{reply_text}");
+
+        blocked.write_all(b"QUIT\r\n").await.expect("quit blocked");
+        let _ = read_reply(&mut blocked).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
 
         accept_task.await.expect("accept task join");
     }

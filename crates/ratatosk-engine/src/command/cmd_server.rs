@@ -1031,10 +1031,15 @@ pub(super) fn append_info_clients_section(out: &mut String, server: &ServerState
     out.push_str("# Clients\r\n");
     out.push_str(&format!(
         "connected_clients:{}\r\n",
-        server.stats.connected_clients()
+        server
+            .connected_client_snapshots()
+            .max(server.stats.connected_clients() as usize)
     ));
-    out.push_str("blocked_clients:0\r\n");
-    out.push_str("tracking_clients:0\r\n");
+    out.push_str(&format!("blocked_clients:{}\r\n", server.blocked_clients()));
+    out.push_str(&format!(
+        "tracking_clients:{}\r\n",
+        server.tracking_clients()
+    ));
     out.push_str("\r\n");
 }
 
@@ -1342,6 +1347,7 @@ pub(super) fn cmd_swapdb(args: &[Bytes], server: &mut ServerState) -> CommandOut
     CommandOutcome::reply(RespFrame::ok())
 }
 
+#[allow(clippy::result_large_err)]
 pub(super) fn parse_flush_mode(args: &[Bytes], command: &str) -> Result<(), CommandOutcome> {
     if args.len() > 1 {
         return Err(wrong_arity(command));

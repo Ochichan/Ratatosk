@@ -9,6 +9,7 @@ pub enum RespFrame {
     Integer(i64),
     BulkString(Option<Bytes>),
     Array(Vec<RespFrame>),
+    Push(Vec<RespFrame>),
     Map(Vec<(RespFrame, RespFrame)>),
     Null,
 }

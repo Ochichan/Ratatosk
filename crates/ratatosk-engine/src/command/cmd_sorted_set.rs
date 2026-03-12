@@ -19,6 +19,13 @@ const MAX_ZSET_POP_COUNT: usize = 100_000;
 const MAX_ZSET_NUMKEYS: usize = 10_000;
 const MAX_ZSET_RANDOM_COUNT: usize = 100_000;
 
+fn blocking_watch_keys(client: &ClientState, keys: &[Bytes]) -> Vec<(usize, Bytes)> {
+    keys.iter()
+        .cloned()
+        .map(|key| (client.selected_db(), key))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -1501,6 +1508,7 @@ pub(super) fn cmd_zremrangebylex(
 
 /// Read a sorted set from the db; returns an empty set if the key does not exist.
 /// Returns Err if the key exists but is the wrong type.
+#[allow(clippy::result_large_err)]
 fn read_zset_or_empty(
     db: &hashbrown::HashMap<Bytes, StoredValue>,
     key: &Bytes,
@@ -1514,6 +1522,7 @@ fn read_zset_or_empty(
     Ok(sorted_entries(zset))
 }
 
+#[allow(clippy::result_large_err)]
 fn compute_union(
     db: &hashbrown::HashMap<Bytes, StoredValue>,
     keys: &[Bytes],
@@ -1543,6 +1552,7 @@ fn compute_union(
     Ok(out)
 }
 
+#[allow(clippy::result_large_err)]
 fn compute_inter(
     db: &hashbrown::HashMap<Bytes, StoredValue>,
     keys: &[Bytes],
@@ -1590,6 +1600,7 @@ fn compute_inter(
     Ok(out)
 }
 
+#[allow(clippy::result_large_err)]
 fn compute_diff(
     db: &hashbrown::HashMap<Bytes, StoredValue>,
     keys: &[Bytes],
@@ -1622,6 +1633,7 @@ fn compute_diff(
 
 /// Parse numkeys + key list from args starting at a given index.
 /// Returns (numkeys, keys_slice_end_index, numkeys_value).
+#[allow(clippy::result_large_err)]
 fn parse_numkeys_and_keys(
     args: &[Bytes],
     start: usize,
@@ -2209,7 +2221,12 @@ fn zmpop_inner(
     }
 
     let full_frame = build_blocking_frame("BZMPOP", args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, &keys),
+    )
 }
 
 fn try_zmpop_once(
@@ -2491,7 +2508,12 @@ fn cmd_bzpop(
     }
 
     let full_frame = build_blocking_frame(command_name, args);
-    CommandOutcome::blocking(outcome.response, deadline_ms, full_frame)
+    CommandOutcome::blocking(
+        outcome.response,
+        deadline_ms,
+        full_frame,
+        blocking_watch_keys(client, keys),
+    )
 }
 
 fn try_bzpop_once(

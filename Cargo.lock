@@ -1113,6 +1113,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

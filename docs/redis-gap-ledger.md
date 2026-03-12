@@ -101,18 +101,18 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `BITFIELD_RO` | bitmap | 6.0.0 | done | behavioral_subset | m4-extended-types |  |
 | `BITOP` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types |  |
 | `BITPOS` | bitmap | 2.8.7 | done | behavioral_subset | m4-extended-types |  |
-| `BLMOVE` | list | 6.2.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout). |
-| `BLMPOP` | list | 7.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout). |
-| `BLPOP` | list | 2.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout). |
-| `BRPOP` | list | 2.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout). |
-| `BRPOPLPUSH` | list | 2.2.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (timeout wait-loop with polling; nil on timeout). |
-| `BZMPOP` | sorted_set | 7.0.0 | done | behavioral_subset | m2-collections |  |
-| `BZPOPMAX` | sorted_set | 5.0.0 | done | behavioral_subset | m2-collections |  |
-| `BZPOPMIN` | sorted_set | 5.0.0 | done | behavioral_subset | m2-collections |  |
+| `BLMOVE` | list | 6.2.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
+| `BLMPOP` | list | 7.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
+| `BLPOP` | list | 2.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
+| `BRPOP` | list | 2.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
+| `BRPOPLPUSH` | list | 2.2.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
+| `BZMPOP` | sorted_set | 7.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback). |
+| `BZPOPMAX` | sorted_set | 5.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback). |
+| `BZPOPMIN` | sorted_set | 5.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback). |
 | `CLIENT` | connection | 2.4.0 | done | baseline_local | m0-foundation | M0 compatibility baseline implemented with HELP/ID/GETNAME/SETNAME/INFO/LIST. |
 | `CLIENT CACHING` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: YES/NO parsing and per-client state toggle. |
 | `CLIENT GETNAME` | connection | 2.6.9 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
-| `CLIENT GETREDIR` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: returns tracking redirect client id. |
+| `CLIENT GETREDIR` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: returns configured tracking redirect id (`0` for self-redirection while enabled, `-1` when tracking is off) and cooperates with `broken_redirect` tracking state. |
 | `CLIENT HELP` | connection | 5.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `CLIENT ID` | connection | 5.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `CLIENT INFO` | connection | 6.2.0 | done | baseline_local | m0-foundation | M0 compatibility baseline implemented (single-connection info string). |
@@ -124,8 +124,8 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `CLIENT REPLY` | connection | 3.2.0 | done | syntax_only | m0-foundation | M0 client baseline implemented: ON/OFF/SKIP parsing and local reply mode state. |
 | `CLIENT SETINFO` | connection | 7.2.0 | done | syntax_only | m0-foundation | M0 client baseline implemented: LIB-NAME/LIB-VER metadata accepted (no-op). |
 | `CLIENT SETNAME` | connection | 2.6.9 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
-| `CLIENT TRACKING` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: ON/OFF with REDIRECT and option parsing. |
-| `CLIENT TRACKINGINFO` | connection | 6.2.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: flags/redirect/prefixes map response. |
+| `CLIENT TRACKING` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented with direct-key invalidation, BCAST/PREFIX/NOLOOP registry, OPTIN/OPTOUT next-command gating, async invalidate push, connected-target REDIRECT validation, target wakeup delivery, `broken_redirect` marking, and RESP3 `tracking-redir-broken` push. |
+| `CLIENT TRACKINGINFO` | connection | 6.2.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: flags/redirect/prefix state plus current direct-key/BCAST tracking metadata surface, configured redirect visibility, and `broken_redirect` state reporting. |
 | `CLIENT UNBLOCK` | connection | 5.0.0 | done | syntax_only | m0-foundation | M0 client-admin baseline implemented: ID/mode parsing with deterministic no-op unblock result. |
 | `CLIENT UNPAUSE` | connection | 6.2.0 | done | syntax_only | m0-foundation | M0 client-admin baseline implemented: explicit unpause no-op semantics. |
 | `CLUSTER` | cluster | 3.0.0 | done | unsupported | m5-advanced |  |
@@ -434,7 +434,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `UNLINK` | generic | 4.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (synchronous fallback). |
 | `UNSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented: unsubscribe channel/all with remaining-subscription counts. |
 | `UNWATCH` | transactions | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented. |
-| `WAIT` | generic | 3.0.0 | done | syntax_only | m1-kv-core | M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking wait registry. |
+| `WAIT` | generic | 3.0.0 | done | syntax_only | m1-kv-core | M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking timeout semantics. |
 | `WAITAOF` | generic | 7.2.0 | done | baseline_local | m1-kv-core | M1 baseline implemented: immediate standalone WAITAOF vector from local AOF health and tracked replica ACK offsets. |
 | `WATCH` | transactions | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented with key-version tracking. |
 | `XACK` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented. |
@@ -460,8 +460,8 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XLEN` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented. |
 | `XPENDING` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (summary + range forms). |
 | `XRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (inclusive range + COUNT option). |
-| `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, non-blocking immediate return). |
-| `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path). |
+| `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). |
+| `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). |
 | `XREVRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (reverse inclusive range + COUNT option). |
 | `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XTRIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |

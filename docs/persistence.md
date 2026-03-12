@@ -256,9 +256,10 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 | AOF rewrite (`BGREWRITEAOF`) | 구현 | AOF 워커에서 rewrite를 수행한 뒤 writer를 reopen한다. |
 | AOF writer 서버 통합 | 구현 | 쓰기 명령이 AOF 워커 큐(`append`)로 비동기 전달된다. |
 | Legacy AOF format gate | 구현 | headerless AOF는 기본 거부하며 `RATATOSK_ALLOW_LEGACY_AOF=true`에서만 임시 허용한다. |
+| Manifest bootstrap/recovery | 구현 | manifest save/load, startup discovery, recovery-file 순차 replay가 baseline으로 연결된다. |
 | server_cron 통합 | 부분 | SIGUSR1 수신은 구현되어 있고, 추가 save 정책 자동화는 별도 작업이다. |
 | LZF 압축 | 미구현 | RDB string 압축 (큰 값 전용) |
-| Manifest 파일 I/O | 미구현 | manifest를 디스크에 직렬화/역직렬화 |
+| Manifest rewrite switch | 부분 | manifest candidate validation/cleanup helper와 manifest-backed rewrite 후 새 INCR 회전은 연결됐지만 BASE materialization과 full atomic manifest switch는 아직 남아 있다. |
 
 ---
 

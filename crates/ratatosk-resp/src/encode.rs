@@ -71,6 +71,15 @@ fn encoded_len_inner(frame: &RespFrame) -> usize {
             }
             total
         }
+        RespFrame::Push(items) => {
+            let mut total = 1usize
+                .saturating_add(decimal_len_u64(items.len() as u64))
+                .saturating_add(2);
+            for item in items {
+                total = total.saturating_add(encoded_len_inner(item));
+            }
+            total
+        }
         RespFrame::Map(entries) => {
             let mut total = 1usize
                 .saturating_add(decimal_len_u64(entries.len() as u64))
@@ -128,6 +137,15 @@ fn encode_into(frame: &RespFrame, out: &mut Vec<u8>) {
                 encode_into(item, out);
             }
         }
+        RespFrame::Push(items) => {
+            out.push(b'>');
+            let mut len_buf = Buffer::new();
+            out.extend_from_slice(len_buf.format(items.len()).as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_into(item, out);
+            }
+        }
         RespFrame::Map(entries) => {
             out.push(b'%');
             let mut len_buf = Buffer::new();
@@ -178,6 +196,19 @@ mod tests {
         let frame = RespFrame::Map(vec![(RespFrame::bulk_str("proto"), RespFrame::Integer(3))]);
         let out = encode(&frame);
         assert_eq!(out.as_ref(), b"%1\r\n$5\r\nproto\r\n:3\r\n");
+    }
+
+    #[test]
+    fn encode_push() {
+        let frame = RespFrame::Push(vec![
+            RespFrame::bulk_str("tracking-redir-broken"),
+            RespFrame::Integer(42),
+        ]);
+        let out = encode(&frame);
+        assert_eq!(
+            out.as_ref(),
+            b">2\r\n$21\r\ntracking-redir-broken\r\n:42\r\n"
+        );
     }
 
     #[test]

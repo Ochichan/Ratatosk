@@ -12,7 +12,9 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
     path::PathBuf,
+    sync::Arc,
 };
+use tokio::sync::Notify;
 
 pub const DEFAULT_DB_COUNT: usize = 16;
 
@@ -321,6 +323,360 @@ impl Default for ReplicationState {
 impl ReplicationState {
     fn replica_entry_mut(&mut self, client_id: i64) -> &mut ReplicaClientState {
         self.replicas.entry(client_id).or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientTrackingState — key tracking and invalidation delivery registry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientTrackingState {
+    key_watchers: HashMap<(usize, Bytes), HashMap<i64, TrackingWatcher>>,
+    tracker_keys: HashMap<i64, HashSet<(usize, Bytes)>>,
+    broadcast_watchers: HashMap<i64, BroadcastWatcher>,
+    broken_redirects: HashSet<i64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackingWatcher {
+    target_client_id: i64,
+    no_loop: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BroadcastWatcher {
+    target_client_id: i64,
+    no_loop: bool,
+    prefixes: Vec<Bytes>,
+}
+
+impl ClientTrackingState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn track_key(
+        &mut self,
+        tracker_client_id: i64,
+        target_client_id: i64,
+        no_loop: bool,
+        db_idx: usize,
+        key: Bytes,
+    ) {
+        let tracked_key = (db_idx, key.clone());
+        self.key_watchers
+            .entry(tracked_key.clone())
+            .or_default()
+            .insert(
+                tracker_client_id,
+                TrackingWatcher {
+                    target_client_id,
+                    no_loop,
+                },
+            );
+        self.tracker_keys
+            .entry(tracker_client_id)
+            .or_default()
+            .insert(tracked_key);
+    }
+
+    pub fn configure_broadcast(
+        &mut self,
+        tracker_client_id: i64,
+        target_client_id: i64,
+        no_loop: bool,
+        mut prefixes: Vec<Bytes>,
+    ) {
+        prefixes.sort();
+        prefixes.dedup();
+        self.broadcast_watchers.insert(
+            tracker_client_id,
+            BroadcastWatcher {
+                target_client_id,
+                no_loop,
+                prefixes,
+            },
+        );
+    }
+
+    pub fn invalidate_keys<I>(
+        &mut self,
+        writer_client_id: i64,
+        db_idx: usize,
+        keys: I,
+    ) -> HashMap<i64, Vec<Bytes>>
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        let mut invalidations: HashMap<i64, Vec<Bytes>> = HashMap::new();
+
+        for key in keys {
+            let tracked_key = (db_idx, key.clone());
+            if let Some(watchers) = self.key_watchers.remove(&tracked_key) {
+                for (tracker_client_id, watcher) in watchers {
+                    if !(watcher.no_loop && tracker_client_id == writer_client_id) {
+                        invalidations
+                            .entry(watcher.target_client_id)
+                            .or_default()
+                            .push(key.clone());
+                    }
+
+                    if let Some(keys) = self.tracker_keys.get_mut(&tracker_client_id) {
+                        keys.remove(&tracked_key);
+                        let should_remove_tracker = keys.is_empty();
+                        if should_remove_tracker {
+                            let _ = keys;
+                            self.tracker_keys.remove(&tracker_client_id);
+                        }
+                    }
+                }
+            }
+
+            for (tracker_client_id, watcher) in &self.broadcast_watchers {
+                if watcher.no_loop && *tracker_client_id == writer_client_id {
+                    continue;
+                }
+                if watcher.prefixes.is_empty()
+                    || watcher
+                        .prefixes
+                        .iter()
+                        .any(|prefix| key.starts_with(prefix))
+                {
+                    invalidations
+                        .entry(watcher.target_client_id)
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+        }
+
+        for keys in invalidations.values_mut() {
+            keys.sort();
+            keys.dedup();
+        }
+
+        invalidations
+    }
+
+    pub fn clear_tracker(&mut self, tracker_client_id: i64) {
+        self.broadcast_watchers.remove(&tracker_client_id);
+        self.broken_redirects.remove(&tracker_client_id);
+
+        if let Some(tracked_keys) = self.tracker_keys.remove(&tracker_client_id) {
+            let mut empty_keys = Vec::new();
+            for tracked_key in tracked_keys {
+                if let Some(watchers) = self.key_watchers.get_mut(&tracked_key) {
+                    watchers.remove(&tracker_client_id);
+                    if watchers.is_empty() {
+                        empty_keys.push(tracked_key);
+                    }
+                }
+            }
+
+            for tracked_key in empty_keys {
+                self.key_watchers.remove(&tracked_key);
+            }
+        }
+    }
+
+    pub fn clear_target(&mut self, target_client_id: i64) -> Vec<i64> {
+        let mut detached_trackers = HashSet::new();
+
+        for (tracker_client_id, watcher) in &mut self.broadcast_watchers {
+            if watcher.target_client_id == target_client_id {
+                watcher.target_client_id = *tracker_client_id;
+                detached_trackers.insert(*tracker_client_id);
+            }
+        }
+
+        for watchers in self.key_watchers.values_mut() {
+            for (tracker_client_id, watcher) in watchers {
+                if watcher.target_client_id == target_client_id {
+                    watcher.target_client_id = *tracker_client_id;
+                    detached_trackers.insert(*tracker_client_id);
+                }
+            }
+        }
+
+        for tracker_client_id in &detached_trackers {
+            self.broken_redirects.insert(*tracker_client_id);
+        }
+
+        let mut detached = detached_trackers.into_iter().collect::<Vec<_>>();
+        detached.sort_unstable();
+        detached
+    }
+
+    pub fn redirect_broken(&self, tracker_client_id: i64) -> bool {
+        self.broken_redirects.contains(&tracker_client_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClientRegistry — live connection snapshots for INFO/CLIENT introspection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientSnapshot {
+    pub id: i64,
+    pub addr: Bytes,
+    pub laddr: Bytes,
+    pub name: Option<Bytes>,
+    pub age_seconds: i64,
+    pub idle_seconds: i64,
+    pub flags: Bytes,
+    pub db: usize,
+    pub sub: usize,
+    pub psub: usize,
+    pub ssub: usize,
+    pub multi: i64,
+    pub cmd: Bytes,
+    pub user: Bytes,
+    pub redir: i64,
+    pub tracking_enabled: bool,
+    pub resp: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientRegistry {
+    clients: HashMap<i64, ClientSnapshot>,
+    blocked_clients: HashSet<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// BlockingState — producer-driven wake registry for blocking commands
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+pub struct BlockingState {
+    key_waiters: HashMap<(usize, Bytes), HashSet<i64>>,
+    client_keys: HashMap<i64, HashSet<(usize, Bytes)>>,
+    client_notifiers: HashMap<i64, Arc<Notify>>,
+}
+
+impl BlockingState {
+    pub fn register(&mut self, client_id: i64, keys: Vec<(usize, Bytes)>) -> Arc<Notify> {
+        self.clear(client_id);
+
+        let notifier = self
+            .client_notifiers
+            .entry(client_id)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone();
+
+        let key_set = keys.into_iter().collect::<HashSet<_>>();
+        for key in &key_set {
+            self.key_waiters
+                .entry(key.clone())
+                .or_default()
+                .insert(client_id);
+        }
+        if !key_set.is_empty() {
+            self.client_keys.insert(client_id, key_set);
+        }
+
+        notifier
+    }
+
+    pub fn clear(&mut self, client_id: i64) {
+        let Some(keys) = self.client_keys.remove(&client_id) else {
+            return;
+        };
+
+        let mut empty_keys = Vec::new();
+        for key in keys {
+            if let Some(waiters) = self.key_waiters.get_mut(&key) {
+                waiters.remove(&client_id);
+                if waiters.is_empty() {
+                    empty_keys.push(key);
+                }
+            }
+        }
+
+        for key in empty_keys {
+            self.key_waiters.remove(&key);
+        }
+    }
+
+    pub fn remove_client(&mut self, client_id: i64) {
+        self.clear(client_id);
+        self.client_notifiers.remove(&client_id);
+    }
+
+    pub fn notify_keys<I>(&self, db_idx: usize, keys: I)
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        let mut notified_clients = HashSet::new();
+        for key in keys {
+            if let Some(waiters) = self.key_waiters.get(&(db_idx, key)) {
+                notified_clients.extend(waiters.iter().copied());
+            }
+        }
+
+        for client_id in notified_clients {
+            if let Some(notifier) = self.client_notifiers.get(&client_id) {
+                notifier.notify_waiters();
+            }
+        }
+    }
+}
+
+impl ClientRegistry {
+    pub fn upsert(&mut self, snapshot: ClientSnapshot) {
+        self.clients.insert(snapshot.id, snapshot);
+    }
+
+    pub fn remove(&mut self, client_id: i64) {
+        self.clients.remove(&client_id);
+        self.blocked_clients.remove(&client_id);
+    }
+
+    pub fn detach_redirect_target(&mut self, target_client_id: i64) {
+        for snapshot in self.clients.values_mut() {
+            if snapshot.redir == target_client_id {
+                snapshot.redir = -1;
+            }
+        }
+    }
+
+    pub fn get(&self, client_id: i64) -> Option<&ClientSnapshot> {
+        self.clients.get(&client_id)
+    }
+
+    pub fn list(&self) -> Vec<ClientSnapshot> {
+        let mut snapshots = self.clients.values().cloned().collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        snapshots
+    }
+
+    pub fn set_blocked(&mut self, client_id: i64, blocked: bool) {
+        if blocked {
+            self.blocked_clients.insert(client_id);
+        } else {
+            self.blocked_clients.remove(&client_id);
+        }
+    }
+
+    pub fn is_blocked(&self, client_id: i64) -> bool {
+        self.blocked_clients.contains(&client_id)
+    }
+
+    pub fn blocked_clients(&self) -> usize {
+        self.blocked_clients.len()
+    }
+
+    pub fn tracking_clients(&self) -> usize {
+        self.clients
+            .values()
+            .filter(|snapshot| snapshot.tracking_enabled)
+            .count()
+    }
+
+    pub fn len(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
     }
 }
 
@@ -682,6 +1038,12 @@ pub enum PubSubMessage {
         channel: Bytes,
         payload: Bytes,
     },
+    Invalidate {
+        keys: Vec<Bytes>,
+    },
+    TrackingRedirectBroken {
+        redirect_client_id: i64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -700,9 +1062,17 @@ pub struct PubSubState {
     client_pattern_subs: HashMap<i64, HashSet<Bytes>>,
     pending: HashMap<i64, Vec<PubSubMessage>>,
     overflowed_clients: HashSet<i64>,
+    client_notifiers: HashMap<i64, Arc<Notify>>,
 }
 
 impl PubSubState {
+    pub fn register_client(&mut self, client_id: i64) -> Arc<Notify> {
+        self.client_notifiers
+            .entry(client_id)
+            .or_insert_with(|| Arc::new(Notify::new()))
+            .clone()
+    }
+
     pub fn subscribe_channel(&mut self, client_id: i64, channel: Bytes) -> i64 {
         self.channels
             .entry(channel.clone())
@@ -905,6 +1275,14 @@ impl PubSubState {
     }
 
     fn enqueue_pending(&mut self, client_id: i64, message: PubSubMessage) -> bool {
+        if !self.client_notifiers.contains_key(&client_id)
+            && self.client_total_subscriptions(client_id) == 0
+        {
+            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "missing_client")
+                .increment(1);
+            return false;
+        }
+
         if self.overflowed_clients.contains(&client_id) {
             metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "client_overflowed")
                 .increment(1);
@@ -929,6 +1307,9 @@ impl PubSubState {
         queue.push(message);
 
         metrics::histogram!("ratatosk_pubsub_pending_queue_len").record(queue.len() as f64);
+        if let Some(notifier) = self.client_notifiers.get(&client_id) {
+            notifier.notify_one();
+        }
 
         true
     }
@@ -943,6 +1324,14 @@ impl PubSubState {
 
     pub fn pending_len_for_client(&self, client_id: i64) -> usize {
         self.pending.get(&client_id).map_or(0, Vec::len)
+    }
+
+    pub fn has_pending_messages(&self, client_id: i64) -> bool {
+        self.overflowed_clients.contains(&client_id)
+            || self
+                .pending
+                .get(&client_id)
+                .is_some_and(|messages| !messages.is_empty())
     }
 
     pub fn client_has_subscriptions(&self, client_id: i64) -> bool {
@@ -1029,6 +1418,14 @@ impl PubSubState {
         receivers
     }
 
+    pub fn enqueue_invalidation(&mut self, client_id: i64, keys: Vec<Bytes>) -> bool {
+        self.enqueue_pending(client_id, PubSubMessage::Invalidate { keys })
+    }
+
+    pub fn enqueue_invalidation_message(&mut self, client_id: i64, message: PubSubMessage) -> bool {
+        self.enqueue_pending(client_id, message)
+    }
+
     pub fn drain_messages(&mut self, client_id: i64) -> Vec<PubSubMessage> {
         self.pending.remove(&client_id).unwrap_or_default()
     }
@@ -1069,6 +1466,7 @@ impl PubSubState {
 
         self.pending.remove(&client_id);
         self.overflowed_clients.remove(&client_id);
+        self.client_notifiers.remove(&client_id);
     }
 
     fn client_total_subscriptions(&self, client_id: i64) -> usize {
@@ -1906,6 +2304,9 @@ pub struct ServerState {
     pub script_cache: ScriptCache,
     pub cluster_node_id: Bytes,
     replication: ReplicationState,
+    tracking: ClientTrackingState,
+    clients: ClientRegistry,
+    blocking: BlockingState,
     lazy_free_tx: Option<LazyFreeSender>,
     rdb_save_in_progress: bool,
     last_rdb_save_status: Option<Result<(), String>>,
@@ -1957,6 +2358,9 @@ impl ServerState {
             script_cache: ScriptCache::default(),
             cluster_node_id: node_id,
             replication: ReplicationState::default(),
+            tracking: ClientTrackingState::default(),
+            clients: ClientRegistry::default(),
+            blocking: BlockingState::default(),
             lazy_free_tx: None,
             rdb_save_in_progress: false,
             last_rdb_save_status: None,
@@ -2144,6 +2548,155 @@ impl ServerState {
         self.replication.replicas.remove(&client_id);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn tracking_register_key(
+        &mut self,
+        tracker_client_id: i64,
+        target_client_id: i64,
+        no_loop: bool,
+        db_idx: usize,
+        key: Bytes,
+    ) {
+        self.tracking
+            .track_key(tracker_client_id, target_client_id, no_loop, db_idx, key);
+    }
+
+    pub fn tracking_configure_broadcast(
+        &mut self,
+        tracker_client_id: i64,
+        target_client_id: i64,
+        no_loop: bool,
+        prefixes: Vec<Bytes>,
+    ) {
+        self.tracking
+            .configure_broadcast(tracker_client_id, target_client_id, no_loop, prefixes);
+    }
+
+    pub fn tracking_clear_tracker(&mut self, tracker_client_id: i64) {
+        self.tracking.clear_tracker(tracker_client_id);
+    }
+
+    pub fn tracking_remove_client(&mut self, client_id: i64) {
+        self.tracking.clear_tracker(client_id);
+        let detached_trackers = self.tracking.clear_target(client_id);
+        for tracker_client_id in detached_trackers {
+            if self
+                .client_snapshot(tracker_client_id)
+                .is_some_and(|snapshot| snapshot.resp >= 3)
+            {
+                let _ = self.pubsub.enqueue_invalidation_message(
+                    tracker_client_id,
+                    PubSubMessage::TrackingRedirectBroken {
+                        redirect_client_id: client_id,
+                    },
+                );
+            }
+        }
+        self.blocking.remove_client(client_id);
+    }
+
+    pub fn tracking_invalidate_keys<I>(&mut self, writer_client_id: i64, db_idx: usize, keys: I)
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        let invalidations = self
+            .tracking
+            .invalidate_keys(writer_client_id, db_idx, keys);
+        for (client_id, keys) in invalidations {
+            let _ = self.pubsub.enqueue_invalidation(client_id, keys);
+        }
+    }
+
+    pub fn register_blocked_client(
+        &mut self,
+        client_id: i64,
+        keys: Vec<(usize, Bytes)>,
+    ) -> Arc<Notify> {
+        self.blocking.register(client_id, keys)
+    }
+
+    pub fn clear_blocked_client(&mut self, client_id: i64) {
+        self.blocking.clear(client_id);
+    }
+
+    pub fn notify_blocked_clients<I>(&self, db_idx: usize, keys: I)
+    where
+        I: IntoIterator<Item = Bytes>,
+    {
+        self.blocking.notify_keys(db_idx, keys);
+    }
+
+    pub fn upsert_client_snapshot(&mut self, snapshot: ClientSnapshot) {
+        self.clients.upsert(snapshot);
+    }
+
+    pub fn client_snapshot(&self, client_id: i64) -> Option<&ClientSnapshot> {
+        self.clients.get(client_id)
+    }
+
+    pub fn client_snapshots(&self) -> Vec<ClientSnapshot> {
+        self.clients.list()
+    }
+
+    pub fn tracking_active_redirect(
+        &self,
+        tracker_client_id: i64,
+        configured_redirect: i64,
+    ) -> i64 {
+        if configured_redirect < 0 {
+            return -1;
+        }
+        if configured_redirect != tracker_client_id
+            && !self.tracking.redirect_broken(tracker_client_id)
+            && self.clients.get(configured_redirect).is_some()
+        {
+            configured_redirect
+        } else {
+            -1
+        }
+    }
+
+    pub fn tracking_target_client_id(
+        &self,
+        tracker_client_id: i64,
+        configured_redirect: i64,
+    ) -> i64 {
+        let active_redirect = self.tracking_active_redirect(tracker_client_id, configured_redirect);
+        if active_redirect >= 0 {
+            active_redirect
+        } else {
+            tracker_client_id
+        }
+    }
+
+    pub fn tracking_redirect_broken(&self, tracker_client_id: i64) -> bool {
+        self.tracking.redirect_broken(tracker_client_id)
+    }
+
+    pub fn remove_client_snapshot(&mut self, client_id: i64) {
+        self.clients.remove(client_id);
+    }
+
+    pub fn set_client_blocked(&mut self, client_id: i64, blocked: bool) {
+        self.clients.set_blocked(client_id, blocked);
+    }
+
+    pub fn client_is_blocked(&self, client_id: i64) -> bool {
+        self.clients.is_blocked(client_id)
+    }
+
+    pub fn blocked_clients(&self) -> usize {
+        self.clients.blocked_clients()
+    }
+
+    pub fn tracking_clients(&self) -> usize {
+        self.clients.tracking_clients()
+    }
+
+    pub fn connected_client_snapshots(&self) -> usize {
+        self.clients.len()
+    }
+
     /// Returns the server uptime in seconds.
     pub fn uptime_seconds(&self) -> i64 {
         let now = ratatosk_core::time::now_ms();
@@ -2328,9 +2881,10 @@ fn generate_cluster_node_id() -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, time::Duration};
 
     use bytes::Bytes;
+    use tokio::time::timeout;
 
     use super::{PubSubState, ServerState, StatsState};
 
@@ -2440,6 +2994,27 @@ mod tests {
         ps.remove_client(1);
         ps.subscribe_channel(1, channel.clone());
         assert_eq!(ps.publish(&channel, &payload), 1);
+    }
+
+    #[tokio::test]
+    async fn pubsub_notifier_wakes_client_for_invalidation() {
+        let mut ps = PubSubState::default();
+        let notifier = ps.register_client(7);
+
+        assert!(ps.enqueue_invalidation(7, vec![Bytes::from("tracked")]));
+
+        timeout(Duration::from_millis(50), notifier.notified())
+            .await
+            .expect("pubsub notifier should wake waiting client");
+        let drained = ps.drain_messages(7);
+        assert_eq!(drained.len(), 1);
+    }
+
+    #[test]
+    fn enqueue_invalidation_drops_for_missing_client() {
+        let mut ps = PubSubState::default();
+        assert!(!ps.enqueue_invalidation(99, vec![Bytes::from("tracked")]));
+        assert!(ps.drain_messages(99).is_empty());
     }
 
     #[test]
