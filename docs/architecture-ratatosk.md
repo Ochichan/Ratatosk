@@ -1,6 +1,6 @@
 # Ratatosk Architecture
 
-이 문서는 **현재 저장소 코드 기준**(2026-02-11) 아키텍처를 설명한다.
+이 문서는 **현재 저장소 코드 기준**(2026-03-15) 아키텍처를 설명한다.
 과거 계획 문서가 아니라 실제 구현 상태를 기준으로 작성했다.
 
 ## Snapshot
@@ -163,7 +163,7 @@ eviction/cron/notification 관련 설정이 `ConfigState`에 포함된다:
 
 추가 signal 핸들링:
 - **SIGINT/SIGTERM** → graceful shutdown (drain + grace period)
-- **SIGUSR1** → RDB save 트리거 (로그 출력, persistence 연동 예정)
+- **SIGUSR1** → RDB save 트리거 (persistence runtime 연동 완료)
 
 ## Eviction System
 
@@ -233,8 +233,13 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 ## Pub/Sub Internals
 
 - channel/shard/pattern subscription map을 분리 유지.
-- client별 pending queue를 운영하며 limit 초과 시 overflow 플래그 설정.
-- pending queue limit: 4096 (`PUBSUB_PENDING_QUEUE_LIMIT`).
+- RESP3 Push wrapping: 모든 메시지 타입(Message, SMessage, PMessage, Invalidate, TrackingRedirectBroken)이 RESP3 push frame으로 래핑된다.
+- client별 pending queue를 운영하며 Redis 호환 3단계 limit 체계:
+  - **hard limit**: queue 크기 ≥ hard limit → 즉시 overflow (disconnect). 기본 4096.
+  - **soft limit + timer**: queue 크기 ≥ soft limit → 타이머 시작. `soft_seconds` 동안 지속 시 overflow. 타이머 내 soft limit 미만 복귀 시 리셋. 기본 2048/60초.
+  - `PubSubState.soft_limit_exceeded_at: HashMap<i64, Instant>`로 per-client 타이머 추적.
+- **초기화**: `PubSubState::new(&ConfigState)`로 생성되어 `ConfigState`가 유일한 기본값 출처 (single source of truth). `pending_queue_limit()`도 `self.hard_limit`을 반환하여 런타임 변경이 즉시 반영됨.
+- pending queue limit은 `CONFIG GET/SET`으로 런타임 조정 가능: `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`. 변경 시 `pubsub.set_queue_limits()`로 즉시 반영.
 - overflow client는 다음 처리 루프에서 에러 응답 후 연결 종료.
 
 ## Concurrency Model
@@ -250,8 +255,8 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 | Thread | 역할 | 통신 |
 |--------|------|------|
 | Lazy-free | 대용량 값 비동기 삭제 | `crossbeam_channel::bounded(4096)` |
-| (미래) RDB save | Background snapshot | `AtomicBool` shutdown flag |
-| (미래) AOF rewrite | AOF 재작성 | — |
+| RDB save | Background snapshot (`BGSAVE`) | tokio task + shutdown drain |
+| AOF rewrite | Background AOF 재작성 (`BGREWRITEAOF`) | AOF worker channel |
 
 참고: `crates/ratatosk-server/src/io_thread.rs`의 `IoThreadPool`은 현재 placeholder다.
 
@@ -264,6 +269,14 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 - 기본 bind는 loopback(`127.0.0.1`).
 - non-loopback bind는 `RATATOSK_ALLOW_INSECURE_BIND=true` 없으면 거부.
 - max clients/output buffer/shutdown grace에 대해 0값 방어 검증.
+
+### AUTH brute force prevention
+
+`crates/ratatosk-engine/src/command/cmd_acl.rs`, `crates/ratatosk-server/src/client.rs`:
+
+- **progressive delay**: 실패 횟수에 따라 응답 전 지수 지연을 적용한다. `delay_ms = min(100 × 2^(failures-1), 2000) × jitter(0.8..1.2)`. `tokio::time::sleep`으로 비동기 대기하므로 OS 스레드를 차단하지 않는다.
+- per-connection: 5회 연속 AUTH 실패 시 지연 후 연결을 종료한다 (`CommandOutcome::close_with_delay`).
+- per-IP: `AuthRateLimiter`가 IP별 실패를 추적하며, 60초 윈도우 내 20회 실패 시 해당 IP의 신규 AUTH 시도를 거부한다.
 
 ### Sanitization helpers
 
@@ -281,6 +294,11 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 - 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
   - 예: `SAVE`/`BGSAVE`는 현재 통계 timestamp 갱신 중심.
   - 예: 복제/클러스터 계열은 standalone 호환 응답 중심.
+- `CLIENT REPLY`는 I/O loop에서 실제 적용된다 (`off`=응답 억제, `skip`=다음 1회 억제, push notification 무영향).
+- `CLIENT SETINFO`는 `lib-name`/`lib-ver`를 `ClientState`에 저장하고, `CLIENT LIST` 출력에 반영한다.
+- `CLIENT TRACKING`은 `BCAST`+`OPTIN`/`OPTOUT` 비호환 조합을 검증해 거부한다.
+- `PSYNC`는 standalone mode에서 ERR를 반환한다 (fake FULLRESYNC 대신).
+- `REPLICAOF`는 `NO ONE` 이외의 인자에 대해 ERR를 반환한다.
 
 즉, "명령 surface"는 넓지만 내부 동작 parity 수준은 명령별로 다를 수 있다.
 
@@ -301,6 +319,7 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 - `maxmemory`, `maxmemory-policy`, `maxmemory-samples`
 - `hz`, `notify-keyspace-events`, `tcp-keepalive`
 - `lazyfree-lazy-expire`, `lazyfree-lazy-server-del`, `lazyfree-lazy-user-del`
+- `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 
 ## Build / Run / Test
 
@@ -337,4 +356,5 @@ cargo run -p ratatosk-server --bin ratatosk
 - Atomic file write: `crates/ratatosk-persist/src/atomic.rs`
 - Runtime accept loop: `crates/ratatosk-server/src/event_loop.rs`
 - Client pipeline: `crates/ratatosk-server/src/client.rs`
+- Persistence runtime: `crates/ratatosk-server/src/persistence/{mod,rdb,aof,util}.rs`
 - Config: `crates/ratatosk-server/src/config.rs`

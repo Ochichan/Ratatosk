@@ -533,6 +533,8 @@ pub struct ClientSnapshot {
     pub redir: i64,
     pub tracking_enabled: bool,
     pub resp: i64,
+    pub lib_name: Option<Bytes>,
+    pub lib_ver: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1050,9 +1052,7 @@ pub enum PubSubMessage {
 // PubSubState — channel/pattern subscriptions + pending delivery
 // ---------------------------------------------------------------------------
 
-const PUBSUB_PENDING_QUEUE_LIMIT: usize = 4096;
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PubSubState {
     channels: HashMap<Bytes, HashSet<i64>>,
     shard_channels: HashMap<Bytes, HashSet<i64>>,
@@ -1063,9 +1063,46 @@ pub struct PubSubState {
     pending: HashMap<i64, Vec<PubSubMessage>>,
     overflowed_clients: HashSet<i64>,
     client_notifiers: HashMap<i64, Arc<Notify>>,
+    /// Tracks when each client first exceeded the soft limit (for soft timeout window).
+    soft_limit_exceeded_at: HashMap<i64, std::time::Instant>,
+    /// Active queue limits (synced from ConfigState).
+    hard_limit: usize,
+    soft_limit: usize,
+    soft_seconds: u64,
+}
+
+impl Default for PubSubState {
+    fn default() -> Self {
+        Self::new(&ConfigState::default())
+    }
 }
 
 impl PubSubState {
+    pub fn new(config: &ConfigState) -> Self {
+        Self {
+            channels: HashMap::default(),
+            shard_channels: HashMap::default(),
+            patterns: HashMap::default(),
+            client_channel_subs: HashMap::default(),
+            client_shard_channel_subs: HashMap::default(),
+            client_pattern_subs: HashMap::default(),
+            pending: HashMap::default(),
+            overflowed_clients: HashSet::default(),
+            client_notifiers: HashMap::default(),
+            soft_limit_exceeded_at: HashMap::default(),
+            hard_limit: config.pubsub_queue_hard_limit(),
+            soft_limit: config.pubsub_queue_soft_limit(),
+            soft_seconds: config.pubsub_queue_soft_seconds(),
+        }
+    }
+
+    /// Update queue limits from config. Call after CONFIG SET changes.
+    pub fn set_queue_limits(&mut self, hard_limit: usize, soft_limit: usize, soft_seconds: u64) {
+        self.hard_limit = hard_limit;
+        self.soft_limit = soft_limit;
+        self.soft_seconds = soft_seconds;
+    }
+
     pub fn register_client(&mut self, client_id: i64) -> Arc<Notify> {
         self.client_notifiers
             .entry(client_id)
@@ -1275,6 +1312,21 @@ impl PubSubState {
     }
 
     fn enqueue_pending(&mut self, client_id: i64, message: PubSubMessage) -> bool {
+        let hard = self.hard_limit;
+        let soft = self.soft_limit;
+        let secs = self.soft_seconds;
+        self.enqueue_pending_with_limits(client_id, message, hard, soft, secs)
+    }
+
+    /// Enqueue with configurable limits. `soft_limit == 0` disables soft limit logic.
+    pub fn enqueue_pending_with_limits(
+        &mut self,
+        client_id: i64,
+        message: PubSubMessage,
+        hard_limit: usize,
+        soft_limit: usize,
+        soft_seconds: u64,
+    ) -> bool {
         if !self.client_notifiers.contains_key(&client_id)
             && self.client_total_subscriptions(client_id) == 0
         {
@@ -1290,8 +1342,11 @@ impl PubSubState {
         }
 
         let queue = self.pending.entry(client_id).or_default();
-        if queue.len() >= PUBSUB_PENDING_QUEUE_LIMIT {
+
+        // Hard limit: immediate overflow
+        if queue.len() >= hard_limit {
             self.overflowed_clients.insert(client_id);
+            self.soft_limit_exceeded_at.remove(&client_id);
             metrics::counter!("ratatosk_pubsub_clients_overflowed_total").increment(1);
             metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "queue_full")
                 .increment(1);
@@ -1299,9 +1354,47 @@ impl PubSubState {
                 target = "ratatosk::pubsub",
                 client_id,
                 queue_size = queue.len(),
-                "PubSub client overflowed - queue limit exceeded"
+                "PubSub client overflowed - hard limit exceeded"
             );
             return false;
+        }
+
+        // Soft limit: start timer, overflow after soft_seconds
+        if soft_limit > 0 && queue.len() >= soft_limit {
+            let now = std::time::Instant::now();
+            match self.soft_limit_exceeded_at.get(&client_id) {
+                None => {
+                    // First time exceeding soft limit — start timer
+                    self.soft_limit_exceeded_at.insert(client_id, now);
+                    tracing::warn!(
+                        target = "ratatosk::pubsub",
+                        client_id,
+                        queue_size = queue.len(),
+                        soft_limit,
+                        soft_seconds,
+                        "PubSub client exceeded soft limit - window started"
+                    );
+                }
+                Some(&started) if now.duration_since(started).as_secs() >= soft_seconds => {
+                    // Soft timeout elapsed — overflow
+                    self.overflowed_clients.insert(client_id);
+                    self.soft_limit_exceeded_at.remove(&client_id);
+                    metrics::counter!("ratatosk_pubsub_clients_overflowed_total").increment(1);
+                    metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "soft_timeout")
+                        .increment(1);
+                    tracing::warn!(
+                        target = "ratatosk::pubsub",
+                        client_id,
+                        queue_size = queue.len(),
+                        "PubSub client overflowed - soft limit timeout exceeded"
+                    );
+                    return false;
+                }
+                _ => {} // Still within soft window, allow enqueue
+            }
+        } else {
+            // Below soft limit — reset timer if one was active
+            self.soft_limit_exceeded_at.remove(&client_id);
         }
 
         queue.push(message);
@@ -1319,7 +1412,12 @@ impl PubSubState {
     }
 
     pub fn pending_queue_limit(&self) -> usize {
-        PUBSUB_PENDING_QUEUE_LIMIT
+        self.hard_limit
+    }
+
+    /// Clean up soft limit tracking when a client disconnects.
+    pub fn clear_soft_limit_timer(&mut self, client_id: i64) {
+        self.soft_limit_exceeded_at.remove(&client_id);
     }
 
     pub fn pending_len_for_client(&self, client_id: i64) -> usize {
@@ -1467,6 +1565,7 @@ impl PubSubState {
         self.pending.remove(&client_id);
         self.overflowed_clients.remove(&client_id);
         self.client_notifiers.remove(&client_id);
+        self.soft_limit_exceeded_at.remove(&client_id);
     }
 
     fn client_total_subscriptions(&self, client_id: i64) -> usize {
@@ -2114,6 +2213,9 @@ pub struct ConfigState {
     lazyfree_lazy_server_del: bool,
     lazyfree_lazy_user_del: bool,
     tcp_keepalive: u32,
+    pubsub_queue_hard_limit: usize,
+    pubsub_queue_soft_limit: usize,
+    pubsub_queue_soft_seconds: u64,
 }
 
 impl Default for ConfigState {
@@ -2134,6 +2236,9 @@ impl Default for ConfigState {
             lazyfree_lazy_server_del: false,
             lazyfree_lazy_user_del: false,
             tcp_keepalive: 300,
+            pubsub_queue_hard_limit: 4096,
+            pubsub_queue_soft_limit: 2048,
+            pubsub_queue_soft_seconds: 60,
         }
     }
 }
@@ -2258,6 +2363,30 @@ impl ConfigState {
     pub fn set_tcp_keepalive(&mut self, value: u32) {
         self.tcp_keepalive = value;
     }
+
+    pub fn pubsub_queue_hard_limit(&self) -> usize {
+        self.pubsub_queue_hard_limit
+    }
+
+    pub fn set_pubsub_queue_hard_limit(&mut self, value: usize) {
+        self.pubsub_queue_hard_limit = value;
+    }
+
+    pub fn pubsub_queue_soft_limit(&self) -> usize {
+        self.pubsub_queue_soft_limit
+    }
+
+    pub fn set_pubsub_queue_soft_limit(&mut self, value: usize) {
+        self.pubsub_queue_soft_limit = value;
+    }
+
+    pub fn pubsub_queue_soft_seconds(&self) -> u64 {
+        self.pubsub_queue_soft_seconds
+    }
+
+    pub fn set_pubsub_queue_soft_seconds(&mut self, value: u64) {
+        self.pubsub_queue_soft_seconds = value;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2345,16 +2474,18 @@ impl ServerState {
         }
 
         let node_id = generate_cluster_node_id();
+        let config = ConfigState::default();
+        let pubsub = PubSubState::new(&config);
         let result = Self {
             dbs,
             key_versions,
             next_client_id: 1,
             next_key_version: 1,
             started_at_ms: unix_ms_now(),
-            pubsub: PubSubState::default(),
+            pubsub,
             stats: StatsState::default(),
             acl: AclState::default(),
-            config: ConfigState::default(),
+            config,
             script_cache: ScriptCache::default(),
             cluster_node_id: node_id,
             replication: ReplicationState::default(),
