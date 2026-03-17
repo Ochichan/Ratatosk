@@ -1,13 +1,13 @@
 # Ratatosk Architecture
 
-이 문서는 **현재 저장소 코드 기준**(2026-03-15) 아키텍처를 설명한다.
+이 문서는 **현재 저장소 코드 기준**(2026-03-16) 아키텍처를 설명한다.
 과거 계획 문서가 아니라 실제 구현 상태를 기준으로 작성했다.
 
 ## Snapshot
 
 - Workspace crates: `ratatosk-core`, `ratatosk-resp`, `ratatosk-engine`, `ratatosk-persist`, `ratatosk-server`
 - Runtime model: tokio TCP accept loop + per-client task + server_cron timer
-- Shared state: `Arc<tokio::sync::Mutex<ServerState>>`
+- Shared state: `SharedState` wrapping `Mutex<ServerState>` + per-DB `parking_lot::RwLock` + lock-free components
 - Protocol: RESP2/RESP3 호환 파싱 경로
 - Command catalog: `420` entries. 구현 상태와 Redis 의미론 tier는 `docs/redis-gap-ledger.json` / `docs/redis-gap-ledger.md`를 함께 봐야 한다.
 - Persistence: RDB snapshot + AOF append-only file
@@ -45,7 +45,7 @@ ratatosk-core
 |-------|------|----------|
 | `ratatosk-core` | 도메인 타입 (`ClientId`, `DbIndex`, `SlotId`), 비트마스크 플래그, 에러, 시간 유틸 | `forbid` |
 | `ratatosk-resp` | RESP2/RESP3 zero-copy 파서 + 인코더 | `forbid` |
-| `ratatosk-engine` | Keyspace, 420개 명령 핸들러, eviction, active expiry, pub/sub, notification, HLL, 슬롯 | `forbid` |
+| `ratatosk-engine` | Keyspace, config/stats state, 420개 명령 핸들러, eviction, active expiry, pub/sub, notification, HLL, 슬롯, Lua scripting (`lua-scripting` feature) | `forbid` |
 | `ratatosk-persist` | RDB saver/loader, AOF writer/manifest/recovery, atomic file write, CRC64 | `forbid` |
 | `ratatosk-server` | TCP accept loop, per-client I/O, server_cron, lazy-free thread, config | — |
 
@@ -85,8 +85,9 @@ ratatosk-core
 `crates/ratatosk-engine/src/command/mod.rs`:
 
 - 명령 실행 전에 인증/ACL 검사.
-- `execute(frame, &mut server, &mut client_state)` 호출 시점에 Mutex를 잠그므로
-  state mutation은 사실상 직렬화된다.
+- `execute(frame, &mut access, &mut client_state)` 호출. `access`는 `ServerAccess` 래퍼로, `SharedState` 내부 `Mutex<ServerState>`를 잠근 뒤 생성된다.
+  DB 접근은 내부 per-DB `parking_lot::RwLock`을 통해 이루어지므로, 서로 다른 DB에 대한 명령은 잠재적으로 병렬 실행 가능하다.
+  stats/config 읽기/client id 할당은 lock-free.
 - `CommandOutcome { response, close, retry_blocking }`로 결과를 통일.
 
 ### 5) Blocking command retry
@@ -105,10 +106,29 @@ ratatosk-core
 
 ## Core State Model
 
+### SharedState
+
+`SharedState`는 `Mutex<ServerState>`를 감싸면서 독립적으로 접근 가능한 lock-free 컴포넌트를 제공한다:
+
+| Component | Type | 역할 |
+|-----------|------|------|
+| `atomic_stats` | `AtomicStatsState` | 10개 lock-free atomic counter (total_commands_processed, connected_clients, net_input/output_bytes, evicted/expired_keys, keyspace_hits/misses, ops_per_sec, cached_memory_estimate) |
+| `config_cache` | `arc_swap::ArcSwap<ConfigState>` | lock-free config 읽기 (`config_cache.load()`) |
+| `next_client_id` | `AtomicU64` | lock 없이 새 client ID 할당 |
+
+이 구조로 client 요청당 ~9회의 lock 획득이 제거된다.
+
+참고:
+- `crates/ratatosk-engine/src/config.rs` — `ConfigState`
+- `crates/ratatosk-engine/src/stats.rs` — `StatsState`, `AtomicStatsState`
+
+Workspace dependency: `arc-swap = "1"`
+
+### ServerState + DataState (Per-DB RwLock)
+
 `crates/ratatosk-engine/src/keyspace.rs`의 `ServerState`:
 
-- `dbs: Vec<HashMap<Bytes, StoredValue>>`
-- `key_versions` (WATCH/transaction versioning)
+- `data: DataState` — DB별 per-shard RwLock 계층
 - `pubsub: PubSubState`
 - `stats: StatsState`
 - `acl: AclState`
@@ -117,7 +137,29 @@ ratatosk-core
 - `cluster_node_id`
 - `lazy_free_tx: Option<LazyFreeSender>` — 백그라운드 삭제 채널
 
+`DataState`는 DB별 `parking_lot::RwLock<DbShard>`를 관리한다:
+
+```rust
+pub struct DataState {
+    shards: Vec<parking_lot::RwLock<DbShard>>,
+    next_key_version: AtomicU64,
+}
+
+pub struct DbShard {
+    pub data: HashMap<Bytes, StoredValue>,
+    pub key_versions: HashMap<Bytes, u64>,
+}
+```
+
+- `db(idx)` → `MappedRwLockReadGuard<HashMap>` (auto-deref로 `&HashMap`처럼 사용)
+- `db_mut(idx)` → `MappedRwLockWriteGuard<HashMap>` (auto-deref로 `&mut HashMap`처럼 사용)
+- `write_two_dbs(a, b)` — ascending index 순서로 2개 DB 동시 write lock (MOVE, SWAPDB용)
+- `write_all_dbs()` — 전체 DB ascending lock (FLUSHALL, load_from_rdb용)
+- `snapshot_all()` — DB별 순차 read-lock + clone (BGSAVE용)
+
 기본 DB 개수는 16(`DEFAULT_DB_COUNT`).
+
+Lock ordering invariant: **항상 ascending index 순서로 DB lock 획득** → deadlock 방지.
 
 ### StoredValue
 
@@ -234,21 +276,40 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 
 - channel/shard/pattern subscription map을 분리 유지.
 - RESP3 Push wrapping: 모든 메시지 타입(Message, SMessage, PMessage, Invalidate, TrackingRedirectBroken)이 RESP3 push frame으로 래핑된다.
-- client별 pending queue를 운영하며 Redis 호환 3단계 limit 체계:
-  - **hard limit**: queue 크기 ≥ hard limit → 즉시 overflow (disconnect). 기본 4096.
-  - **soft limit + timer**: queue 크기 ≥ soft limit → 타이머 시작. `soft_seconds` 동안 지속 시 overflow. 타이머 내 soft limit 미만 복귀 시 리셋. 기본 2048/60초.
-  - `PubSubState.soft_limit_exceeded_at: HashMap<i64, Instant>`로 per-client 타이머 추적.
+- **mpsc push delivery**: per-subscriber `tokio::sync::mpsc::channel` 기반. `register_client()`가 `mpsc::Receiver<PubSubMessage>`를 반환하며, channel capacity는 `hard_limit`으로 설정된다.
+- `publish()`는 `try_send()`로 메시지를 전달한다. channel이 가득 차면 overflow로 간주하고, receiver가 `None`을 수신하여 disconnect된다.
 - **초기화**: `PubSubState::new(&ConfigState)`로 생성되어 `ConfigState`가 유일한 기본값 출처 (single source of truth). `pending_queue_limit()`도 `self.hard_limit`을 반환하여 런타임 변경이 즉시 반영됨.
-- pending queue limit은 `CONFIG GET/SET`으로 런타임 조정 가능: `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`. 변경 시 `pubsub.set_queue_limits()`로 즉시 반영.
-- overflow client는 다음 처리 루프에서 에러 응답 후 연결 종료.
+- `CONFIG GET/SET pubsub-queue-hard-limit`으로 런타임 조정 가능.
+- Client tracking invalidation도 동일한 per-client mpsc 채널을 통해 자동 전달된다 (`mark_write_command → invalidate_tracked_keys → tracking_invalidate_keys → pubsub.enqueue_invalidation`).
+- Monitor notifications는 별도 `Arc<Notify>` 경로를 사용한다 (`register_monitor_notifier()`).
+
+### Client Loop (WaitResult)
+
+subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합:
+
+- `PubSubMsg` — mpsc 채널에서 메시지 수신
+- `PubSubClosed` — 채널 닫힘 (overflow 등)
+- `MonitorWake` — monitor notifier 깨어남
+- `NetworkRead` — 네트워크 입력
+
+제거된 API: `drain_messages()`, `take_overflowed_client()`, `client_notifiers` HashMap, `soft_limit_exceeded_at`.
 
 ## Concurrency Model
 
-현재 모델은 "single event loop only"가 아니라 아래와 같다.
+현재 모델은 "single event loop only"가 아니라 `SharedState` 기반 계층적 동시성이다.
 
 - 네트워크는 tokio per-client task로 동시 처리.
-- command execution은 공유 `Mutex<ServerState>`로 직렬화.
-- 즉, I/O 병렬성은 있지만 state mutation은 단일 임계구역 기반.
+- command execution은 `SharedState` 내부 `Mutex<ServerState>`를 잠근 뒤, per-DB `parking_lot::RwLock`을 통해 DB에 접근한다.
+  - **서로 다른 DB**에 대한 명령은 잠재적으로 병렬 실행 가능 (per-DB RwLock).
+  - **같은 DB** 내 읽기 명령은 동시 실행 가능 (RwLock read sharing).
+  - 쓰기 명령은 해당 DB의 write lock을 획득.
+- **lock-free 경로** (Mutex 불필요):
+  - `AtomicStatsState`: 10개 atomic counter (total_commands_processed, connected_clients 등) — 매 요청마다 lock 없이 갱신.
+  - `ArcSwap<ConfigState>`: config 읽기는 `config_cache.load()`로 lock-free. 쓰기만 lock 필요.
+  - `next_client_id`: 새 연결 시 atomic increment로 client ID 할당.
+- 이 구조로 client 요청당 ~9회의 lock 획득이 제거됨.
+- **Lock ordering**: DB shard lock은 항상 ascending index 순서로 획득. `parking_lot` guard는 `!Send`이므로 `.await`를 넘을 수 없어 compile-time deadlock 방지.
+- `ServerAccess` 래퍼가 `execute()` 함수의 인자로 사용되어 DB 접근과 meta-state 접근을 분리한다.
 
 ### Background Threads
 
@@ -286,6 +347,27 @@ Redis 호환 keyspace notification 시스템. `CONFIG SET notify-keyspace-events
 - token prefix redaction (`ghp_`, `sk-`, `npm_`, `xox`, `AKIA`).
 - 20자 이상 영숫자 토큰 redaction.
 - shell metacharacter blocklist 기반 입력 거부 helper 제공.
+
+## Lua Scripting (feature-gated)
+
+`lua-scripting` feature를 활성화하면 Lua 5.1 스크립팅을 사용할 수 있다.
+
+- Dependency: `mlua = { version = "0.11", features = ["lua51", "vendored"] }`
+- 구현: `crates/ratatosk-engine/src/command/lua_runtime.rs` (thread-local Lua VM)
+- Sandbox: TABLE+STRING+MATH+OS+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한
+- `redis.call()` / `redis.pcall()`: `mlua::Scope` + `RefCell`로 내부 `execute()`에 bridge
+- Type conversion: Redis 규약 (true->1, false->nil, table->Array, number->Integer)
+- Nested EVAL/EVALSHA는 거부됨
+
+지원 명령:
+
+| Command | 설명 |
+|---------|------|
+| `EVAL` / `EVAL_RO` | Lua 스크립트 직접 실행 |
+| `EVALSHA` / `EVALSHA_RO` | SHA1으로 캐시된 스크립트 실행 |
+| `SCRIPT LOAD` | 스크립트를 SHA1 캐시에 등록 |
+| `SCRIPT EXISTS` | 캐시 존재 여부 확인 |
+| `SCRIPT FLUSH` | 캐시 초기화 |
 
 ## Compatibility Notes
 
@@ -357,4 +439,5 @@ cargo run -p ratatosk-server --bin ratatosk
 - Runtime accept loop: `crates/ratatosk-server/src/event_loop.rs`
 - Client pipeline: `crates/ratatosk-server/src/client.rs`
 - Persistence runtime: `crates/ratatosk-server/src/persistence/{mod,rdb,aof,util}.rs`
+- Lua runtime: `crates/ratatosk-engine/src/command/lua_runtime.rs`
 - Config: `crates/ratatosk-server/src/config.rs`

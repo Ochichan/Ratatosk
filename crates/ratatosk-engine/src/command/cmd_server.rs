@@ -26,8 +26,8 @@ pub(super) fn cmd_dbsize(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_keys(db, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_keys(&mut db, now);
     CommandOutcome::reply(RespFrame::Integer(db.len() as i64))
 }
 
@@ -112,11 +112,17 @@ pub(super) fn cmd_info(
     CommandOutcome::reply(RespFrame::bulk_str(&out))
 }
 
-pub(super) fn cmd_monitor(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_monitor(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("monitor");
     }
 
+    server.register_monitor(client.id());
+    client.set_monitor(true);
     CommandOutcome::reply(RespFrame::ok())
 }
 
@@ -234,27 +240,16 @@ pub(super) fn cmd_sync(args: &[Bytes]) -> CommandOutcome {
 
 pub(super) fn cmd_psync(
     args: &[Bytes],
-    server: &mut ServerState,
-    client: &ClientState,
+    _server: &mut ServerState,
+    _client: &ClientState,
 ) -> CommandOutcome {
-    let [replid, offset_raw] = args else {
+    if args.len() != 2 {
         return wrong_arity("psync");
-    };
-
-    if replid.as_ref() != b"?" {
-        let _ = String::from_utf8_lossy(replid);
     }
 
-    let Some(_offset) = parse_i64(offset_raw) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    };
-
-    server.replication_mark_psync(client.id());
-    CommandOutcome::reply(RespFrame::simple_str(&format!(
-        "FULLRESYNC {} {}",
-        String::from_utf8_lossy(server.replication_primary_replid()),
-        server.replication_offset()
-    )))
+    CommandOutcome::reply(err(
+        "ERR PSYNC is not supported; Ratatosk runs in standalone mode",
+    ))
 }
 
 pub(super) fn cmd_replicaof(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
@@ -267,15 +262,9 @@ pub(super) fn cmd_replicaof(args: &[Bytes], server: &mut ServerState) -> Command
         return CommandOutcome::reply(RespFrame::ok());
     }
 
-    let Some(port) = parse_i64(port_raw) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    };
-    if !(0..=65535).contains(&port) {
-        return CommandOutcome::reply(err("ERR value is out of range"));
-    }
-
-    server.replication_configure_replica(host.clone(), port);
-    CommandOutcome::reply(RespFrame::ok())
+    CommandOutcome::reply(err(
+        "ERR REPLICAOF is not supported; Ratatosk runs in standalone mode. Use REPLICAOF NO ONE to confirm standalone.",
+    ))
 }
 
 pub(super) fn cmd_latency(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
@@ -343,26 +332,104 @@ pub(super) fn cmd_latency(args: &[Bytes], server: &mut ServerState) -> CommandOu
             let events = server.stats.latency_event_names();
             if events.is_empty() {
                 return CommandOutcome::reply(RespFrame::bulk_str(
-                    "No latency spikes were observed in the current baseline window.",
+                    "I have no latency reports to show. Be happy!",
                 ));
             }
-            CommandOutcome::reply(RespFrame::bulk_str(&format!(
-                "Observed latency samples for {} event classes.",
-                events.len()
-            )))
+
+            let mut report = String::new();
+            for event in &events {
+                let history = server.stats.latency_history(event);
+                if history.is_empty() {
+                    continue;
+                }
+                let name = String::from_utf8_lossy(event);
+                let max_ms = history.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
+                let min_ms = history.iter().map(|(_, ms)| *ms).min().unwrap_or(0);
+                let sum: i64 = history.iter().map(|(_, ms)| *ms).sum();
+                let avg_ms = sum / history.len() as i64;
+
+                // Median
+                let mut sorted: Vec<i64> = history.iter().map(|(_, ms)| *ms).collect();
+                sorted.sort_unstable();
+                let median_ms = sorted[sorted.len() / 2];
+
+                use std::fmt::Write;
+                let _ = writeln!(
+                    report,
+                    "{name} - {samples} samples, median {median_ms} ms, avg {avg_ms} ms, \
+                     min {min_ms} ms, max {max_ms} ms.",
+                    samples = history.len()
+                );
+
+                if max_ms > 100 {
+                    let _ = writeln!(
+                        report,
+                        "  WARNING: High latency detected for '{name}'. \
+                         Consider checking slow commands or system load."
+                    );
+                }
+            }
+            CommandOutcome::reply(RespFrame::bulk_str(&report))
         }
         b"GRAPH" => {
             let [_, event] = args else {
                 return wrong_arity("latency");
             };
             let history = server.stats.latency_history(event);
-            let latest_ms = history.last().map(|(_, ms)| *ms).unwrap_or(0);
-            let max_ms = history.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
+            if history.is_empty() {
+                return CommandOutcome::reply(RespFrame::bulk_str(""));
+            }
+
             let name = String::from_utf8_lossy(event);
-            let graph = format!(
-                "{name} - samples: {} latest: {latest_ms} ms max: {max_ms} ms",
-                history.len()
+            let max_ms = history.iter().map(|(_, ms)| *ms).max().unwrap_or(1);
+            let min_ms = history.iter().map(|(_, ms)| *ms).min().unwrap_or(0);
+            let all_time_max = max_ms; // We track per-window only
+
+            // Build ASCII art graph (Redis-compatible format)
+            let graph_height: usize = 16;
+            let samples: Vec<i64> = history.iter().map(|(_, ms)| *ms).collect();
+            let num_cols = samples.len().min(80);
+            let display_samples = &samples[samples.len().saturating_sub(num_cols)..];
+
+            let range = (max_ms - min_ms).max(1);
+            let mut graph = String::new();
+            use std::fmt::Write;
+            let _ = writeln!(
+                graph,
+                "{name} - high {max_ms} ms, low {min_ms} ms (all time high {all_time_max} ms)"
             );
+
+            for row in (0..graph_height).rev() {
+                let threshold = min_ms + (range * row as i64) / graph_height as i64;
+                let mut line = String::with_capacity(num_cols + 1);
+                for &val in display_samples {
+                    let normalized =
+                        ((val - min_ms) as usize * graph_height) / range.max(1) as usize;
+                    if normalized > row {
+                        line.push('#');
+                    } else if normalized == row && row == 0 {
+                        line.push('_');
+                    } else {
+                        line.push(' ');
+                    }
+                }
+                let _ = writeln!(graph, "{line} | {threshold} ms");
+            }
+
+            // Time labels (seconds ago)
+            let now_ts = history.last().map(|(ts, _)| *ts).unwrap_or(0);
+            let display_history = &history[history.len().saturating_sub(num_cols)..];
+            let mut labels = String::new();
+            for (ts, _) in display_history {
+                let ago = now_ts - ts;
+                if ago > 60 {
+                    let _ = write!(labels, "{}", ago / 60);
+                } else {
+                    labels.push('.');
+                }
+            }
+            let _ = writeln!(graph, "{labels}");
+
             CommandOutcome::reply(RespFrame::bulk_str(&graph))
         }
         b"HISTOGRAM" => {
@@ -479,6 +546,14 @@ enum ConfigSetOp {
     SlowlogLogSlowerThan(i64),
     SlowlogMaxLen(usize),
     LatencyTracking(bool),
+    PubsubQueueHardLimit(usize),
+    PubsubQueueSoftLimit(usize),
+    PubsubQueueSoftSeconds(u64),
+    ActiveExpireCycleLookups(usize),
+    ActiveExpireCycleThresholdPct(u32),
+    QueryBufferLimit(usize),
+    OutputBufferFlushThreshold(usize),
+    ClientWriteTimeoutSec(u64),
 }
 
 pub(super) fn cmd_config_get(args: &[Bytes], server: &ServerState) -> CommandOutcome {
@@ -595,6 +670,118 @@ pub(super) fn cmd_config_set(
                     return CommandOutcome::reply(err("ERR argument must be 'yes' or 'no'"));
                 }
             }
+            b"PUBSUB-QUEUE-HARD-LIMIT" => {
+                let Some(parsed) = parse_i64(value) else {
+                    return CommandOutcome::reply(err(
+                        "ERR value is not an integer or out of range",
+                    ));
+                };
+                if parsed < 0 {
+                    return CommandOutcome::reply(err("ERR value is out of range"));
+                }
+                (
+                    ConfigSetOp::PubsubQueueHardLimit(parsed as usize),
+                    "pubsub-queue-hard-limit",
+                )
+            }
+            b"PUBSUB-QUEUE-SOFT-LIMIT" => {
+                let Some(parsed) = parse_i64(value) else {
+                    return CommandOutcome::reply(err(
+                        "ERR value is not an integer or out of range",
+                    ));
+                };
+                if parsed < 0 {
+                    return CommandOutcome::reply(err("ERR value is out of range"));
+                }
+                (
+                    ConfigSetOp::PubsubQueueSoftLimit(parsed as usize),
+                    "pubsub-queue-soft-limit",
+                )
+            }
+            b"PUBSUB-QUEUE-SOFT-SECONDS" => {
+                let Some(parsed) = parse_i64(value) else {
+                    return CommandOutcome::reply(err(
+                        "ERR value is not an integer or out of range",
+                    ));
+                };
+                if parsed < 0 {
+                    return CommandOutcome::reply(err("ERR value is out of range"));
+                }
+                (
+                    ConfigSetOp::PubsubQueueSoftSeconds(parsed as u64),
+                    "pubsub-queue-soft-seconds",
+                )
+            }
+            b"ACTIVE-EXPIRE-CYCLE-LOOKUPS" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if (1..=1000).contains(&v) => v,
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR Invalid value for active-expire-cycle-lookups (1..1000)",
+                        ));
+                    }
+                };
+                (
+                    ConfigSetOp::ActiveExpireCycleLookups(parsed as usize),
+                    "active-expire-cycle-lookups",
+                )
+            }
+            b"ACTIVE-EXPIRE-CYCLE-THRESHOLD-PCT" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if (1..=100).contains(&v) => v,
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR Invalid value for active-expire-cycle-threshold-pct (1..100)",
+                        ));
+                    }
+                };
+                (
+                    ConfigSetOp::ActiveExpireCycleThresholdPct(parsed as u32),
+                    "active-expire-cycle-threshold-pct",
+                )
+            }
+            b"QUERY-BUFFER-LIMIT" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if v >= 1024 => v,
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR Invalid value for query-buffer-limit (min 1024)",
+                        ));
+                    }
+                };
+                (
+                    ConfigSetOp::QueryBufferLimit(parsed as usize),
+                    "query-buffer-limit",
+                )
+            }
+            b"OUTPUT-BUFFER-FLUSH-THRESHOLD" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if v >= 1024 => v,
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR Invalid value for output-buffer-flush-threshold (min 1024)",
+                        ));
+                    }
+                };
+                (
+                    ConfigSetOp::OutputBufferFlushThreshold(parsed as usize),
+                    "output-buffer-flush-threshold",
+                )
+            }
+            b"CLIENT-WRITE-TIMEOUT-SEC" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if (1..=3600).contains(&v) => v,
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR Invalid value for client-write-timeout-sec (1..3600)",
+                        ));
+                    }
+                };
+                (
+                    ConfigSetOp::ClientWriteTimeoutSec(parsed as u64),
+                    "client-write-timeout-sec",
+                )
+            }
             b"DATABASES" => {
                 return CommandOutcome::reply(err("ERR Unsupported CONFIG parameter: databases"));
             }
@@ -634,8 +821,37 @@ pub(super) fn cmd_config_set(
             }
             ConfigSetOp::SlowlogMaxLen(value) => server.stats.set_slowlog_max_len(value),
             ConfigSetOp::LatencyTracking(value) => server.stats.set_latency_tracking_enabled(value),
+            ConfigSetOp::PubsubQueueHardLimit(value) => {
+                server.config.set_pubsub_queue_hard_limit(value)
+            }
+            ConfigSetOp::PubsubQueueSoftLimit(value) => {
+                server.config.set_pubsub_queue_soft_limit(value)
+            }
+            ConfigSetOp::PubsubQueueSoftSeconds(value) => {
+                server.config.set_pubsub_queue_soft_seconds(value)
+            }
+            ConfigSetOp::ActiveExpireCycleLookups(value) => {
+                server.config.set_active_expire_cycle_lookups(value)
+            }
+            ConfigSetOp::ActiveExpireCycleThresholdPct(value) => {
+                server.config.set_active_expire_cycle_threshold_pct(value)
+            }
+            ConfigSetOp::QueryBufferLimit(value) => server.config.set_query_buffer_limit(value),
+            ConfigSetOp::OutputBufferFlushThreshold(value) => {
+                server.config.set_output_buffer_flush_threshold(value)
+            }
+            ConfigSetOp::ClientWriteTimeoutSec(value) => {
+                server.config.set_client_write_timeout_sec(value)
+            }
         }
     }
+
+    // Sync pubsub queue limits from config after any CONFIG SET
+    server.pubsub.set_queue_limits(
+        server.config.pubsub_queue_hard_limit(),
+        server.config.pubsub_queue_soft_limit(),
+        server.config.pubsub_queue_soft_seconds(),
+    );
 
     CommandOutcome::reply(RespFrame::ok())
 }
@@ -735,6 +951,43 @@ pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
             Bytes::from_static(b"tcp-keepalive"),
             Bytes::from(server.config.tcp_keepalive().to_string()),
         ),
+        (
+            Bytes::from_static(b"pubsub-queue-hard-limit"),
+            Bytes::from(server.config.pubsub_queue_hard_limit().to_string()),
+        ),
+        (
+            Bytes::from_static(b"pubsub-queue-soft-limit"),
+            Bytes::from(server.config.pubsub_queue_soft_limit().to_string()),
+        ),
+        (
+            Bytes::from_static(b"pubsub-queue-soft-seconds"),
+            Bytes::from(server.config.pubsub_queue_soft_seconds().to_string()),
+        ),
+        (
+            Bytes::from_static(b"active-expire-cycle-lookups"),
+            Bytes::from(server.config.active_expire_cycle_lookups().to_string()),
+        ),
+        (
+            Bytes::from_static(b"active-expire-cycle-threshold-pct"),
+            Bytes::from(
+                server
+                    .config
+                    .active_expire_cycle_threshold_pct()
+                    .to_string(),
+            ),
+        ),
+        (
+            Bytes::from_static(b"query-buffer-limit"),
+            Bytes::from(server.config.query_buffer_limit().to_string()),
+        ),
+        (
+            Bytes::from_static(b"output-buffer-flush-threshold"),
+            Bytes::from(server.config.output_buffer_flush_threshold().to_string()),
+        ),
+        (
+            Bytes::from_static(b"client-write-timeout-sec"),
+            Bytes::from(server.config.client_write_timeout_sec().to_string()),
+        ),
     ]
 }
 
@@ -827,7 +1080,7 @@ pub(super) fn cmd_memory(
     match subcommand.as_slice() {
         b"USAGE" => cmd_memory_usage(&args[1..], server, client),
         b"STATS" => cmd_memory_stats(&args[1..], server),
-        b"DOCTOR" => cmd_memory_doctor(&args[1..]),
+        b"DOCTOR" => cmd_memory_doctor(&args[1..], server),
         b"MALLOC-STATS" => cmd_memory_malloc_stats(&args[1..]),
         b"PURGE" => cmd_memory_purge(&args[1..]),
         b"HELP" => {
@@ -875,8 +1128,8 @@ pub(super) fn cmd_memory_usage(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(value) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Null);
@@ -948,12 +1201,16 @@ pub(super) fn cmd_memory_stats(args: &[Bytes], server: &ServerState) -> CommandO
     }
 
     let total_keys = (0..server.db_count())
-        .map(|db| server.db(db).len() as i64)
+        .map(|db_idx| server.db(db_idx).len() as i64)
         .sum::<i64>();
-    let total_dataset_bytes = (0..server.db_count())
-        .flat_map(|db| server.db(db).iter())
-        .map(|(key, value)| estimate_value_memory_usage(key, value))
-        .sum::<i64>();
+    let total_dataset_bytes: i64 = (0..server.db_count())
+        .map(|db_idx| {
+            let db = server.db(db_idx);
+            db.iter()
+                .map(|(key, value)| estimate_value_memory_usage(key, value))
+                .sum::<i64>()
+        })
+        .sum();
 
     CommandOutcome::reply(RespFrame::Map(vec![
         (
@@ -979,14 +1236,56 @@ pub(super) fn cmd_memory_stats(args: &[Bytes], server: &ServerState) -> CommandO
     ]))
 }
 
-pub(super) fn cmd_memory_doctor(args: &[Bytes]) -> CommandOutcome {
+pub(super) fn cmd_memory_doctor(args: &[Bytes], server: &ServerState) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("memory");
     }
 
-    CommandOutcome::reply(RespFrame::bulk_str(
-        "Hi Sam, this instance uses baseline memory diagnostics. No critical issues detected.",
-    ))
+    let total_keys: i64 = (0..server.db_count())
+        .map(|db_idx| server.db(db_idx).len() as i64)
+        .sum();
+    let total_dataset_bytes: i64 = (0..server.db_count())
+        .map(|db_idx| {
+            let db = server.db(db_idx);
+            db.iter()
+                .map(|(key, value)| estimate_value_memory_usage(key, value))
+                .sum::<i64>()
+        })
+        .sum();
+
+    let mut concerns = Vec::new();
+
+    // 1. Empty instance check
+    if total_keys == 0 {
+        concerns.push(
+            "This instance has no keys loaded. It is either a fresh start or all data has been evicted/expired."
+                .to_string(),
+        );
+    }
+
+    // 2. High overhead: dataset < 50% of estimated total
+    // (overhead = per-key metadata, data structures, etc.)
+    if total_keys > 0 {
+        let key_overhead = total_keys * 64; // estimated per-key metadata
+        let estimated_total = total_dataset_bytes + key_overhead;
+        if estimated_total > 0 && total_dataset_bytes * 100 / estimated_total < 50 {
+            concerns.push(format!(
+                "Dataset bytes ({total_dataset_bytes}) are less than 50% of estimated total allocation ({estimated_total}). High metadata overhead for the stored data."
+            ));
+        }
+    }
+
+    let report = if concerns.is_empty() {
+        "Sam, I have no memory problems".to_string()
+    } else {
+        let mut msg = "Sam, I have a few concerns:\n\n".to_string();
+        for (i, concern) in concerns.iter().enumerate() {
+            msg.push_str(&format!("{}. {}\n", i + 1, concern));
+        }
+        msg
+    };
+
+    CommandOutcome::reply(RespFrame::bulk_str(&report))
 }
 
 pub(super) fn cmd_memory_malloc_stats(args: &[Bytes]) -> CommandOutcome {
@@ -994,16 +1293,45 @@ pub(super) fn cmd_memory_malloc_stats(args: &[Bytes]) -> CommandOutcome {
         return wrong_arity("memory");
     }
 
+    #[cfg(feature = "mimalloc")]
+    {
+        let mut output = String::new();
+        unsafe {
+            libmimalloc_sys::mi_stats_merge();
+
+            unsafe extern "C" fn callback(
+                msg: *const std::ffi::c_char,
+                arg: *mut std::ffi::c_void,
+            ) {
+                if !msg.is_null() {
+                    let c_str = std::ffi::CStr::from_ptr(msg);
+                    if let Ok(s) = c_str.to_str() {
+                        let out = &mut *(arg as *mut String);
+                        out.push_str(s);
+                    }
+                }
+            }
+
+            let ptr = &mut output as *mut String as *mut std::ffi::c_void;
+            libmimalloc_sys::mi_stats_print_out(Some(callback), ptr);
+        }
+        CommandOutcome::reply(RespFrame::bulk_str(&output))
+    }
+
+    #[cfg(not(feature = "mimalloc"))]
     CommandOutcome::reply(RespFrame::bulk_str(
-        "allocator:system
-active:baseline
-",
+        "allocator:system\nMIMO stats not available (mimalloc feature not enabled)\n",
     ))
 }
 
 pub(super) fn cmd_memory_purge(args: &[Bytes]) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("memory");
+    }
+
+    #[cfg(feature = "mimalloc")]
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
     }
 
     CommandOutcome::reply(RespFrame::ok())
@@ -1024,7 +1352,29 @@ pub(super) fn append_info_server_section(out: &mut String, server: &ServerState,
     ));
     out.push_str(&format!("uptime_in_seconds:{uptime_seconds}\r\n"));
     out.push_str(&format!("uptime_in_days:{}\r\n", uptime_seconds / 86_400));
+    out.push_str(&format!(
+        "health_status:{}\r\n",
+        server_health_status(server)
+    ));
+    out.push_str(&format!(
+        "bridge_contract_version:{}\r\n",
+        crate::keyspace::BRIDGE_CONTRACT_VERSION
+    ));
     out.push_str("\r\n");
+}
+
+fn server_health_status(server: &ServerState) -> &'static str {
+    let persistence_healthy = !server.aof_write_latched()
+        && server.last_rdb_save_status().is_none_or(Result::is_ok)
+        && server.last_aof_rewrite_status().is_none_or(Result::is_ok);
+    let memory_healthy = server.config.maxmemory() == 0
+        || server.stats.cached_memory_estimate() < server.config.maxmemory() as u64;
+
+    if persistence_healthy && memory_healthy {
+        "healthy"
+    } else {
+        "degraded"
+    }
 }
 
 pub(super) fn append_info_clients_section(out: &mut String, server: &ServerState) {
@@ -1221,8 +1571,8 @@ pub(super) fn append_info_keyspace_section(
 
     let db_count = server.db_count();
     for db_idx in 0..db_count {
-        let db = server.db_mut(db_idx);
-        purge_expired_keys(db, now_ms);
+        let mut db = server.db_mut(db_idx);
+        purge_expired_keys(&mut db, now_ms);
 
         if db.is_empty() {
             continue;

@@ -1,22 +1,32 @@
-use argon2::Argon2;
-use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-};
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
-use crate::security::{sanitize_acl_log_line, sanitize_slowlog_argv};
-use ratatosk_core::time::{now_ms as unix_ms_now, now_sec as unix_sec_now};
+pub use crate::acl::{AclState, AclUser};
+pub use crate::clients::{BlockingState, ClientRegistry, ClientSnapshot};
+use crate::config::ConfigState;
+pub use crate::pubsub::{PubSubMessage, PubSubState};
+pub use crate::replication::{
+    ReplicaClientInfo, ReplicaClientState, ReplicationMode, ReplicationState,
+};
+pub use crate::stats::{AtomicStatsState, SlowlogEntry, StatsState};
+pub use crate::tracking::ClientTrackingState;
+use ratatosk_core::time::now_ms as unix_ms_now;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
-    path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering},
+    },
 };
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 pub const DEFAULT_DB_COUNT: usize = 16;
+
+/// Bridge contract version exposed in INFO server output.
+/// Cross-component bridges use this for compatibility handshakes.
+pub const BRIDGE_CONTRACT_VERSION: &str = "0.1";
 
 pub type DbSnapshot = Vec<HashMap<Bytes, StoredValue>>;
 
@@ -265,421 +275,6 @@ pub enum AofWriteState {
         last_error: String,
         latched_at_ms: i64,
     },
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationState — standalone replication metadata skeleton
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum ReplicationMode {
-    #[default]
-    Master,
-    Replica {
-        master_host: Bytes,
-        master_port: i64,
-    },
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReplicaClientState {
-    pub listening_port: Option<i64>,
-    pub ip_address: Option<Bytes>,
-    pub capabilities: HashSet<Bytes>,
-    pub ack_offset: i64,
-    pub ack_time_ms: Option<i64>,
-    pub handshake_complete: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicaClientInfo {
-    pub client_id: i64,
-    pub listening_port: i64,
-    pub ip_address: Bytes,
-    pub ack_offset: i64,
-    pub lag_seconds: i64,
-    pub state: &'static str,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReplicationState {
-    mode: ReplicationMode,
-    primary_replid: Bytes,
-    master_repl_offset: i64,
-    replicas: HashMap<i64, ReplicaClientState>,
-}
-
-impl Default for ReplicationState {
-    fn default() -> Self {
-        Self {
-            mode: ReplicationMode::Master,
-            primary_replid: generate_cluster_node_id(),
-            master_repl_offset: 0,
-            replicas: HashMap::new(),
-        }
-    }
-}
-
-impl ReplicationState {
-    fn replica_entry_mut(&mut self, client_id: i64) -> &mut ReplicaClientState {
-        self.replicas.entry(client_id).or_default()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ClientTrackingState — key tracking and invalidation delivery registry
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default)]
-pub struct ClientTrackingState {
-    key_watchers: HashMap<(usize, Bytes), HashMap<i64, TrackingWatcher>>,
-    tracker_keys: HashMap<i64, HashSet<(usize, Bytes)>>,
-    broadcast_watchers: HashMap<i64, BroadcastWatcher>,
-    broken_redirects: HashSet<i64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TrackingWatcher {
-    target_client_id: i64,
-    no_loop: bool,
-}
-
-#[derive(Debug, Clone)]
-struct BroadcastWatcher {
-    target_client_id: i64,
-    no_loop: bool,
-    prefixes: Vec<Bytes>,
-}
-
-impl ClientTrackingState {
-    #[allow(clippy::too_many_arguments)]
-    pub fn track_key(
-        &mut self,
-        tracker_client_id: i64,
-        target_client_id: i64,
-        no_loop: bool,
-        db_idx: usize,
-        key: Bytes,
-    ) {
-        let tracked_key = (db_idx, key.clone());
-        self.key_watchers
-            .entry(tracked_key.clone())
-            .or_default()
-            .insert(
-                tracker_client_id,
-                TrackingWatcher {
-                    target_client_id,
-                    no_loop,
-                },
-            );
-        self.tracker_keys
-            .entry(tracker_client_id)
-            .or_default()
-            .insert(tracked_key);
-    }
-
-    pub fn configure_broadcast(
-        &mut self,
-        tracker_client_id: i64,
-        target_client_id: i64,
-        no_loop: bool,
-        mut prefixes: Vec<Bytes>,
-    ) {
-        prefixes.sort();
-        prefixes.dedup();
-        self.broadcast_watchers.insert(
-            tracker_client_id,
-            BroadcastWatcher {
-                target_client_id,
-                no_loop,
-                prefixes,
-            },
-        );
-    }
-
-    pub fn invalidate_keys<I>(
-        &mut self,
-        writer_client_id: i64,
-        db_idx: usize,
-        keys: I,
-    ) -> HashMap<i64, Vec<Bytes>>
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        let mut invalidations: HashMap<i64, Vec<Bytes>> = HashMap::new();
-
-        for key in keys {
-            let tracked_key = (db_idx, key.clone());
-            if let Some(watchers) = self.key_watchers.remove(&tracked_key) {
-                for (tracker_client_id, watcher) in watchers {
-                    if !(watcher.no_loop && tracker_client_id == writer_client_id) {
-                        invalidations
-                            .entry(watcher.target_client_id)
-                            .or_default()
-                            .push(key.clone());
-                    }
-
-                    if let Some(keys) = self.tracker_keys.get_mut(&tracker_client_id) {
-                        keys.remove(&tracked_key);
-                        let should_remove_tracker = keys.is_empty();
-                        if should_remove_tracker {
-                            let _ = keys;
-                            self.tracker_keys.remove(&tracker_client_id);
-                        }
-                    }
-                }
-            }
-
-            for (tracker_client_id, watcher) in &self.broadcast_watchers {
-                if watcher.no_loop && *tracker_client_id == writer_client_id {
-                    continue;
-                }
-                if watcher.prefixes.is_empty()
-                    || watcher
-                        .prefixes
-                        .iter()
-                        .any(|prefix| key.starts_with(prefix))
-                {
-                    invalidations
-                        .entry(watcher.target_client_id)
-                        .or_default()
-                        .push(key.clone());
-                }
-            }
-        }
-
-        for keys in invalidations.values_mut() {
-            keys.sort();
-            keys.dedup();
-        }
-
-        invalidations
-    }
-
-    pub fn clear_tracker(&mut self, tracker_client_id: i64) {
-        self.broadcast_watchers.remove(&tracker_client_id);
-        self.broken_redirects.remove(&tracker_client_id);
-
-        if let Some(tracked_keys) = self.tracker_keys.remove(&tracker_client_id) {
-            let mut empty_keys = Vec::new();
-            for tracked_key in tracked_keys {
-                if let Some(watchers) = self.key_watchers.get_mut(&tracked_key) {
-                    watchers.remove(&tracker_client_id);
-                    if watchers.is_empty() {
-                        empty_keys.push(tracked_key);
-                    }
-                }
-            }
-
-            for tracked_key in empty_keys {
-                self.key_watchers.remove(&tracked_key);
-            }
-        }
-    }
-
-    pub fn clear_target(&mut self, target_client_id: i64) -> Vec<i64> {
-        let mut detached_trackers = HashSet::new();
-
-        for (tracker_client_id, watcher) in &mut self.broadcast_watchers {
-            if watcher.target_client_id == target_client_id {
-                watcher.target_client_id = *tracker_client_id;
-                detached_trackers.insert(*tracker_client_id);
-            }
-        }
-
-        for watchers in self.key_watchers.values_mut() {
-            for (tracker_client_id, watcher) in watchers {
-                if watcher.target_client_id == target_client_id {
-                    watcher.target_client_id = *tracker_client_id;
-                    detached_trackers.insert(*tracker_client_id);
-                }
-            }
-        }
-
-        for tracker_client_id in &detached_trackers {
-            self.broken_redirects.insert(*tracker_client_id);
-        }
-
-        let mut detached = detached_trackers.into_iter().collect::<Vec<_>>();
-        detached.sort_unstable();
-        detached
-    }
-
-    pub fn redirect_broken(&self, tracker_client_id: i64) -> bool {
-        self.broken_redirects.contains(&tracker_client_id)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ClientRegistry — live connection snapshots for INFO/CLIENT introspection
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Default)]
-pub struct ClientSnapshot {
-    pub id: i64,
-    pub addr: Bytes,
-    pub laddr: Bytes,
-    pub name: Option<Bytes>,
-    pub age_seconds: i64,
-    pub idle_seconds: i64,
-    pub flags: Bytes,
-    pub db: usize,
-    pub sub: usize,
-    pub psub: usize,
-    pub ssub: usize,
-    pub multi: i64,
-    pub cmd: Bytes,
-    pub user: Bytes,
-    pub redir: i64,
-    pub tracking_enabled: bool,
-    pub resp: i64,
-    pub lib_name: Option<Bytes>,
-    pub lib_ver: Option<Bytes>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ClientRegistry {
-    clients: HashMap<i64, ClientSnapshot>,
-    blocked_clients: HashSet<i64>,
-}
-
-// ---------------------------------------------------------------------------
-// BlockingState — producer-driven wake registry for blocking commands
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Default)]
-pub struct BlockingState {
-    key_waiters: HashMap<(usize, Bytes), HashSet<i64>>,
-    client_keys: HashMap<i64, HashSet<(usize, Bytes)>>,
-    client_notifiers: HashMap<i64, Arc<Notify>>,
-}
-
-impl BlockingState {
-    pub fn register(&mut self, client_id: i64, keys: Vec<(usize, Bytes)>) -> Arc<Notify> {
-        self.clear(client_id);
-
-        let notifier = self
-            .client_notifiers
-            .entry(client_id)
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone();
-
-        let key_set = keys.into_iter().collect::<HashSet<_>>();
-        for key in &key_set {
-            self.key_waiters
-                .entry(key.clone())
-                .or_default()
-                .insert(client_id);
-        }
-        if !key_set.is_empty() {
-            self.client_keys.insert(client_id, key_set);
-        }
-
-        notifier
-    }
-
-    pub fn clear(&mut self, client_id: i64) {
-        let Some(keys) = self.client_keys.remove(&client_id) else {
-            return;
-        };
-
-        let mut empty_keys = Vec::new();
-        for key in keys {
-            if let Some(waiters) = self.key_waiters.get_mut(&key) {
-                waiters.remove(&client_id);
-                if waiters.is_empty() {
-                    empty_keys.push(key);
-                }
-            }
-        }
-
-        for key in empty_keys {
-            self.key_waiters.remove(&key);
-        }
-    }
-
-    pub fn remove_client(&mut self, client_id: i64) {
-        self.clear(client_id);
-        self.client_notifiers.remove(&client_id);
-    }
-
-    pub fn notify_keys<I>(&self, db_idx: usize, keys: I)
-    where
-        I: IntoIterator<Item = Bytes>,
-    {
-        let mut notified_clients = HashSet::new();
-        for key in keys {
-            if let Some(waiters) = self.key_waiters.get(&(db_idx, key)) {
-                notified_clients.extend(waiters.iter().copied());
-            }
-        }
-
-        for client_id in notified_clients {
-            if let Some(notifier) = self.client_notifiers.get(&client_id) {
-                notifier.notify_waiters();
-            }
-        }
-    }
-}
-
-impl ClientRegistry {
-    pub fn upsert(&mut self, snapshot: ClientSnapshot) {
-        self.clients.insert(snapshot.id, snapshot);
-    }
-
-    pub fn remove(&mut self, client_id: i64) {
-        self.clients.remove(&client_id);
-        self.blocked_clients.remove(&client_id);
-    }
-
-    pub fn detach_redirect_target(&mut self, target_client_id: i64) {
-        for snapshot in self.clients.values_mut() {
-            if snapshot.redir == target_client_id {
-                snapshot.redir = -1;
-            }
-        }
-    }
-
-    pub fn get(&self, client_id: i64) -> Option<&ClientSnapshot> {
-        self.clients.get(&client_id)
-    }
-
-    pub fn list(&self) -> Vec<ClientSnapshot> {
-        let mut snapshots = self.clients.values().cloned().collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        snapshots
-    }
-
-    pub fn set_blocked(&mut self, client_id: i64, blocked: bool) {
-        if blocked {
-            self.blocked_clients.insert(client_id);
-        } else {
-            self.blocked_clients.remove(&client_id);
-        }
-    }
-
-    pub fn is_blocked(&self, client_id: i64) -> bool {
-        self.blocked_clients.contains(&client_id)
-    }
-
-    pub fn blocked_clients(&self) -> usize {
-        self.blocked_clients.len()
-    }
-
-    pub fn tracking_clients(&self) -> usize {
-        self.clients
-            .values()
-            .filter(|snapshot| snapshot.tracking_enabled)
-            .count()
-    }
-
-    pub fn len(&self) -> usize {
-        self.clients.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -971,1421 +566,103 @@ impl StoredValue {
 }
 
 // ---------------------------------------------------------------------------
-// SlowlogEntry
+// SharedState — independently-locked server state components
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-pub struct SlowlogEntry {
-    pub id: i64,
-    pub unix_time: i64,
-    pub duration_us: i64,
-    pub argv: Vec<Bytes>,
+/// Top-level shared state with per-component locking.
+///
+/// Hot-path operations (stats, config reads) bypass the inner `ServerState`
+/// lock entirely via atomic counters and [`arc_swap::ArcSwap`].  The inner
+/// lock is still acquired for data mutations and less-frequent operations.
+///
+/// This is Phase 0c of the concurrency overhaul: independent stats/config
+/// access while the bulk of server state remains behind a single lock.
+pub struct SharedState {
+    /// Per-DB data with `parking_lot::RwLock` — commands on different DBs
+    /// run in parallel, same-DB reads share the lock.
+    pub data: DataState,
+
+    /// Non-DB server state — ACL, replication, clients, blocking,
+    /// tracking, monitors, persistence flags.
+    pub meta: Mutex<ServerState>,
+
+    /// Lock-free atomic counters for the hottest stats fields.
+    pub stats: AtomicStatsState,
+
+    /// Lock-free read access to the current config.  Updated via
+    /// `store()` on CONFIG SET; readers call `load()` without any lock.
+    pub config_cache: arc_swap::ArcSwap<ConfigState>,
+
+    /// Atomic client-ID allocator — no lock needed for new connections.
+    pub next_client_id: AtomicI64,
+
+    /// Server start timestamp (immutable after init).
+    pub started_at_ms: i64,
+
+    /// Cluster node ID (immutable after init).
+    pub cluster_node_id: Bytes,
 }
 
-// ---------------------------------------------------------------------------
-// AclUser
-// ---------------------------------------------------------------------------
+impl SharedState {
+    /// Create a new `SharedState` from an existing `ServerState`.
+    ///
+    /// The atomic stats are initialized from the `ServerState`'s current
+    /// counters, and the config cache is seeded from its `ConfigState`.
+    pub fn new(server: ServerState) -> Self {
+        Self::with_data(DataState::default(), server)
+    }
 
-#[derive(Debug, Clone)]
-pub struct AclUser {
-    pub enabled: bool,
-    pub nopass: bool,
-    pub passwords: HashSet<Bytes>,
-    pub allow_all_commands: bool,
-    pub allowed_categories: HashSet<Bytes>,
-}
+    /// Create with a specific number of databases.
+    pub fn with_db_count(db_count: usize, server: ServerState) -> Self {
+        Self::with_data(DataState::new(db_count), server)
+    }
 
-impl AclUser {
-    pub fn default_user() -> Self {
+    /// Create from separate DataState and ServerState.
+    pub fn with_data(data: DataState, mut server: ServerState) -> Self {
+        let config = server.config.clone();
+        let started_at_ms = server.started_at_ms;
+        let cluster_node_id = server.cluster_node_id.clone();
+        let next_client_id = server.next_client_id;
+        // Clear next_client_id from inner state — allocation is now atomic.
+        server.next_client_id = i64::MAX;
+
+        let stats = AtomicStatsState::from_stats(&server.stats);
+
         Self {
-            enabled: true,
-            nopass: true,
-            passwords: HashSet::new(),
-            allow_all_commands: true,
-            allowed_categories: HashSet::new(),
+            data,
+            meta: Mutex::new(server),
+            stats,
+            config_cache: arc_swap::ArcSwap::from_pointee(config),
+            next_client_id: AtomicI64::new(next_client_id),
+            started_at_ms,
+            cluster_node_id,
         }
     }
 
-    pub fn new_disabled() -> Self {
-        Self {
-            enabled: false,
-            nopass: false,
-            passwords: HashSet::new(),
-            allow_all_commands: false,
-            allowed_categories: HashSet::new(),
-        }
-    }
-
-    pub fn category_allowed(&self, category: &[u8]) -> bool {
-        self.allow_all_commands || self.allowed_categories.contains(category)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PubSubMessage
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-pub enum PubSubMessage {
-    Message {
-        channel: Bytes,
-        payload: Bytes,
-    },
-    SMessage {
-        channel: Bytes,
-        payload: Bytes,
-    },
-    PMessage {
-        pattern: Bytes,
-        channel: Bytes,
-        payload: Bytes,
-    },
-    Invalidate {
-        keys: Vec<Bytes>,
-    },
-    TrackingRedirectBroken {
-        redirect_client_id: i64,
-    },
-}
-
-// ---------------------------------------------------------------------------
-// PubSubState — channel/pattern subscriptions + pending delivery
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct PubSubState {
-    channels: HashMap<Bytes, HashSet<i64>>,
-    shard_channels: HashMap<Bytes, HashSet<i64>>,
-    patterns: HashMap<Bytes, HashSet<i64>>,
-    client_channel_subs: HashMap<i64, HashSet<Bytes>>,
-    client_shard_channel_subs: HashMap<i64, HashSet<Bytes>>,
-    client_pattern_subs: HashMap<i64, HashSet<Bytes>>,
-    pending: HashMap<i64, Vec<PubSubMessage>>,
-    overflowed_clients: HashSet<i64>,
-    client_notifiers: HashMap<i64, Arc<Notify>>,
-    /// Tracks when each client first exceeded the soft limit (for soft timeout window).
-    soft_limit_exceeded_at: HashMap<i64, std::time::Instant>,
-    /// Active queue limits (synced from ConfigState).
-    hard_limit: usize,
-    soft_limit: usize,
-    soft_seconds: u64,
-}
-
-impl Default for PubSubState {
-    fn default() -> Self {
-        Self::new(&ConfigState::default())
-    }
-}
-
-impl PubSubState {
-    pub fn new(config: &ConfigState) -> Self {
-        Self {
-            channels: HashMap::default(),
-            shard_channels: HashMap::default(),
-            patterns: HashMap::default(),
-            client_channel_subs: HashMap::default(),
-            client_shard_channel_subs: HashMap::default(),
-            client_pattern_subs: HashMap::default(),
-            pending: HashMap::default(),
-            overflowed_clients: HashSet::default(),
-            client_notifiers: HashMap::default(),
-            soft_limit_exceeded_at: HashMap::default(),
-            hard_limit: config.pubsub_queue_hard_limit(),
-            soft_limit: config.pubsub_queue_soft_limit(),
-            soft_seconds: config.pubsub_queue_soft_seconds(),
-        }
-    }
-
-    /// Update queue limits from config. Call after CONFIG SET changes.
-    pub fn set_queue_limits(&mut self, hard_limit: usize, soft_limit: usize, soft_seconds: u64) {
-        self.hard_limit = hard_limit;
-        self.soft_limit = soft_limit;
-        self.soft_seconds = soft_seconds;
-    }
-
-    pub fn register_client(&mut self, client_id: i64) -> Arc<Notify> {
-        self.client_notifiers
-            .entry(client_id)
-            .or_insert_with(|| Arc::new(Notify::new()))
-            .clone()
-    }
-
-    pub fn subscribe_channel(&mut self, client_id: i64, channel: Bytes) -> i64 {
-        self.channels
-            .entry(channel.clone())
-            .or_default()
-            .insert(client_id);
-        self.client_channel_subs
-            .entry(client_id)
-            .or_default()
-            .insert(channel);
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn subscribe_shard_channel(&mut self, client_id: i64, channel: Bytes) -> i64 {
-        self.shard_channels
-            .entry(channel.clone())
-            .or_default()
-            .insert(client_id);
-        self.client_shard_channel_subs
-            .entry(client_id)
-            .or_default()
-            .insert(channel);
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn subscribe_pattern(&mut self, client_id: i64, pattern: Bytes) -> i64 {
-        self.patterns
-            .entry(pattern.clone())
-            .or_default()
-            .insert(client_id);
-        self.client_pattern_subs
-            .entry(client_id)
-            .or_default()
-            .insert(pattern);
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn unsubscribe_channel(&mut self, client_id: i64, channel: &Bytes) -> i64 {
-        let drop_client_channels =
-            if let Some(channels) = self.client_channel_subs.get_mut(&client_id) {
-                channels.remove(channel);
-                channels.is_empty()
-            } else {
-                false
-            };
-        if drop_client_channels {
-            self.client_channel_subs.remove(&client_id);
-        }
-
-        let drop_channel = if let Some(subscribers) = self.channels.get_mut(channel) {
-            subscribers.remove(&client_id);
-            subscribers.is_empty()
-        } else {
-            false
-        };
-        if drop_channel {
-            self.channels.remove(channel);
-        }
-
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn unsubscribe_shard_channel(&mut self, client_id: i64, channel: &Bytes) -> i64 {
-        let drop_client_channels =
-            if let Some(channels) = self.client_shard_channel_subs.get_mut(&client_id) {
-                channels.remove(channel);
-                channels.is_empty()
-            } else {
-                false
-            };
-        if drop_client_channels {
-            self.client_shard_channel_subs.remove(&client_id);
-        }
-
-        let drop_channel = if let Some(subscribers) = self.shard_channels.get_mut(channel) {
-            subscribers.remove(&client_id);
-            subscribers.is_empty()
-        } else {
-            false
-        };
-        if drop_channel {
-            self.shard_channels.remove(channel);
-        }
-
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn unsubscribe_pattern(&mut self, client_id: i64, pattern: &Bytes) -> i64 {
-        let drop_client_patterns =
-            if let Some(patterns) = self.client_pattern_subs.get_mut(&client_id) {
-                patterns.remove(pattern);
-                patterns.is_empty()
-            } else {
-                false
-            };
-        if drop_client_patterns {
-            self.client_pattern_subs.remove(&client_id);
-        }
-
-        let drop_pattern = if let Some(subscribers) = self.patterns.get_mut(pattern) {
-            subscribers.remove(&client_id);
-            subscribers.is_empty()
-        } else {
-            false
-        };
-        if drop_pattern {
-            self.patterns.remove(pattern);
-        }
-
-        self.client_total_subscriptions(client_id) as i64
-    }
-
-    pub fn client_channels(&self, client_id: i64) -> Vec<Bytes> {
-        let mut out = self
-            .client_channel_subs
-            .get(&client_id)
-            .map(|set| set.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        out.sort();
-        out
-    }
-
-    pub fn client_shard_channels(&self, client_id: i64) -> Vec<Bytes> {
-        let mut out = self
-            .client_shard_channel_subs
-            .get(&client_id)
-            .map(|set| set.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        out.sort();
-        out
-    }
-
-    pub fn client_patterns(&self, client_id: i64) -> Vec<Bytes> {
-        let mut out = self
-            .client_pattern_subs
-            .get(&client_id)
-            .map(|set| set.iter().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        out.sort();
-        out
-    }
-
-    pub fn channels_matching(&self, pattern: Option<&str>) -> Vec<Bytes> {
-        let mut out = self
-            .channels
-            .keys()
-            .filter(|channel| {
-                pattern.is_none_or(|pat| {
-                    glob_match::glob_match(pat, &String::from_utf8_lossy(channel))
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        out.sort();
-        out
-    }
-
-    pub fn shard_channels_matching(&self, pattern: Option<&str>) -> Vec<Bytes> {
-        let mut out = self
-            .shard_channels
-            .keys()
-            .filter(|channel| {
-                pattern.is_none_or(|pat| {
-                    glob_match::glob_match(pat, &String::from_utf8_lossy(channel))
-                })
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        out.sort();
-        out
-    }
-
-    pub fn numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
-        channels
-            .iter()
-            .map(|channel| {
-                let count = self
-                    .channels
-                    .get(channel)
-                    .map_or(0i64, |set| set.len() as i64);
-                (channel.clone(), count)
-            })
-            .collect()
-    }
-
-    pub fn shard_numsub(&self, channels: &[Bytes]) -> Vec<(Bytes, i64)> {
-        channels
-            .iter()
-            .map(|channel| {
-                let count = self
-                    .shard_channels
-                    .get(channel)
-                    .map_or(0i64, |set| set.len() as i64);
-                (channel.clone(), count)
-            })
-            .collect()
-    }
-
-    pub fn numpat(&self) -> i64 {
-        self.patterns.len() as i64
-    }
-
-    fn enqueue_pending(&mut self, client_id: i64, message: PubSubMessage) -> bool {
-        let hard = self.hard_limit;
-        let soft = self.soft_limit;
-        let secs = self.soft_seconds;
-        self.enqueue_pending_with_limits(client_id, message, hard, soft, secs)
-    }
-
-    /// Enqueue with configurable limits. `soft_limit == 0` disables soft limit logic.
-    pub fn enqueue_pending_with_limits(
-        &mut self,
-        client_id: i64,
-        message: PubSubMessage,
-        hard_limit: usize,
-        soft_limit: usize,
-        soft_seconds: u64,
-    ) -> bool {
-        if !self.client_notifiers.contains_key(&client_id)
-            && self.client_total_subscriptions(client_id) == 0
-        {
-            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "missing_client")
-                .increment(1);
-            return false;
-        }
-
-        if self.overflowed_clients.contains(&client_id) {
-            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "client_overflowed")
-                .increment(1);
-            return false;
-        }
-
-        let queue = self.pending.entry(client_id).or_default();
-
-        // Hard limit: immediate overflow
-        if queue.len() >= hard_limit {
-            self.overflowed_clients.insert(client_id);
-            self.soft_limit_exceeded_at.remove(&client_id);
-            metrics::counter!("ratatosk_pubsub_clients_overflowed_total").increment(1);
-            metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "queue_full")
-                .increment(1);
-            tracing::warn!(
-                target = "ratatosk::pubsub",
-                client_id,
-                queue_size = queue.len(),
-                "PubSub client overflowed - hard limit exceeded"
+    /// Allocate a new unique client ID (lock-free).
+    pub fn alloc_client_id(&self) -> i64 {
+        let id = self.next_client_id.fetch_add(1, AtomicOrdering::Relaxed);
+        if id >= ServerState::MAX_CLIENT_ID {
+            panic!(
+                "client ID pool exhausted (reached {}), restart server to reset",
+                ServerState::MAX_CLIENT_ID
             );
-            return false;
         }
-
-        // Soft limit: start timer, overflow after soft_seconds
-        if soft_limit > 0 && queue.len() >= soft_limit {
-            let now = std::time::Instant::now();
-            match self.soft_limit_exceeded_at.get(&client_id) {
-                None => {
-                    // First time exceeding soft limit — start timer
-                    self.soft_limit_exceeded_at.insert(client_id, now);
-                    tracing::warn!(
-                        target = "ratatosk::pubsub",
-                        client_id,
-                        queue_size = queue.len(),
-                        soft_limit,
-                        soft_seconds,
-                        "PubSub client exceeded soft limit - window started"
-                    );
-                }
-                Some(&started) if now.duration_since(started).as_secs() >= soft_seconds => {
-                    // Soft timeout elapsed — overflow
-                    self.overflowed_clients.insert(client_id);
-                    self.soft_limit_exceeded_at.remove(&client_id);
-                    metrics::counter!("ratatosk_pubsub_clients_overflowed_total").increment(1);
-                    metrics::counter!("ratatosk_pubsub_messages_dropped_total", "reason" => "soft_timeout")
-                        .increment(1);
-                    tracing::warn!(
-                        target = "ratatosk::pubsub",
-                        client_id,
-                        queue_size = queue.len(),
-                        "PubSub client overflowed - soft limit timeout exceeded"
-                    );
-                    return false;
-                }
-                _ => {} // Still within soft window, allow enqueue
-            }
-        } else {
-            // Below soft limit — reset timer if one was active
-            self.soft_limit_exceeded_at.remove(&client_id);
-        }
-
-        queue.push(message);
-
-        metrics::histogram!("ratatosk_pubsub_pending_queue_len").record(queue.len() as f64);
-        if let Some(notifier) = self.client_notifiers.get(&client_id) {
-            notifier.notify_one();
-        }
-
-        true
-    }
-
-    pub fn take_overflowed_client(&mut self, client_id: i64) -> bool {
-        self.overflowed_clients.remove(&client_id)
-    }
-
-    pub fn pending_queue_limit(&self) -> usize {
-        self.hard_limit
-    }
-
-    /// Clean up soft limit tracking when a client disconnects.
-    pub fn clear_soft_limit_timer(&mut self, client_id: i64) {
-        self.soft_limit_exceeded_at.remove(&client_id);
-    }
-
-    pub fn pending_len_for_client(&self, client_id: i64) -> usize {
-        self.pending.get(&client_id).map_or(0, Vec::len)
-    }
-
-    pub fn has_pending_messages(&self, client_id: i64) -> bool {
-        self.overflowed_clients.contains(&client_id)
-            || self
-                .pending
-                .get(&client_id)
-                .is_some_and(|messages| !messages.is_empty())
-    }
-
-    pub fn client_has_subscriptions(&self, client_id: i64) -> bool {
-        self.client_total_subscriptions(client_id) > 0
-    }
-
-    pub fn publish(&mut self, channel: &Bytes, payload: &Bytes) -> i64 {
-        let mut receivers = 0i64;
-
-        let direct_subscribers: SmallVec<[i64; 8]> = self
-            .channels
-            .get(channel)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
-
-        for client_id in direct_subscribers {
-            if self.enqueue_pending(
-                client_id,
-                PubSubMessage::Message {
-                    channel: channel.clone(),
-                    payload: payload.clone(),
-                },
-            ) {
-                receivers += 1;
-            }
-        }
-
-        if !self.patterns.is_empty() {
-            let channel_text = String::from_utf8_lossy(channel);
-            let patterns: SmallVec<[(Bytes, SmallVec<[i64; 8]>); 4]> = self
-                .patterns
-                .iter()
-                .filter(|(pattern, _)| {
-                    glob_match::glob_match(
-                        std::str::from_utf8(pattern).unwrap_or(""),
-                        &channel_text,
-                    )
-                })
-                .map(|(pattern, subscribers)| {
-                    (pattern.clone(), subscribers.iter().copied().collect())
-                })
-                .collect();
-
-            for (pattern, subscribers) in patterns {
-                for client_id in subscribers {
-                    if self.enqueue_pending(
-                        client_id,
-                        PubSubMessage::PMessage {
-                            pattern: pattern.clone(),
-                            channel: channel.clone(),
-                            payload: payload.clone(),
-                        },
-                    ) {
-                        receivers += 1;
-                    }
-                }
-            }
-        }
-
-        receivers
-    }
-
-    pub fn publish_shard(&mut self, channel: &Bytes, payload: &Bytes) -> i64 {
-        let mut receivers = 0i64;
-
-        let direct_subscribers: SmallVec<[i64; 8]> = self
-            .shard_channels
-            .get(channel)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
-
-        for client_id in direct_subscribers {
-            if self.enqueue_pending(
-                client_id,
-                PubSubMessage::SMessage {
-                    channel: channel.clone(),
-                    payload: payload.clone(),
-                },
-            ) {
-                receivers += 1;
-            }
-        }
-
-        receivers
-    }
-
-    pub fn enqueue_invalidation(&mut self, client_id: i64, keys: Vec<Bytes>) -> bool {
-        self.enqueue_pending(client_id, PubSubMessage::Invalidate { keys })
-    }
-
-    pub fn enqueue_invalidation_message(&mut self, client_id: i64, message: PubSubMessage) -> bool {
-        self.enqueue_pending(client_id, message)
-    }
-
-    pub fn drain_messages(&mut self, client_id: i64) -> Vec<PubSubMessage> {
-        self.pending.remove(&client_id).unwrap_or_default()
-    }
-
-    pub fn remove_client(&mut self, client_id: i64) {
-        if let Some(channels) = self.client_channel_subs.remove(&client_id) {
-            for channel in channels {
-                if let Some(subscribers) = self.channels.get_mut(&channel) {
-                    subscribers.remove(&client_id);
-                    if subscribers.is_empty() {
-                        self.channels.remove(&channel);
-                    }
-                }
-            }
-        }
-
-        if let Some(channels) = self.client_shard_channel_subs.remove(&client_id) {
-            for channel in channels {
-                if let Some(subscribers) = self.shard_channels.get_mut(&channel) {
-                    subscribers.remove(&client_id);
-                    if subscribers.is_empty() {
-                        self.shard_channels.remove(&channel);
-                    }
-                }
-            }
-        }
-
-        if let Some(patterns) = self.client_pattern_subs.remove(&client_id) {
-            for pattern in patterns {
-                if let Some(subscribers) = self.patterns.get_mut(&pattern) {
-                    subscribers.remove(&client_id);
-                    if subscribers.is_empty() {
-                        self.patterns.remove(&pattern);
-                    }
-                }
-            }
-        }
-
-        self.pending.remove(&client_id);
-        self.overflowed_clients.remove(&client_id);
-        self.client_notifiers.remove(&client_id);
-        self.soft_limit_exceeded_at.remove(&client_id);
-    }
-
-    fn client_total_subscriptions(&self, client_id: i64) -> usize {
-        self.client_channel_subs
-            .get(&client_id)
-            .map_or(0usize, HashSet::len)
-            .saturating_add(
-                self.client_shard_channel_subs
-                    .get(&client_id)
-                    .map_or(0usize, HashSet::len),
-            )
-            .saturating_add(
-                self.client_pattern_subs
-                    .get(&client_id)
-                    .map_or(0usize, HashSet::len),
-            )
-    }
-
-    #[cfg(test)]
-    pub fn assert_invariants(&self) {
-        // For each client in client_channel_subs, verify they appear in channels
-        for (client_id, client_channels) in &self.client_channel_subs {
-            for channel in client_channels {
-                assert!(
-                    self.channels
-                        .get(channel)
-                        .is_some_and(|subs| subs.contains(client_id)),
-                    "client {client_id} subscribed to channel {:?} but not in channels map",
-                    channel
-                );
-            }
-        }
-        // For each client in channels, verify they appear in client_channel_subs
-        for (channel, subscribers) in &self.channels {
-            for client_id in subscribers {
-                assert!(
-                    self.client_channel_subs
-                        .get(client_id)
-                        .is_some_and(|chs| chs.contains(channel)),
-                    "channel {:?} has subscriber {client_id} but not in client_channel_subs",
-                    channel
-                );
-            }
-        }
-
-        // Same for shard_channels
-        for (client_id, client_channels) in &self.client_shard_channel_subs {
-            for channel in client_channels {
-                assert!(
-                    self.shard_channels
-                        .get(channel)
-                        .is_some_and(|subs| subs.contains(client_id)),
-                    "client {client_id} subscribed to shard channel {:?} but not in shard_channels map",
-                    channel
-                );
-            }
-        }
-        for (channel, subscribers) in &self.shard_channels {
-            for client_id in subscribers {
-                assert!(
-                    self.client_shard_channel_subs
-                        .get(client_id)
-                        .is_some_and(|chs| chs.contains(channel)),
-                    "shard channel {:?} has subscriber {client_id} but not in client_shard_channel_subs",
-                    channel
-                );
-            }
-        }
-
-        // Same for patterns
-        for (client_id, client_patterns) in &self.client_pattern_subs {
-            for pattern in client_patterns {
-                assert!(
-                    self.patterns
-                        .get(pattern)
-                        .is_some_and(|subs| subs.contains(client_id)),
-                    "client {client_id} subscribed to pattern {:?} but not in patterns map",
-                    pattern
-                );
-            }
-        }
-        for (pattern, subscribers) in &self.patterns {
-            for client_id in subscribers {
-                assert!(
-                    self.client_pattern_subs
-                        .get(client_id)
-                        .is_some_and(|pats| pats.contains(pattern)),
-                    "pattern {:?} has subscriber {client_id} but not in client_pattern_subs",
-                    pattern
-                );
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// StatsState — slowlog, latency tracking, command counters
-// ---------------------------------------------------------------------------
-
-/// Per-event latency history with a cached running maximum to avoid O(n) scans.
-#[derive(Debug, Default)]
-struct LatencyHistory {
-    samples: VecDeque<(i64, i64)>,
-    max_ms: i64,
-}
-
-#[derive(Debug)]
-pub struct StatsState {
-    total_commands_processed: u64,
-    last_save_unix_sec: i64,
-    slowlog_log_slower_than_us: i64,
-    slowlog_max_len: usize,
-    latency_tracking_enabled: bool,
-    slowlog_entries: VecDeque<SlowlogEntry>,
-    next_slowlog_id: i64,
-    latency_events: HashMap<Bytes, LatencyHistory>,
-    connected_clients: u64,
-    total_net_input_bytes: u64,
-    total_net_output_bytes: u64,
-    evicted_keys: u64,
-    expired_keys: u64,
-    keyspace_hits: u64,
-    keyspace_misses: u64,
-    /// Snapshot of `total_commands_processed` at the previous ops/sec sample.
-    prev_commands_snapshot: u64,
-    /// Computed instantaneous operations per second.
-    instantaneous_ops_per_sec: u64,
-    /// Cached memory estimate (bytes).
-    cached_memory_estimate: u64,
-    /// Cron tick when memory estimate was last computed.
-    last_memory_estimate_tick: u64,
-}
-
-impl Default for StatsState {
-    fn default() -> Self {
-        Self {
-            total_commands_processed: 0,
-            last_save_unix_sec: unix_sec_now(),
-            // Disabled by default on hot path; enable explicitly with CONFIG SET.
-            slowlog_log_slower_than_us: -1,
-            slowlog_max_len: 128,
-            latency_tracking_enabled: false,
-            slowlog_entries: VecDeque::new(),
-            next_slowlog_id: 0,
-            latency_events: HashMap::new(),
-            connected_clients: 0,
-            total_net_input_bytes: 0,
-            total_net_output_bytes: 0,
-            evicted_keys: 0,
-            expired_keys: 0,
-            keyspace_hits: 0,
-            keyspace_misses: 0,
-            prev_commands_snapshot: 0,
-            instantaneous_ops_per_sec: 0,
-            cached_memory_estimate: 0,
-            last_memory_estimate_tick: 0,
-        }
-    }
-}
-
-impl StatsState {
-    pub fn mark_command_processed(&mut self) {
-        self.total_commands_processed = self.total_commands_processed.saturating_add(1);
-    }
-
-    pub fn total_commands_processed(&self) -> u64 {
-        self.total_commands_processed
-    }
-
-    pub fn adjust_commands_processed_by(&mut self, overcounted: u64) {
-        self.total_commands_processed = self.total_commands_processed.saturating_sub(overcounted);
-    }
-
-    pub fn reset(&mut self) {
-        self.total_commands_processed = 0;
-        self.connected_clients = 0;
-        self.total_net_input_bytes = 0;
-        self.total_net_output_bytes = 0;
-        self.evicted_keys = 0;
-        self.expired_keys = 0;
-        self.keyspace_hits = 0;
-        self.keyspace_misses = 0;
-        self.prev_commands_snapshot = 0;
-        self.instantaneous_ops_per_sec = 0;
-    }
-
-    pub fn connected_clients(&self) -> u64 {
-        self.connected_clients
-    }
-
-    pub fn mark_client_connected(&mut self) {
-        self.connected_clients = self.connected_clients.saturating_add(1);
-    }
-
-    pub fn mark_client_disconnected(&mut self) {
-        self.connected_clients = self.connected_clients.saturating_sub(1);
-    }
-
-    pub fn total_net_input_bytes(&self) -> u64 {
-        self.total_net_input_bytes
-    }
-
-    pub fn add_net_input_bytes(&mut self, bytes: u64) {
-        self.total_net_input_bytes = self.total_net_input_bytes.saturating_add(bytes);
-    }
-
-    pub fn total_net_output_bytes(&self) -> u64 {
-        self.total_net_output_bytes
-    }
-
-    pub fn add_net_output_bytes(&mut self, bytes: u64) {
-        self.total_net_output_bytes = self.total_net_output_bytes.saturating_add(bytes);
-    }
-
-    pub fn evicted_keys(&self) -> u64 {
-        self.evicted_keys
-    }
-
-    pub fn add_evicted_keys(&mut self, count: u64) {
-        self.evicted_keys = self.evicted_keys.saturating_add(count);
-    }
-
-    pub fn expired_keys(&self) -> u64 {
-        self.expired_keys
-    }
-
-    pub fn add_expired_keys(&mut self, count: u64) {
-        self.expired_keys = self.expired_keys.saturating_add(count);
-    }
-
-    pub fn keyspace_hits(&self) -> u64 {
-        self.keyspace_hits
-    }
-
-    pub fn mark_keyspace_hit(&mut self) {
-        self.keyspace_hits = self.keyspace_hits.saturating_add(1);
-    }
-
-    pub fn add_keyspace_hits(&mut self, count: u64) {
-        self.keyspace_hits = self.keyspace_hits.saturating_add(count);
-    }
-
-    pub fn keyspace_misses(&self) -> u64 {
-        self.keyspace_misses
-    }
-
-    pub fn mark_keyspace_miss(&mut self) {
-        self.keyspace_misses = self.keyspace_misses.saturating_add(1);
-    }
-
-    pub fn add_keyspace_misses(&mut self, count: u64) {
-        self.keyspace_misses = self.keyspace_misses.saturating_add(count);
-    }
-
-    pub fn instantaneous_ops_per_sec(&self) -> u64 {
-        self.instantaneous_ops_per_sec
-    }
-
-    pub fn sample_ops_per_sec(&mut self, interval_secs: u64) {
-        let current = self.total_commands_processed;
-        let delta = current.saturating_sub(self.prev_commands_snapshot);
-        self.instantaneous_ops_per_sec = if interval_secs > 0 {
-            delta / interval_secs
-        } else {
-            delta
-        };
-        self.prev_commands_snapshot = current;
-    }
-
-    pub fn last_save_unix_sec(&self) -> i64 {
-        self.last_save_unix_sec
-    }
-
-    pub fn mark_last_save_now(&mut self) {
-        self.last_save_unix_sec = unix_sec_now();
-    }
-
-    pub fn slowlog_log_slower_than_us(&self) -> i64 {
-        self.slowlog_log_slower_than_us
-    }
-
-    pub fn set_slowlog_log_slower_than_us(&mut self, value: i64) {
-        self.slowlog_log_slower_than_us = value;
-    }
-
-    pub fn slowlog_max_len(&self) -> usize {
-        self.slowlog_max_len
-    }
-
-    pub fn slowlog_tracking_enabled(&self) -> bool {
-        self.slowlog_log_slower_than_us >= 0 && self.slowlog_max_len > 0
-    }
-
-    pub fn set_slowlog_max_len(&mut self, value: usize) {
-        self.slowlog_max_len = value;
-        while self.slowlog_entries.len() > self.slowlog_max_len {
-            self.slowlog_entries.pop_back();
-        }
-    }
-
-    pub fn slowlog_len(&self) -> usize {
-        self.slowlog_entries.len()
-    }
-
-    pub fn slowlog_entries(&self) -> &VecDeque<SlowlogEntry> {
-        &self.slowlog_entries
-    }
-
-    pub fn slowlog_reset(&mut self) {
-        self.slowlog_entries.clear();
-    }
-
-    pub fn append_slowlog(&mut self, duration_us: i64, argv: &[Bytes]) {
-        let threshold = self.slowlog_log_slower_than_us;
-        if threshold < 0 {
-            return;
-        }
-        if duration_us < threshold {
-            return;
-        }
-        if self.slowlog_max_len == 0 {
-            return;
-        }
-
-        let entry = SlowlogEntry {
-            id: self.next_slowlog_id,
-            unix_time: unix_sec_now(),
-            duration_us,
-            argv: sanitize_slowlog_argv(argv),
-        };
-        self.next_slowlog_id = self.next_slowlog_id.wrapping_add(1);
-        self.slowlog_entries.push_front(entry);
-        while self.slowlog_entries.len() > self.slowlog_max_len {
-            self.slowlog_entries.pop_back();
-        }
-    }
-
-    pub fn record_latency_sample(&mut self, event: &[u8], latency_ms: i64) {
-        if !self.latency_tracking_enabled {
-            return;
-        }
-
-        // Normalize to lowercase on a stack buffer — command names are always short.
-        // This ensures a caller passing "GET" hits the same stored "get" entry.
-        let len = event.len().min(32);
-        let mut buf = [0u8; 32];
-        for (i, &b) in event[..len].iter().enumerate() {
-            buf[i] = b.to_ascii_lowercase();
-        }
-        let lower = &buf[..len];
-
-        let now_sec = unix_sec_now();
-        let sample_ms = latency_ms.max(0);
-        let history = self
-            .latency_events
-            .raw_entry_mut()
-            .from_key(lower)
-            .or_insert_with(|| (Bytes::copy_from_slice(lower), LatencyHistory::default()))
-            .1;
-        // Keep one zero-latency sample per event per second to reduce churn
-        // on fast command loops while preserving LATENCY visibility.
-        if sample_ms == 0
-            && history
-                .samples
-                .back()
-                .is_some_and(|(last_ts, last_ms)| *last_ts == now_sec && *last_ms == 0)
-        {
-            return;
-        }
-
-        history.samples.push_back((now_sec, sample_ms));
-        if sample_ms > history.max_ms {
-            history.max_ms = sample_ms;
-        }
-        while history.samples.len() > 160 {
-            let (_, evicted_ms) = history.samples.pop_front().unwrap();
-            if evicted_ms == history.max_ms {
-                history.max_ms = history.samples.iter().map(|(_, ms)| *ms).max().unwrap_or(0);
-            }
-        }
-    }
-
-    pub fn latency_tracking_enabled(&self) -> bool {
-        self.latency_tracking_enabled
-    }
-
-    pub fn set_latency_tracking_enabled(&mut self, enabled: bool) {
-        self.latency_tracking_enabled = enabled;
-    }
-
-    pub fn latency_latest(&self) -> Vec<(Bytes, i64, i64, i64)> {
-        let mut out = Vec::new();
-        for (event, history) in &self.latency_events {
-            let Some((latest_ts, latest_ms)) = history.samples.back().copied() else {
-                continue;
-            };
-            out.push((event.clone(), latest_ts, latest_ms, history.max_ms));
-        }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
-    }
-
-    pub fn latency_history(&self, event: &Bytes) -> Vec<(i64, i64)> {
-        self.latency_events
-            .get(event.as_ref())
-            .map(|h| h.samples.iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    pub fn latency_reset(&mut self, events: &[Bytes]) -> i64 {
-        if events.is_empty() {
-            let removed = self.latency_events.len() as i64;
-            self.latency_events.clear();
-            return removed;
-        }
-
-        let mut removed = 0i64;
-        for event in events {
-            if self.latency_events.remove(event.as_ref()).is_some() {
-                removed += 1;
-            }
-        }
-        removed
-    }
-
-    pub fn latency_event_names(&self) -> Vec<Bytes> {
-        let mut names = self.latency_events.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    pub fn cached_memory_estimate(&self) -> u64 {
-        self.cached_memory_estimate
-    }
-
-    pub fn set_cached_memory_estimate(&mut self, estimate: u64, tick: u64) {
-        self.cached_memory_estimate = estimate;
-        self.last_memory_estimate_tick = tick;
-    }
-
-    pub fn last_memory_estimate_tick(&self) -> u64 {
-        self.last_memory_estimate_tick
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AclState — user accounts + audit log
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct AclState {
-    users: HashMap<Bytes, AclUser>,
-    log: VecDeque<Bytes>,
-}
-
-impl Default for AclState {
-    fn default() -> Self {
-        let mut users = HashMap::new();
-        users.insert(Bytes::from_static(b"default"), AclUser::default_user());
-        Self {
-            users,
-            log: VecDeque::new(),
-        }
-    }
-}
-
-impl AclState {
-    pub fn user_names(&self) -> Vec<Bytes> {
-        let mut names = self.users.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        names
-    }
-
-    pub fn get_user(&self, username: &Bytes) -> Option<&AclUser> {
-        self.users.get(username)
-    }
-
-    pub fn get_or_create_user_mut(&mut self, username: &Bytes) -> &mut AclUser {
-        self.users
-            .entry(username.clone())
-            .or_insert_with(AclUser::new_disabled)
-    }
-
-    pub fn del_users(&mut self, usernames: &[Bytes]) -> i64 {
-        let mut removed = 0i64;
-        for username in usernames {
-            if username.as_ref() == b"default" {
-                continue;
-            }
-            if self.users.remove(username).is_some() {
-                removed += 1;
-            }
-        }
-        removed
-    }
-
-    pub fn authenticate_user(&self, username: &Bytes, password: &Bytes) -> bool {
-        let Some(user) = self.users.get(username) else {
-            return false;
-        };
-        if !user.enabled {
-            return false;
-        }
-        if user.nopass {
-            return true;
-        }
-        if user.passwords.is_empty() {
-            return false;
-        }
-
-        for stored in &user.passwords {
-            if verify_password_hash(stored, password) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    pub fn default_user_is_nopass_enabled(&self) -> bool {
-        self.users
-            .get(b"default" as &[u8])
-            .is_some_and(|user| user.enabled && user.nopass)
-    }
-
-    pub fn default_user_has_full_access(&self) -> bool {
-        self.users
-            .get(b"default" as &[u8])
-            .is_some_and(|user| user.enabled && user.allow_all_commands)
-    }
-
-    pub fn command_allowed(&self, username: &Bytes, required_categories: &[&[u8]]) -> bool {
-        let Some(user) = self.users.get(username) else {
-            return false;
-        };
-        if !user.enabled {
-            return false;
-        }
-        if user.allow_all_commands {
-            return true;
-        }
-
-        required_categories
-            .iter()
-            .all(|category| user.category_allowed(category))
-    }
-
-    pub fn command_allowed_mask(&self, username: &Bytes, required_mask: u8) -> bool {
-        let Some(user) = self.users.get(username) else {
-            return false;
-        };
-        if !user.enabled {
-            return false;
-        }
-        if user.allow_all_commands || required_mask == 0 {
-            return true;
-        }
-
-        (required_mask & (1 << 0) == 0 || user.category_allowed(b"admin"))
-            && (required_mask & (1 << 1) == 0 || user.category_allowed(b"write"))
-            && (required_mask & (1 << 2) == 0 || user.category_allowed(b"read"))
-            && (required_mask & (1 << 3) == 0 || user.category_allowed(b"pubsub"))
-            && (required_mask & (1 << 4) == 0 || user.category_allowed(b"connection"))
-            && (required_mask & (1 << 5) == 0 || user.category_allowed(b"fast"))
-    }
-
-    pub fn hash_password(raw_password: &[u8]) -> Option<Bytes> {
-        let salt = SaltString::generate(&mut OsRng);
-        let hash = Argon2::default()
-            .hash_password(raw_password, &salt)
-            .ok()?
-            .to_string();
-        Some(Bytes::from(hash))
-    }
-
-    pub fn remove_password(&mut self, username: &Bytes, raw_password: &[u8]) -> bool {
-        let Some(user) = self.users.get_mut(username) else {
-            return false;
-        };
-
-        let mut removed = false;
-        let current = user.passwords.iter().cloned().collect::<Vec<_>>();
-        for stored in current {
-            if verify_password_hash(&stored, raw_password) && user.passwords.remove(&stored) {
-                removed = true;
-            }
-        }
-
-        removed
-    }
-
-    pub fn push_log(&mut self, line: Bytes) {
-        let sanitized = sanitize_acl_log_line(&String::from_utf8_lossy(&line));
-        self.log.push_front(Bytes::from(sanitized));
-        while self.log.len() > 128 {
-            self.log.pop_back();
-        }
-    }
-
-    pub fn log(&self, count: usize) -> Vec<Bytes> {
-        self.log.iter().take(count).cloned().collect()
-    }
-
-    pub fn log_reset(&mut self) {
-        self.log.clear();
-    }
-}
-
-fn verify_password_hash(stored: &Bytes, candidate: &[u8]) -> bool {
-    if stored == candidate {
-        // Temporary compatibility for legacy in-memory plaintext entries.
-        return true;
-    }
-
-    let Ok(hash_str) = std::str::from_utf8(stored) else {
-        return false;
-    };
-    let Ok(parsed) = PasswordHash::new(hash_str) else {
-        return false;
-    };
-
-    Argon2::default()
-        .verify_password(candidate, &parsed)
-        .is_ok()
-}
-
-// ---------------------------------------------------------------------------
-// ConfigState — runtime-adjustable configuration
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-pub struct ConfigState {
-    timeout: i64,
-    appendonly: bool,
-    save: Bytes,
-    dir: PathBuf,
-    dbfilename: String,
-    appendfsync: Bytes,
-    maxmemory: usize,
-    maxmemory_policy: Bytes,
-    maxmemory_samples: usize,
-    hz: u32,
-    notify_keyspace_events: Bytes,
-    lazyfree_lazy_expire: bool,
-    lazyfree_lazy_server_del: bool,
-    lazyfree_lazy_user_del: bool,
-    tcp_keepalive: u32,
-    pubsub_queue_hard_limit: usize,
-    pubsub_queue_soft_limit: usize,
-    pubsub_queue_soft_seconds: u64,
-}
-
-impl Default for ConfigState {
-    fn default() -> Self {
-        Self {
-            timeout: 0,
-            appendonly: false,
-            save: Bytes::from_static(b"3600 1 300 100 60 10000"),
-            dir: PathBuf::from("."),
-            dbfilename: "dump.rdb".to_string(),
-            appendfsync: Bytes::from_static(b"everysec"),
-            maxmemory: 0,
-            maxmemory_policy: Bytes::from_static(b"noeviction"),
-            maxmemory_samples: 5,
-            hz: 10,
-            notify_keyspace_events: Bytes::new(),
-            lazyfree_lazy_expire: false,
-            lazyfree_lazy_server_del: false,
-            lazyfree_lazy_user_del: false,
-            tcp_keepalive: 300,
-            pubsub_queue_hard_limit: 4096,
-            pubsub_queue_soft_limit: 2048,
-            pubsub_queue_soft_seconds: 60,
-        }
-    }
-}
-
-impl ConfigState {
-    pub fn timeout(&self) -> i64 {
-        self.timeout
-    }
-
-    pub fn set_timeout(&mut self, value: i64) {
-        self.timeout = value;
-    }
-
-    pub fn appendonly(&self) -> bool {
-        self.appendonly
-    }
-
-    pub fn set_appendonly(&mut self, value: bool) {
-        self.appendonly = value;
-    }
-
-    pub fn save(&self) -> &Bytes {
-        &self.save
-    }
-
-    pub fn set_save(&mut self, value: Bytes) {
-        self.save = value;
-    }
-
-    pub fn dir(&self) -> &PathBuf {
-        &self.dir
-    }
-
-    pub fn set_dir(&mut self, value: PathBuf) {
-        self.dir = value;
-    }
-
-    pub fn dbfilename(&self) -> &str {
-        &self.dbfilename
-    }
-
-    pub fn set_dbfilename(&mut self, value: String) {
-        self.dbfilename = value;
-    }
-
-    pub fn appendfsync(&self) -> &Bytes {
-        &self.appendfsync
-    }
-
-    pub fn set_appendfsync(&mut self, value: Bytes) {
-        self.appendfsync = value;
-    }
-
-    pub fn maxmemory(&self) -> usize {
-        self.maxmemory
-    }
-
-    pub fn set_maxmemory(&mut self, value: usize) {
-        self.maxmemory = value;
-    }
-
-    pub fn maxmemory_policy(&self) -> &Bytes {
-        &self.maxmemory_policy
-    }
-
-    pub fn set_maxmemory_policy(&mut self, value: Bytes) {
-        self.maxmemory_policy = value;
-    }
-
-    pub fn maxmemory_samples(&self) -> usize {
-        self.maxmemory_samples
-    }
-
-    pub fn set_maxmemory_samples(&mut self, value: usize) {
-        self.maxmemory_samples = value;
-    }
-
-    pub fn hz(&self) -> u32 {
-        self.hz
-    }
-
-    pub fn set_hz(&mut self, value: u32) {
-        self.hz = value.clamp(1, 500);
-    }
-
-    pub fn notify_keyspace_events(&self) -> &Bytes {
-        &self.notify_keyspace_events
-    }
-
-    pub fn set_notify_keyspace_events(&mut self, value: Bytes) {
-        self.notify_keyspace_events = value;
-    }
-
-    pub fn lazyfree_lazy_expire(&self) -> bool {
-        self.lazyfree_lazy_expire
-    }
-
-    pub fn set_lazyfree_lazy_expire(&mut self, value: bool) {
-        self.lazyfree_lazy_expire = value;
-    }
-
-    pub fn lazyfree_lazy_server_del(&self) -> bool {
-        self.lazyfree_lazy_server_del
-    }
-
-    pub fn set_lazyfree_lazy_server_del(&mut self, value: bool) {
-        self.lazyfree_lazy_server_del = value;
-    }
-
-    pub fn lazyfree_lazy_user_del(&self) -> bool {
-        self.lazyfree_lazy_user_del
-    }
-
-    pub fn set_lazyfree_lazy_user_del(&mut self, value: bool) {
-        self.lazyfree_lazy_user_del = value;
-    }
-
-    pub fn tcp_keepalive(&self) -> u32 {
-        self.tcp_keepalive
-    }
-
-    pub fn set_tcp_keepalive(&mut self, value: u32) {
-        self.tcp_keepalive = value;
-    }
-
-    pub fn pubsub_queue_hard_limit(&self) -> usize {
-        self.pubsub_queue_hard_limit
-    }
-
-    pub fn set_pubsub_queue_hard_limit(&mut self, value: usize) {
-        self.pubsub_queue_hard_limit = value;
-    }
-
-    pub fn pubsub_queue_soft_limit(&self) -> usize {
-        self.pubsub_queue_soft_limit
-    }
-
-    pub fn set_pubsub_queue_soft_limit(&mut self, value: usize) {
-        self.pubsub_queue_soft_limit = value;
+        id
     }
 
-    pub fn pubsub_queue_soft_seconds(&self) -> u64 {
-        self.pubsub_queue_soft_seconds
+    /// Update the config cache after a CONFIG SET.
+    ///
+    /// Call this while still holding the inner lock so that the ArcSwap
+    /// is updated atomically with respect to the canonical `ConfigState`.
+    pub fn update_config_cache(&self, config: &ConfigState) {
+        self.config_cache.store(Arc::new(config.clone()));
     }
 
-    pub fn set_pubsub_queue_soft_seconds(&mut self, value: u64) {
-        self.pubsub_queue_soft_seconds = value;
+    /// Total connections received (derived from client ID counter).
+    pub fn total_connections_received(&self) -> u64 {
+        let current = self.next_client_id.load(AtomicOrdering::Relaxed);
+        current.saturating_sub(1) as u64
     }
 }
 
@@ -2416,15 +693,127 @@ pub fn should_lazy_free(value: &StoredValue) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// DbShard + DataState — per-DB data grouping
+// ---------------------------------------------------------------------------
+
+/// One logical database — data + WATCH versions.
+#[derive(Debug, Clone, Default)]
+pub struct DbShard {
+    pub data: HashMap<Bytes, StoredValue>,
+    pub key_versions: HashMap<Bytes, u64>,
+}
+
+/// The DB layer — per-DB `parking_lot::RwLock` for concurrent access.
+///
+/// Commands on different DBs execute in parallel. Same-DB reads share
+/// the lock; writes are exclusive. Lock ordering: always ascending index.
+pub struct DataState {
+    shards: Vec<parking_lot::RwLock<DbShard>>,
+    next_key_version: AtomicU64,
+}
+
+impl std::fmt::Debug for DataState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DataState")
+            .field("shard_count", &self.shards.len())
+            .field(
+                "next_key_version",
+                &self.next_key_version.load(AtomicOrdering::Relaxed),
+            )
+            .finish()
+    }
+}
+
+impl Default for DataState {
+    fn default() -> Self {
+        Self::new(DEFAULT_DB_COUNT)
+    }
+}
+
+impl DataState {
+    pub fn new(db_count: usize) -> Self {
+        let mut shards = Vec::with_capacity(db_count);
+        for _ in 0..db_count {
+            shards.push(parking_lot::RwLock::new(DbShard::default()));
+        }
+        Self {
+            shards,
+            next_key_version: AtomicU64::new(1),
+        }
+    }
+
+    pub fn db_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Single-DB read lock.
+    pub fn read_db(&self, idx: usize) -> parking_lot::RwLockReadGuard<'_, DbShard> {
+        self.shards[idx].read()
+    }
+
+    /// Single-DB write lock.
+    pub fn write_db(&self, idx: usize) -> parking_lot::RwLockWriteGuard<'_, DbShard> {
+        self.shards[idx].write()
+    }
+
+    /// Two DBs in ascending order. Asserts a != b.
+    pub fn write_two_dbs(
+        &self,
+        a: usize,
+        b: usize,
+    ) -> (
+        parking_lot::RwLockWriteGuard<'_, DbShard>,
+        parking_lot::RwLockWriteGuard<'_, DbShard>,
+    ) {
+        assert_ne!(a, b, "write_two_dbs called with same index");
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        let lo_g = self.shards[lo].write();
+        let hi_g = self.shards[hi].write();
+        if a < b { (lo_g, hi_g) } else { (hi_g, lo_g) }
+    }
+
+    /// All DBs write-locked in ascending order. For FLUSHALL, load_from_rdb.
+    pub fn write_all_dbs(&self) -> Vec<parking_lot::RwLockWriteGuard<'_, DbShard>> {
+        (0..self.shards.len())
+            .map(|i| self.shards[i].write())
+            .collect()
+    }
+
+    /// Allocate the next key version (atomic, lock-free).
+    pub fn alloc_key_version(&self) -> u64 {
+        self.next_key_version.fetch_add(1, AtomicOrdering::Relaxed)
+    }
+
+    /// Per-DB sequential snapshot. Each DB read-locked briefly, cloned, released.
+    pub fn snapshot_all(&self) -> DbSnapshot {
+        (0..self.shards.len())
+            .map(|i| {
+                let guard = self.shards[i].read();
+                guard.data.clone()
+            })
+            .collect()
+    }
+
+    /// Load RDB data into all DBs. Acquires all write locks in order.
+    pub fn load_from_snapshot(&self, snapshot: DbSnapshot) {
+        let mut guards = self.write_all_dbs();
+        for (i, db_data) in snapshot.into_iter().enumerate() {
+            if i < guards.len() {
+                guards[i].data = db_data;
+                guards[i].key_versions.clear();
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ServerState — top-level composition
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default)]
 pub struct ServerState {
-    dbs: Vec<HashMap<Bytes, StoredValue>>,
-    key_versions: Vec<HashMap<Bytes, u64>>,
+    pub data: DataState,
     next_client_id: i64,
-    next_key_version: u64,
     started_at_ms: i64,
     pub pubsub: PubSubState,
     pub stats: StatsState,
@@ -2445,6 +834,14 @@ pub struct ServerState {
     aof_rewrite_in_progress: bool,
     last_aof_rewrite_status: Option<Result<(), String>>,
     last_aof_rewrite_time_ms: Option<i64>,
+    /// Set of client IDs that are in MONITOR mode.
+    monitor_clients: HashSet<i64>,
+    /// Pending monitor output lines per client. Each entry is a pre-formatted
+    /// RESP simple-string line ready for encoding.
+    monitor_pending: HashMap<i64, Vec<Bytes>>,
+    /// Per-client Notify used to wake MONITOR clients when new monitor output
+    /// is available.  Separate from the pub/sub mpsc channel.
+    monitor_notifiers: HashMap<i64, Arc<tokio::sync::Notify>>,
 }
 
 impl ServerState {
@@ -2453,34 +850,13 @@ impl ServerState {
     /// allowing billions of connections.
     const MAX_CLIENT_ID: i64 = i64::MAX / 2;
 
-    /// Debug-only invariant check: ensures dbs and key_versions stay synchronized.
-    #[cfg(debug_assertions)]
-    fn assert_invariants(&self) {
-        assert_eq!(
-            self.dbs.len(),
-            self.key_versions.len(),
-            "dbs and key_versions must have same length ({} vs {})",
-            self.dbs.len(),
-            self.key_versions.len()
-        );
-    }
-
     pub fn new(db_count: usize) -> Self {
-        let mut dbs = Vec::with_capacity(db_count);
-        let mut key_versions = Vec::with_capacity(db_count);
-        for _ in 0..db_count {
-            dbs.push(HashMap::new());
-            key_versions.push(HashMap::new());
-        }
-
         let node_id = generate_cluster_node_id();
         let config = ConfigState::default();
         let pubsub = PubSubState::new(&config);
-        let result = Self {
-            dbs,
-            key_versions,
+        Self {
+            data: DataState::new(db_count),
             next_client_id: 1,
-            next_key_version: 1,
             started_at_ms: unix_ms_now(),
             pubsub,
             stats: StatsState::default(),
@@ -2501,10 +877,10 @@ impl ServerState {
             aof_rewrite_in_progress: false,
             last_aof_rewrite_status: None,
             last_aof_rewrite_time_ms: None,
-        };
-        #[cfg(debug_assertions)]
-        result.assert_invariants();
-        result
+            monitor_clients: HashSet::new(),
+            monitor_pending: HashMap::new(),
+            monitor_notifiers: HashMap::new(),
+        }
     }
 
     pub fn with_default_dbs() -> Self {
@@ -2528,45 +904,85 @@ impl ServerState {
     }
 
     pub fn db_count(&self) -> usize {
-        self.dbs.len()
+        self.data.db_count()
     }
 
-    pub fn db(&self, idx: usize) -> &HashMap<Bytes, StoredValue> {
-        &self.dbs[idx]
+    /// Acquire a read lock on a DB, returning a mapped guard to the inner HashMap.
+    pub fn db(
+        &self,
+        idx: usize,
+    ) -> parking_lot::MappedRwLockReadGuard<'_, HashMap<Bytes, StoredValue>> {
+        parking_lot::RwLockReadGuard::map(self.data.read_db(idx), |s| &s.data)
     }
 
-    pub fn db_mut(&mut self, idx: usize) -> &mut HashMap<Bytes, StoredValue> {
-        &mut self.dbs[idx]
+    /// Acquire a write lock on a DB, returning a mapped guard to the inner HashMap.
+    pub fn db_mut(
+        &self,
+        idx: usize,
+    ) -> parking_lot::MappedRwLockWriteGuard<'_, HashMap<Bytes, StoredValue>> {
+        parking_lot::RwLockWriteGuard::map(self.data.write_db(idx), |s| &mut s.data)
     }
 
-    pub fn clear_db(&mut self, idx: usize) {
-        self.dbs[idx].clear();
-        self.key_versions[idx].clear();
+    pub fn clear_db(&self, idx: usize) {
+        let mut shard = self.data.write_db(idx);
+        shard.data.clear();
+        shard.key_versions.clear();
     }
 
-    pub fn swap_dbs(&mut self, left: usize, right: usize) {
-        self.dbs.swap(left, right);
-        self.key_versions.swap(left, right);
+    pub fn swap_dbs(&self, left: usize, right: usize) {
+        let (mut a, mut b) = self.data.write_two_dbs(left, right);
+        std::mem::swap(&mut *a, &mut *b);
     }
 
-    pub fn clear_all_dbs(&mut self) {
-        for db in &mut self.dbs {
-            db.clear();
-        }
-        for versions in &mut self.key_versions {
-            versions.clear();
+    pub fn clear_all_dbs(&self) {
+        for mut shard in self.data.write_all_dbs() {
+            shard.data.clear();
+            shard.key_versions.clear();
         }
     }
 
     pub fn snapshot_dbs(&self) -> DbSnapshot {
-        self.dbs.clone()
+        self.data.snapshot_all()
     }
 
-    pub fn load_from_rdb(&mut self, data: DbSnapshot) {
-        self.dbs = data;
-        self.key_versions = (0..self.dbs.len()).map(|_| HashMap::new()).collect();
-        #[cfg(debug_assertions)]
-        self.assert_invariants();
+    pub fn load_from_rdb(&self, snapshot: DbSnapshot) {
+        self.data.load_from_snapshot(snapshot);
+    }
+
+    pub fn key_version(&self, db_idx: usize, key: &Bytes) -> u64 {
+        let shard = self.data.read_db(db_idx);
+        shard.key_versions.get(key).copied().unwrap_or(0)
+    }
+
+    pub fn touch_key_version(&self, db_idx: usize, key: Bytes) {
+        let mut shard = self.data.write_db(db_idx);
+        let version = self.data.alloc_key_version();
+        shard.key_versions.insert(key, version);
+    }
+
+    pub fn lazy_free_del(&self, db_idx: usize, key: &Bytes) -> bool {
+        let mut shard = self.data.write_db(db_idx);
+        let Some(value) = shard.data.remove(key) else {
+            return false;
+        };
+        let version = self.data.alloc_key_version();
+        shard.key_versions.insert(key.clone(), version);
+        drop(shard);
+        self.try_lazy_free(value);
+        true
+    }
+
+    pub fn lazy_free_flush_db(&self, db_idx: usize) {
+        let mut shard = self.data.write_db(db_idx);
+        let old_db = std::mem::take(&mut shard.data);
+        shard.key_versions.clear();
+        drop(shard);
+
+        if let Some(tx) = self.lazy_free_tx() {
+            for (_, value) in old_db {
+                let _ = tx.try_send(value);
+            }
+        }
     }
 
     pub fn started_at_ms(&self) -> i64 {
@@ -2633,8 +1049,7 @@ impl ServerState {
     }
 
     pub fn replication_configure_master(&mut self) {
-        self.replication.mode = ReplicationMode::Master;
-        self.replication.primary_replid = generate_cluster_node_id();
+        self.replication.reset_as_master();
     }
 
     pub fn replication_configure_replica(&mut self, master_host: Bytes, master_port: i64) {
@@ -2834,57 +1249,26 @@ impl ServerState {
         (now - self.started_at_ms) / 1000
     }
 
-    pub fn key_version(&self, db_idx: usize, key: &Bytes) -> u64 {
-        self.key_versions[db_idx].get(key).copied().unwrap_or(0)
-    }
-
-    pub fn touch_key_version(&mut self, db_idx: usize, key: Bytes) {
-        let version = self.next_key_version;
-        self.next_key_version = self.next_key_version.wrapping_add(1);
-        self.key_versions[db_idx].insert(key, version);
-    }
-
     /// Set the lazy-free sender channel. Called once during server startup.
     pub fn set_lazy_free_sender(&mut self, sender: LazyFreeSender) {
         self.lazy_free_tx = Some(sender);
     }
 
-    /// Remove a key and send its value to the lazy-free thread if large enough.
-    /// Falls back to synchronous drop if no lazy-free channel is configured
-    /// or if the value is small.
-    pub fn lazy_free_del(&mut self, db_idx: usize, key: &Bytes) -> bool {
-        let Some(value) = self.dbs[db_idx].remove(key) else {
-            return false;
-        };
-        self.touch_key_version(db_idx, key.clone());
-
+    /// Try to send a value to the lazy-free thread. Returns false if
+    /// no channel or value is too small.
+    pub fn try_lazy_free(&self, value: StoredValue) -> bool {
         if let Some(ref tx) = self.lazy_free_tx {
             if should_lazy_free(&value) {
-                // Best-effort send; if channel is full, drop synchronously
                 let _ = tx.try_send(value);
                 return true;
             }
         }
-        // Small value or no channel — drop immediately (implicit)
-        drop(value);
-        true
+        false
     }
 
-    /// Replace a DB with a new empty one, sending the old data to lazy-free.
-    pub fn lazy_free_flush_db(&mut self, db_idx: usize) {
-        let old_db = std::mem::take(&mut self.dbs[db_idx]);
-        self.key_versions[db_idx].clear();
-
-        if let Some(ref tx) = self.lazy_free_tx {
-            if old_db.len() >= LAZY_FREE_THRESHOLD {
-                // Wrap the entire HashMap in a synthetic StoredValue for transport
-                for (_, value) in old_db {
-                    let _ = tx.try_send(value);
-                }
-                return;
-            }
-        }
-        drop(old_db);
+    /// Access the lazy-free sender (for FLUSHDB).
+    pub fn lazy_free_tx(&self) -> Option<&LazyFreeSender> {
+        self.lazy_free_tx.as_ref()
     }
 
     pub fn rdb_save_in_progress(&self) -> bool {
@@ -2980,13 +1364,89 @@ impl ServerState {
     pub fn clear_last_aof_rewrite_time_ms(&mut self) {
         self.last_aof_rewrite_time_ms = None;
     }
+
+    // -----------------------------------------------------------------------
+    // MONITOR support
+    // -----------------------------------------------------------------------
+
+    /// Register a client as a MONITOR listener.
+    pub fn register_monitor(&mut self, client_id: i64) {
+        self.monitor_clients.insert(client_id);
+    }
+
+    /// Remove a client from the MONITOR set and drop its pending queue.
+    pub fn unregister_monitor(&mut self, client_id: i64) {
+        self.monitor_clients.remove(&client_id);
+        self.monitor_pending.remove(&client_id);
+        self.monitor_notifiers.remove(&client_id);
+    }
+
+    /// Returns `true` if at least one client is in MONITOR mode.
+    /// This is the hot-path guard — when `false`, the command dispatch
+    /// skips all formatting work.
+    #[inline]
+    pub fn has_monitors(&self) -> bool {
+        !self.monitor_clients.is_empty()
+    }
+
+    /// Returns `true` if a specific client is in MONITOR mode.
+    pub fn is_monitor_client(&self, client_id: i64) -> bool {
+        self.monitor_clients.contains(&client_id)
+    }
+
+    /// Push a pre-formatted monitor line to every MONITOR client except
+    /// the one that issued the command (`source_client_id`).
+    pub fn broadcast_monitor_message(&mut self, source_client_id: i64, line: Bytes) {
+        // Collect target client IDs first to satisfy the borrow checker.
+        let targets: SmallVec<[i64; 8]> = self
+            .monitor_clients
+            .iter()
+            .copied()
+            .filter(|&cid| cid != source_client_id)
+            .collect();
+
+        for cid in &targets {
+            self.monitor_pending
+                .entry(*cid)
+                .or_default()
+                .push(line.clone());
+        }
+        // Wake monitor clients so their I/O loops pick up pending lines.
+        for cid in &targets {
+            if let Some(n) = self.monitor_notifiers.get(cid) {
+                n.notify_one();
+            }
+        }
+    }
+
+    /// Register a Notify handle for MONITOR wake-ups and return a clone.
+    pub fn register_monitor_notifier(&mut self, client_id: i64) -> Arc<tokio::sync::Notify> {
+        self.monitor_notifiers
+            .entry(client_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+            .clone()
+    }
+
+    /// Drain all pending monitor messages for a client.
+    pub fn drain_monitor_messages(&mut self, client_id: i64) -> Vec<Bytes> {
+        self.monitor_pending.remove(&client_id).unwrap_or_default()
+    }
+
+    /// Returns the number of MONITOR clients.
+    pub fn monitor_client_count(&self) -> usize {
+        self.monitor_clients.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Free functions
 // ---------------------------------------------------------------------------
 
-pub fn purge_expired_key(db: &mut HashMap<Bytes, StoredValue>, key: &Bytes, now_ms: i64) {
+pub fn purge_expired_key(
+    db: &mut impl std::ops::DerefMut<Target = HashMap<Bytes, StoredValue>>,
+    key: &Bytes,
+    now_ms: i64,
+) {
     if db
         .get(key.as_ref())
         .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms))
@@ -2995,7 +1455,10 @@ pub fn purge_expired_key(db: &mut HashMap<Bytes, StoredValue>, key: &Bytes, now_
     }
 }
 
-pub fn purge_expired_keys(db: &mut HashMap<Bytes, StoredValue>, now_ms: i64) {
+pub fn purge_expired_keys(
+    db: &mut impl std::ops::DerefMut<Target = HashMap<Bytes, StoredValue>>,
+    now_ms: i64,
+) {
     db.retain(|_, value| value.expire_at_ms.is_none_or(|ts| ts > now_ms));
 }
 
@@ -3017,11 +1480,13 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::timeout;
 
-    use super::{PubSubState, ServerState, StatsState};
+    use super::{PubSubState, ServerState, StatsState, StoredValue};
 
     #[test]
     fn remove_client_cleans_all_subscriptions() {
         let mut ps = PubSubState::default();
+        let mut _rx1 = ps.register_client(1);
+        let mut _rx2 = ps.register_client(2);
 
         ps.subscribe_channel(1, Bytes::from("ch1"));
         ps.subscribe_channel(1, Bytes::from("ch2"));
@@ -3041,7 +1506,6 @@ mod tests {
         assert!(ps.client_channels(1).is_empty());
         assert!(ps.client_shard_channels(1).is_empty());
         assert!(ps.client_patterns(1).is_empty());
-        assert!(ps.drain_messages(1).is_empty());
 
         // ch1 should still have client 2
         assert_eq!(ps.numsub(&[Bytes::from("ch1")])[0].1, 1);
@@ -3052,6 +1516,7 @@ mod tests {
     #[test]
     fn publish_after_remove_client_returns_zero() {
         let mut ps = PubSubState::default();
+        let mut _rx1 = ps.register_client(1);
 
         ps.subscribe_channel(1, Bytes::from("news"));
         assert_eq!(ps.publish(&Bytes::from("news"), &Bytes::from("hi")), 1);
@@ -3098,54 +1563,55 @@ mod tests {
     }
 
     #[test]
-    fn pending_queue_overflow_marks_client_once_and_drops_new_messages() {
+    fn pending_queue_overflow_drops_messages_when_channel_full() {
         let mut ps = PubSubState::default();
+        let mut rx = ps.register_client(1);
         let channel = Bytes::from("news");
         let payload = Bytes::from("msg");
 
         ps.subscribe_channel(1, channel.clone());
-        for _ in 0..ps.pending_queue_limit() {
+        let limit = ps.pending_queue_limit();
+        for _ in 0..limit {
             assert_eq!(ps.publish(&channel, &payload), 1);
         }
-        assert_eq!(ps.pending_len_for_client(1), ps.pending_queue_limit());
 
-        // The first publish past the cap marks overflow and drops delivery.
-        assert_eq!(ps.publish(&channel, &payload), 0);
-        assert!(ps.take_overflowed_client(1));
-        // Overflow flag is one-shot per connection loop check.
-        assert!(!ps.take_overflowed_client(1));
-
-        // Once overflowed, new deliveries are dropped until client is removed.
+        // The first publish past the cap drops delivery (channel full).
         assert_eq!(ps.publish(&channel, &payload), 0);
 
-        let drained = ps.drain_messages(1);
-        assert_eq!(drained.len(), ps.pending_queue_limit());
+        // Once overflowed (sender removed), further deliveries are dropped.
+        assert_eq!(ps.publish(&channel, &payload), 0);
+
+        // Drain all messages that were successfully sent.
+        let drained = PubSubState::drain_rx(&mut rx);
+        assert_eq!(drained.len(), limit);
 
         // Removing and re-subscribing clears overflow bookkeeping.
         ps.remove_client(1);
+        let mut rx2 = ps.register_client(1);
         ps.subscribe_channel(1, channel.clone());
         assert_eq!(ps.publish(&channel, &payload), 1);
+        let drained2 = PubSubState::drain_rx(&mut rx2);
+        assert_eq!(drained2.len(), 1);
     }
 
     #[tokio::test]
-    async fn pubsub_notifier_wakes_client_for_invalidation() {
+    async fn pubsub_receiver_wakes_client_for_invalidation() {
         let mut ps = PubSubState::default();
-        let notifier = ps.register_client(7);
+        let mut rx = ps.register_client(7);
 
         assert!(ps.enqueue_invalidation(7, vec![Bytes::from("tracked")]));
 
-        timeout(Duration::from_millis(50), notifier.notified())
+        let msg = timeout(Duration::from_millis(50), rx.recv())
             .await
-            .expect("pubsub notifier should wake waiting client");
-        let drained = ps.drain_messages(7);
-        assert_eq!(drained.len(), 1);
+            .expect("receiver should wake for invalidation")
+            .expect("should receive a message");
+        assert!(matches!(msg, super::PubSubMessage::Invalidate { .. }));
     }
 
     #[test]
     fn enqueue_invalidation_drops_for_missing_client() {
         let mut ps = PubSubState::default();
         assert!(!ps.enqueue_invalidation(99, vec![Bytes::from("tracked")]));
-        assert!(ps.drain_messages(99).is_empty());
     }
 
     #[test]
@@ -3377,5 +1843,247 @@ mod tests {
         stats.record_latency_sample(b"GET", 10);
         assert_eq!(stats.latency_event_names().len(), 1);
         assert_eq!(stats.latency_event_names()[0].as_ref(), b"get");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase E: Per-DB RwLock concurrency tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn concurrent_multi_db_set_get() {
+        use std::sync::Arc;
+
+        let state = Arc::new(ServerState::with_default_dbs());
+        let mut handles = Vec::new();
+
+        // N threads, each writing to a different DB
+        for db_idx in 0..4usize {
+            let state = Arc::clone(&state);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..100 {
+                    let key = Bytes::from(format!("key:{i}"));
+                    let val = StoredValue::string(Bytes::from(format!("val:{db_idx}:{i}")), None);
+                    state.db_mut(db_idx).insert(key, val);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+
+        // Verify each DB has its own 100 keys with correct values
+        for db_idx in 0..4usize {
+            let db = state.db(db_idx);
+            assert_eq!(db.len(), 100, "DB {db_idx} should have 100 keys");
+            for i in 0..100 {
+                let key = Bytes::from(format!("key:{i}"));
+                let expected = Bytes::from(format!("val:{db_idx}:{i}"));
+                let entry = db.get(&key).expect("key should exist");
+                assert_eq!(entry.as_string(), Some(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn move_deadlock_freedom() {
+        use std::sync::Arc;
+
+        let state = Arc::new(ServerState::with_default_dbs());
+
+        // Seed DB 0 and DB 1
+        state.db_mut(0).insert(
+            Bytes::from("a"),
+            StoredValue::string(Bytes::from("0"), None),
+        );
+        state.db_mut(1).insert(
+            Bytes::from("b"),
+            StoredValue::string(Bytes::from("1"), None),
+        );
+
+        // Concurrent MOVE-like: thread 1 locks (0,1), thread 2 locks (1,0)
+        // ascending order prevents deadlock
+        let s1 = Arc::clone(&state);
+        let s2 = Arc::clone(&state);
+
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                let (mut a, mut b) = s1.data.write_two_dbs(0, 1);
+                // Move key from DB 0 → DB 1
+                if let Some(v) = a.data.remove(&Bytes::from("a")) {
+                    b.data.insert(Bytes::from("a"), v);
+                }
+                // Move it back
+                if let Some(v) = b.data.remove(&Bytes::from("a")) {
+                    a.data.insert(Bytes::from("a"), v);
+                }
+            }
+        });
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..100 {
+                let (mut a, mut b) = s2.data.write_two_dbs(1, 0);
+                if let Some(v) = a.data.remove(&Bytes::from("b")) {
+                    b.data.insert(Bytes::from("b"), v);
+                }
+                if let Some(v) = b.data.remove(&Bytes::from("b")) {
+                    a.data.insert(Bytes::from("b"), v);
+                }
+            }
+        });
+
+        h1.join().expect("thread 1 panicked");
+        h2.join().expect("thread 2 panicked");
+    }
+
+    #[test]
+    fn snapshot_does_not_block_writes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let state = Arc::new(ServerState::with_default_dbs());
+
+        // Seed some data
+        for i in 0..100 {
+            state.db_mut(0).insert(
+                Bytes::from(format!("k:{i}")),
+                StoredValue::string(Bytes::from("v"), None),
+            );
+        }
+
+        let write_done = Arc::new(AtomicBool::new(false));
+
+        let s = Arc::clone(&state);
+        let wd = Arc::clone(&write_done);
+        let writer = std::thread::spawn(move || {
+            for i in 100..200 {
+                s.db_mut(0).insert(
+                    Bytes::from(format!("k:{i}")),
+                    StoredValue::string(Bytes::from("v"), None),
+                );
+            }
+            wd.store(true, Ordering::Release);
+        });
+
+        // Snapshot while writer is running
+        let snap = state.snapshot_dbs();
+        writer.join().expect("writer panicked");
+
+        // Snapshot should have captured some consistent state
+        assert!(!snap[0].is_empty(), "snapshot should have captured data");
+        assert!(write_done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn snapshot_per_db_consistency() {
+        let state = ServerState::with_default_dbs();
+
+        state.db_mut(0).insert(
+            Bytes::from("x"),
+            StoredValue::string(Bytes::from("before"), None),
+        );
+
+        let snap = state.snapshot_dbs();
+
+        // Modify after snapshot
+        state.db_mut(0).insert(
+            Bytes::from("x"),
+            StoredValue::string(Bytes::from("after"), None),
+        );
+
+        // Snapshot data should be unchanged
+        let snapped = snap[0].get(&Bytes::from("x")).expect("key in snapshot");
+        assert_eq!(snapped.as_string(), Some(&Bytes::from("before")));
+    }
+
+    #[test]
+    fn swapdb_atomicity() {
+        let state = ServerState::with_default_dbs();
+
+        state.db_mut(0).insert(
+            Bytes::from("a"),
+            StoredValue::string(Bytes::from("val_a"), None),
+        );
+        state.db_mut(1).insert(
+            Bytes::from("b"),
+            StoredValue::string(Bytes::from("val_b"), None),
+        );
+
+        state.swap_dbs(0, 1);
+
+        // DB 0 should now have key "b", DB 1 should have key "a"
+        assert!(state.db(0).contains_key(&Bytes::from("b")));
+        assert!(!state.db(0).contains_key(&Bytes::from("a")));
+        assert!(state.db(1).contains_key(&Bytes::from("a")));
+        assert!(!state.db(1).contains_key(&Bytes::from("b")));
+    }
+
+    #[test]
+    fn flushall_under_concurrency() {
+        use std::sync::Arc;
+
+        let state = Arc::new(ServerState::with_default_dbs());
+
+        // Seed multiple DBs
+        for db_idx in 0..4 {
+            for i in 0..50 {
+                state.db_mut(db_idx).insert(
+                    Bytes::from(format!("k:{i}")),
+                    StoredValue::string(Bytes::from("v"), None),
+                );
+            }
+        }
+
+        let s = Arc::clone(&state);
+        let writer = std::thread::spawn(move || {
+            for i in 50..100 {
+                s.db_mut(2).insert(
+                    Bytes::from(format!("k:{i}")),
+                    StoredValue::string(Bytes::from("v"), None),
+                );
+            }
+        });
+
+        state.clear_all_dbs();
+        writer.join().expect("writer panicked");
+
+        // After clear + writer, only DB 2 may have keys (from writer after clear)
+        for db_idx in [0usize, 1, 3] {
+            assert!(
+                state.db(db_idx).is_empty(),
+                "DB {db_idx} should be empty after FLUSHALL"
+            );
+        }
+    }
+
+    #[test]
+    fn expiry_per_db_isolation() {
+        let state = ServerState::with_default_dbs();
+
+        // DB 0: expired key, DB 3: alive key
+        state.db_mut(0).insert(
+            Bytes::from("expired"),
+            StoredValue::string(Bytes::from("v"), Some(1)),
+        );
+        state.db_mut(3).insert(
+            Bytes::from("alive"),
+            StoredValue::string(Bytes::from("v"), Some(i64::MAX)),
+        );
+
+        // Simulate expiry on DB 0 only
+        {
+            let mut db = state.db_mut(0);
+            super::purge_expired_keys(&mut db, 1000);
+        }
+
+        assert!(
+            state.db(0).is_empty(),
+            "expired key should be purged from DB 0"
+        );
+        assert!(
+            state.db(3).contains_key(&Bytes::from("alive")),
+            "DB 3 key should be untouched"
+        );
     }
 }
