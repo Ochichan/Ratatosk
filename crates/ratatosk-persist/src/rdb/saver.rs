@@ -21,7 +21,7 @@ pub fn save(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
             format!("creating RDB file '{}': {e}", path.display()),
         )
     })?;
-    let mut state = ServerState::new(snapshot.len());
+    let state = ServerState::new(snapshot.len());
     state.load_from_rdb(snapshot.clone());
     RdbSaver::new(file).save_state(&state)
 }
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn save_with_string_key() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("hello"),
             StoredValue::string(Bytes::from("world"), None),
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn save_with_expiry() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("key"),
             StoredValue::string(Bytes::from("val"), Some(1_234_567_890_000)),

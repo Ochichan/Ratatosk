@@ -276,8 +276,8 @@ pub(super) fn cmd_setbit(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
@@ -319,8 +319,8 @@ pub(super) fn cmd_getbit(
     let offset = offset as usize;
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -348,8 +348,8 @@ pub(super) fn cmd_bitcount(
     let key = &args[0];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -453,8 +453,8 @@ pub(super) fn cmd_bitpos(
     let target_bit = target_bit as u8;
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         // Empty key: bit 0 is always at position 0, bit 1 is not found
@@ -564,7 +564,7 @@ pub(super) fn cmd_bitop(
     let src_keys = &args[2..];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     // NOT takes exactly 1 source key
     if op_raw.as_slice() == b"NOT" && src_keys.len() != 1 {
@@ -576,7 +576,7 @@ pub(super) fn cmd_bitop(
     let mut max_len: usize = 0;
 
     for src_key in src_keys {
-        purge_expired_key(db, src_key, now);
+        purge_expired_key(&mut db, src_key, now);
         if let Some(entry) = db.get(src_key) {
             let Some(data) = entry.as_string() else {
                 return wrong_type_response();
@@ -651,7 +651,7 @@ pub(super) fn cmd_bitop(
         }
     }
 
-    purge_expired_key(db, dest_key, now);
+    purge_expired_key(&mut db, dest_key, now);
     let result_len = result.len() as i64;
     db.insert(
         dest_key.clone(),
@@ -784,8 +784,8 @@ pub(super) fn cmd_bitfield(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
@@ -905,8 +905,8 @@ pub(super) fn cmd_bitfield_ro(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let data = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {

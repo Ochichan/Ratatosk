@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn roundtrip_string_keys() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("hello"),
             StoredValue::string(Bytes::from("world"), None),
@@ -418,17 +418,15 @@ mod tests {
 
     #[test]
     fn roundtrip_list() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         let list = VecDeque::from(vec![Bytes::from("a"), Bytes::from("b"), Bytes::from("c")]);
         state
             .db_mut(0)
             .insert(Bytes::from("mylist"), StoredValue::list(list, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded
-            .db(0)
-            .get(&Bytes::from("mylist"))
-            .expect("list exists");
+        let db = loaded.db(0);
+        let val = db.get(&Bytes::from("mylist")).expect("list exists");
         let list = val.as_list().expect("is list");
         assert_eq!(list.len(), 3);
         assert_eq!(list[0], Bytes::from("a"));
@@ -438,7 +436,7 @@ mod tests {
 
     #[test]
     fn roundtrip_set() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         let mut set = HashSet::new();
         set.insert(Bytes::from("x"));
         set.insert(Bytes::from("y"));
@@ -447,7 +445,8 @@ mod tests {
             .insert(Bytes::from("myset"), StoredValue::set(set, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded.db(0).get(&Bytes::from("myset")).expect("set exists");
+        let db = loaded.db(0);
+        let val = db.get(&Bytes::from("myset")).expect("set exists");
         let loaded_set = val.as_set().expect("is set");
         assert_eq!(loaded_set.len(), 2);
         assert!(loaded_set.contains(&Bytes::from("x")));
@@ -456,7 +455,7 @@ mod tests {
 
     #[test]
     fn roundtrip_hash() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         let mut hash = HashMap::new();
         hash.insert(Bytes::from("f1"), HashFieldEntry::new(Bytes::from("v1")));
         hash.insert(Bytes::from("f2"), HashFieldEntry::new(Bytes::from("v2")));
@@ -465,10 +464,8 @@ mod tests {
             .insert(Bytes::from("myhash"), StoredValue::hash(hash, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded
-            .db(0)
-            .get(&Bytes::from("myhash"))
-            .expect("hash exists");
+        let db = loaded.db(0);
+        let val = db.get(&Bytes::from("myhash")).expect("hash exists");
         let loaded_hash = val.as_hash().expect("is hash");
         assert_eq!(loaded_hash.len(), 2);
         assert_eq!(
@@ -483,7 +480,7 @@ mod tests {
 
     #[test]
     fn roundtrip_sorted_set() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         let mut zset = SortedSet::default();
         zset.insert(Bytes::from("alice"), 1.5);
         zset.insert(Bytes::from("bob"), 2.0);
@@ -492,10 +489,8 @@ mod tests {
             .insert(Bytes::from("myzset"), StoredValue::sorted_set(zset, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded
-            .db(0)
-            .get(&Bytes::from("myzset"))
-            .expect("zset exists");
+        let db = loaded.db(0);
+        let val = db.get(&Bytes::from("myzset")).expect("zset exists");
         let loaded_zset = val.as_sorted_set().expect("is zset");
         assert_eq!(loaded_zset.len(), 2);
         assert_eq!(loaded_zset.score(&Bytes::from("alice")), Some(1.5));
@@ -504,7 +499,7 @@ mod tests {
 
     #[test]
     fn roundtrip_multiple_dbs() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("k0"),
             StoredValue::string(Bytes::from("v0"), None),
@@ -547,7 +542,7 @@ mod tests {
 
     #[test]
     fn crc_mismatch_returns_error() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("k"),
             StoredValue::string(Bytes::from("v"), None),
@@ -571,7 +566,7 @@ mod tests {
 
     #[test]
     fn roundtrip_stream() {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         let entries = vec![
             StreamEntry {
                 id: StreamId { ms: 1000, seq: 0 },
@@ -590,10 +585,8 @@ mod tests {
             .insert(Bytes::from("mystream"), StoredValue::stream(entries, None));
 
         let loaded = roundtrip_state(&state);
-        let val = loaded
-            .db(0)
-            .get(&Bytes::from("mystream"))
-            .expect("stream exists");
+        let db = loaded.db(0);
+        let val = db.get(&Bytes::from("mystream")).expect("stream exists");
         let (loaded_entries, _) = val.as_stream().expect("is stream");
         assert_eq!(loaded_entries.len(), 2);
         assert_eq!(loaded_entries[0].id.ms, 1000);
@@ -607,7 +600,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("snapshot.rdb");
 
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         state.db_mut(0).insert(
             Bytes::from("k"),
             StoredValue::string(Bytes::from("v"), None),
@@ -620,7 +613,7 @@ mod tests {
         crate::rdb::saver::save(&state.snapshot_dbs(), &path).expect("save snapshot");
         let snapshot = crate::rdb::loader::load(&path).expect("load snapshot");
 
-        let mut loaded = ServerState::new(snapshot.len());
+        let loaded = ServerState::new(snapshot.len());
         loaded.load_from_rdb(snapshot);
 
         assert_eq!(loaded.db(0).len(), 1);

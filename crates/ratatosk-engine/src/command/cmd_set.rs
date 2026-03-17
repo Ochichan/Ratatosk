@@ -27,8 +27,8 @@ pub(super) fn cmd_sadd(
 
     let key = &args[0];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         let mut set = HashSet::with_capacity(args.len().saturating_sub(1));
@@ -68,8 +68,8 @@ pub(super) fn cmd_srem(
 
     let key = &args[0];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -102,8 +102,8 @@ pub(super) fn cmd_sismember(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -128,8 +128,8 @@ pub(super) fn cmd_smismember(
     let members = &args[1..];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(
@@ -161,8 +161,8 @@ pub(super) fn cmd_smembers(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -188,8 +188,8 @@ pub(super) fn cmd_scard(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -234,8 +234,8 @@ pub(super) fn cmd_spop(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         return if count.is_some() {
@@ -343,8 +343,8 @@ pub(super) fn cmd_srandmember(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return if count.is_some() {
@@ -442,8 +442,8 @@ pub(super) fn cmd_sscan(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return scan_reply(0, vec![]);
@@ -481,9 +481,9 @@ pub(super) fn cmd_smove(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, source, now);
-    purge_expired_key(db, destination, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, source, now);
+    purge_expired_key(&mut db, destination, now);
 
     if source == destination {
         let Some(entry) = db.get_mut(source) else {
@@ -558,8 +558,8 @@ pub(super) fn cmd_sdiff(
     let first_key = &args[0];
     let others = &args[1..];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, first_key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, first_key, now);
 
     let Some(first_entry) = db.get(first_key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -570,7 +570,7 @@ pub(super) fn cmd_sdiff(
 
     let mut result = first_set.clone();
     for key in others {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };
@@ -598,9 +598,9 @@ pub(super) fn cmd_sinter(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in args {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
     let mut sets = Vec::with_capacity(args.len());
@@ -684,9 +684,9 @@ pub(super) fn cmd_sintercard(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
     let mut smallest_idx = 0usize;
@@ -756,11 +756,11 @@ pub(super) fn cmd_sunion(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     let mut result = HashSet::new();
 
     for key in args {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };
@@ -786,9 +786,9 @@ pub(super) fn cmd_sdiffstore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, destination, now);
-    purge_expired_key(db, &source_keys[0], now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, destination, now);
+    purge_expired_key(&mut db, &source_keys[0], now);
 
     let mut result = match db.get(&source_keys[0]) {
         None => HashSet::new(),
@@ -799,7 +799,7 @@ pub(super) fn cmd_sdiffstore(
     };
 
     for key in &source_keys[1..] {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };
@@ -837,10 +837,10 @@ pub(super) fn cmd_sinterstore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, destination, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, destination, now);
     for key in source_keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
     let result = {
@@ -906,12 +906,12 @@ pub(super) fn cmd_sunionstore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, destination, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, destination, now);
     let mut result = HashSet::new();
 
     for key in source_keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };

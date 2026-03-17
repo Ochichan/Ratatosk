@@ -1,7 +1,7 @@
 # Eviction & Expiry
 
 Ratatosk의 메모리 관리 및 키 만료 시스템.
-기준: 2026-02-11 코드 상태.
+기준: 2026-03-16 코드 상태.
 
 ## 개요
 
@@ -100,7 +100,7 @@ LFU 모드에서는 `lru_clock` 필드를 접근 빈도 카운터로 재활용�
 | Sorted Set | 128 bytes per entry (dual index) |
 | Stream | 32 bytes per entry + field overhead + 256 bytes per group |
 
-`estimate_used_memory(state)`: 전체 DB의 합산.
+`estimate_used_memory(state)`: 전체 DB의 합산. 각 DB는 per-DB `RwLock` read guard를 순차적으로 획득하여 조회한다.
 
 ---
 
@@ -124,15 +124,25 @@ for each DB:
         stop (CPU 절약)
 ```
 
-| 상수 | 값 | 설명 |
-|------|-----|------|
-| `ACTIVE_EXPIRE_CYCLE_LOOKUPS` | 20 | DB당 최대 샘플 수 |
-| `ACTIVE_EXPIRE_CYCLE_THRESHOLD` | 0.25 | 조기 중단 임계값 |
+| 설정 | 기본값 | 설명 |
+|------|--------|------|
+| `active-expire-cycle-lookups` | 20 | DB당 최대 샘플 수 (1–1000) |
+| `active-expire-cycle-threshold-pct` | 25 | 조기 중단 임계값 (%, 1–100) |
+
+런타임 조정:
+
+```
+CONFIG SET active-expire-cycle-lookups 40
+CONFIG SET active-expire-cycle-threshold-pct 10
+```
 
 특징:
 - 만료 가능한 키(TTL 있는 키)만 대상
 - 빈 DB나 TTL 키가 없는 DB는 건너뜀
-- 만료율이 25% 미만이면 해당 DB에서 조기 중단 → CPU 낭비 방지
+- 만료율이 threshold 미만이면 해당 DB에서 조기 중단 → CPU 낭비 방지
+- lookups를 높이면 만료가 더 적극적이지만 CPU 사용량 증가
+- threshold를 낮추면 만료 키가 적은 DB에서도 계속 샘플링
+- **Per-DB RwLock**: sampling 단계에서 read guard를 획득하고, guard를 해제한 뒤 expiry 단계에서 write guard를 획득한다. 하나의 DB를 정리하는 동안 다른 DB는 차단되지 않는다.
 
 ---
 

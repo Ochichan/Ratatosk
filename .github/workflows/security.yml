@@ -39,3 +39,8 @@ jobs:
 
       - name: Cargo audit
         run: cargo audit
+
+      - name: Gitleaks secret scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --no-git --source=. --config=.gitleaks.toml

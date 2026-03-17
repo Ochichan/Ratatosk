@@ -1,9 +1,9 @@
 # Ratatosk Ecosystem Integration
 
 Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Sub 이벤트 버스 역할을 맡는다.
-이 문서는 **현재 코드 상태**(2026-02-11)와 외부 프로젝트 통합 기준을 정리한다.
+이 문서는 **현재 코드 상태**(2026-03-16)와 외부 프로젝트 통합 기준을 정리한다.
 
-## Implementation Status (2026-02-11)
+## Implementation Status (2026-03-16)
 
 기준 파일: `docs/redis-gap-ledger.json`
 
@@ -26,11 +26,13 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 | RDB snapshot | 완료 | save/load + CRC64 + atomic write |
 | AOF writer | 완료 | RESP append + fsync 정책 |
 | AOF recovery | 완료 | RESP 파싱 → execute 재생 |
-| AOF manifest | 부분 구현 | save/load, bootstrap/recovery, manifest switch helper, rewrite 후 새 INCR rotation은 연결됐지만 BASE materialization과 runtime full atomic switch는 아직 없음 |
-| Background save | 완료 | background snapshot worker 연결 |
-| AOF rewrite | 완료 | background rewrite worker 연결, 다만 Redis식 current-state compaction은 아님 |
+| AOF manifest | 부분 구현 | save/load, bootstrap/recovery, manifest switch helper, rewrite 후 새 INCR rotation 연결. BASE materialization과 full atomic switch는 아직 없음 |
+| Background save | 완료 | `BGSAVE` background snapshot worker + shutdown drain |
+| AOF rewrite | 완료 | `BGREWRITEAOF` background rewrite worker. Redis식 current-state compaction은 아님 |
 | AOF 서버 통합 | 완료 | write 명령 후 자동 append 경로 존재 |
-| Replication | 부분 구현 | role 전이, logical repl offset, replica ACK accounting은 있으나 backlog/network stream/failover는 아직 없음 |
+| Blocking commands | 완료 | blocked wait registry + producer-side wakeup (list/sorted-set/stream) |
+| Client tracking | 부분 구현 | direct/BCAST/PREFIX/NOLOOP/OPTIN/OPTOUT + redirect wakeup. Redis full contract는 아직 |
+| Replication | 부분 구현 | role 전이, logical repl offset, replica ACK accounting. `PSYNC`는 ERR 반환 (standalone mode), `REPLICAOF`는 `NO ONE` 이외 ERR. backlog/network stream/failover 없음 |
 | Cluster | 미구현 | 해시 슬롯 helper 일부만 존재, distributed routing 없음 |
 
 중요:
@@ -50,7 +52,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - `SUBSCRIBE`/`PSUBSCRIBE`/`SSUBSCRIBE` + `PUBLISH`/`SPUBLISH` 제공.
 - keyspace notification으로 키 변경 이벤트 자동 발행.
-- pending queue 기반 backpressure로 느린 subscriber를 보호.
+- per-subscriber `tokio::sync::mpsc` 채널 기반 push delivery. `try_send()` overflow 시 subscriber disconnect.
 
 ### 3) Persistent data store
 
@@ -61,7 +63,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 ### 4) Redis-compatible endpoint
 
 - 기존 Redis 클라이언트/SDK를 그대로 붙여 초기 통합 비용을 낮춤.
-- 운영 도구(`INFO`, `CONFIG`, `SLOWLOG`, `LATENCY`)를 기본 제공.
+- 운영 도구(`INFO`, `CONFIG`, `SLOWLOG`, `LATENCY`)를 기본 제공. `MONITOR`는 미지원.
 
 ## Integration Matrix
 
@@ -82,6 +84,8 @@ cargo run -p ratatosk-server --bin ratatosk --release
 ```
 
 - default bind/port: `127.0.0.1:6379`
+- **Recommended coexistence port**: `6380` — avoids collision with a co-located Redis instance.
+  Set `RATATOSK_PORT=6380` when running alongside Redis. A startup warning is emitted when using port 6379.
 
 ### Autostart (systemd --user)
 
@@ -109,6 +113,7 @@ cargo run -p ratatosk-server --bin ratatosk --release
 - `hz`, `notify-keyspace-events`, `tcp-keepalive`
 - `lazyfree-lazy-expire`, `lazyfree-lazy-server-del`, `lazyfree-lazy-user-del`
 - `appendfsync` (always/everysec/no)
+- `pubsub-queue-hard-limit` (mpsc channel capacity)
 
 ## Recommended Key Naming
 
@@ -122,6 +127,18 @@ cargo run -p ratatosk-server --bin ratatosk --release
 - 공유 키는 서비스 prefix를 강제한다.
 - 캐시 키는 TTL을 기본값으로 둔다(무기한 키 금지).
 - Pub/Sub 채널은 도메인 prefix로 분리한다(`conductor:events:*`).
+
+### Key Prefix Enforcement
+
+Ratatosk supports optional key prefix enforcement via `CONFIG SET enforce-key-prefix`:
+
+| Value | Behavior |
+|-------|----------|
+| `no` (default) | No enforcement; any key name accepted |
+| `warn` | Log a warning when a key without `service:` prefix is written |
+| `yes` | Reject writes to keys that don't match `<service>:*` pattern |
+
+Known prefixes: `conductor:`, `ironclaw:`, `cc:`, `muninn:`, `rustmux:`.
 
 ## Integration Playbooks
 
@@ -155,20 +172,27 @@ Ratatosk은 선택적 의존성으로 취급한다.
 ### Security defaults
 
 - loopback bind 기본 + insecure bind explicit opt-in.
+- AUTH brute force prevention: per-connection progressive delay (지수 백오프 + 지터, 최대 2초) + 5회 연속 실패 시 연결 종료, per-IP `AuthRateLimiter` (60초 윈도우 내 20회 실패 시 거부).
+- `MONITOR`는 미지원 (`ERR MONITOR is not supported in this Ratatosk build`). 단, monitor notification은 `Arc<Notify>` 기반으로 등록된 클라이언트에게 전달됨.
 - TLS 종단은 프록시 계층(stunnel, nginx stream, envoy 등)에서 처리 권장.
 
 ### Backpressure and limits
 
 - query buffer limit: 1 MiB
 - output buffer limit: 기본 8 MiB
-- pubsub pending queue limit: 4096
+- pubsub delivery: per-subscriber `mpsc::channel` (capacity = hard_limit). `try_send()` 실패 시 overflow → disconnect
 - lazy free channel capacity: 4096
 
 ## Roadmap Priorities
 
-1. **Persistence 서버 통합**: AOF writer를 이벤트 루프에 연결, background RDB save 구현
-2. **AOF rewrite**: background에서 compact AOF 생성, manifest 기반 파일 전환
-3. **Notification wiring**: 80+ mutation site에 `notify!` 매크로 삽입
-4. **Redis parity hardening**: edge-case semantics를 Redis와 byte-level 비교 검증
-5. **통합 계약 테스트**: 주요 서비스별 smoke + failure-path 자동화
-6. **성능 회귀 자동화**: benchmark guardrail CI 루틴 고정
+1. ~~**Persistence 서버 통합**~~: 완료 — AOF writer 이벤트 루프 연결, background RDB save 구현
+2. ~~**AOF rewrite**~~: 완료 — `BGREWRITEAOF` background rewrite worker 연결
+3. ~~**Notification wiring**~~: 완료 — `notify!` 매크로 삽입
+4. ~~**SharedState concurrency model**~~: 완료 — `AtomicStatsState` (10 lock-free counters), `ArcSwap<ConfigState>` lock-free config reads, atomic `next_client_id`, per-DB `parking_lot::RwLock<DbShard>` (서로 다른 DB 병렬 접근, 같은 DB 읽기 공유)
+5. ~~**Pub/Sub push delivery**~~: 완료 — per-subscriber `mpsc::channel` 기반 push delivery, `WaitResult` enum client loop
+6. ~~**Lua 5.1 scripting**~~: 완료 — `lua-scripting` feature gate, EVAL/EVALSHA/SCRIPT LOAD/EXISTS/FLUSH, sandbox (1MB mem / 100K instr limit)
+7. **Persistence 재설계**: snapshot clone → iterable view, AOF rewrite → current-state materialization, multipart manifest atomic switch
+8. **Redis parity hardening**: edge-case semantics를 Redis와 byte-level 비교 검증
+9. **Replication 실체화**: backlog, network stream, WAIT/WAITAOF blocking semantics
+10. **통합 계약 테스트**: 주요 서비스별 smoke + failure-path 자동화
+11. **성능 회귀 자동화**: benchmark guardrail CI 루틴 고정

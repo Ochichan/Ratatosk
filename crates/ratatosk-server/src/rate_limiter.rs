@@ -84,6 +84,85 @@ impl Default for ConnectionRateLimiter {
     }
 }
 
+/// Per-IP AUTH failure rate limiter.
+///
+/// Tracks AUTH failures across reconnection attempts to prevent brute-force
+/// attacks that reconnect after each failure. An IP is blocked when it exceeds
+/// `max_failures` within `window`.
+pub struct AuthRateLimiter {
+    failures: HashMap<IpAddr, Vec<Instant>>,
+    window: Duration,
+    max_failures: usize,
+    last_cleanup: Instant,
+}
+
+impl AuthRateLimiter {
+    pub fn new(window: Duration, max_failures: usize) -> Self {
+        Self {
+            failures: HashMap::new(),
+            window,
+            max_failures,
+            last_cleanup: Instant::now(),
+        }
+    }
+
+    /// Record an AUTH failure from the given IP. Returns `true` if the IP
+    /// should now be blocked (threshold exceeded).
+    pub fn record_failure(&mut self, addr: IpAddr) -> bool {
+        let now = Instant::now();
+
+        if now.duration_since(self.last_cleanup) > self.window {
+            self.cleanup(now);
+            self.last_cleanup = now;
+        }
+
+        let entries = self.failures.entry(addr).or_default();
+        entries.retain(|t| now.duration_since(*t) < self.window);
+        entries.push(now);
+
+        if entries.len() > self.max_failures {
+            tracing::warn!(
+                target = "ratatosk::security",
+                remote_ip = %addr,
+                failures = entries.len(),
+                max_failures = self.max_failures,
+                window_sec = self.window.as_secs(),
+                "AUTH failure rate limit exceeded for IP"
+            );
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if the given IP is currently blocked due to excessive AUTH failures.
+    pub fn is_blocked(&mut self, addr: IpAddr) -> bool {
+        let now = Instant::now();
+        let entries = self.failures.entry(addr).or_default();
+        entries.retain(|t| now.duration_since(*t) < self.window);
+        entries.len() > self.max_failures
+    }
+
+    /// Clear failure records for an IP (e.g. on successful AUTH).
+    pub fn clear(&mut self, addr: IpAddr) {
+        self.failures.remove(&addr);
+    }
+
+    fn cleanup(&mut self, now: Instant) {
+        self.failures.retain(|_, entries| {
+            entries.retain(|t| now.duration_since(*t) < self.window);
+            !entries.is_empty()
+        });
+    }
+}
+
+impl Default for AuthRateLimiter {
+    fn default() -> Self {
+        // Default: 20 AUTH failures per 60 seconds per IP
+        Self::new(Duration::from_secs(60), 20)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +204,57 @@ mod tests {
         assert!(limiter.check_rate_limit(ip2));
         assert!(limiter.check_rate_limit(ip2));
         assert!(!limiter.check_rate_limit(ip2));
+    }
+
+    #[test]
+    fn auth_rate_limiter_blocks_after_threshold() {
+        let mut limiter = AuthRateLimiter::new(Duration::from_secs(60), 5);
+        let ip = IpAddr::from([10, 0, 0, 1]);
+
+        // First 5 failures should not block
+        for _ in 0..5 {
+            assert!(
+                !limiter.record_failure(ip),
+                "Should not block within threshold"
+            );
+        }
+
+        // 6th failure should trigger block
+        assert!(
+            limiter.record_failure(ip),
+            "Should block after exceeding threshold"
+        );
+        assert!(limiter.is_blocked(ip), "IP should be blocked");
+    }
+
+    #[test]
+    fn auth_rate_limiter_clear_resets() {
+        let mut limiter = AuthRateLimiter::new(Duration::from_secs(60), 3);
+        let ip = IpAddr::from([10, 0, 0, 1]);
+
+        for _ in 0..3 {
+            limiter.record_failure(ip);
+        }
+        assert!(limiter.record_failure(ip));
+
+        limiter.clear(ip);
+        assert!(!limiter.is_blocked(ip), "Should not be blocked after clear");
+    }
+
+    #[test]
+    fn auth_rate_limiter_tracks_ips_separately() {
+        let mut limiter = AuthRateLimiter::new(Duration::from_secs(60), 3);
+        let ip1 = IpAddr::from([10, 0, 0, 1]);
+        let ip2 = IpAddr::from([10, 0, 0, 2]);
+
+        for _ in 0..4 {
+            limiter.record_failure(ip1);
+        }
+
+        assert!(limiter.is_blocked(ip1));
+        assert!(
+            !limiter.is_blocked(ip2),
+            "Different IP should not be blocked"
+        );
     }
 }

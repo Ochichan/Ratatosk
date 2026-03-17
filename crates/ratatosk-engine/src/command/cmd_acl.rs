@@ -389,6 +389,30 @@ pub(super) fn authenticate_client(
     false
 }
 
+/// Maximum consecutive AUTH failures before disconnecting the client.
+const AUTH_FAILURE_THRESHOLD: u32 = 5;
+
+/// Compute progressive delay for AUTH failures using exponential backoff + jitter.
+/// delay_ms = min(100 * 2^(failures - 1), 2000) * jitter(0.8..1.2)
+fn auth_failure_delay_ms(failures: u32) -> u64 {
+    use rand::Rng;
+    let base = std::cmp::min(
+        100u64.saturating_mul(1u64 << (failures.saturating_sub(1))),
+        2000,
+    );
+    let jitter: f64 = rand::thread_rng().gen_range(0.8..1.2);
+    (base as f64 * jitter) as u64
+}
+
+fn auth_failure_outcome(failures: u32) -> CommandOutcome {
+    let delay = auth_failure_delay_ms(failures);
+    if failures >= AUTH_FAILURE_THRESHOLD {
+        CommandOutcome::close_with_delay(err(AUTH_FAILURE), delay)
+    } else {
+        CommandOutcome::reply_with_delay(err(AUTH_FAILURE), delay)
+    }
+}
+
 pub(super) fn cmd_auth(
     args: &[Bytes],
     server: &ServerState,
@@ -405,16 +429,36 @@ pub(super) fn cmd_auth(
     let result = match args {
         [password] => {
             if authenticate_client(server, &Bytes::from_static(b"default"), password, client) {
+                client.reset_auth_failures();
                 CommandOutcome::reply(RespFrame::ok())
             } else {
-                CommandOutcome::reply(err(AUTH_FAILURE))
+                let failures = client.increment_auth_failures();
+                if failures >= AUTH_FAILURE_THRESHOLD {
+                    tracing::warn!(
+                        target = "ratatosk::security",
+                        client_id = client.id(),
+                        failures,
+                        "AUTH failure threshold reached, disconnecting client"
+                    );
+                }
+                auth_failure_outcome(failures)
             }
         }
         [username, password] => {
             if authenticate_client(server, username, password, client) {
+                client.reset_auth_failures();
                 CommandOutcome::reply(RespFrame::ok())
             } else {
-                CommandOutcome::reply(err(AUTH_FAILURE))
+                let failures = client.increment_auth_failures();
+                if failures >= AUTH_FAILURE_THRESHOLD {
+                    tracing::warn!(
+                        target = "ratatosk::security",
+                        client_id = client.id(),
+                        failures,
+                        "AUTH failure threshold reached, disconnecting client"
+                    );
+                }
+                auth_failure_outcome(failures)
             }
         }
         _ => wrong_arity("auth"),
@@ -432,7 +476,9 @@ pub(super) fn cmd_auth(
             .into_owned();
     let payload = format!(
         "event=AUTH client_id={} username={} success={}",
-        client.id, username_text, success
+        client.id(),
+        username_text,
+        success
     );
     let stamp = next_audit_stamp("AUTH", &payload);
     tracing::info!(
@@ -441,7 +487,7 @@ pub(super) fn cmd_auth(
         audit_seq = stamp.seq,
         audit_prev_hash = %stamp.prev_hash,
         audit_hash = %stamp.hash,
-        client_id = client.id,
+        client_id = client.id(),
         username = %username_text,
         success,
         "ACL authentication attempt"
@@ -460,6 +506,7 @@ pub(super) fn cmd_reset(
     }
 
     server.tracking_remove_client(client.id());
+    server.unregister_monitor(client.id());
     client.reset_for_connection();
     CommandOutcome::reply(RespFrame::simple_str("RESET"))
 }

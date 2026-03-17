@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "ratatosk-engine/mimalloc"]
 
 [dependencies]
 ratatosk-core = { workspace = true }

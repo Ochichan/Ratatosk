@@ -4,12 +4,130 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::{keyspace::ServerState, security::next_audit_stamp};
 
+#[cfg(feature = "lua-scripting")]
+use super::ClientState;
 use super::{CommandOutcome, err, to_uppercase_bytes, wrong_arity};
 
 // ---------------------------------------------------------------------------
 // EVAL / EVALSHA / EVAL_RO / EVALSHA_RO
 // ---------------------------------------------------------------------------
 
+/// Parse the common `(numkeys, KEYS..., ARGV...)` suffix shared by EVAL and
+/// EVALSHA. Returns `(keys, argv)` slices on success.
+#[cfg(feature = "lua-scripting")]
+fn parse_keys_argv<'a>(
+    args: &'a [Bytes],
+    cmd_name: &str,
+) -> Result<(&'a [Bytes], &'a [Bytes]), CommandOutcome> {
+    // args[0] = script/sha, args[1] = numkeys, rest = keys... args...
+    if args.len() < 2 {
+        return Err(wrong_arity(cmd_name));
+    }
+
+    let numkeys_str = std::str::from_utf8(&args[1]).unwrap_or("");
+    let numkeys: usize = match numkeys_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            return Err(CommandOutcome::reply(err(
+                "ERR value is not an integer or out of range",
+            )));
+        }
+    };
+
+    // Validate argument count: script + numkeys + numkeys keys + remaining argv
+    if args.len() < 2 + numkeys {
+        return Err(CommandOutcome::reply(err(
+            "ERR Number of keys can't be greater than number of args",
+        )));
+    }
+
+    let keys = &args[2..2 + numkeys];
+    let argv = &args[2 + numkeys..];
+
+    Ok((keys, argv))
+}
+
+// ---- Feature: lua-scripting enabled ----
+
+#[cfg(feature = "lua-scripting")]
+pub(super) fn cmd_eval(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    let (keys, argv) = match parse_keys_argv(args, "eval") {
+        Ok(pair) => pair,
+        Err(outcome) => return outcome,
+    };
+
+    let script = &args[0];
+
+    // Cache the script
+    let sha = sha1_hex(script);
+    let sha_bytes = Bytes::copy_from_slice(sha.as_bytes());
+    server
+        .script_cache
+        .scripts
+        .insert(sha_bytes, script.clone());
+
+    let result = super::lua_runtime::eval_script(script, keys, argv, server, client);
+    CommandOutcome::reply(result)
+}
+
+#[cfg(feature = "lua-scripting")]
+pub(super) fn cmd_evalsha(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    let (keys, argv) = match parse_keys_argv(args, "evalsha") {
+        Ok(pair) => pair,
+        Err(outcome) => return outcome,
+    };
+
+    let sha = &args[0];
+
+    // Look up the script in the cache
+    let script = match server.script_cache.scripts.get(sha) {
+        Some(s) => s.clone(),
+        None => {
+            // Also try lowercase form of the SHA (Redis is case-insensitive for SHA)
+            let sha_lower =
+                Bytes::from(std::str::from_utf8(sha).unwrap_or("").to_ascii_lowercase());
+            match server.script_cache.scripts.get(&sha_lower) {
+                Some(s) => s.clone(),
+                None => {
+                    return CommandOutcome::reply(err("NOSCRIPT No matching script. Use EVAL."));
+                }
+            }
+        }
+    };
+
+    let result = super::lua_runtime::eval_script(&script, keys, argv, server, client);
+    CommandOutcome::reply(result)
+}
+
+#[cfg(feature = "lua-scripting")]
+pub(super) fn cmd_eval_ro(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    cmd_eval(args, server, client)
+}
+
+#[cfg(feature = "lua-scripting")]
+pub(super) fn cmd_evalsha_ro(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    cmd_evalsha(args, server, client)
+}
+
+// ---- Feature: lua-scripting disabled (stubs) ----
+
+#[cfg(not(feature = "lua-scripting"))]
 pub(super) fn cmd_eval(args: &[Bytes]) -> CommandOutcome {
     if args.len() < 2 {
         return wrong_arity("eval");
@@ -17,6 +135,7 @@ pub(super) fn cmd_eval(args: &[Bytes]) -> CommandOutcome {
     CommandOutcome::reply(err("ERR Scripting not supported in this build"))
 }
 
+#[cfg(not(feature = "lua-scripting"))]
 pub(super) fn cmd_evalsha(args: &[Bytes]) -> CommandOutcome {
     if args.len() < 2 {
         return wrong_arity("evalsha");
@@ -24,10 +143,12 @@ pub(super) fn cmd_evalsha(args: &[Bytes]) -> CommandOutcome {
     CommandOutcome::reply(err("NOSCRIPT No matching script. Please use EVAL."))
 }
 
+#[cfg(not(feature = "lua-scripting"))]
 pub(super) fn cmd_eval_ro(args: &[Bytes]) -> CommandOutcome {
     cmd_eval(args)
 }
 
+#[cfg(not(feature = "lua-scripting"))]
 pub(super) fn cmd_evalsha_ro(args: &[Bytes]) -> CommandOutcome {
     cmd_evalsha(args)
 }

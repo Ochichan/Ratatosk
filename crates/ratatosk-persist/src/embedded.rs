@@ -75,7 +75,7 @@ impl EmbeddedPersistence {
             writer.write_all(&key_count.to_le_bytes())?;
             hasher.update(key_count.to_le_bytes());
 
-            for (key, value) in db {
+            for (key, value) in db.iter() {
                 // Write key
                 Self::write_bytes_with_hash(&mut writer, &mut hasher, key)?;
 

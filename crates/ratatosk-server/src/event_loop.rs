@@ -6,11 +6,11 @@ use ratatosk_engine::{
         EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction,
     },
     expiry::{active_expire_cycle, detect_clock_jump},
-    keyspace::ServerState,
+    keyspace::{ServerState, SharedState},
 };
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -221,14 +221,10 @@ fn build_eviction_config(state: &ServerState) -> EvictionConfig {
 /// 1. Active expiry cycle (sampling-based)
 /// 2. Eviction check (maxmemory)
 /// 3. Ops/sec sampling (every `ops_sec_interval` ticks)
-async fn server_cron(
-    server_state: &Arc<Mutex<ServerState>>,
-    cron_tick: &mut u64,
-    ops_sec_interval: u64,
-) {
+async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_sec_interval: u64) {
     detect_clock_jump();
 
-    let mut server = server_state.lock().await;
+    let mut server = server_state.meta.lock().await;
     let current_ms = now_ms();
 
     // 1. Active expiry cycle
@@ -287,6 +283,15 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         )
     })?;
 
+    if config.port == 6379 {
+        tracing::warn!(
+            target = "ratatosk::startup",
+            port = 6379,
+            "listening on the default Redis port (6379); this may conflict with a co-located Redis instance. \
+             Consider RATATOSK_PORT=6380 for coexistence."
+        );
+    }
+
     emit_fd_metrics();
 
     // Lazy-free background thread for async deletion of large values
@@ -339,7 +344,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
     let mut initial_state = ServerState::with_default_dbs();
     initial_state.set_lazy_free_sender(lazy_free_tx);
-    let server_state = Arc::new(Mutex::new(initial_state));
+    let server_state = Arc::new(SharedState::new(initial_state));
     apply_server_persistence_config(&server_state, &config).await;
 
     let persistence = Arc::new(PersistenceRuntime::from_config(&config).map_err(|error| {
@@ -385,11 +390,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         "connection rate limiter configured"
     );
 
-    // server_cron timer — default 10 Hz
-    let cron_hz = {
-        let server = server_state.lock().await;
-        server.config.hz()
-    };
+    // server_cron timer — default 10 Hz (lock-free config read)
+    let cron_hz = server_state.config_cache.load().hz();
     let cron_period = Duration::from_millis(1000 / u64::from(cron_hz.max(1)));
     let mut cron_interval = tokio::time::interval(cron_period);
     cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
