@@ -4,7 +4,7 @@ use std::path::Path;
 
 use bytes::{Buf, BytesMut};
 use ratatosk_engine::{
-    command::{ClientState, execute},
+    command::{ClientState, ServerAccess, execute},
     keyspace::ServerState,
 };
 use ratatosk_resp::{frame::RespFrame, parse};
@@ -108,7 +108,10 @@ impl AofRecovery {
             let bytes_before = buf.len();
             match parse(&mut buf) {
                 Ok(Some(frame)) => {
-                    let outcome = execute(frame, state, &mut client);
+                    let outcome = {
+                        let mut access = ServerAccess::new_inline(state);
+                        execute(frame, &mut access, &mut client)
+                    };
                     if let RespFrame::Error(message) = &outcome.response {
                         let position = total_bytes.saturating_sub(buf.len());
                         tracing::error!(
@@ -249,14 +252,15 @@ mod tests {
         assert!(!result.corruption_detected);
 
         // Verify data
-        let hello = state.db(0).get(&Bytes::from("hello"));
+        let db = state.db(0);
+        let hello = db.get(&Bytes::from("hello"));
         assert!(hello.is_some());
         assert_eq!(
             hello.and_then(|v| v.as_string()),
             Some(&Bytes::from("world"))
         );
 
-        let count = state.db(0).get(&Bytes::from("count"));
+        let count = db.get(&Bytes::from("count"));
         assert!(count.is_some());
         assert_eq!(count.and_then(|v| v.as_string()), Some(&Bytes::from("42")));
     }

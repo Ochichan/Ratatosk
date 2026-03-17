@@ -216,8 +216,8 @@ fn cmd_hexpire_common(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     // Key does not exist -> all fields report -2
     let Some(stored) = db.get_mut(key) else {
@@ -367,8 +367,8 @@ fn cmd_httl_common(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(stored) = db.get(key) else {
         let results: Vec<RespFrame> = fields.iter().map(|_| RespFrame::Integer(-2)).collect();
@@ -473,8 +473,8 @@ pub(super) fn cmd_hpersist(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(stored) = db.get_mut(key) else {
         let results: Vec<RespFrame> = fields.iter().map(|_| RespFrame::Integer(-2)).collect();
@@ -527,8 +527,8 @@ pub(super) fn cmd_hgetdel(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(stored) = db.get_mut(key) else {
         let results: Vec<RespFrame> = fields.iter().map(|_| RespFrame::BulkString(None)).collect();
@@ -652,8 +652,8 @@ pub(super) fn cmd_hgetex(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(stored) = db.get_mut(key) else {
         let results: Vec<RespFrame> = fields.iter().map(|_| RespFrame::BulkString(None)).collect();
@@ -753,8 +753,8 @@ pub(super) fn cmd_hsetex(
         return CommandOutcome::reply(err("ERR invalid expire time in 'hsetex' command"));
     };
 
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         let mut hash = HashMap::with_capacity(n);

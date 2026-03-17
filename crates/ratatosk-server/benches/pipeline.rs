@@ -3,7 +3,7 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use ratatosk_engine::{
-    command::{ClientState, execute},
+    command::{ClientState, ServerAccess, execute},
     keyspace::ServerState,
 };
 use ratatosk_resp::{RespFrame, encode_to_vec, parse};
@@ -65,7 +65,8 @@ fn bench_pipeline_set(c: &mut Criterion) {
                     |(mut server, mut client, mut input)| {
                         let mut encoded = Vec::with_capacity(input.len());
                         while let Some(frame) = parse(&mut input).expect("valid RESP") {
-                            let outcome = execute(frame, &mut server, &mut client);
+                            let mut access = ServerAccess::new_inline(&mut server);
+                            let outcome = execute(frame, &mut access, &mut client);
                             encode_to_vec(&outcome.response, &mut encoded);
                         }
                         black_box(encoded.len());
@@ -101,7 +102,8 @@ fn bench_pipeline_ping(c: &mut Criterion) {
                     |(mut server, mut client, mut input)| {
                         let mut encoded = Vec::with_capacity(input.len());
                         while let Some(frame) = parse(&mut input).expect("valid RESP") {
-                            let outcome = execute(frame, &mut server, &mut client);
+                            let mut access = ServerAccess::new_inline(&mut server);
+                            let outcome = execute(frame, &mut access, &mut client);
                             encode_to_vec(&outcome.response, &mut encoded);
                         }
                         black_box(encoded.len());
@@ -198,7 +200,8 @@ fn bench_pipeline_set_execute_only(c: &mut Criterion) {
                     |(mut server, mut client, frames)| {
                         let mut replies = 0usize;
                         for frame in frames {
-                            let outcome = execute(frame, &mut server, &mut client);
+                            let mut access = ServerAccess::new_inline(&mut server);
+                            let outcome = execute(frame, &mut access, &mut client);
                             replies = replies.saturating_add(1);
                             black_box(outcome.response);
                         }
@@ -236,7 +239,8 @@ fn bench_pipeline_ping_execute_only(c: &mut Criterion) {
                     |(mut server, mut client, frames)| {
                         let mut replies = 0usize;
                         for frame in frames {
-                            let outcome = execute(frame, &mut server, &mut client);
+                            let mut access = ServerAccess::new_inline(&mut server);
+                            let outcome = execute(frame, &mut access, &mut client);
                             replies = replies.saturating_add(1);
                             black_box(outcome.response);
                         }

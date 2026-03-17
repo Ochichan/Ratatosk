@@ -65,13 +65,13 @@ impl<'a> DirectDb<'a> {
             .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now));
         if is_expired {
             let key_bytes = Bytes::copy_from_slice(key);
-            purge_expired_key(self.server.db_mut(self.db_idx), &key_bytes, now);
+            purge_expired_key(&mut self.server.db_mut(self.db_idx), &key_bytes, now);
         }
     }
 
     /// Write path: caller already holds an owned `Bytes` key.
     fn purge_if_expired_write(&mut self, key: &Bytes, now: i64) {
-        purge_expired_key(self.server.db_mut(self.db_idx), key, now);
+        purge_expired_key(&mut self.server.db_mut(self.db_idx), key, now);
     }
 
     /// Touch the key version for watch notifications.
@@ -100,7 +100,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let result = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     if opts.xx {
@@ -156,7 +156,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let (removed, is_empty) = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             let Some(entry) = db.get_mut(&key) else {
                 return false;
             };
@@ -180,7 +180,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let (removed, is_empty) = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             let Some(entry) = db.get_mut(&key) else {
                 return 0;
             };
@@ -395,7 +395,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key_bytes, now);
 
         let new_score = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key_bytes.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     let mut zset = SortedSet::default();
@@ -433,7 +433,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let added = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     let mut hash = HashMap::with_capacity(fields.len());
@@ -473,7 +473,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let added = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     let mut hash = HashMap::with_capacity(1);
@@ -507,7 +507,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let (removed, is_empty) = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             let Some(entry) = db.get_mut(&key) else {
                 return false;
             };
@@ -658,7 +658,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let added = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     let mut set = HashSet::with_capacity(members.len());
@@ -694,7 +694,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let added = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             match db.entry(key.clone()) {
                 hashbrown::hash_map::Entry::Vacant(vacant) => {
                     let mut set = HashSet::with_capacity(1);
@@ -721,7 +721,7 @@ impl DirectDb<'_> {
         self.purge_if_expired_write(&key, now);
 
         let (removed, is_empty) = {
-            let db = self.server.db_mut(self.db_idx);
+            let mut db = self.server.db_mut(self.db_idx);
             let Some(entry) = db.get_mut(&key) else {
                 return false;
             };
@@ -896,12 +896,14 @@ impl DirectDb<'_> {
         let now = now_ms();
         self.purge_if_expired_write(&key_bytes, now);
 
-        let db = self.server.db_mut(self.db_idx);
-        let hashbrown::hash_map::Entry::Vacant(vacant) = db.entry(key_bytes.clone()) else {
-            return false;
-        };
-        let value_bytes = Bytes::copy_from_slice(value);
-        vacant.insert(StoredValue::string(value_bytes, None));
+        {
+            let mut db = self.server.db_mut(self.db_idx);
+            let hashbrown::hash_map::Entry::Vacant(vacant) = db.entry(key_bytes.clone()) else {
+                return false;
+            };
+            let value_bytes = Bytes::copy_from_slice(value);
+            vacant.insert(StoredValue::string(value_bytes, None));
+        }
         self.touch_version(&key_bytes);
         true
     }
@@ -912,23 +914,34 @@ impl DirectDb<'_> {
         let now = now_ms();
         self.purge_if_expired_write(&key_bytes, now);
 
-        let db = self.server.db_mut(self.db_idx);
-        if let Some(entry) = db.get_mut(&key_bytes) {
-            if let Some(existing) = entry.as_string() {
-                let mut buf = BytesMut::with_capacity(existing.len() + value.len());
-                buf.extend_from_slice(existing);
-                buf.extend_from_slice(value);
-                let len = buf.len();
-                entry.data = crate::keyspace::ValueData::String(buf.freeze());
-                self.touch_version(&key_bytes);
-                return len;
+        let len = {
+            let mut db = self.server.db_mut(self.db_idx);
+            if let Some(entry) = db.get_mut(&key_bytes) {
+                if let Some(existing) = entry.as_string() {
+                    let mut buf = BytesMut::with_capacity(existing.len() + value.len());
+                    buf.extend_from_slice(existing);
+                    buf.extend_from_slice(value);
+                    let len = buf.len();
+                    entry.data = crate::keyspace::ValueData::String(buf.freeze());
+                    Some(len)
+                } else {
+                    None
+                }
+            } else {
+                None
             }
+        };
+        if let Some(len) = len {
+            self.touch_version(&key_bytes);
+            return len;
         }
 
-        // Key doesn't exist, create new
+        // Key doesn't exist (or wasn't a string), create new
         let value_bytes = Bytes::copy_from_slice(value);
         let len = value_bytes.len();
-        db.insert(key_bytes.clone(), StoredValue::string(value_bytes, None));
+        self.server
+            .db_mut(self.db_idx)
+            .insert(key_bytes.clone(), StoredValue::string(value_bytes, None));
         self.touch_version(&key_bytes);
         len
     }
@@ -995,7 +1008,7 @@ impl DirectDb<'_> {
     pub fn expire(&mut self, key: &[u8], expire_at_ms: i64) -> bool {
         let key_bytes = Bytes::copy_from_slice(key);
 
-        let db = self.server.db_mut(self.db_idx);
+        let mut db = self.server.db_mut(self.db_idx);
         let Some(entry) = db.get_mut(&key_bytes) else {
             return false;
         };
@@ -1029,7 +1042,7 @@ impl DirectDb<'_> {
     pub fn persist(&mut self, key: &[u8]) -> bool {
         let key_bytes = Bytes::copy_from_slice(key);
 
-        let db = self.server.db_mut(self.db_idx);
+        let mut db = self.server.db_mut(self.db_idx);
         let Some(entry) = db.get_mut(&key_bytes) else {
             return false;
         };
@@ -1047,15 +1060,15 @@ impl DirectDb<'_> {
         let now = now_ms();
         self.purge_if_expired_write(&old_key_bytes, now);
 
-        let db = self.server.db_mut(self.db_idx);
-        let Some(value) = db.remove(&old_key_bytes) else {
-            return false;
-        };
-
-        let new_key_touch = new_key_bytes.clone(); // ref-count incr (cheap)
-        db.insert(new_key_bytes, value);
+        {
+            let mut db = self.server.db_mut(self.db_idx);
+            let Some(value) = db.remove(&old_key_bytes) else {
+                return false;
+            };
+            db.insert(new_key_bytes.clone(), value);
+        }
         self.touch_version(&old_key_bytes);
-        self.touch_version(&new_key_touch);
+        self.touch_version(&new_key_bytes);
         true
     }
 }

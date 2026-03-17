@@ -120,14 +120,14 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `CLIENT LIST` | connection | 2.4.0 | done | baseline_local | m0-foundation | M0 compatibility baseline implemented (single-connection list with TYPE/ID filtering baseline). |
 | `CLIENT NO-EVICT` | connection | 7.0.0 | done | baseline_local | m0-foundation | M0 client baseline implemented: ON/OFF parsing and local state toggle. |
 | `CLIENT NO-TOUCH` | connection | 7.2.0 | done | baseline_local | m0-foundation | M0 client baseline implemented: ON/OFF parsing and local state toggle. |
-| `CLIENT PAUSE` | connection | 3.0.0 | done | syntax_only | m0-foundation | M0 client-admin baseline implemented: timeout/mode parsing with no-op pause semantics. |
-| `CLIENT REPLY` | connection | 3.2.0 | done | syntax_only | m0-foundation | M0 client baseline implemented: ON/OFF/SKIP parsing and local reply mode state. |
-| `CLIENT SETINFO` | connection | 7.2.0 | done | syntax_only | m0-foundation | M0 client baseline implemented: LIB-NAME/LIB-VER metadata accepted (no-op). |
+| `CLIENT PAUSE` | connection | 3.0.0 | done | unsupported | m0-foundation | Returns ERR; CLIENT PAUSE is not supported in this Ratatosk build. |
+| `CLIENT REPLY` | connection | 3.2.0 | done | behavioral_subset | m0-foundation | Reply mode enforced in I/O loop: OFF suppresses all responses, SKIP suppresses next response only. Push notifications (pub/sub, invalidation) unaffected. |
+| `CLIENT SETINFO` | connection | 7.2.0 | done | behavioral_subset | m0-foundation | LIB-NAME/LIB-VER stored in ClientState and included in CLIENT LIST output. |
 | `CLIENT SETNAME` | connection | 2.6.9 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `CLIENT TRACKING` | connection | 6.0.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented with direct-key invalidation, BCAST/PREFIX/NOLOOP registry, OPTIN/OPTOUT next-command gating, async invalidate push, connected-target REDIRECT validation, target wakeup delivery, `broken_redirect` marking, and RESP3 `tracking-redir-broken` push. |
 | `CLIENT TRACKINGINFO` | connection | 6.2.0 | done | baseline_local | m0-foundation | M0 client-tracking baseline implemented: flags/redirect/prefix state plus current direct-key/BCAST tracking metadata surface, configured redirect visibility, and `broken_redirect` state reporting. |
 | `CLIENT UNBLOCK` | connection | 5.0.0 | done | syntax_only | m0-foundation | M0 client-admin baseline implemented: ID/mode parsing with deterministic no-op unblock result. |
-| `CLIENT UNPAUSE` | connection | 6.2.0 | done | syntax_only | m0-foundation | M0 client-admin baseline implemented: explicit unpause no-op semantics. |
+| `CLIENT UNPAUSE` | connection | 6.2.0 | done | unsupported | m0-foundation | Returns ERR; CLIENT UNPAUSE is not supported in this Ratatosk build. |
 | `CLUSTER` | cluster | 3.0.0 | done | unsupported | m5-advanced |  |
 | `CLUSTER ADDSLOTS` | cluster | 3.0.0 | done | unsupported | m5-advanced |  |
 | `CLUSTER ADDSLOTSRANGE` | cluster | 7.0.0 | done | unsupported | m5-advanced |  |
@@ -289,10 +289,10 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `LSET` | list | 1.0.0 | done | behavioral_subset | m2-collections | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `LTRIM` | list | 1.0.0 | done | behavioral_subset | m2-collections | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `MEMORY` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (USAGE/HELP subset). |
-| `MEMORY DOCTOR` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
+| `MEMORY DOCTOR` | server | 4.0.0 | done | behavioral_subset | m0-foundation | Real diagnostics: empty instance, overhead ratio analysis. Redis-style report format. |
 | `MEMORY HELP` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
-| `MEMORY MALLOC-STATS` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
-| `MEMORY PURGE` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
+| `MEMORY MALLOC-STATS` | server | 4.0.0 | done | behavioral_subset | m0-foundation | mimalloc FFI (`mi_stats_merge` + `mi_stats_print_out`) when `mimalloc` feature enabled. |
+| `MEMORY PURGE` | server | 4.0.0 | done | behavioral_subset | m0-foundation | mimalloc `mi_collect(true)` when `mimalloc` feature enabled. OK otherwise. |
 | `MEMORY STATS` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `MEMORY USAGE` | server | 4.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (SAMPLES syntax accepted). |
 | `MGET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
@@ -303,7 +303,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `MODULE LOAD` | server | 4.0.0 | done | unsupported | m0-foundation | M0 module baseline implemented (unsupported in this build). |
 | `MODULE LOADEX` | server | 7.0.0 | done | unsupported | m0-foundation | M0 module baseline implemented (unsupported in this build). |
 | `MODULE UNLOAD` | server | 4.0.0 | done | unsupported | m0-foundation | M0 module baseline implemented (unsupported in this build). |
-| `MONITOR` | server | 1.0.0 | done | syntax_only | m0-foundation | M0 baseline implemented: MONITOR command accepted with standalone OK response. |
+| `MONITOR` | server | 1.0.0 | done | unsupported | m0-foundation | Returns ERR; MONITOR is not supported in this Ratatosk build. |
 | `MOVE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `MSET` | string | 1.0.1 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `MSETEX` | string | 8.4.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: numkeys KV block + NX/XX + EX/PX shared expiration, atomic all-or-nothing. |
@@ -327,7 +327,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `PING` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
 | `PSETEX` | string | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `PSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with pattern fanout and async push delivery. |
-| `PSYNC` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with stateful FULLRESYNC handshake over the current replid/offset. |
+| `PSYNC` | server | 2.8.0 | done | unsupported | m0-foundation | Returns ERR; Ratatosk runs in standalone mode. |
 | `PTTL` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `PUBLISH` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with receiver counting and server-side fanout queue. |
 | `PUBSUB` | pubsub | 2.8.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented with CHANNELS/NUMSUB/NUMPAT/HELP dispatch. |
@@ -345,7 +345,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `RENAME` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `RENAMENX` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `REPLCONF` | server | 3.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with LISTENING-PORT/CAPA/ACK/GETACK/IP-ADDRESS subset backed by per-client replica metadata. |
-| `REPLICAOF` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with standalone role transition between master and configured upstream replica. |
+| `REPLICAOF` | server | 5.0.0 | done | unsupported | m0-foundation | Returns ERR for replication targets; REPLICAOF NO ONE still accepted for standalone confirmation. |
 | `RESET` | connection | 6.2.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `RESTORE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. |
 | `RESTORE-ASKING` | server | 3.0.0 | done | behavioral_subset | m0-foundation | M0 replication-control baseline implemented as RESTORE alias behavior. |
@@ -401,7 +401,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `SINTERCARD` | set | 7.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented (numkeys/LIMIT parser + cardinality-only path). |
 | `SINTERSTORE` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
 | `SISMEMBER` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set core baseline implemented. |
-| `SLAVEOF` | server | 1.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented as REPLICAOF alias. |
+| `SLAVEOF` | server | 1.0.0 | done | unsupported | m0-foundation | REPLICAOF alias; returns ERR for replication targets, NO ONE still accepted. |
 | `SLOWLOG` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented (GET/LEN/RESET/HELP subset). |
 | `SLOWLOG GET` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |
 | `SLOWLOG HELP` | server | 6.2.0 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |

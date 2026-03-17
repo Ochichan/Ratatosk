@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+mimalloc = ["dep:libmimalloc-sys"]
+lua-scripting = ["dep:mlua"]
+
 [dependencies]
 ratatosk-core = { workspace = true }
 ratatosk-resp = { workspace = true }
@@ -17,9 +21,12 @@ itoa = { workspace = true }
 argon2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
+arc-swap = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 glob-match = { workspace = true }
 sha2 = { workspace = true }
 fs2 = { workspace = true }
 tokio = { workspace = true }
+libmimalloc-sys = { version = "0.1", optional = true }
+mlua = { workspace = true, optional = true }

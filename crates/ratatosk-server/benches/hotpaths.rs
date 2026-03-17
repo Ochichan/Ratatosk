@@ -6,7 +6,7 @@ use criterion::{
 };
 use hashbrown::{HashMap, HashSet};
 use ratatosk_engine::{
-    command::{ClientState, execute},
+    command::{ClientState, ServerAccess, execute},
     keyspace::{
         ServerState, StoredValue, StreamConsumer, StreamEntry, StreamGroup, StreamId,
         StreamPendingEntry,
@@ -28,9 +28,8 @@ fn cmd_frame(parts: Vec<Bytes>) -> RespFrame {
 }
 
 fn setup_set_state(size: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
-    let db = server.db_mut(0);
 
     let mut s1 = HashSet::with_capacity(size);
     let mut s2 = HashSet::with_capacity(size);
@@ -42,9 +41,12 @@ fn setup_set_state(size: usize) -> (ServerState, ClientState) {
         s3.insert(Bytes::from(format!("m{}", i + (size / 2))));
     }
 
-    db.insert(bs(b"s1"), StoredValue::set(s1, None));
-    db.insert(bs(b"s2"), StoredValue::set(s2, None));
-    db.insert(bs(b"s3"), StoredValue::set(s3, None));
+    {
+        let mut db = server.db_mut(0);
+        db.insert(bs(b"s1"), StoredValue::set(s1, None));
+        db.insert(bs(b"s2"), StoredValue::set(s2, None));
+        db.insert(bs(b"s3"), StoredValue::set(s3, None));
+    }
 
     (server, client)
 }
@@ -64,24 +66,12 @@ fn build_stream_entries(entry_count: usize) -> Vec<StreamEntry> {
 }
 
 fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
 
     let key = bs(b"s");
     let group_name = bs(b"g");
     let consumer_name = bs(b"c1");
-
-    server.db_mut(0).insert(
-        key.clone(),
-        StoredValue::stream(build_stream_entries(entry_count), None),
-    );
-
-    let Some(entry) = server.db_mut(0).get_mut(&key) else {
-        panic!("stream not inserted");
-    };
-    let Some(groups) = entry.as_stream_groups_mut() else {
-        panic!("not a stream");
-    };
 
     let pending_len = pending_count.min(entry_count);
     let mut consumer_pending = HashSet::with_capacity(pending_len);
@@ -121,14 +111,25 @@ fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState,
         }
     };
 
-    groups.insert(
-        group_name,
-        StreamGroup {
-            last_delivered_id,
-            consumers,
-            pending,
-        },
-    );
+    {
+        let mut db = server.db_mut(0);
+        db.insert(
+            key.clone(),
+            StoredValue::stream(build_stream_entries(entry_count), None),
+        );
+
+        let entry = db.get_mut(&key).expect("stream not inserted");
+        let groups = entry.as_stream_groups_mut().expect("not a stream");
+
+        groups.insert(
+            group_name,
+            StreamGroup {
+                last_delivered_id,
+                consumers,
+                pending,
+            },
+        );
+    }
 
     (server, client)
 }
@@ -144,7 +145,8 @@ fn bench_set_hotpaths(c: &mut Criterion) {
             b.iter_batched(
                 || setup_set_state(size),
                 |(mut server, mut client)| {
-                    let outcome = execute(sinter_frame.clone(), &mut server, &mut client);
+                    let mut access = ServerAccess::new_inline(&mut server);
+                    let outcome = execute(sinter_frame.clone(), &mut access, &mut client);
                     black_box(outcome.response);
                 },
                 BatchSize::SmallInput,
@@ -162,7 +164,8 @@ fn bench_set_hotpaths(c: &mut Criterion) {
             b.iter_batched(
                 || setup_set_state(size),
                 |(mut server, mut client)| {
-                    let outcome = execute(sinterstore_frame.clone(), &mut server, &mut client);
+                    let mut access = ServerAccess::new_inline(&mut server);
+                    let outcome = execute(sinterstore_frame.clone(), &mut access, &mut client);
                     black_box(outcome.response);
                 },
                 BatchSize::SmallInput,
@@ -182,8 +185,9 @@ fn bench_set_hotpaths(c: &mut Criterion) {
                 b.iter_batched(
                     || setup_set_state(size),
                     |(mut server, mut client)| {
+                        let mut access = ServerAccess::new_inline(&mut server);
                         let outcome =
-                            execute(srandmember_neg_frame.clone(), &mut server, &mut client);
+                            execute(srandmember_neg_frame.clone(), &mut access, &mut client);
                         black_box(outcome.response);
                     },
                     BatchSize::SmallInput,
@@ -219,7 +223,8 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 0),
                     |(mut server, mut client)| {
-                        let outcome = execute(xreadgroup_frame.clone(), &mut server, &mut client);
+                        let mut access = ServerAccess::new_inline(&mut server);
+                        let outcome = execute(xreadgroup_frame.clone(), &mut access, &mut client);
                         black_box(outcome.response);
                     },
                     BatchSize::SmallInput,
@@ -239,7 +244,8 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 512),
                     |(mut server, mut client)| {
-                        let outcome = execute(xclaim_frame.clone(), &mut server, &mut client);
+                        let mut access = ServerAccess::new_inline(&mut server);
+                        let outcome = execute(xclaim_frame.clone(), &mut access, &mut client);
                         black_box(outcome.response);
                     },
                     BatchSize::SmallInput,
@@ -264,7 +270,8 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 1024),
                     |(mut server, mut client)| {
-                        let outcome = execute(xautoclaim_frame.clone(), &mut server, &mut client);
+                        let mut access = ServerAccess::new_inline(&mut server);
+                        let outcome = execute(xautoclaim_frame.clone(), &mut access, &mut client);
                         black_box(outcome.response);
                     },
                     BatchSize::SmallInput,

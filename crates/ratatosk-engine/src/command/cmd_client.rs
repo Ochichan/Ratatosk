@@ -96,7 +96,7 @@ pub(super) fn cmd_client(
         b"TRACKINGINFO" => cmd_client_trackinginfo(&args[1..], server, client),
         b"CACHING" => cmd_client_caching(&args[1..], client),
         b"GETREDIR" => cmd_client_getredir(&args[1..], server, client),
-        b"SETINFO" => cmd_client_setinfo(&args[1..]),
+        b"SETINFO" => cmd_client_setinfo(&args[1..], client),
         b"NO-EVICT" => cmd_client_no_evict(&args[1..], client),
         b"NO-TOUCH" => cmd_client_no_touch(&args[1..], client),
         b"REPLY" => cmd_client_reply(&args[1..], client),
@@ -230,36 +230,21 @@ fn cmd_client_kill(args: &[Bytes], client: &ClientState) -> CommandOutcome {
 }
 
 fn cmd_client_pause(args: &[Bytes]) -> CommandOutcome {
-    let [timeout_raw, rest @ ..] = args else {
+    if args.is_empty() {
         return wrong_arity("client");
-    };
-
-    let Some(timeout) = parse_i64(timeout_raw) else {
-        return CommandOutcome::reply(err("ERR timeout is not an integer or out of range"));
-    };
-    if timeout < 0 {
-        return CommandOutcome::reply(err("ERR timeout is negative"));
     }
-
-    if !rest.is_empty() {
-        if rest.len() != 1 {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        }
-        let mode = to_uppercase_stack(&rest[0]);
-        if !matches!(mode.as_slice(), b"WRITE" | b"ALL") {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        }
-    }
-
-    CommandOutcome::reply(RespFrame::ok())
+    CommandOutcome::reply(err(
+        "ERR CLIENT PAUSE is not supported in this Ratatosk build",
+    ))
 }
 
 fn cmd_client_unpause(args: &[Bytes]) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("client");
     }
-
-    CommandOutcome::reply(RespFrame::ok())
+    CommandOutcome::reply(err(
+        "ERR CLIENT UNPAUSE is not supported in this Ratatosk build",
+    ))
 }
 
 fn cmd_client_unblock(args: &[Bytes], _client: &ClientState) -> CommandOutcome {
@@ -383,6 +368,9 @@ fn cmd_client_tracking(
     }
     if tracking_optin && tracking_optout {
         return CommandOutcome::reply(err("ERR OPTIN and OPTOUT are mutually exclusive"));
+    }
+    if tracking_broadcast && (tracking_optin || tracking_optout) {
+        return CommandOutcome::reply(err("ERR OPTIN and OPTOUT are not compatible with BCAST"));
     }
     if tracking_redirect >= 0
         && tracking_redirect != client.id()
@@ -512,14 +500,16 @@ fn cmd_client_getredir(
     CommandOutcome::reply(RespFrame::Integer(redirect))
 }
 
-fn cmd_client_setinfo(args: &[Bytes]) -> CommandOutcome {
-    let [field, _value] = args else {
+fn cmd_client_setinfo(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
+    let [field, value] = args else {
         return wrong_arity("client");
     };
 
     let upper = to_uppercase_stack(field);
-    if !matches!(upper.as_slice(), b"LIB-NAME" | b"LIB-VER") {
-        return CommandOutcome::reply(err("ERR syntax error"));
+    match upper.as_slice() {
+        b"LIB-NAME" => client.set_lib_name(value.clone()),
+        b"LIB-VER" => client.set_lib_ver(value.clone()),
+        _ => return CommandOutcome::reply(err("ERR syntax error")),
     }
 
     CommandOutcome::reply(RespFrame::ok())
@@ -664,7 +654,7 @@ pub(super) fn format_client_snapshot_line(snapshot: &ClientSnapshot, blocked: bo
 
     let _ = write!(
         out,
-        "id={} addr={} laddr={} fd=-1 name={} age={} idle={} flags={} db={} sub={} psub={} ssub={} multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} redir={} resp={}",
+        "id={} addr={} laddr={} fd=-1 name={} age={} idle={} flags={} db={} sub={} psub={} ssub={} multi={} qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 rbs=0 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r cmd={} user={} lib-name={} lib-ver={} redir={} resp={}",
         snapshot.id,
         String::from_utf8_lossy(&snapshot.addr),
         String::from_utf8_lossy(&snapshot.laddr),
@@ -679,6 +669,16 @@ pub(super) fn format_client_snapshot_line(snapshot: &ClientSnapshot, blocked: bo
         snapshot.multi,
         cmd,
         user,
+        snapshot
+            .lib_name
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
+        snapshot
+            .lib_ver
+            .as_ref()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .unwrap_or_default(),
         snapshot.redir,
         snapshot.resp
     );

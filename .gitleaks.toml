@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "literal-secret-in-toml"
+description = "Literal secret in config (should use env: prefix)"
+regex = '''(?i)(api_key|token|secret|password)\s*=\s*"(?!env:)[^"]{8,}"'''
+path = '''\.toml$'''
+
+[allowlist]
+paths = [
+    '''Cargo\.toml$''',
+    '''Cargo\.lock$''',
+    '''\.gitleaks\.toml$''',
+]

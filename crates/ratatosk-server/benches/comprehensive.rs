@@ -4,8 +4,8 @@ use bytes::Bytes;
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use hashbrown::HashMap;
 use ratatosk_engine::{
-    command::{ClientState, execute},
-    keyspace::{HashFieldEntry, ServerState, SortedSet, StoredValue},
+    command::{ClientState, ServerAccess, execute},
+    keyspace::{HashFieldEntry, PubSubState, ServerState, SortedSet, StoredValue},
 };
 use ratatosk_resp::RespFrame;
 
@@ -23,22 +23,24 @@ fn frame(parts: Vec<Bytes>) -> RespFrame {
 }
 
 fn setup_string_state(key_count: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
-    let db = server.db_mut(0);
 
-    for idx in 0..key_count {
-        db.insert(
-            Bytes::from(format!("k{idx}")),
-            StoredValue::string(Bytes::from(format!("v{idx}")), None),
-        );
+    {
+        let mut db = server.db_mut(0);
+        for idx in 0..key_count {
+            db.insert(
+                Bytes::from(format!("k{idx}")),
+                StoredValue::string(Bytes::from(format!("v{idx}")), None),
+            );
+        }
     }
 
     (server, client)
 }
 
 fn setup_hash_state(field_count: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
 
     let mut fields = HashMap::with_capacity(field_count);
@@ -57,7 +59,7 @@ fn setup_hash_state(field_count: usize) -> (ServerState, ClientState) {
 }
 
 fn setup_list_state(len: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
 
     let mut list = VecDeque::with_capacity(len);
@@ -73,7 +75,7 @@ fn setup_list_state(len: usize) -> (ServerState, ClientState) {
 }
 
 fn setup_zset_state(len: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
 
     let mut zset = SortedSet::default();
@@ -90,34 +92,45 @@ fn setup_zset_state(len: usize) -> (ServerState, ClientState) {
 }
 
 fn setup_scan_state(key_count: usize) -> (ServerState, ClientState) {
-    let mut server = ServerState::with_default_dbs();
+    let server = ServerState::with_default_dbs();
     let client = ClientState::default();
-    let db = server.db_mut(0);
 
-    for idx in 0..key_count {
-        let key = if idx % 2 == 0 {
-            Bytes::from(format!("scan:{idx}"))
-        } else {
-            Bytes::from(format!("other:{idx}"))
-        };
-        db.insert(key, StoredValue::string(b(b"1"), None));
+    {
+        let mut db = server.db_mut(0);
+        for idx in 0..key_count {
+            let key = if idx % 2 == 0 {
+                Bytes::from(format!("scan:{idx}"))
+            } else {
+                Bytes::from(format!("other:{idx}"))
+            };
+            db.insert(key, StoredValue::string(b(b"1"), None));
+        }
     }
 
     (server, client)
 }
 
-fn setup_pubsub_state(channels: usize) -> (ServerState, ClientState, ClientState) {
+fn setup_pubsub_state(
+    channels: usize,
+) -> (
+    ServerState,
+    ClientState,
+    ClientState,
+    tokio::sync::mpsc::Receiver<ratatosk_engine::keyspace::PubSubMessage>,
+) {
     let mut server = ServerState::with_default_dbs();
     let mut sub_client = ClientState::new(101);
     let pub_client = ClientState::new(202);
+    let rx = server.pubsub.register_client(101);
 
     let mut sub_args = vec![b(b"SUBSCRIBE")];
     for idx in 0..channels {
         sub_args.push(Bytes::from(format!("ch{idx}")));
     }
 
-    let _ = execute(frame(sub_args), &mut server, &mut sub_client);
-    (server, sub_client, pub_client)
+    let mut access = ServerAccess::new_inline(&mut server);
+    let _ = execute(frame(sub_args), &mut access, &mut sub_client);
+    (server, sub_client, pub_client, rx)
 }
 
 fn bench_connection_server(c: &mut Criterion) {
@@ -127,7 +140,8 @@ fn bench_connection_server(c: &mut Criterion) {
         let (mut server, mut client) = setup_string_state(1);
         let ping = frame(vec![b(b"PING")]);
         bench.iter(|| {
-            let outcome = execute(ping.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(ping.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -137,7 +151,8 @@ fn bench_connection_server(c: &mut Criterion) {
         let mut client = ClientState::default();
         let cmd = frame(vec![b(b"TIME")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -147,7 +162,8 @@ fn bench_connection_server(c: &mut Criterion) {
         let mut client = ClientState::default();
         let cmd = frame(vec![b(b"INFO"), b(b"SERVER")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -156,7 +172,8 @@ fn bench_connection_server(c: &mut Criterion) {
         let (mut server, mut client) = setup_string_state(8192);
         let cmd = frame(vec![b(b"DBSIZE")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -172,7 +189,8 @@ fn bench_string_hash(c: &mut Criterion) {
         let (mut server, mut client) = setup_string_state(8192);
         let get = frame(vec![b(b"GET"), Bytes::from("k4096")]);
         bench.iter(|| {
-            let outcome = execute(get.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(get.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -181,7 +199,8 @@ fn bench_string_hash(c: &mut Criterion) {
         let (mut server, mut client) = setup_string_state(1);
         let set = frame(vec![b(b"SET"), b(b"k0"), b(b"updated")]);
         bench.iter(|| {
-            let outcome = execute(set.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(set.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -194,7 +213,8 @@ fn bench_string_hash(c: &mut Criterion) {
         }
         let mget = frame(args);
         bench.iter(|| {
-            let outcome = execute(mget.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(mget.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -204,7 +224,8 @@ fn bench_string_hash(c: &mut Criterion) {
         let (mut server, mut client) = setup_hash_state(4096);
         let hget = frame(vec![b(b"HGET"), b(b"h"), Bytes::from("f2048")]);
         bench.iter(|| {
-            let outcome = execute(hget.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(hget.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -217,7 +238,8 @@ fn bench_string_hash(c: &mut Criterion) {
         }
         let hmget = frame(args);
         bench.iter(|| {
-            let outcome = execute(hmget.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(hmget.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -226,7 +248,8 @@ fn bench_string_hash(c: &mut Criterion) {
         let (mut server, mut client) = setup_hash_state(512);
         let hgetall = frame(vec![b(b"HGETALL"), b(b"h")]);
         bench.iter(|| {
-            let outcome = execute(hgetall.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(hgetall.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -242,7 +265,8 @@ fn bench_list_zset(c: &mut Criterion) {
         let (mut server, mut client) = setup_list_state(8192);
         let cmd = frame(vec![b(b"LRANGE"), b(b"l"), b(b"0"), b(b"99")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -251,7 +275,8 @@ fn bench_list_zset(c: &mut Criterion) {
         let (mut server, mut client) = setup_list_state(8192);
         let cmd = frame(vec![b(b"LINDEX"), b(b"l"), b(b"4096")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -260,7 +285,8 @@ fn bench_list_zset(c: &mut Criterion) {
         let (mut server, mut client) = setup_zset_state(8192);
         let cmd = frame(vec![b(b"ZRANGE"), b(b"z"), b(b"0"), b(b"99")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -269,7 +295,8 @@ fn bench_list_zset(c: &mut Criterion) {
         let (mut server, mut client) = setup_zset_state(8192);
         let cmd = frame(vec![b(b"ZSCORE"), b(b"z"), Bytes::from("m4096")]);
         bench.iter(|| {
-            let outcome = execute(cmd.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(cmd.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -292,7 +319,8 @@ fn bench_key_scan_pubsub(c: &mut Criterion) {
             b(b"100"),
         ]);
         bench.iter(|| {
-            let outcome = execute(scan.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(scan.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
@@ -308,32 +336,34 @@ fn bench_key_scan_pubsub(c: &mut Criterion) {
         }
         let exists = frame(args);
         bench.iter(|| {
-            let outcome = execute(exists.clone(), &mut server, &mut client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(exists.clone(), &mut access, &mut client);
             black_box(outcome.response);
         });
     });
 
     group.bench_function("publish_1sub", |bench| {
-        let (mut server, sub_client, mut pub_client) = setup_pubsub_state(1);
-        let sub_id = sub_client.id();
+        let (mut server, _sub_client, mut pub_client, mut rx) = setup_pubsub_state(1);
         let publish = frame(vec![b(b"PUBLISH"), b(b"ch0"), b(b"payload")]);
         bench.iter(|| {
-            let outcome = execute(publish.clone(), &mut server, &mut pub_client);
-            let drained = server.pubsub.drain_messages(sub_id);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(publish.clone(), &mut access, &mut pub_client);
+            let drained = PubSubState::drain_rx(&mut rx);
             black_box(drained.len());
             black_box(outcome.response);
         });
     });
 
     group.bench_function("pubsub_numsub_16", |bench| {
-        let (mut server, _sub_client, mut pubsub_client) = setup_pubsub_state(16);
+        let (mut server, _sub_client, mut pubsub_client, _rx) = setup_pubsub_state(16);
         let mut args = vec![b(b"PUBSUB"), b(b"NUMSUB")];
         for idx in 0..16 {
             args.push(Bytes::from(format!("ch{idx}")));
         }
         let numsub = frame(args);
         bench.iter(|| {
-            let outcome = execute(numsub.clone(), &mut server, &mut pubsub_client);
+            let mut access = ServerAccess::new_inline(&mut server);
+            let outcome = execute(numsub.clone(), &mut access, &mut pubsub_client);
             black_box(outcome.response);
         });
     });

@@ -1,6 +1,6 @@
 # Redis Gap Analysis
 
-기준일: 2026-03-13
+기준일: 2026-03-16 (updated with ecosystem hardening changes)
 
 이 문서는 현재 Ratatosk 코드베이스와 Redis 공식 문서를 대조해, "명령 이름이 존재하는가"가 아니라 "Redis가 약속하는 동작 계약과 운영 모델을 얼마나 실제로 충족하는가"를 정리한다.
 
@@ -27,10 +27,10 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 하지만 Redis를 실제 운영에 투입할 때 중요한 다음 축에서는 아직 큰 갭이 있다.
 
 1. 복제, Sentinel, Cluster가 "시스템"으로 존재하지 않는다.
-2. Lua scripting / Functions가 사실상 비어 있다.
-3. blocking command, client-side caching, Pub/Sub delivery가 Redis 내부 모델과 다르다.
+2. Lua scripting은 feature-gated로 구현됐지만 (`lua-scripting`), Redis Functions는 아직 비어 있다.
+3. blocking command, client-side caching이 Redis 내부 모델과 다르다. Pub/Sub delivery는 mpsc push로 개선됨.
 4. persistence background work가 Redis의 fork/COW, multipart AOF 모델과 다르다.
-5. runtime이 전역 `Mutex<ServerState>` 직렬화에 의존해 확장성과 tail latency 특성이 다르다.
+5. `SharedState`로 lock-free fast path를 분리하고, DB 접근은 per-DB `parking_lot::RwLock`으로 분리했다. Meta-state(pubsub, ACL 등)는 여전히 `Mutex<ServerState>`에 의존하지만, 서로 다른 DB에 대한 명령은 병렬 실행 가능하다.
 6. 여러 server/client/admin 명령이 실제 동작보다 "syntax-compatible shell"에 가깝다.
 
 현재 ledger tier summary:
@@ -58,7 +58,7 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 - `crates/ratatosk-engine/src/keyspace.rs`
 - `crates/ratatosk-server/src/client.rs`
 - `crates/ratatosk-server/src/event_loop.rs`
-- `crates/ratatosk-server/src/persistence.rs`
+- `crates/ratatosk-server/src/persistence/`
 - `crates/ratatosk-persist/src/aof/manifest.rs`
 
 외부 근거는 Redis 공식 문서를 사용했다.
@@ -84,11 +84,11 @@ Redis 공식 문서는 replication을 비동기 복제와 partial resynchronizat
 
 현재 코드:
 
-- `MONITOR`는 여전히 그냥 `OK`를 반환한다: `crates/ratatosk-engine/src/command/cmd_server.rs`
+- `MONITOR`는 ERR를 반환한다 (`ERR MONITOR is not supported in this Ratatosk build`): `crates/ratatosk-engine/src/command/cmd_server.rs`
 - `ROLE`은 이제 master/replica 모드, logical replication offset, 등록된 replica 목록을 반영한다: `crates/ratatosk-engine/src/command/cmd_server.rs`
 - `REPLCONF`는 LISTENING-PORT/CAPA/IP-ADDRESS/ACK/GETACK를 per-client replica metadata에 연결한다: `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `PSYNC`는 현재 replid/offset 기준 `FULLRESYNC` 응답과 replica handshake 완료 표시를 남긴다: `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `REPLICAOF`/`SLAVEOF NO ONE`는 standalone role transition을 남긴다: `crates/ratatosk-engine/src/command/cmd_server.rs`
+- `PSYNC`는 ERR를 반환한다 (standalone mode): `crates/ratatosk-engine/src/command/cmd_server.rs`
+- `REPLICAOF`/`SLAVEOF`는 `NO ONE` 이외의 인자에 대해 ERR를 반환한다. `NO ONE`은 여전히 수용된다: `crates/ratatosk-engine/src/command/cmd_server.rs`
 - `WAIT`/`WAITAOF`는 tracked replica ACK offset과 local AOF health를 즉시 반영하지만, 여전히 timeout 동안 ACK를 기다리는 blocking semantics는 없다: `crates/ratatosk-engine/src/command/cmd_generic.rs`
 
 실제 영향:
@@ -140,34 +140,40 @@ Redis 공식 문서에서 Sentinel은 분산 감시/쿼럼/자동 failover 시�
 
 Migration cost: high
 
-### 3. Scripting / Functions가 생태계 수준으로 비어 있다
+### 3. Lua Scripting은 feature-gated로 구현됐지만, Functions는 아직 비어 있다
 
-Redis 공식 문서는 `EVAL`의 atomic execution과 Lua integration을, Functions 문서는 library lifecycle과 server-side programmability를 전제로 한다. Ratatosk는 `SCRIPT LOAD/EXISTS/FLUSH` 수준의 캐시 조작만 있고, 실제 실행 엔진이 없다.
+Redis 공식 문서는 `EVAL`의 atomic execution과 Lua integration을, Functions 문서는 library lifecycle과 server-side programmability를 전제로 한다.
 
-현재 코드:
+**Lua 5.1 scripting** (`lua-scripting` feature gate):
 
-- `EVAL`은 바로 unsupported 에러를 낸다: `crates/ratatosk-engine/src/command/cmd_script.rs:13-18`
-- `EVALSHA`는 `NOSCRIPT`만 반환한다: `crates/ratatosk-engine/src/command/cmd_script.rs:20-25`
-- `SCRIPT LOAD/EXISTS/FLUSH`는 SHA 캐시 조작만 한다: `crates/ratatosk-engine/src/command/cmd_script.rs:39-120`
+- `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO` — Lua 5.1 VM에서 실행. `redis.call()` / `redis.pcall()`로 내부 `execute()`에 bridge.
+- `SCRIPT LOAD/EXISTS/FLUSH` — SHA1 캐시 관리.
+- Sandbox: TABLE+STRING+MATH+OS+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한.
+- Nested EVAL/EVALSHA 거부. Type conversion은 Redis 규약 준수 (true->1, false->nil, table->Array, number->Integer).
+- 구현: `crates/ratatosk-engine/src/command/lua_runtime.rs` (thread-local Lua VM, mlua 기반)
+
+**Redis Functions는 아직 비어 있다:**
+
 - `FCALL`은 항상 function not found: `crates/ratatosk-engine/src/command/cmd_script.rs:149-158`
 - `FUNCTION LOAD/DELETE/RESTORE`는 unsupported, `LIST`는 빈 배열, `DUMP`는 null, `STATS`는 빈 엔진 목록이다: `crates/ratatosk-engine/src/command/cmd_script.rs:160-260`
 
 실제 영향:
 
-- Redis에서 흔한 Lua-based atomic business logic, custom compare-and-set, rate limiting, migration scripts를 그대로 옮길 수 없다.
-- Redis Functions를 사용하는 최신 Redis 배포 패턴과는 호환되지 않는다.
+- `lua-scripting` feature 활성화 시, Redis에서 흔한 Lua-based atomic business logic, compare-and-set, rate limiting 스크립트를 그대로 옮길 수 있다.
+- Redis Functions를 사용하는 최신 Redis 배포 패턴과는 여전히 호환되지 않는다.
+- feature 미활성화 시 `EVAL`은 unsupported 에러를 반환한다.
 
 미래 파손 시나리오:
 
-- 애플리케이션이 `EVALSHA`를 정상적인 hot path로 쓰면 Ratatosk는 성공 경로가 아예 없다.
-- 운영자가 Redis Functions로 배포한 서버측 로직을 Ratatosk에선 재현할 수 없다.
+- Functions (`FCALL`) 기반 서버측 로직을 Ratatosk에선 재현할 수 없다.
+- Lua scripting feature가 비활성화된 빌드에서 `EVALSHA` hot path는 여전히 실패한다.
 
 권장 순서:
 
-1. Lua engine을 실제로 넣을지
-2. 아니면 scripting/function 계열을 명시적으로 "not supported" 범주로 재분류할지
+1. ~~Lua engine을 실제로 넣을지~~ → 완료 (`lua-scripting` feature gate)
+2. Redis Functions를 구현할지, 명시적으로 "not supported"로 유지할지 결정
 
-Migration cost: high
+Migration cost: medium (Lua scripting 해결, Functions 미해결)
 
 ### 4. Blocking command는 blocked wait registry를 갖췄지만 Redis scheduler parity에는 아직 못 미친다
 
@@ -205,12 +211,12 @@ Redis persistence 문서는 RDB background save와 AOF rewrite가 copy-on-write/
 
 현재 코드:
 
-- `snapshot_dbs()`는 전체 DB를 그대로 clone한다: `crates/ratatosk-engine/src/keyspace.rs:1965-1967`
-- `BGSAVE` 시작 시 global lock 안에서 snapshot clone을 만든다: `crates/ratatosk-server/src/persistence.rs:511-519`
-- synchronous `SAVE`도 동일하게 clone 기반이다: `crates/ratatosk-server/src/persistence.rs:679-686`
-- runtime은 legacy single-file 경로를 compatibility fallback으로 유지하지만, appendonly bootstrap은 manifest를 우선 사용한다: `crates/ratatosk-server/src/persistence.rs`
-- `BGREWRITEAOF`는 여전히 기존 AOF를 읽어서 `SELECT`를 건너뛰고 동일 command stream을 다시 append한다: `crates/ratatosk-server/src/persistence.rs`
-- `AofManifest`는 save/load, bootstrap, startup recovery baseline에 더해 manifest-backed rewrite 후 새 incr 회전과 manifest commit baseline까지 runtime 경로에 연결됐다. 다만 BASE file materialization과 full atomic switch transaction은 아직 없다: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/switch.rs`, `crates/ratatosk-server/src/persistence.rs`
+- `DataState::snapshot_all()`은 per-DB read lock을 순차적으로 잡아 각 DB를 clone한다 (global lock이 아닌 per-DB `parking_lot::RwLock` 사용): `crates/ratatosk-engine/src/keyspace.rs`
+- `BGSAVE` 시작 시 per-DB read lock을 순차적으로 잡아 snapshot clone을 만든다 (전체 DB를 한 번에 잠그지 않음): `crates/ratatosk-server/src/persistence/`
+- synchronous `SAVE`도 동일하게 clone 기반이다: `crates/ratatosk-server/src/persistence/:679-686`
+- runtime은 legacy single-file 경로를 compatibility fallback으로 유지하지만, appendonly bootstrap은 manifest를 우선 사용한다: `crates/ratatosk-server/src/persistence/`
+- `BGREWRITEAOF`는 여전히 기존 AOF를 읽어서 `SELECT`를 건너뛰고 동일 command stream을 다시 append한다: `crates/ratatosk-server/src/persistence/`
+- `AofManifest`는 save/load, bootstrap, startup recovery baseline에 더해 manifest-backed rewrite 후 새 incr 회전과 manifest commit baseline까지 runtime 경로에 연결됐다. 다만 BASE file materialization과 full atomic switch transaction은 아직 없다: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/switch.rs`, `crates/ratatosk-server/src/persistence/`
 
 실제 영향:
 
@@ -234,20 +240,21 @@ Migration cost: high
 
 ### 6. Runtime concurrency 모델이 Redis와도 다르고, 멀티코어 확장 모델과도 다르다
 
-Ratatosk는 per-client tokio task를 띄우지만, 실제 명령 실행은 전역 `Arc<Mutex<ServerState>>` 하나를 잠그고 진행한다. Redis의 전통적인 장점은 단일 event loop 위에서 명확한 순서를 유지하는 데 있고, 최근 버전은 I/O thread 등 경계를 명확히 둔다. Ratatosk는 그 중간 형태라서 장점보다 락 기반 병목이 먼저 드러날 가능성이 높다.
+Ratatosk는 per-client tokio task를 띄우지만, 실제 명령 실행은 `SharedState` 내부의 `Mutex<ServerState>`를 잠그고 진행한다. `SharedState`가 `AtomicStatsState`, `ArcSwap<ConfigState>`, atomic `next_client_id`를 lock-free로 분리하여 요청당 ~9회의 lock 획득을 제거했지만, state mutation 자체는 여전히 단일 mutex 기반이다. Redis의 전통적인 장점은 단일 event loop 위에서 명확한 순서를 유지하는 데 있고, 최근 버전은 I/O thread 등 경계를 명확히 둔다. Ratatosk는 그 중간 형태라서 lock-free fast path 개선에도 불구하고 state mutation 병목은 남아 있다.
 
 현재 코드:
 
-- shared state type alias: `Arc<Mutex<ServerState>>`: `crates/ratatosk-server/src/client.rs:40`
-- 일반 명령 실행 직전마다 전역 락을 잡는다: `crates/ratatosk-server/src/client.rs:300-317`
-- blocking 재시도도 동일한 락을 반복 획득한다: `crates/ratatosk-server/src/client.rs:404-452`
-- accept loop는 클라이언트별 task를 무제한 생성하는 구조다: `crates/ratatosk-server/src/event_loop.rs:281-520`
-- `IoThreadPool`은 placeholder다: `crates/ratatosk-server/src/io_thread.rs:1-8`
+- shared state: `SharedState` (내부 `Mutex<ServerState>` + lock-free components): `crates/ratatosk-server/src/client.rs`
+- 일반 명령 실행 직전마다 내부 Mutex를 잡는다: `crates/ratatosk-server/src/client.rs`
+- stats 갱신, config 읽기, client id 할당은 lock-free 경로로 분리됨
+- Pub/Sub delivery는 per-subscriber mpsc channel로 Mutex 밖에서 수행됨
+- accept loop는 클라이언트별 task를 무제한 생성하는 구조다: `crates/ratatosk-server/src/event_loop.rs`
+- `IoThreadPool`은 placeholder다: `crates/ratatosk-server/src/io_thread.rs`
 
 실제 영향:
 
-- 읽기/쓰기 혼합 부하에서 task 수는 늘어나지만 state execution은 하나의 락으로 수렴한다.
-- blocked command polling, Pub/Sub polling, cron, persistence bookkeeping이 모두 같은 상태 경계에 몰린다.
+- lock-free fast path (stats, config, client id, pub/sub delivery)로 경합이 줄었지만, state mutation은 하나의 lock으로 수렴한다.
+- ~~blocked command polling, Pub/Sub polling~~ → Pub/Sub는 mpsc push로 전환됨. cron, persistence bookkeeping은 같은 상태 경계에 남아 있다.
 - "async 서버인데 실제 state path는 serial mutex"라는 형태 때문에 성능 분석과 최적화가 더 어렵다.
 
 미래 파손 시나리오:
@@ -296,10 +303,10 @@ Fix:
 
 현재 코드:
 
-- `CLIENT PAUSE` / `UNPAUSE`는 실제 dispatch에 영향 없이 `OK`: `crates/ratatosk-engine/src/command/cmd_client.rs:212-243`
+- `CLIENT PAUSE` / `UNPAUSE`는 ERR를 반환한다: `crates/ratatosk-engine/src/command/cmd_client.rs:212-243`
 - `CLIENT UNBLOCK`은 항상 `0`: `crates/ratatosk-engine/src/command/cmd_client.rs:245-266`
-- `CLIENT SETINFO`는 검증 후 `OK`: `crates/ratatosk-engine/src/command/cmd_client.rs:367-378`
-- `CLIENT REPLY`는 field만 바꾸고 사용처가 없다: `crates/ratatosk-engine/src/command/cmd_client.rs:402-417`
+- `CLIENT SETINFO`는 `lib-name`/`lib-ver`를 `ClientState`에 저장하고, `CLIENT LIST` 출력에 반영한다: `crates/ratatosk-engine/src/command/cmd_client.rs:367-378`
+- `CLIENT REPLY`는 I/O loop에서 실제 적용된다. `off`는 응답을 억제하고, `skip`은 다음 응답 하나를 억제하며, push notification은 영향받지 않는다: `crates/ratatosk-engine/src/command/cmd_client.rs:402-417`
 
 영향:
 
@@ -326,45 +333,51 @@ Fix:
 
 - 남은 작업: Redis가 노출하는 전체 client metadata와 pause/unblock/kill semantics를 registry에 연결할 것
 
-### 4. Pub/Sub는 pending queue polling 기반이며 subscribed-state 제약도 약하다
+### 4. Pub/Sub는 mpsc push delivery로 전환됐지만 subscribed-state 제약은 아직 약하다
 
 현재 코드:
 
-- server는 client별 pending queue를 유지하고 4096개에서 overflow 처리한다: `crates/ratatosk-engine/src/keyspace.rs:632-875`
-- subscribed client는 20ms polling으로 pending queue를 확인한다: `crates/ratatosk-server/src/client.rs:29`, `:710-753`, `:867-890`
-- subscription 상태여도 일반 command pipeline이 계속 동작한다: `crates/ratatosk-server/src/client.rs:786-834`
+- ~~pending queue polling~~ → per-subscriber `tokio::sync::mpsc::channel` 기반 push delivery로 전환 완료.
+- `register_client()`가 `mpsc::Receiver<PubSubMessage>`를 반환. channel capacity = hard_limit.
+- `publish()`는 `try_send()` 사용. channel full 시 overflow → disconnect.
+- client loop는 `WaitResult` enum (`PubSubMsg | PubSubClosed | MonitorWake | NetworkRead`)으로 통합.
+- monitor notifications는 별도 `Arc<Notify>` 경로 (`register_monitor_notifier()`).
+- 제거: `drain_messages()`, `take_overflowed_client()`, `client_notifiers` HashMap, `soft_limit_exceeded_at`.
+- subscription 상태여도 일반 command pipeline이 계속 동작한다: `crates/ratatosk-server/src/client.rs`
 
 영향:
 
-- Redis의 push-heavy event loop delivery보다 coarse하다.
+- ~~Redis의 push-heavy event loop delivery보다 coarse하다~~ → mpsc push delivery로 Redis의 push 모델에 근접.
 - subscribed-state에서 허용 명령 집합 차이로 일부 클라이언트 가정이 깨질 수 있다.
 
 Fix:
 
-- subscribed client state와 allowed command subset을 명시화하고, 가능하면 wakeup 기반 delivery로 바꿀 것
+- subscribed client state와 allowed command subset을 명시화할 것
 
 ### 5. MONITOR, MEMORY, LATENCY 일부 응답은 baseline diagnostics다
 
 현재 코드:
 
-- `MONITOR`는 단순 `OK`: `crates/ratatosk-engine/src/command/cmd_server.rs:106-112`
-- `LATENCY DOCTOR/GRAPH/HISTOGRAM`은 coarse summary다: `crates/ratatosk-engine/src/command/cmd_server.rs:233-368`
-- `MEMORY DOCTOR/MALLOC-STATS/PURGE`는 baseline text 또는 `OK`를 돌려준다: `crates/ratatosk-engine/src/command/cmd_server.rs:929-951`
+- `MONITOR`는 ERR를 반환한다 (`ERR MONITOR is not supported in this Ratatosk build`): `crates/ratatosk-engine/src/command/cmd_server.rs:106-112`
+- `LATENCY GRAPH`는 16행 ASCII art를 출력하며 normalized min-max scaling을 적용한다. `LATENCY DOCTOR`는 이벤트별 median/avg/min/max 통계를 출력한다. `LATENCY HISTOGRAM`은 coarse summary다: `crates/ratatosk-engine/src/command/cmd_server.rs:233-368`
+- `MEMORY DOCTOR`: 실제 진단 구현 완료. 빈 인스턴스 감지, dataset 대비 overhead 비율 분석. 정상 시 `"Sam, I have no memory problems"`, 문제 시 항목별 진단 보고.
+- `MEMORY MALLOC-STATS`: `#[cfg(feature = "mimalloc")]` 활성화 시 `mi_stats_merge()` + `mi_stats_print_out()` FFI로 mimalloc 통계 출력. 미활성화 시 allocator 정보 메시지 반환.
+- `MEMORY PURGE`: `#[cfg(feature = "mimalloc")]` 활성화 시 `mi_collect(true)`로 적극적 메모리 회수. 미활성화 시 OK 반환.
 
 영향:
 
-- 운영자가 Redis 수준의 introspection을 기대하면 과신하기 쉽다.
+- mimalloc feature 미활성화 시 MALLOC-STATS는 여전히 제한적 정보만 반환한다.
 
 Fix:
 
-- 진짜 지표를 채우거나, 최소한 help/ledger/status에서 baseline semantics를 더 강하게 표기할 것
+- ~~진짜 지표를 채우거나, 최소한 help/ledger/status에서 baseline semantics를 더 강하게 표기할 것~~ → DOCTOR/PURGE 구현 완료. MALLOC-STATS는 mimalloc feature 의존.
 
 ## Dependency Graph Issues
 
 ### 1. `ratatosk-persist`의 multipart AOF abstraction이 runtime 전체 lifecycle을 아직 소유하지 못한다
 
 - 문제: `AofManifest` save/load, startup recovery, rewrite 후 incr rotation/manifest commit baseline은 올라왔지만, BASE materialization과 full atomic switch transaction은 아직 `ratatosk-server` orchestration과 기존 single-file rewrite 모델에 묶여 있다.
-- 증거: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/rewrite.rs`, `crates/ratatosk-server/src/persistence.rs`
+- 증거: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/rewrite.rs`, `crates/ratatosk-server/src/persistence/`
 - 영향: Redis 7+ persistence evolution을 따라갈 때 crate 경계가 다시 흐려지고, multipart 운영 규칙이 runtime 정책과 섞인다.
 - fix: rewrite lifecycle과 file rotation 정책을 `ratatosk-persist` 쪽으로 더 끌어내릴 것
 
@@ -381,18 +394,18 @@ P0:
 
 - Replication / PSYNC / ROLE / WAIT / WAITAOF를 실제 semantics로 만들지 않으면, Redis replacement로 포지셔닝하기 어렵다.
 - Cluster / Sentinel은 help text보다 실제 subsystem 유무가 중요하므로, 제품 범위를 먼저 결정해야 한다.
-- Scripting / Functions 부재는 많은 실사용 Redis 워크로드를 바로 막는다.
+- ~~Scripting / Functions 부재는 많은 실사용 Redis 워크로드를 바로 막는다~~ → Lua scripting은 `lua-scripting` feature gate로 해결. Redis Functions는 아직 미구현.
 
 P1:
 
-- Blocking commands를 waiter model로 전환
+- ~~Blocking commands를 waiter model로 전환~~ → 완료
 - client-side caching invalidation을 redirect wakeup까지 확장
 - persistence rewrite를 current-state compaction 모델로 재설계
 
 P2:
 
 - CLIENT LIST/INFO 실상화
-- Pub/Sub delivery path 개선
+- ~~Pub/Sub delivery path 개선~~ → 완료 (mpsc push delivery)
 - MONITOR/MEMORY/LATENCY 운영 진단 개선
 
 ## Suggested Refactoring Sequence
@@ -607,7 +620,7 @@ Phase A6. unsupported combination matrix와 에러 계약
 Phase B0. 아키텍처 결정 기록
 
 1. `ratatosk-server`는 orchestration만 맡고, 파일 포맷/manifest/rewrite lifecycle은 `ratatosk-persist`가 소유한다는 원칙을 문서화한다.
-2. snapshot source는 "global clone"에서 "iterable consistent view"로 옮기는 것을 목표로 명시한다.
+2. snapshot source는 "global clone"에서 "iterable consistent view"로 옮기는 것을 목표로 명시한다. (Phase 0d + R-P1 완료: per-DB `parking_lot::RwLock` 도입으로 snapshot clone 비용이 per-DB로 분산됐다. 단일 global lock hold가 아니라 DB별 순차 read-lock + clone으로 바뀌어 lock 점유 시간이 분산된다. 남은 Phase B 작업은 clone 자체를 제거하는 방향이다.)
 3. AOF는 "기존 로그 재기록"이 아니라 "현재 상태 materialization + incremental tail" 모델로 바꾸겠다고 선언한다.
 
 성공 기준:
@@ -629,7 +642,7 @@ Phase B1. persistence 경계 분리
 
 대상 파일:
 
-- `crates/ratatosk-server/src/persistence.rs`
+- `crates/ratatosk-server/src/persistence/`
 - `crates/ratatosk-persist/src/aof/manifest.rs`
 - `crates/ratatosk-persist/src/aof/rewrite.rs`
 - `crates/ratatosk-persist/src/aof/materialize.rs` (신규 제안)
@@ -642,9 +655,11 @@ Phase B1. persistence 경계 분리
 
 Phase B2. snapshot 비용 모델 교체
 
-1. `snapshot_dbs()` 전체 clone 호출 지점을 조사해 read-only serialization view로 대체 가능한 경로부터 옮긴다.
+참고: per-DB `parking_lot::RwLock` 도입(Phase 0d + R-P1 완료)으로 snapshot clone 비용이 이미 per-DB로 분산됐다. `DataState::snapshot_all()`은 DB별 순차 read-lock + clone을 수행하므로, 단일 global lock에서 전체 dataset을 clone하던 이전 모델 대비 lock 점유가 amortize된다. 이 Phase의 남은 작업은 clone 자체를 제거하고 iterable view로 전환하는 것이다.
+
+1. `snapshot_all()` 및 기존 snapshot clone 호출 지점을 조사해 read-only serialization view로 대체 가능한 경로부터 옮긴다.
 2. DB 단위 또는 key chunk 단위 iterator를 만들고, background writer가 chunk를 순차 소비하게 만든다.
-3. 긴 작업 동안 global lock 점유 시간을 측정하고 상한을 문서화한다.
+3. 긴 작업 동안 per-DB lock 점유 시간을 측정하고 상한을 문서화한다.
 4. 실패 시점 중간 산출물 정리 정책을 넣는다.
 5. 권장 인터페이스:
    - engine 쪽: `SnapshotCursor` 또는 `IterableSnapshotView`
@@ -777,4 +792,4 @@ Phase B5. 운영/관측/테스트 정비
 - Redis command vocabulary: 넓음
 - Redis operational/distributed semantics: 아직 큰 갭
 
-따라서 다음 단계의 핵심은 새 명령을 더 채우는 것이 아니라, 이미 표면상 존재하는 명령들 중 replication, cluster, Sentinel, scripting, blocking, client tracking처럼 시스템 성격이 강한 영역을 실제 subsystem으로 승격하는 일이다.
+따라서 다음 단계의 핵심은 새 명령을 더 채우는 것이 아니라, 이미 표면상 존재하는 명령들 중 replication, cluster, Sentinel, Redis Functions처럼 시스템 성격이 강한 영역을 실제 subsystem으로 승격하는 일이다. Lua scripting, Pub/Sub push delivery, SharedState lock-free fast path는 이미 해결됐다.

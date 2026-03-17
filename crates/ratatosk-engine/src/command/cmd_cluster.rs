@@ -28,6 +28,11 @@ pub(super) fn cmd_cluster(
         b"COUNTKEYSINSLOT" => cluster_countkeysinslot(&args[1..], server, client),
         b"GETKEYSINSLOT" => cluster_getkeysinslot(&args[1..], server, client),
         b"HELP" => cluster_help(),
+        b"SLOTS" => cluster_slots(),
+        b"SHARDS" => cluster_shards(),
+        b"NODES" => cluster_nodes(),
+        b"REPLICAS" | b"SLAVES" => cluster_replicas(),
+        b"LINKS" => cluster_links(),
         _ => cluster_stub(),
     }
 }
@@ -89,8 +94,8 @@ fn cluster_countkeysinslot(
 
     let target_slot = slot_num as u16;
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    crate::keyspace::purge_expired_keys(db, now);
+    let mut db = server.db_mut(client.selected_db);
+    crate::keyspace::purge_expired_keys(&mut db, now);
 
     let count = db
         .iter()
@@ -128,8 +133,8 @@ fn cluster_getkeysinslot(
     let target_slot = slot_num as u16;
     let limit = max_count as usize;
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    crate::keyspace::purge_expired_keys(db, now);
+    let mut db = server.db_mut(client.selected_db);
+    crate::keyspace::purge_expired_keys(&mut db, now);
 
     let keys: Vec<RespFrame> = db
         .iter()
@@ -248,9 +253,36 @@ fn cluster_help() -> CommandOutcome {
     CommandOutcome::reply(RespFrame::Array(lines))
 }
 
+fn cluster_slots() -> CommandOutcome {
+    // Single-node mode: return empty slot mapping (no cluster slots assigned)
+    CommandOutcome::reply(RespFrame::Array(vec![]))
+}
+
+fn cluster_shards() -> CommandOutcome {
+    // Single-node mode: return empty shard mapping
+    CommandOutcome::reply(RespFrame::Array(vec![]))
+}
+
+fn cluster_nodes() -> CommandOutcome {
+    CommandOutcome::reply(err(
+        "ERR Ratatosk is running in single-node mode; CLUSTER NODES is not available. See CLUSTER INFO for current status.",
+    ))
+}
+
+fn cluster_replicas() -> CommandOutcome {
+    CommandOutcome::reply(err(
+        "ERR Ratatosk is running in single-node mode; no replicas are configured.",
+    ))
+}
+
+fn cluster_links() -> CommandOutcome {
+    // Single-node mode: no cluster bus links
+    CommandOutcome::reply(RespFrame::Array(vec![]))
+}
+
 fn cluster_stub() -> CommandOutcome {
     CommandOutcome::reply(err(
-        "ERR This instance has cluster support disabled. Check the 'cluster-enabled' configuration directive.",
+        "ERR Ratatosk is running in single-node mode; this cluster subcommand is not available. Use CLUSTER INFO or CLUSTER HELP.",
     ))
 }
 

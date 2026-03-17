@@ -562,8 +562,8 @@ pub(super) fn cmd_geoadd(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     // Ensure sorted set exists or create one
     if let Some(entry) = db.get(key) {
@@ -645,8 +645,8 @@ pub(super) fn cmd_geopos(
     let members = &args[1..];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(
@@ -706,8 +706,8 @@ pub(super) fn cmd_geodist(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -748,8 +748,8 @@ pub(super) fn cmd_geohash(
     let members = &args[1..];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(
@@ -804,8 +804,8 @@ pub(super) fn cmd_geosearch(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -852,9 +852,9 @@ pub(super) fn cmd_geosearchstore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, src_key, now);
-    purge_expired_key(db, dest_key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, src_key, now);
+    purge_expired_key(&mut db, dest_key, now);
 
     let Some(entry) = db.get(src_key) else {
         // Source does not exist: remove dest if exists and return 0
@@ -999,8 +999,8 @@ pub(super) fn cmd_georadius(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         if let Some(sk) = &store_key {
@@ -1183,8 +1183,8 @@ pub(super) fn cmd_georadiusbymember(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         if let Some(sk) = &store_key {

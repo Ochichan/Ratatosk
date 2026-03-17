@@ -1,9 +1,20 @@
 # Persistence
 
 Ratatosk의 데이터 영속성 시스템.
-`ratatosk-persist` 크레이트가 RDB 스냅샷과 AOF 로그를 담당한다.
+`ratatosk-persist` 크레이트가 RDB 스냅샷과 AOF 로그의 format/codec을 담당하고,
+`ratatosk-server/src/persistence/` 모듈이 runtime orchestration을 담당한다.
 
-기준: 2026-02-11 코드 상태.
+### 모듈 구조
+
+```
+crates/ratatosk-server/src/persistence/
+├── mod.rs   — PersistenceRuntime, from_config, load_startup_data, pub API re-exports
+├── rdb.rs   — run_save (synchronous RDB snapshot)
+├── aof.rs   — AofWorkerCommand, spawn_aof_worker, append/flush/rewrite, manifest, startup replay
+└── util.rs  — check_disk_space, validate_working_directory, env_truthy
+```
+
+기준: 2026-03-16 코드 상태.
 
 ## 개요
 
@@ -215,6 +226,8 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 
 AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 AOF에서 복구된다.
 
+참고: Pub/Sub delivery는 per-subscriber `mpsc::channel` 기반 push 방식이므로 AOF에 기록되지 않는다. AOF는 state-mutating 명령만 기록하며, Pub/Sub 메시지와 client tracking invalidation은 휘발성 delivery 경로로 처리된다.
+
 ---
 
 ## 에러 타입
@@ -248,14 +261,15 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 합계: 30개 테스트.
 
 ---
-## 운영 상태 (2026-02-13)
+## 운영 상태 (2026-03-16)
 
 | 항목 | 상태 | 설명 |
 |------|------|------|
-| Background RDB save | 구현 | `BGSAVE`가 백그라운드 태스크로 실행되고 shutdown 시 drain된다. |
+| Background RDB save | 구현 | `BGSAVE`가 백그라운드 태스크로 실행되고 shutdown 시 drain된다. snapshot은 per-DB 순차 read-lock + clone으로 수행 (`DataState::snapshot_all()`). |
 | AOF rewrite (`BGREWRITEAOF`) | 구현 | AOF 워커에서 rewrite를 수행한 뒤 writer를 reopen한다. |
 | AOF writer 서버 통합 | 구현 | 쓰기 명령이 AOF 워커 큐(`append`)로 비동기 전달된다. |
 | Legacy AOF format gate | 구현 | headerless AOF는 기본 거부하며 `RATATOSK_ALLOW_LEGACY_AOF=true`에서만 임시 허용한다. |
+| Legacy AOF migration | 구현 | `RATATOSK_MIGRATE_AOF=true` 설정 시 레거시 단일 파일 AOF를 manifest 기반으로 자동 변환. startup에서 감지 후 경고 메시지 출력. |
 | Manifest bootstrap/recovery | 구현 | manifest save/load, startup discovery, recovery-file 순차 replay가 baseline으로 연결된다. |
 | server_cron 통합 | 부분 | SIGUSR1 수신은 구현되어 있고, 추가 save 정책 자동화는 별도 작업이다. |
 | LZF 압축 | 미구현 | RDB string 압축 (큰 값 전용) |

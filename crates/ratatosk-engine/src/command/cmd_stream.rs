@@ -129,8 +129,8 @@ pub(super) fn cmd_xadd(
     let id_raw = &args[1];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
@@ -185,8 +185,8 @@ pub(super) fn cmd_xlen(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -253,8 +253,8 @@ pub(super) fn cmd_xrange(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -355,8 +355,8 @@ pub(super) fn cmd_xread(
     };
 
     for (key, id_raw) in keys.iter().zip(ids.iter()) {
-        let db = server.db_mut(client.selected_db);
-        purge_expired_key(db, key, now);
+        let mut db = server.db_mut(client.selected_db);
+        purge_expired_key(&mut db, key, now);
 
         let stream = match db.get(key) {
             Some(entry) => {
@@ -632,8 +632,8 @@ pub(super) fn cmd_xgroup(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             if !db.contains_key(key) && mkstream {
                 db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
@@ -683,8 +683,8 @@ pub(super) fn cmd_xgroup(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get_mut(key) else {
                 return CommandOutcome::reply(RespFrame::Integer(0));
@@ -709,8 +709,8 @@ pub(super) fn cmd_xgroup(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get_mut(key) else {
                 return xreadgroup_nogroup_error(key, group_name);
@@ -744,8 +744,8 @@ pub(super) fn cmd_xgroup(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get_mut(key) else {
                 return xreadgroup_nogroup_error(key, group_name);
@@ -781,8 +781,8 @@ pub(super) fn cmd_xgroup(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get_mut(key) else {
                 return xreadgroup_nogroup_error(key, group_name);
@@ -894,8 +894,8 @@ pub(super) fn cmd_xreadgroup(
     let now = now_ms();
 
     for (key, id_raw) in keys.iter().zip(ids.iter()) {
-        let db = server.db_mut(client.selected_db);
-        purge_expired_key(db, key, now);
+        let mut db = server.db_mut(client.selected_db);
+        purge_expired_key(&mut db, key, now);
 
         let Some(entry) = db.get_mut(key) else {
             return xreadgroup_nogroup_error(key, &group_name);
@@ -1102,8 +1102,8 @@ pub(super) fn cmd_xack(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1150,8 +1150,8 @@ pub(super) fn cmd_xpending(
     let group_name = &args[1];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return xreadgroup_nogroup_error(key, group_name);
@@ -1311,8 +1311,8 @@ pub(super) fn cmd_xinfo(
             }
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get(key) else {
                 return CommandOutcome::reply(err("ERR no such key"));
@@ -1379,8 +1379,8 @@ pub(super) fn cmd_xinfo(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get(key) else {
                 return CommandOutcome::reply(err("ERR no such key"));
@@ -1416,8 +1416,8 @@ pub(super) fn cmd_xinfo(
             };
 
             let now = now_ms();
-            let db = server.db_mut(client.selected_db);
-            purge_expired_key(db, key, now);
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
 
             let Some(entry) = db.get(key) else {
                 return stream_nogroup_error(key, group_name);
@@ -1513,8 +1513,8 @@ pub(super) fn cmd_xtrim(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1568,8 +1568,8 @@ pub(super) fn cmd_xdel(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1608,8 +1608,8 @@ pub(super) fn cmd_xsetid(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(err("ERR no such key"));
@@ -1669,8 +1669,8 @@ pub(super) fn cmd_xclaim(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return stream_nogroup_error(key, group_name);
@@ -1791,8 +1791,8 @@ pub(super) fn cmd_xautoclaim(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return stream_nogroup_error(key, group_name);
@@ -1910,8 +1910,8 @@ pub(super) fn cmd_xackdel(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Array(
@@ -2030,8 +2030,8 @@ pub(super) fn cmd_xdelex(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Array(
@@ -2127,8 +2127,8 @@ pub(super) fn cmd_xcfgset(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(err("ERR no such key"));

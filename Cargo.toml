@@ -55,6 +55,7 @@ metrics-exporter-prometheus = { version = "0.15", default-features = false, feat
 # Concurrency
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
+arc-swap = "1"
 
 # Data structures
 hashbrown = "0.15"
@@ -82,6 +83,9 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Glob pattern matching (pub/sub)
 glob-match = "0.2"
+
+# Lua scripting (feature-gated)
+mlua = { version = "0.11", features = ["lua51", "vendored"] }
 
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }

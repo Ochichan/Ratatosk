@@ -22,8 +22,8 @@ pub(super) fn cmd_append(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let (value, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
@@ -58,8 +58,8 @@ pub(super) fn cmd_strlen(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -88,8 +88,8 @@ pub(super) fn cmd_getrange(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::bulk_str(""));
@@ -128,8 +128,8 @@ pub(super) fn cmd_setrange(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if value.is_empty() {
         let Some(entry) = db.get(key) else {
@@ -177,8 +177,8 @@ pub(super) fn cmd_getset(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if db.get(key).is_some_and(|entry| !entry.is_string()) {
         return wrong_type_response();
@@ -201,8 +201,8 @@ pub(super) fn cmd_setnx(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if db.contains_key(key) {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -222,11 +222,11 @@ pub(super) fn cmd_mget(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     let mut out = Vec::with_capacity(args.len());
 
     for key in args {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let value = db.get(key).and_then(|entry| entry.as_string().cloned());
         out.push(RespFrame::BulkString(value));
     }
@@ -243,7 +243,7 @@ pub(super) fn cmd_mset(
         return wrong_arity("mset");
     }
 
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     let mut idx = 0usize;
     while idx < args.len() {
         db.insert(
@@ -266,11 +266,11 @@ pub(super) fn cmd_msetnx(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     let mut idx = 0usize;
     while idx < args.len() {
-        purge_expired_key(db, &args[idx], now);
+        purge_expired_key(&mut db, &args[idx], now);
         if db.contains_key(&args[idx]) {
             return CommandOutcome::reply(RespFrame::Integer(0));
         }
@@ -358,8 +358,8 @@ pub(super) fn cmd_incrbyfloat(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let (base, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
@@ -392,8 +392,8 @@ pub(super) fn cmd_incr_decr_with_delta(
     delta: i64,
 ) -> CommandOutcome {
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let (current, expire_at_ms) = if let Some(existing) = db.get(key) {
         let Some(s) = existing.as_string() else {
@@ -495,8 +495,8 @@ pub(super) fn cmd_set(
         return CommandOutcome::reply(err("ERR syntax error"));
     }
 
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, &key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, &key, now);
 
     let existing_entry = db.get(&key);
     let should_set = (!nx || existing_entry.is_none()) && (!xx || existing_entry.is_some());
@@ -557,14 +557,16 @@ pub(super) fn cmd_get(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let result = {
+        let mut db = server.db_mut(client.selected_db);
+        purge_expired_key(&mut db, key, now);
 
-    // Single lookup: extract result and release borrow before accessing stats
-    let result = match db.get(key) {
-        None => Err(false),                             // not found
-        Some(entry) if !entry.is_string() => Err(true), // wrong type
-        Some(entry) => Ok(entry.as_string().cloned()),
+        // Single lookup: extract result and release borrow before accessing stats
+        match db.get(key) {
+            None => Err(false),                             // not found
+            Some(entry) if !entry.is_string() => Err(true), // wrong type
+            Some(entry) => Ok(entry.as_string().cloned()),
+        }
     };
 
     match result {
@@ -597,8 +599,8 @@ pub(super) fn cmd_setex_with_mode(
         Err(response) => return CommandOutcome::reply(response),
     };
 
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if expire_at_ms <= now {
         db.remove(key);
@@ -622,8 +624,8 @@ pub(super) fn cmd_getdel(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -654,8 +656,8 @@ pub(super) fn cmd_getex(
         Err(response) => return CommandOutcome::reply(response),
     };
 
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));

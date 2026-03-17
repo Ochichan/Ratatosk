@@ -36,8 +36,8 @@ pub(super) fn cmd_randomkey(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_keys(db, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_keys(&mut db, now);
 
     let key = db.keys().next().cloned();
     CommandOutcome::reply(RespFrame::BulkString(key))
@@ -53,8 +53,8 @@ pub(super) fn cmd_type(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if let Some(entry) = db.get(key) {
         CommandOutcome::reply(RespFrame::simple_str(entry.type_name()))
@@ -73,8 +73,8 @@ pub(super) fn cmd_keys(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_keys(db, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_keys(&mut db, now);
 
     let pattern = String::from_utf8_lossy(pattern).to_string();
     let mut out = db
@@ -108,6 +108,13 @@ pub(super) fn cmd_wait(args: &[Bytes], server: &ServerState) -> CommandOutcome {
     }
 
     let acked = server.replication_acked_replicas(server.replication_offset()) as i64;
+    if num_replicas > 0 && acked == 0 {
+        tracing::warn!(
+            target = "ratatosk::replication",
+            requested_replicas = num_replicas,
+            "WAIT returning 0: Ratatosk is running in single-node mode with no replicas"
+        );
+    }
     CommandOutcome::reply(RespFrame::Integer(acked.min(num_replicas)))
 }
 
@@ -136,6 +143,13 @@ pub(super) fn cmd_waitaof(args: &[Bytes], server: &ServerState) -> CommandOutcom
         0
     };
     let replica_ack = server.replication_acked_replicas(server.replication_offset()) as i64;
+    if num_replicas > 0 && replica_ack == 0 {
+        tracing::warn!(
+            target = "ratatosk::replication",
+            requested_replicas = num_replicas,
+            "WAITAOF returning 0 replica acks: Ratatosk is running in single-node mode with no replicas"
+        );
+    }
     CommandOutcome::reply(RespFrame::Array(vec![
         RespFrame::Integer(local_ack.min(num_local)),
         RespFrame::Integer(replica_ack.min(num_replicas)),
@@ -153,8 +167,8 @@ pub(super) fn cmd_delex(
 
     let key = &args[0];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key).cloned() else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -220,8 +234,8 @@ pub(super) fn cmd_digest(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -244,8 +258,8 @@ pub(super) fn cmd_dump(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -305,8 +319,8 @@ pub(super) fn cmd_restore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if db.contains_key(key) && !replace {
         return CommandOutcome::reply(err("BUSYKEY Target key name already exists."));
@@ -365,9 +379,9 @@ pub(super) fn cmd_lcs(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key1, now);
-    purge_expired_key(db, key2, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key1, now);
+    purge_expired_key(&mut db, key2, now);
 
     let left = match db.get(key1) {
         None => Bytes::new(),
@@ -475,9 +489,9 @@ pub(super) fn cmd_msetex(
         return CommandOutcome::reply(err("ERR syntax error"));
     }
 
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for (key, _) in &kvs {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
     if nx && kvs.iter().any(|(key, _)| db.contains_key(key)) {

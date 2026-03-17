@@ -116,74 +116,80 @@ pub fn expire_condition_matches(
 // Active expiry — sampling-based periodic cleanup (called by server_cron)
 // ---------------------------------------------------------------------------
 
-/// Number of random keys to sample per DB per cycle.
-const ACTIVE_EXPIRE_CYCLE_LOOKUPS: usize = 20;
-
-/// Stop early if fewer than 25% of sampled keys were expired.
-const ACTIVE_EXPIRE_CYCLE_THRESHOLD: f64 = 0.25;
-
 /// Run one cycle of active expiry across all databases.
 ///
 /// Samples random keys with TTL set, removes those that have expired.
+/// The number of keys to sample and the early-stop threshold are
+/// configurable via `ConfigState::active_expire_cycle_lookups` (default 20)
+/// and `ConfigState::active_expire_cycle_threshold_pct` (default 25%).
 /// Returns the total number of keys expired across all databases.
 pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
+    let cycle_lookups = state.config.active_expire_cycle_lookups();
+    let cycle_threshold = state.config.active_expire_cycle_threshold_pct() as f64 / 100.0;
+
     let mut total_expired = 0usize;
     let mut rng = rand::thread_rng();
 
     for db_idx in 0..state.db_count() {
-        let db = state.db(db_idx);
-        if db.is_empty() {
-            continue;
-        }
-
-        // First pass: count volatile keys without allocating
-        let volatile_count = db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count();
-
-        if volatile_count == 0 {
-            continue;
-        }
-
-        // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
-        // where k = samples_to_take, instead of O(n) for the full index array
-        let samples_to_take = ACTIVE_EXPIRE_CYCLE_LOOKUPS.min(volatile_count);
-        let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
-        for i in samples_to_take..volatile_count {
-            let j = rng.gen_range(0..i + 1);
-            if j < samples_to_take {
-                sample_indices[j] = i;
-            }
-        }
-        sample_indices.sort_unstable();
-
-        // Second pass: collect only sampled keys (small, bounded allocation)
-        let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
-        let mut volatile_idx = 0;
-        let mut sample_cursor = 0;
-        for (key, value) in db.iter() {
-            if value.expire_at_ms.is_none() {
+        // Sampling phase: hold read guard, collect candidate keys, then release.
+        let (samples_to_take, sampled_keys) = {
+            let db = state.db(db_idx);
+            if db.is_empty() {
                 continue;
             }
-            if sample_cursor < sample_indices.len() && volatile_idx == sample_indices[sample_cursor]
-            {
-                sampled_keys.push(key.clone());
-                sample_cursor += 1;
-                if sample_cursor >= sample_indices.len() {
-                    break;
+
+            // First pass: count volatile keys without allocating
+            let volatile_count = db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count();
+
+            if volatile_count == 0 {
+                continue;
+            }
+
+            // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
+            let samples_to_take = cycle_lookups.min(volatile_count);
+            let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
+            for i in samples_to_take..volatile_count {
+                let j = rng.gen_range(0..i + 1);
+                if j < samples_to_take {
+                    sample_indices[j] = i;
                 }
             }
-            volatile_idx += 1;
-        }
+            sample_indices.sort_unstable();
 
-        // Process sampled keys
+            // Second pass: collect only sampled keys (small, bounded allocation)
+            let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
+            let mut volatile_idx = 0;
+            let mut sample_cursor = 0;
+            for (key, value) in db.iter() {
+                if value.expire_at_ms.is_none() {
+                    continue;
+                }
+                if sample_cursor < sample_indices.len()
+                    && volatile_idx == sample_indices[sample_cursor]
+                {
+                    sampled_keys.push(key.clone());
+                    sample_cursor += 1;
+                    if sample_cursor >= sample_indices.len() {
+                        break;
+                    }
+                }
+                volatile_idx += 1;
+            }
+
+            (samples_to_take, sampled_keys)
+        }; // read guard dropped here
+
+        // Expiry phase: acquire write guard per key check+removal.
         let mut expired = 0usize;
         for key in sampled_keys {
-            let is_expired = state
-                .db(db_idx)
-                .get(&key)
+            let mut db = state.db_mut(db_idx);
+            let is_expired = db
+                .get(key.as_ref())
                 .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms));
 
             if is_expired {
-                state.db_mut(db_idx).remove(&key);
+                db.remove(key.as_ref());
+                drop(db); // release write guard before touch_key_version
                 state.touch_key_version(db_idx, key);
                 expired += 1;
             }
@@ -193,7 +199,7 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
 
         // Stop early if few keys are expiring (save CPU)
         let sampled = samples_to_take;
-        if sampled > 0 && (expired as f64 / sampled as f64) < ACTIVE_EXPIRE_CYCLE_THRESHOLD {
+        if sampled > 0 && (expired as f64 / sampled as f64) < cycle_threshold {
             continue;
         }
     }

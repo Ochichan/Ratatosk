@@ -42,8 +42,8 @@ pub(super) fn cmd_pfadd(
     let key = &args[0];
     let elements = &args[1..];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     // Fetch existing HLL data and its TTL, or start fresh.
     let (mut hll_data, expire_at_ms) = if let Some(entry) = db.get(key) {
@@ -100,12 +100,12 @@ pub(super) fn cmd_pfcount(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     if args.len() == 1 {
         // Single key: return (and cache) the cardinality directly.
         let key = &args[0];
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
 
         let Some(entry) = db.get(key) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
@@ -133,7 +133,7 @@ pub(super) fn cmd_pfcount(
         let mut tmp = hll::hll_create();
 
         for key in args {
-            purge_expired_key(db, key, now);
+            purge_expired_key(&mut db, key, now);
             let Some(entry) = db.get(key) else {
                 continue;
             };
@@ -165,10 +165,10 @@ pub(super) fn cmd_pfmerge(
     let dest_key = &args[0];
     let source_keys = &args[1..];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     // Start from the destination's existing HLL (if any).
-    purge_expired_key(db, dest_key, now);
+    purge_expired_key(&mut db, dest_key, now);
     let (mut dest_data, dest_expire) = if let Some(entry) = db.get(dest_key) {
         let hll_bytes = match extract_hll_bytes(entry) {
             Ok(b) => b,
@@ -186,7 +186,7 @@ pub(super) fn cmd_pfmerge(
     // Collect source HLL blobs (validated).
     let mut source_vecs: Vec<Vec<u8>> = Vec::with_capacity(source_keys.len());
     for key in source_keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };
@@ -223,8 +223,8 @@ pub(super) fn cmd_pfdebug(
 
     let key = &args[1];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(err("ERR The specified key does not exist"));

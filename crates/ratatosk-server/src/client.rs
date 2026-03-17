@@ -6,14 +6,14 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use ratatosk_engine::{
-    command::{ClientState, CommandOutcome, execute, is_write_command},
-    keyspace::{PubSubMessage, ServerState},
+    command::{ClientState, CommandOutcome, ServerAccess, execute, is_write_command},
+    keyspace::{PubSubMessage, SharedState},
 };
 use ratatosk_resp::{RespFrame, encode, encode_to_vec, encoded_len, parse};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{Mutex, Notify},
+    sync::Notify,
     time::timeout,
 };
 
@@ -24,11 +24,17 @@ use crate::persistence::{
     PersistenceRuntime, append_aof_command, run_save, start_bgrewriteaof, start_bgsave,
 };
 
+// Fallback defaults — runtime values are read from ConfigState at connection start.
+#[allow(dead_code)]
 const QUERY_BUFFER_LIMIT: usize = 1024 * 1024;
+#[allow(dead_code)]
 const OUTPUT_BUFFER_FLUSH_THRESHOLD: usize = 16 * 1024;
+#[allow(dead_code)]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-const BLOCKING_RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
-const BLOCKING_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(200);
+// Maximum wait between blocking retries.  With FIFO wake-one semantics only
+// the front-of-queue waiter is notified, so exponential backoff is no longer
+// needed — this constant caps the wait that guards against lost notifications.
+const BLOCKING_RETRY_POLL_CAP: Duration = Duration::from_millis(500);
 const AOF_APPEND_SLOW_THRESHOLD: Duration = Duration::from_secs(3);
 const OUTPUT_BUFFER_LIMIT_ERR: &str = "ERR output buffer limit exceeded";
 const AOF_WRITE_LATCH_ERR_PREFIX: &str =
@@ -36,7 +42,7 @@ const AOF_WRITE_LATCH_ERR_PREFIX: &str =
 const READONLY_BATCH_ENV: &str = "RATATOSK_PIPELINE_READONLY_BATCH_LOCK";
 static READONLY_BATCH_ENABLED: OnceLock<bool> = OnceLock::new();
 
-pub type SharedServerState = Arc<Mutex<ServerState>>;
+pub type SharedServerState = Arc<SharedState>;
 
 /// Check if an error represents an expected client disconnect (not a server error).
 fn is_benign_disconnect(error: &io::Error) -> bool {
@@ -69,7 +75,7 @@ async fn refresh_client_snapshot(
     laddr: &Bytes,
     blocked: bool,
 ) {
-    let mut server = server_state.lock().await;
+    let mut server = server_state.meta.lock().await;
     server.upsert_client_snapshot(client_state.snapshot_with_redirect(
         addr.clone(),
         laddr.clone(),
@@ -106,13 +112,6 @@ fn append_encoded_frame(
     output.reserve(frame_len);
     encode_to_vec(frame, output);
     true
-}
-
-fn next_retry_backoff(current: Duration) -> Duration {
-    current
-        .checked_mul(2)
-        .unwrap_or(BLOCKING_RETRY_BACKOFF_MAX)
-        .min(BLOCKING_RETRY_BACKOFF_MAX)
 }
 
 fn readonly_batch_enabled() -> bool {
@@ -158,7 +157,7 @@ async fn try_run_readonly_batch(
     }
 
     let lock_wait_start = std::time::Instant::now();
-    let mut server = server_state.lock().await;
+    let mut server = server_state.meta.lock().await;
     metrics::record_server_state_lock_wait_ms(
         "batch_execute_readonly",
         lock_wait_start.elapsed().as_secs_f64() * 1000.0,
@@ -176,7 +175,10 @@ async fn try_run_readonly_batch(
         );
 
         let start = std::time::Instant::now();
-        let outcome = execute(frame, &mut server, client_state);
+        let outcome = {
+            let mut access = ServerAccess::new_inline(&mut server);
+            execute(frame, &mut access, client_state)
+        };
         let duration = start.elapsed();
         let success = !matches!(outcome.response, ratatosk_resp::RespFrame::Error(_));
         metrics::record_command(command_name, success, duration.as_secs_f64());
@@ -206,7 +208,7 @@ fn aof_write_latch_error(detail: &str) -> RespFrame {
 }
 
 async fn set_aof_write_latch(server_state: &SharedServerState, error: String) {
-    let mut server = server_state.lock().await;
+    let mut server = server_state.meta.lock().await;
     server.set_aof_last_error(error.clone());
     drop(server);
 
@@ -219,7 +221,7 @@ async fn set_aof_write_latch(server_state: &SharedServerState, error: String) {
 }
 
 async fn clear_aof_write_latch_if_set(server_state: &SharedServerState) {
-    let mut server = server_state.lock().await;
+    let mut server = server_state.meta.lock().await;
     let was_latched = server.aof_write_latched();
     if was_latched {
         server.clear_aof_last_error();
@@ -279,23 +281,41 @@ async fn wait_for_blocking_ready(
     }
 }
 
+/// Result of the select-based I/O wait: either a pubsub message arrived,
+/// a monitor notification arrived, or network data was read.
+enum WaitResult {
+    PubSubMsg(PubSubMessage),
+    PubSubClosed,
+    MonitorWake,
+    NetworkRead(usize),
+}
+
 async fn wait_for_async_push_or_input(
     stream: &mut TcpStream,
     input: &mut BytesMut,
-    notifier: &Notify,
-) -> io::Result<usize> {
+    pubsub_rx: &mut tokio::sync::mpsc::Receiver<PubSubMessage>,
+    monitor_notifier: &Notify,
+) -> io::Result<WaitResult> {
     tokio::select! {
-        _ = notifier.notified() => Ok(0),
-        result = stream.read_buf(input) => result,
+        msg = pubsub_rx.recv() => match msg {
+            Some(m) => Ok(WaitResult::PubSubMsg(m)),
+            None => Ok(WaitResult::PubSubClosed),
+        },
+        _ = monitor_notifier.notified() => Ok(WaitResult::MonitorWake),
+        result = stream.read_buf(input) => result.map(WaitResult::NetworkRead),
     }
 }
 
-async fn write_all_with_timeout(stream: &mut TcpStream, payload: &[u8]) -> io::Result<()> {
+async fn write_all_with_timeout(
+    stream: &mut TcpStream,
+    payload: &[u8],
+    write_timeout: Duration,
+) -> io::Result<()> {
     if payload.is_empty() {
         return Ok(());
     }
 
-    match timeout(WRITE_TIMEOUT, stream.write_all(payload)).await {
+    match timeout(write_timeout, stream.write_all(payload)).await {
         Ok(result) => result,
         Err(_) => Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -333,7 +353,7 @@ async fn run_with_blocking_retry(
 
     let mut outcome = {
         let lock_wait_start = std::time::Instant::now();
-        let mut server = server_state.lock().await;
+        let mut server = server_state.meta.lock().await;
         metrics::record_server_state_lock_wait_ms(
             "execute",
             lock_wait_start.elapsed().as_secs_f64() * 1000.0,
@@ -352,9 +372,11 @@ async fn run_with_blocking_retry(
                 response: aof_write_latch_error(&aof_error),
                 close: false,
                 retry_blocking: None,
+                delay_ms: None,
             }
         } else {
-            execute(frame, &mut server, client_state)
+            let mut access = ServerAccess::new_inline(&mut server);
+            execute(frame, &mut access, client_state)
         };
         metrics::record_server_state_lock_hold_ms(
             "execute",
@@ -393,14 +415,13 @@ async fn run_with_blocking_retry(
 
     refresh_client_snapshot(server_state, client_state, addr, laddr, true).await;
     let mut notifier = {
-        let mut server = server_state.lock().await;
+        let mut server = server_state.meta.lock().await;
         server.register_blocked_client(client_state.id(), retry.watch_keys.clone())
     };
 
     let deadline_ms = retry.deadline_ms;
     let mut frame = retry.frame;
     let mut last_response = outcome.response;
-    let mut backoff = BLOCKING_RETRY_BACKOFF_INITIAL;
     let mut retry_attempts = 0u64;
 
     loop {
@@ -411,7 +432,7 @@ async fn run_with_blocking_retry(
                 metrics::record_blocking_retry_deadline_exhausted(&command_name);
                 metrics::record_blocking_retry_completed(&command_name, retry_attempts);
                 {
-                    let mut server = server_state.lock().await;
+                    let mut server = server_state.meta.lock().await;
                     server.clear_blocked_client(client_state.id());
                 }
                 refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
@@ -419,6 +440,7 @@ async fn run_with_blocking_retry(
                     response: last_response,
                     close: false,
                     retry_blocking: None,
+                    delay_ms: None,
                 });
             }
         }
@@ -426,9 +448,9 @@ async fn run_with_blocking_retry(
         let wait_for = if let Some(deadline) = deadline_ms {
             let deadline_u64 = u64::try_from(deadline).unwrap_or(u64::MAX);
             let remaining_ms = deadline_u64.saturating_sub(now_ms);
-            Duration::from_millis(remaining_ms).min(backoff)
+            Duration::from_millis(remaining_ms).min(BLOCKING_RETRY_POLL_CAP)
         } else {
-            backoff
+            BLOCKING_RETRY_POLL_CAP
         };
 
         retry_attempts = retry_attempts.saturating_add(1);
@@ -466,7 +488,7 @@ async fn run_with_blocking_retry(
             let is_retry_write = argv.as_deref().is_some_and(is_write_command);
 
             let lock_wait_start = std::time::Instant::now();
-            let mut server = server_state.lock().await;
+            let mut server = server_state.meta.lock().await;
             metrics::record_server_state_lock_wait_ms(
                 "retry_execute",
                 lock_wait_start.elapsed().as_secs_f64() * 1000.0,
@@ -484,9 +506,11 @@ async fn run_with_blocking_retry(
                     response: aof_write_latch_error(&aof_error),
                     close: false,
                     retry_blocking: None,
+                    delay_ms: None,
                 }
             } else {
-                execute(frame, &mut server, client_state)
+                let mut access = ServerAccess::new_inline(&mut server);
+                execute(frame, &mut access, client_state)
             };
             metrics::record_server_state_lock_hold_ms(
                 "retry_execute",
@@ -504,7 +528,7 @@ async fn run_with_blocking_retry(
         let Some(retry) = outcome.retry_blocking else {
             metrics::record_blocking_retry_completed(&command_name, retry_attempts);
             {
-                let mut server = server_state.lock().await;
+                let mut server = server_state.meta.lock().await;
                 server.clear_blocked_client(client_state.id());
             }
             refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
@@ -513,10 +537,9 @@ async fn run_with_blocking_retry(
         last_response = outcome.response;
         frame = retry.frame;
         notifier = {
-            let mut server = server_state.lock().await;
+            let mut server = server_state.meta.lock().await;
             server.register_blocked_client(client_state.id(), retry.watch_keys.clone())
         };
-        backoff = next_retry_backoff(backoff);
     }
 }
 
@@ -588,9 +611,10 @@ async fn apply_post_execute_persistence(
         return;
     }
 
+    // Lock-free config read via ArcSwap.
     let fsync_policy = {
-        let server = server_state.lock().await;
-        String::from_utf8_lossy(server.config.appendfsync()).to_string()
+        let config = server_state.config_cache.load();
+        String::from_utf8_lossy(config.appendfsync()).to_string()
     };
     let command_name = String::from_utf8_lossy(&argv[0]).to_string();
 
@@ -636,44 +660,85 @@ async fn apply_post_execute_persistence(
     }
 }
 
+/// Encode a single PubSubMessage into the output buffer.
+/// Returns `false` if the output buffer would exceed the limit.
+fn encode_pubsub_message(
+    message: PubSubMessage,
+    output: &mut Vec<u8>,
+    output_limit_bytes: usize,
+    protocol_version: i64,
+) -> bool {
+    encode_pubsub_messages(vec![message], output, output_limit_bytes, protocol_version)
+}
+
 fn encode_pubsub_messages(
     messages: Vec<PubSubMessage>,
     output: &mut Vec<u8>,
     output_limit_bytes: usize,
     protocol_version: i64,
 ) -> bool {
+    let use_push = protocol_version >= 3;
+
     for message in messages {
         let frame = match message {
-            PubSubMessage::Message { channel, payload } => RespFrame::Array(vec![
-                RespFrame::bulk_str("message"),
-                RespFrame::BulkString(Some(channel)),
-                RespFrame::BulkString(Some(payload)),
-            ]),
-            PubSubMessage::SMessage { channel, payload } => RespFrame::Array(vec![
-                RespFrame::bulk_str("smessage"),
-                RespFrame::BulkString(Some(channel)),
-                RespFrame::BulkString(Some(payload)),
-            ]),
+            PubSubMessage::Message { channel, payload } => {
+                let inner = vec![
+                    RespFrame::bulk_str("message"),
+                    RespFrame::BulkString(Some(channel)),
+                    RespFrame::BulkString(Some(payload)),
+                ];
+                if use_push {
+                    RespFrame::Push(inner)
+                } else {
+                    RespFrame::Array(inner)
+                }
+            }
+            PubSubMessage::SMessage { channel, payload } => {
+                let inner = vec![
+                    RespFrame::bulk_str("smessage"),
+                    RespFrame::BulkString(Some(channel)),
+                    RespFrame::BulkString(Some(payload)),
+                ];
+                if use_push {
+                    RespFrame::Push(inner)
+                } else {
+                    RespFrame::Array(inner)
+                }
+            }
             PubSubMessage::PMessage {
                 pattern,
                 channel,
                 payload,
-            } => RespFrame::Array(vec![
-                RespFrame::bulk_str("pmessage"),
-                RespFrame::BulkString(Some(pattern)),
-                RespFrame::BulkString(Some(channel)),
-                RespFrame::BulkString(Some(payload)),
-            ]),
-            PubSubMessage::Invalidate { keys } => RespFrame::Array(vec![
-                RespFrame::bulk_str("invalidate"),
-                RespFrame::Array(
-                    keys.into_iter()
-                        .map(|key| RespFrame::BulkString(Some(key)))
-                        .collect(),
-                ),
-            ]),
+            } => {
+                let inner = vec![
+                    RespFrame::bulk_str("pmessage"),
+                    RespFrame::BulkString(Some(pattern)),
+                    RespFrame::BulkString(Some(channel)),
+                    RespFrame::BulkString(Some(payload)),
+                ];
+                if use_push {
+                    RespFrame::Push(inner)
+                } else {
+                    RespFrame::Array(inner)
+                }
+            }
+            PubSubMessage::Invalidate { keys } => {
+                let inner = vec![
+                    RespFrame::bulk_str("invalidate"),
+                    RespFrame::Array(
+                        keys.into_iter()
+                            .map(|key| RespFrame::BulkString(Some(key)))
+                            .collect(),
+                    ),
+                ];
+                if use_push {
+                    RespFrame::Push(inner)
+                } else {
+                    RespFrame::Array(inner)
+                }
+            }
             PubSubMessage::TrackingRedirectBroken { redirect_client_id } => {
-                if protocol_version >= 3 {
+                if use_push {
                     RespFrame::Push(vec![
                         RespFrame::bulk_str("tracking-redir-broken"),
                         RespFrame::Integer(redirect_client_id),
@@ -715,10 +780,10 @@ pub async fn handle_client_with_limits(
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
     let (client_id, remote_addr) = {
-        let mut server = server_state.lock().await;
-        let id = server.alloc_client_id();
-        server.stats.mark_client_connected();
-        let active = server.stats.connected_clients();
+        // Lock-free: atomic client ID allocation and stats update.
+        let id = server_state.alloc_client_id();
+        server_state.stats.mark_client_connected();
+        let active = server_state.stats.connected_clients();
         metrics::set_active_connections(active as usize);
         metrics::record_connection_event("accepted");
         let addr = stream
@@ -763,16 +828,18 @@ pub async fn handle_client_with_limits(
     };
 
     {
-        let mut server = server_state.lock().await;
+        let mut server = server_state.meta.lock().await;
         server.pubsub.remove_client(client_id);
         server.replication_remove_client(client_id);
         server.tracking_remove_client(client_id);
+        server.unregister_monitor(client_id);
         server.remove_client_snapshot(client_id);
-        server.stats.mark_client_disconnected();
-        let active = server.stats.connected_clients();
-        metrics::set_active_connections(active as usize);
-        metrics::record_connection_event(disconnect_reason);
     }
+    // Lock-free stats update after releasing the inner lock.
+    server_state.stats.mark_client_disconnected();
+    let active = server_state.stats.connected_clients();
+    metrics::set_active_connections(active as usize);
+    metrics::record_connection_event(disconnect_reason);
 
     tracing::debug!(
         target = "ratatosk::client",
@@ -799,56 +866,118 @@ async fn handle_client_inner(
     let mut output = Vec::with_capacity(4096);
     let mut client_state = ClientState::new(client_id);
     let (addr, laddr) = socket_addr_bytes(&stream);
-    let async_push_notifier = {
-        let mut server = server_state.lock().await;
-        server.pubsub.register_client(client_id)
+    let (
+        mut pubsub_rx,
+        monitor_notifier,
+        query_buffer_limit,
+        output_buffer_flush_threshold,
+        write_timeout,
+    ) = {
+        let mut server = server_state.meta.lock().await;
+        let rx = server.pubsub.register_client(client_id);
+        let mn = server.register_monitor_notifier(client_id);
+        let qbl = server.config.query_buffer_limit();
+        let obft = server.config.output_buffer_flush_threshold();
+        let wt = Duration::from_secs(server.config.client_write_timeout_sec());
+        (rx, mn, qbl, obft, wt)
     };
     refresh_client_snapshot(server_state, &client_state, &addr, &laddr, false).await;
     loop {
-        let client_accepts_async_push =
-            client_state.has_pubsub_subscriptions() || client_state.tracking_enabled();
-        let (pending_overflow, pending) = {
-            let mut server = server_state.lock().await;
-            let pending_overflow = server.pubsub.take_overflowed_client(client_state.id());
-            let pending = server.pubsub.drain_messages(client_state.id());
-            (pending_overflow, pending)
-        };
-        if pending_overflow {
-            tracing::warn!(
-                client_id = client_state.id(),
-                "disconnecting pubsub client: pending output buffer limit exceeded"
-            );
-            let response = encode(&RespFrame::error_str(
-                "ERR pubsub pending output buffer limit exceeded",
-            ));
-            write_all_with_timeout(&mut stream, &response).await?;
-            return Ok(());
-        }
+        let client_accepts_async_push = client_state.has_pubsub_subscriptions()
+            || client_state.tracking_enabled()
+            || client_state.is_monitor();
 
-        if !pending.is_empty() {
-            if !encode_pubsub_messages(
-                pending,
-                &mut output,
-                io_limits.output_buffer_limit_bytes,
-                client_state.protocol_version(),
-            ) {
-                tracing::warn!(
-                    client_id = client_state.id(),
-                    output_limit_bytes = io_limits.output_buffer_limit_bytes,
-                    "disconnecting client: pubsub output frame exceeded buffer limit"
-                );
-                let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
-                write_all_with_timeout(&mut stream, &response).await?;
-                return Ok(());
+        // Drain any already-buffered pubsub messages (lock-free via mpsc).
+        {
+            let mut had_pubsub = false;
+            while let Ok(msg) = pubsub_rx.try_recv() {
+                had_pubsub = true;
+                if !encode_pubsub_message(
+                    msg,
+                    &mut output,
+                    io_limits.output_buffer_limit_bytes,
+                    client_state.protocol_version(),
+                ) {
+                    tracing::warn!(
+                        client_id = client_state.id(),
+                        output_limit_bytes = io_limits.output_buffer_limit_bytes,
+                        "disconnecting client: pubsub output frame exceeded buffer limit"
+                    );
+                    let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                    return Ok(());
+                }
             }
-            write_all_with_timeout(&mut stream, &output).await?;
-            output.clear();
+            if had_pubsub {
+                write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                output.clear();
+            }
         }
 
+        // Drain MONITOR messages — each line is sent as a RESP simple string.
+        {
+            let monitor_pending = {
+                let mut server = server_state.meta.lock().await;
+                server.drain_monitor_messages(client_state.id())
+            };
+            if !monitor_pending.is_empty() {
+                for line in monitor_pending {
+                    let frame = RespFrame::SimpleString(line);
+                    if !append_encoded_frame(
+                        &mut output,
+                        &frame,
+                        io_limits.output_buffer_limit_bytes,
+                    ) {
+                        tracing::warn!(
+                            client_id = client_state.id(),
+                            output_limit_bytes = io_limits.output_buffer_limit_bytes,
+                            "disconnecting monitor client: output buffer limit exceeded"
+                        );
+                        let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                        write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                        return Ok(());
+                    }
+                }
+                write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                output.clear();
+            }
+        }
+
+        // Wait for either: a pubsub push message, a monitor notification,
+        // or network input from the client.
         let read = if io_limits.client_read_timeout_sec > 0 && !client_accepts_async_push {
             let idle_duration = Duration::from_secs(io_limits.client_read_timeout_sec);
             let read = tokio::select! {
-                _ = async_push_notifier.notified() => 0,
+                msg = pubsub_rx.recv() => match msg {
+                    Some(m) => {
+                        if !encode_pubsub_message(
+                            m,
+                            &mut output,
+                            io_limits.output_buffer_limit_bytes,
+                            client_state.protocol_version(),
+                        ) {
+                            let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                            write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                            return Ok(());
+                        }
+                        write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                        output.clear();
+                        0
+                    }
+                    None => {
+                        // Sender dropped -- channel overflow, disconnect.
+                        tracing::warn!(
+                            client_id = client_id,
+                            "disconnecting pubsub client: push channel closed (overflow)"
+                        );
+                        let response = encode(&RespFrame::error_str(
+                            "ERR pubsub pending output buffer limit exceeded",
+                        ));
+                        write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                        return Ok(());
+                    }
+                },
+                _ = monitor_notifier.notified() => 0,
                 result = timeout(idle_duration, stream.read_buf(&mut input)) => match result {
                     Ok(result) => result?,
                     Err(_) => {
@@ -866,27 +995,61 @@ async fn handle_client_inner(
             }
             read
         } else {
-            let read =
-                wait_for_async_push_or_input(&mut stream, &mut input, async_push_notifier.as_ref())
-                    .await?;
-            if read == 0 && input.is_empty() {
-                continue;
+            match wait_for_async_push_or_input(
+                &mut stream,
+                &mut input,
+                &mut pubsub_rx,
+                monitor_notifier.as_ref(),
+            )
+            .await?
+            {
+                WaitResult::PubSubMsg(msg) => {
+                    if !encode_pubsub_message(
+                        msg,
+                        &mut output,
+                        io_limits.output_buffer_limit_bytes,
+                        client_state.protocol_version(),
+                    ) {
+                        let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                        write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                        return Ok(());
+                    }
+                    write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                    output.clear();
+                    continue;
+                }
+                WaitResult::PubSubClosed => {
+                    tracing::warn!(
+                        client_id = client_id,
+                        "disconnecting pubsub client: push channel closed (overflow)"
+                    );
+                    let response = encode(&RespFrame::error_str(
+                        "ERR pubsub pending output buffer limit exceeded",
+                    ));
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                    return Ok(());
+                }
+                WaitResult::MonitorWake => {
+                    // Loop back to drain monitor messages at the top.
+                    continue;
+                }
+                WaitResult::NetworkRead(0) if input.is_empty() => {
+                    continue;
+                }
+                WaitResult::NetworkRead(n) => n,
             }
-            read
         };
 
         if read == 0 {
             return Ok(());
         }
 
-        {
-            let mut server = server_state.lock().await;
-            server.stats.add_net_input_bytes(read as u64);
-        }
+        // Lock-free stats update for network I/O bytes.
+        server_state.stats.add_net_input_bytes(read as u64);
 
-        if input.len() > QUERY_BUFFER_LIMIT {
+        if input.len() > query_buffer_limit {
             let frame = RespFrame::error_str("ERR query buffer limit exceeded");
-            write_all_with_timeout(&mut stream, &encode(&frame)).await?;
+            write_all_with_timeout(&mut stream, &encode(&frame), write_timeout).await?;
             return Ok(());
         }
 
@@ -904,7 +1067,7 @@ async fn handle_client_inner(
                         "protocol parse error; closing client connection"
                     );
                     let response = encode(&RespFrame::error_str("ERR protocol error"));
-                    write_all_with_timeout(&mut stream, &response).await?;
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
                     return Ok(());
                 }
             }
@@ -944,27 +1107,47 @@ async fn handle_client_inner(
 
         let mut should_close = false;
         for outcome in outcomes {
-            if !append_encoded_frame(
-                &mut output,
-                &outcome.response,
-                io_limits.output_buffer_limit_bytes,
-            ) {
-                tracing::warn!(
-                    client_id = client_state.id(),
-                    output_limit_bytes = io_limits.output_buffer_limit_bytes,
-                    "disconnecting client: command response exceeded output buffer limit"
-                );
-                let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
-                write_all_with_timeout(&mut stream, &response).await?;
-                return Ok(());
+            // Apply progressive delay (e.g. AUTH failure backoff) before sending response.
+            if let Some(delay_ms) = outcome.delay_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
 
-            if output.len() >= OUTPUT_BUFFER_FLUSH_THRESHOLD {
-                let out_len = output.len() as u64;
-                write_all_with_timeout(&mut stream, &output).await?;
-                output.clear();
-                let mut server = server_state.lock().await;
-                server.stats.add_net_output_bytes(out_len);
+            // Enforce CLIENT REPLY mode: suppress responses when off/skip.
+            // Push notifications (pub/sub, invalidation) are unaffected.
+            let reply_mode = client_state.reply_mode().clone();
+            let suppress = match reply_mode.as_ref() {
+                b"off" => true,
+                b"skip" => {
+                    // Skip this one response, then reset to "on"
+                    client_state.set_reply_mode_on();
+                    true
+                }
+                _ => false,
+            };
+
+            if !suppress {
+                if !append_encoded_frame(
+                    &mut output,
+                    &outcome.response,
+                    io_limits.output_buffer_limit_bytes,
+                ) {
+                    tracing::warn!(
+                        client_id = client_state.id(),
+                        output_limit_bytes = io_limits.output_buffer_limit_bytes,
+                        "disconnecting client: command response exceeded output buffer limit"
+                    );
+                    let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                    return Ok(());
+                }
+
+                if output.len() >= output_buffer_flush_threshold {
+                    let out_len = output.len() as u64;
+                    write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                    output.clear();
+                    let mut server = server_state.meta.lock().await;
+                    server.stats.add_net_output_bytes(out_len);
+                }
             }
 
             if outcome.close {
@@ -973,41 +1156,56 @@ async fn handle_client_inner(
             }
         }
 
+        // After command execution, drain any pubsub messages that arrived
+        // during processing (lock-free via mpsc try_recv).
         let should_poll_pubsub =
             client_state.has_pubsub_subscriptions() || client_state.tracking_enabled();
         if should_poll_pubsub {
-            let (pending, still_has_pending) = {
-                let mut server = server_state.lock().await;
-                let pending = server.pubsub.drain_messages(client_state.id());
-                let still_has_pending = server.pubsub.has_pending_messages(client_state.id());
-                (pending, still_has_pending)
-            };
-            let had_pending = !pending.is_empty();
-            if had_pending
-                && !encode_pubsub_messages(
-                    pending,
+            while let Ok(msg) = pubsub_rx.try_recv() {
+                if !encode_pubsub_message(
+                    msg,
                     &mut output,
                     io_limits.output_buffer_limit_bytes,
                     client_state.protocol_version(),
-                )
-            {
-                tracing::warn!(
-                    client_id = client_state.id(),
-                    output_limit_bytes = io_limits.output_buffer_limit_bytes,
-                    "disconnecting client: pubsub output frame exceeded buffer limit"
-                );
-                let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
-                write_all_with_timeout(&mut stream, &response).await?;
-                return Ok(());
+                ) {
+                    tracing::warn!(
+                        client_id = client_state.id(),
+                        output_limit_bytes = io_limits.output_buffer_limit_bytes,
+                        "disconnecting client: pubsub output frame exceeded buffer limit"
+                    );
+                    let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                    return Ok(());
+                }
             }
-            let _had_pending_or_remaining = had_pending || still_has_pending;
+        }
+
+        // Drain MONITOR messages accumulated during command execution.
+        if client_state.is_monitor() {
+            let monitor_msgs = {
+                let mut server = server_state.meta.lock().await;
+                server.drain_monitor_messages(client_state.id())
+            };
+            for line in monitor_msgs {
+                let frame = RespFrame::SimpleString(line);
+                if !append_encoded_frame(&mut output, &frame, io_limits.output_buffer_limit_bytes) {
+                    tracing::warn!(
+                        client_id = client_state.id(),
+                        output_limit_bytes = io_limits.output_buffer_limit_bytes,
+                        "disconnecting monitor client: output buffer limit exceeded"
+                    );
+                    let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
+                    write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                    return Ok(());
+                }
+            }
         }
 
         if !output.is_empty() {
             let out_len = output.len() as u64;
-            write_all_with_timeout(&mut stream, &output).await?;
+            write_all_with_timeout(&mut stream, &output, write_timeout).await?;
             output.clear();
-            let mut server = server_state.lock().await;
+            let mut server = server_state.meta.lock().await;
             server.stats.add_net_output_bytes(out_len);
         }
 
@@ -1020,12 +1218,11 @@ async fn handle_client_inner(
 }
 #[cfg(test)]
 mod tests {
-    use ratatosk_engine::keyspace::ServerState;
+    use ratatosk_engine::keyspace::{ServerState, SharedState};
     use std::{sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::Mutex,
         time::timeout,
     };
 
@@ -1044,7 +1241,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
@@ -1069,7 +1266,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
@@ -1090,6 +1287,26 @@ mod tests {
             .expect("read reply");
         buf.truncate(n);
         buf
+    }
+
+    /// Search the temp dir for any AOF file and return its concatenated contents.
+    fn find_aof_content(dir: &std::path::Path) -> String {
+        let mut content = String::new();
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".aof") && !name_str.ends_with(".manifest") {
+                let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                content.push_str(&text);
+            }
+        }
+        assert!(
+            !content.is_empty(),
+            "no AOF file found in {}",
+            dir.display()
+        );
+        content
     }
 
     fn parse_integer_reply(reply: &[u8]) -> i64 {
@@ -1216,7 +1433,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1303,7 +1520,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1384,7 +1601,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1468,7 +1685,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1571,7 +1788,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1712,7 +1929,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1794,7 +2011,7 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(Mutex::new(ServerState::with_default_dbs()));
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
 
         let shared_for_accept = Arc::clone(&shared);
         let accept_task = tokio::spawn(async move {
@@ -1891,9 +2108,17 @@ mod tests {
         let _ = read_reply(&mut client).await;
         server_task.await.expect("server task complete");
 
-        let aof = std::fs::read_to_string(dir.path().join("appendonly.aof")).expect("read aof");
-        assert!(aof.contains("SET"));
-        assert!(aof.contains("foo"));
-        assert!(aof.contains("bar"));
+        // Find the actual AOF file written — may be the legacy filename or a
+        // manifest-managed incremental file depending on bootstrap layout.
+        let aof_content = find_aof_content(dir.path());
+        assert!(
+            aof_content.contains("SET"),
+            "AOF should contain SET command"
+        );
+        assert!(aof_content.contains("foo"), "AOF should contain key 'foo'");
+        assert!(
+            aof_content.contains("bar"),
+            "AOF should contain value 'bar'"
+        );
     }
 }

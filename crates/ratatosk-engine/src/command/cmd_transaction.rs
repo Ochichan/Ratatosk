@@ -5,7 +5,8 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{ServerState, purge_expired_key};
 
 use super::{
-    ClientState, CommandOutcome, TransactionState, WatchedKey, err, execute, now_ms, wrong_arity,
+    ClientState, CommandOutcome, ServerAccess, TransactionState, WatchedKey, err, execute, now_ms,
+    wrong_arity,
 };
 
 pub(super) fn cmd_multi(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
@@ -69,7 +70,8 @@ pub(super) fn cmd_exec(
                 .map(|value| RespFrame::BulkString(Some(value)))
                 .collect(),
         );
-        let outcome = execute(frame, server, client);
+        let mut access = ServerAccess::new_inline(server);
+        let outcome = execute(frame, &mut access, client);
         replies.push(outcome.response);
     }
 
@@ -110,9 +112,9 @@ pub(super) fn cmd_watch(
     let db_index = client.selected_db;
     let now = now_ms();
     {
-        let db = server.db_mut(db_index);
+        let mut db = server.db_mut(db_index);
         for key in args {
-            purge_expired_key(db, key, now);
+            purge_expired_key(&mut db, key, now);
         }
     }
 
