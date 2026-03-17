@@ -363,7 +363,7 @@ mod tests {
     use crate::keyspace::{HashFieldEntry, ServerState, StoredValue};
 
     fn make_server_with_keys(count: usize) -> ServerState {
-        let mut state = ServerState::with_default_dbs();
+        let state = ServerState::with_default_dbs();
         for i in 0..count {
             let key = Bytes::from(format!("key:{i}"));
             let val = StoredValue::string(Bytes::from(format!("val:{i}")), None);

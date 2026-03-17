@@ -277,8 +277,8 @@ pub(super) fn cmd_zadd(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         if xx {
@@ -363,8 +363,8 @@ pub(super) fn cmd_zrem(
 
     let key = &args[0];
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -397,8 +397,8 @@ pub(super) fn cmd_zscore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -425,8 +425,8 @@ pub(super) fn cmd_zcard(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -455,8 +455,8 @@ pub(super) fn cmd_zincrby(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     if !db.contains_key(key) {
         let mut zset = SortedSet::default();
@@ -494,8 +494,8 @@ pub(super) fn cmd_zmscore(
     let members = &args[1..];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         let out: Vec<RespFrame> = members
@@ -761,8 +761,8 @@ pub(super) fn cmd_zrange(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -826,8 +826,8 @@ pub(super) fn cmd_zrangebyscore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -900,8 +900,8 @@ pub(super) fn cmd_zrevrangebyscore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -970,8 +970,8 @@ pub(super) fn cmd_zrangebylex(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -1039,8 +1039,8 @@ pub(super) fn cmd_zrevrangebylex(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -1084,8 +1084,8 @@ pub(super) fn cmd_zrevrange(
     let with_scores = args.len() > 3 && args[3].eq_ignore_ascii_case(b"WITHSCORES");
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -1184,8 +1184,8 @@ pub(super) fn cmd_zrangestore(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, src, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, src, now);
 
     let selected = {
         let Some(entry) = db.get(src) else {
@@ -1235,8 +1235,8 @@ pub(super) fn cmd_zcount(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1271,8 +1271,8 @@ pub(super) fn cmd_zlexcount(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1304,8 +1304,8 @@ pub(super) fn cmd_zrank(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -1330,8 +1330,8 @@ pub(super) fn cmd_zrevrank(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
@@ -1363,8 +1363,8 @@ pub(super) fn cmd_zremrangebyrank(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1427,8 +1427,8 @@ pub(super) fn cmd_zremrangebyscore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1473,8 +1473,8 @@ pub(super) fn cmd_zremrangebylex(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1705,12 +1705,12 @@ pub(super) fn cmd_zunion(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_union(db, keys, &weights, aggregate) {
+    let result = match compute_union(&db, keys, &weights, aggregate) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -1740,12 +1740,12 @@ pub(super) fn cmd_zunionstore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_union(db, keys, &weights, aggregate) {
+    let result = match compute_union(&db, keys, &weights, aggregate) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -1797,12 +1797,12 @@ pub(super) fn cmd_zinter(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_inter(db, keys, &weights, aggregate) {
+    let result = match compute_inter(&db, keys, &weights, aggregate) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -1832,12 +1832,12 @@ pub(super) fn cmd_zinterstore(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_inter(db, keys, &weights, aggregate) {
+    let result = match compute_inter(&db, keys, &weights, aggregate) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -1895,9 +1895,9 @@ pub(super) fn cmd_zintercard(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
     // Compute intersection cardinality efficiently by finding the smallest set first
@@ -1908,7 +1908,7 @@ pub(super) fn cmd_zintercard(
     // Gather all sets
     let mut sets: Vec<Vec<(Bytes, f64)>> = Vec::with_capacity(keys.len());
     for key in keys {
-        match read_zset_or_empty(db, key) {
+        match read_zset_or_empty(&db, key) {
             Ok(entries) => {
                 if entries.is_empty() {
                     return CommandOutcome::reply(RespFrame::Integer(0));
@@ -1972,12 +1972,12 @@ pub(super) fn cmd_zdiff(
         .is_some_and(|opt| opt.eq_ignore_ascii_case(b"WITHSCORES"));
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_diff(db, keys) {
+    let result = match compute_diff(&db, keys) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -2002,12 +2002,12 @@ pub(super) fn cmd_zdiffstore(
     let keys = &args[2..keys_end];
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
     }
 
-    let result = match compute_diff(db, keys) {
+    let result = match compute_diff(&db, keys) {
         Ok(v) => v,
         Err(outcome) => return outcome,
     };
@@ -2081,8 +2081,8 @@ fn zpop_impl(
     }
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
@@ -2237,10 +2237,10 @@ fn try_zmpop_once(
     client: &ClientState,
 ) -> CommandOutcome {
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
 
         let mut remove_key = false;
         let popped = {
@@ -2324,8 +2324,8 @@ pub(super) fn cmd_zrandmember(
     let with_scores = args.len() == 3 && args[2].eq_ignore_ascii_case(b"WITHSCORES");
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return if count.is_some() {
@@ -2419,8 +2419,8 @@ pub(super) fn cmd_zscan(
     };
 
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
-    purge_expired_key(db, key, now);
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
         return scan_reply(0, vec![]);
@@ -2523,10 +2523,10 @@ fn try_bzpop_once(
     pop_min: bool,
 ) -> CommandOutcome {
     let now = now_ms();
-    let db = server.db_mut(client.selected_db);
+    let mut db = server.db_mut(client.selected_db);
 
     for key in keys {
-        purge_expired_key(db, key, now);
+        purge_expired_key(&mut db, key, now);
 
         let mut remove_key = false;
         let popped = {
