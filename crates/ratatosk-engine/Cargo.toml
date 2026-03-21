@@ -30,3 +30,6 @@ fs2 = { workspace = true }
 tokio = { workspace = true }
 libmimalloc-sys = { version = "0.1", optional = true }
 mlua = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -12,7 +12,8 @@ use std::{
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::keyspace::SharedState;
 use ratatosk_persist::aof::{
-    AofWriter, DEFAULT_AOF_MANIFEST_FILENAME, DEFAULT_SINGLE_FILE_AOF_FILENAME, FsyncPolicy,
+    AofManifest, AofWriter, DEFAULT_AOF_MANIFEST_FILENAME, DEFAULT_SINGLE_FILE_AOF_FILENAME,
+    FsyncPolicy,
 };
 use tokio::sync::mpsc;
 
@@ -114,9 +115,40 @@ pub async fn apply_server_persistence_config(
         state.set_aof_rewrite_in_progress(false);
         state.clear_last_aof_rewrite_status();
         state.clear_last_aof_rewrite_time_ms();
+        state.set_aof_current_path(None);
+        state.set_aof_base_path(None);
     }
 
     crate::metrics::set_aof_write_latched(state.aof_write_latched());
+}
+
+fn runtime_aof_file_paths(
+    runtime: &PersistenceRuntime,
+) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
+    let current_path = runtime
+        .aof_sender()
+        .is_some()
+        .then(|| runtime.aof_path.clone());
+
+    let base_path = match runtime.aof_manifest_path.as_ref() {
+        Some(manifest_path) if manifest_path.exists() => {
+            AofManifest::load_from_file(manifest_path)?.base_path()
+        }
+        _ => None,
+    };
+
+    Ok((current_path, base_path))
+}
+
+pub async fn sync_server_aof_file_info(
+    server_state: &Arc<SharedState>,
+    runtime: &PersistenceRuntime,
+) -> io::Result<()> {
+    let (current_path, base_path) = runtime_aof_file_paths(runtime)?;
+    let mut state = server_state.meta.lock().await;
+    state.set_aof_current_path(current_path);
+    state.set_aof_base_path(base_path);
+    Ok(())
 }
 
 pub async fn load_startup_data(
@@ -223,6 +255,7 @@ pub async fn start_bgrewriteaof(
 
     let handle = tokio::spawn(async move {
         let result = request_aof_rewrite(&runtime).await;
+        let sync_result = sync_server_aof_file_info(&server_state, &runtime).await;
 
         let mut state = server_state.meta.lock().await;
         state.set_aof_rewrite_in_progress(false);
@@ -243,6 +276,14 @@ pub async fn start_bgrewriteaof(
                     "background AOF rewrite failed"
                 );
             }
+        }
+
+        if let Err(error) = sync_result {
+            tracing::warn!(
+                target = "ratatosk::aof",
+                error = %error,
+                "failed to refresh AOF file info after rewrite"
+            );
         }
     });
 

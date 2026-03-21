@@ -23,6 +23,7 @@ const AOF_APPEND_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const AOF_APPEND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AOF_FLUSH_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AOF_REWRITE_REPLY_TIMEOUT: Duration = Duration::from_secs(900);
+const ALLOW_INCOMPLETE_AOF_CHAIN_ENV: &str = "RATATOSK_ALLOW_INCOMPLETE_AOF_CHAIN";
 
 pub(crate) enum AofWorkerCommand {
     Append {
@@ -371,16 +372,41 @@ pub(crate) fn startup_aof_recovery_paths(runtime: &PersistenceRuntime) -> io::Re
 
     let manifest = AofManifest::load_from_file(manifest_path)?;
     let mut recovery_files = Vec::new();
+    let mut missing_files = Vec::new();
     for path in manifest.recovery_files() {
         if path.exists() {
             recovery_files.push(path);
         } else {
-            tracing::warn!(
-                target = "ratatosk::startup",
-                path = %path.display(),
-                manifest = %manifest_path.display(),
-                "AOF manifest references a missing recovery file; skipping"
-            );
+            missing_files.push(path);
+        }
+    }
+
+    if !missing_files.is_empty() {
+        if env_truthy(ALLOW_INCOMPLETE_AOF_CHAIN_ENV) {
+            for path in &missing_files {
+                tracing::warn!(
+                    target = "ratatosk::startup",
+                    path = %path.display(),
+                    manifest = %manifest_path.display(),
+                    override_env = ALLOW_INCOMPLETE_AOF_CHAIN_ENV,
+                    "AOF manifest references a missing recovery file; continuing because incomplete-chain override is enabled"
+                );
+            }
+        } else {
+            let missing = missing_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF manifest '{}' references missing recovery file(s): {}. Refusing startup to avoid partial recovery (set {}=true to bypass)",
+                    manifest_path.display(),
+                    missing,
+                    ALLOW_INCOMPLETE_AOF_CHAIN_ENV
+                ),
+            ));
         }
     }
 
@@ -777,6 +803,65 @@ mod tests {
         assert_eq!(aof_path, legacy_path);
         assert!(manifest_opt.is_none());
         assert!(!manifest_path.exists());
+    }
+
+    #[test]
+    fn startup_aof_recovery_paths_fails_closed_when_manifest_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
+        let mut manifest = AofManifest::new(dir.path());
+        manifest.set_base_after_rewrite("appendonly.aof.base.aof".into());
+        let _incr_path = manifest.new_incr_file();
+        manifest
+            .save_to_file(&manifest_path)
+            .expect("save manifest");
+
+        let runtime = PersistenceRuntime {
+            rdb_path: dir.path().join("dump.rdb"),
+            aof_path: dir.path().join("appendonly.aof.1.incr.aof"),
+            aof_manifest_path: Some(manifest_path.clone()),
+            aof_tx: None,
+        };
+
+        // SAFETY: test-only env isolation for this process.
+        unsafe { env::remove_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV) };
+
+        let error = startup_aof_recovery_paths(&runtime).expect_err("startup should fail closed");
+        let text = error.to_string();
+        assert!(matches!(error.kind(), io::ErrorKind::InvalidData));
+        assert!(text.contains("missing recovery file(s)"), "{text}");
+        assert!(text.contains(ALLOW_INCOMPLETE_AOF_CHAIN_ENV), "{text}");
+    }
+
+    #[test]
+    fn startup_aof_recovery_paths_allows_missing_manifest_file_with_override() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
+        let mut manifest = AofManifest::new(dir.path());
+        manifest.set_base_after_rewrite("appendonly.aof.base.aof".into());
+        let existing_incr = manifest.new_incr_file();
+        let _missing_incr = manifest.new_incr_file();
+        manifest
+            .save_to_file(&manifest_path)
+            .expect("save manifest");
+
+        std::fs::write(&existing_incr, b"REDIS-AOF-001\n").expect("write existing incr");
+
+        let runtime = PersistenceRuntime {
+            rdb_path: dir.path().join("dump.rdb"),
+            aof_path: existing_incr.clone(),
+            aof_manifest_path: Some(manifest_path),
+            aof_tx: None,
+        };
+
+        // SAFETY: test-only env isolation for this process.
+        unsafe { env::set_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV, "true") };
+
+        let files = startup_aof_recovery_paths(&runtime).expect("override should allow startup");
+        assert_eq!(files, vec![existing_incr]);
+
+        // SAFETY: test-only env isolation for this process.
+        unsafe { env::remove_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV) };
     }
 
     #[tokio::test]

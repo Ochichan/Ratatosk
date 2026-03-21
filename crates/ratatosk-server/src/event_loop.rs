@@ -1,4 +1,7 @@
-use std::{fs, io, sync::Arc, time::Duration};
+use std::{io, sync::Arc, time::Duration};
+
+#[cfg(target_os = "linux")]
+use std::fs;
 
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
@@ -20,7 +23,7 @@ use crate::{
     config::ServerConfig,
     persistence::{
         PersistenceRuntime, apply_server_persistence_config, drain_bgrewriteaof_tasks,
-        drain_bgsave_tasks, flush_aof, load_startup_data, start_bgsave,
+        drain_bgsave_tasks, flush_aof, load_startup_data, start_bgsave, sync_server_aof_file_info,
     },
     rate_limiter::ConnectionRateLimiter,
 };
@@ -30,6 +33,7 @@ const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const MEMORY_ESTIMATE_INTERVAL: u64 = 10;
 const DEFAULT_CONN_RATE_LIMIT_WINDOW_SECS: u64 = 10;
 const DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
+const SHUTDOWN_BEST_EFFORT_ENV: &str = "RATATOSK_SHUTDOWN_BEST_EFFORT";
 
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
@@ -75,6 +79,15 @@ fn connection_rate_limit_max_attempts_from_env() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS)
+}
+
+fn shutdown_best_effort_enabled() -> bool {
+    std::env::var(SHUTDOWN_BEST_EFFORT_ENV).is_ok_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
 }
 
 fn io_error_kind_label(error: &io::Error) -> String {
@@ -202,6 +215,87 @@ async fn drain_client_tasks(tasks: &mut JoinSet<()>, grace_period: Duration) {
                 tracing::warn!(target = "ratatosk::shutdown", error = %error, "client task join failure after abort");
             }
         }
+    }
+}
+
+async fn flush_persistence_before_shutdown(
+    appendonly: bool,
+    persistence: &PersistenceRuntime,
+) -> io::Result<bool> {
+    if !appendonly {
+        crate::metrics::record_shutdown_aof_flush_result("skipped", "appendonly_disabled");
+        return Ok(false);
+    }
+
+    let started_at = std::time::Instant::now();
+    let best_effort = shutdown_best_effort_enabled();
+
+    match flush_aof(persistence).await {
+        Ok(()) => {
+            let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+            crate::metrics::record_shutdown_aof_flush_duration_ms(duration_ms, "success");
+            crate::metrics::record_shutdown_aof_flush_result("success", "ok");
+            tracing::info!(
+                target = "ratatosk::shutdown",
+                duration_ms = duration_ms,
+                "AOF flushed before shutdown"
+            );
+            Ok(true)
+        }
+        Err(error) => {
+            let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
+            let error_kind = io_error_kind_label(&error);
+            crate::metrics::record_shutdown_aof_flush_duration_ms(duration_ms, "error");
+            crate::metrics::record_shutdown_aof_flush_result(
+                if best_effort {
+                    "error_best_effort"
+                } else {
+                    "error_fatal"
+                },
+                &error_kind,
+            );
+
+            if best_effort {
+                tracing::warn!(
+                    target = "ratatosk::shutdown",
+                    error = %error,
+                    error_kind = %error_kind,
+                    duration_ms = duration_ms,
+                    best_effort = true,
+                    override_env = SHUTDOWN_BEST_EFFORT_ENV,
+                    "failed to flush AOF before shutdown; continuing due to best-effort mode"
+                );
+                Ok(false)
+            } else {
+                tracing::error!(
+                    target = "ratatosk::shutdown",
+                    error = %error,
+                    error_kind = %error_kind,
+                    duration_ms = duration_ms,
+                    best_effort = false,
+                    override_env = SHUTDOWN_BEST_EFFORT_ENV,
+                    "failed to flush AOF before shutdown"
+                );
+                Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to flush AOF before shutdown: {error}"),
+                ))
+            }
+        }
+    }
+}
+
+fn finalize_shutdown_result(
+    fatal_error: Option<io::Error>,
+    shutdown_flush_error: Option<io::Error>,
+) -> io::Result<()> {
+    match (fatal_error, shutdown_flush_error) {
+        (Some(fatal), Some(flush)) => Err(io::Error::other(format!(
+            "shutdown encountered multiple errors: fatal_runtime_error={fatal}; shutdown_flush_error={flush}"
+        ))),
+        (Some(fatal), None) => Err(fatal),
+        (None, Some(flush)) => Err(flush),
+        (None, None) => Ok(()),
     }
 }
 
@@ -358,6 +452,14 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
             ),
         )
     })?);
+    sync_server_aof_file_info(&server_state, &persistence)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("syncing AOF file info after persistence init: {error}"),
+            )
+        })?;
     load_startup_data(&server_state, &persistence, config.appendonly)
         .await
         .map_err(|error| {
@@ -535,6 +637,7 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
     let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
     drain_client_tasks(&mut client_tasks, grace_period).await;
+    let mut shutdown_flush_error = None;
 
     let (bgsave_completed, bgsave_aborted) = drain_bgsave_tasks(grace_period).await;
     if bgsave_aborted > 0 {
@@ -567,12 +670,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         );
     }
 
-    if config.appendonly {
-        if let Err(error) = flush_aof(&persistence).await {
-            tracing::warn!(error = %error, "failed to flush AOF before shutdown");
-        }
+    if let Err(error) = flush_persistence_before_shutdown(config.appendonly, &persistence).await {
+        shutdown_flush_error = Some(error);
     }
-    tracing::info!("persistence flushed before shutdown");
 
     // Shut down lazy-free background thread
     lazy_free_shutdown.store(true, std::sync::atomic::Ordering::Release);
@@ -583,22 +683,31 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // Abort lazy-free monitor task
     lazy_free_monitor_handle.abort();
 
-    tracing::info!("server shutdown complete");
-
-    if let Some(error) = fatal_error {
-        return Err(error);
+    if fatal_error.is_none() && shutdown_flush_error.is_none() {
+        tracing::info!("server shutdown complete");
+    } else {
+        tracing::warn!(
+            target = "ratatosk::shutdown",
+            "server shutdown completed with errors"
+        );
     }
 
-    Ok(())
+    finalize_shutdown_result(fatal_error, shutdown_flush_error)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        io,
+        time::{Duration, Instant},
+    };
 
     use tokio::task::JoinSet;
 
-    use super::drain_client_tasks;
+    use super::{
+        SHUTDOWN_BEST_EFFORT_ENV, drain_client_tasks, finalize_shutdown_result,
+        shutdown_best_effort_enabled,
+    };
 
     #[tokio::test]
     async fn drain_client_tasks_completes_ready_tasks() {
@@ -623,5 +732,41 @@ mod tests {
 
         assert!(tasks.is_empty());
         assert!(started_at.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn shutdown_best_effort_defaults_to_false() {
+        // SAFETY: test-only env isolation for this process.
+        unsafe { std::env::remove_var(SHUTDOWN_BEST_EFFORT_ENV) };
+        assert!(!shutdown_best_effort_enabled());
+    }
+
+    #[test]
+    fn shutdown_best_effort_reads_truthy_env() {
+        // SAFETY: test-only env isolation for this process.
+        unsafe { std::env::set_var(SHUTDOWN_BEST_EFFORT_ENV, "true") };
+        assert!(shutdown_best_effort_enabled());
+        // SAFETY: test-only env isolation for this process.
+        unsafe { std::env::remove_var(SHUTDOWN_BEST_EFFORT_ENV) };
+    }
+
+    #[test]
+    fn finalize_shutdown_result_combines_runtime_and_flush_errors() {
+        let result = finalize_shutdown_result(
+            Some(io::Error::other("listener failure")),
+            Some(io::Error::new(io::ErrorKind::TimedOut, "flush timeout")),
+        )
+        .expect_err("combined shutdown errors should fail");
+
+        let text = result.to_string();
+        assert!(
+            text.contains("fatal_runtime_error=listener failure"),
+            "{text}"
+        );
+        assert!(
+            text.contains("shutdown_flush_error=failed to flush AOF before shutdown")
+                || text.contains("shutdown_flush_error=flush timeout"),
+            "{text}"
+        );
     }
 }

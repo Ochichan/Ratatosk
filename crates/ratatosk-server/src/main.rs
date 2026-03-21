@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CRASH_MAX_FILES: usize = 64;
 const DEFAULT_CRASH_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const DEFAULT_FD_HEADROOM: usize = 128;
 
 #[derive(Parser)]

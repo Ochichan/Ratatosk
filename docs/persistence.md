@@ -228,6 +228,17 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 
 참고: Pub/Sub delivery는 per-subscriber `mpsc::channel` 기반 push 방식이므로 AOF에 기록되지 않는다. AOF는 state-mutating 명령만 기록하며, Pub/Sub 메시지와 client tracking invalidation은 휘발성 delivery 경로로 처리된다.
 
+## Runtime Observability
+
+`INFO persistence`는 현재 활성 AOF 증분 파일과 manifest BASE 파일의 실제 크기를 노출한다.
+
+- `aof_current_size`: 현재 write target인 active AOF file size
+- `aof_base_size`: manifest BASE file size (`BASE`가 없으면 `0`)
+- `audit_chain_dirty`: audit log append 이후 checkpoint state가 뒤처진 경우 `1`
+- `audit_recovery_status`: startup 시 audit checkpoint를 durable log tail에서 복구한 경우 `log_ahead` 또는 `hash_mismatch`, 복구가 없으면 `none`
+
+Legacy single-file AOF 모드에서는 `aof_current_size`만 의미가 있으며, `aof_base_size`는 `0`이다.
+
 ---
 
 ## 에러 타입
@@ -268,9 +279,10 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 | Background RDB save | 구현 | `BGSAVE`가 백그라운드 태스크로 실행되고 shutdown 시 drain된다. snapshot은 per-DB 순차 read-lock + clone으로 수행 (`DataState::snapshot_all()`). |
 | AOF rewrite (`BGREWRITEAOF`) | 구현 | AOF 워커에서 rewrite를 수행한 뒤 writer를 reopen한다. |
 | AOF writer 서버 통합 | 구현 | 쓰기 명령이 AOF 워커 큐(`append`)로 비동기 전달된다. |
+| Shutdown AOF flush gate | 구현 | appendonly 인스턴스는 종료 시 AOF flush를 시도하고, 실패하면 기본적으로 종료를 실패 처리한다. `RATATOSK_SHUTDOWN_BEST_EFFORT=true`일 때만 경고 후 계속 종료한다. |
 | Legacy AOF format gate | 구현 | headerless AOF는 기본 거부하며 `RATATOSK_ALLOW_LEGACY_AOF=true`에서만 임시 허용한다. |
 | Legacy AOF migration | 구현 | `RATATOSK_MIGRATE_AOF=true` 설정 시 레거시 단일 파일 AOF를 manifest 기반으로 자동 변환. startup에서 감지 후 경고 메시지 출력. |
-| Manifest bootstrap/recovery | 구현 | manifest save/load, startup discovery, recovery-file 순차 replay가 baseline으로 연결된다. |
+| Manifest bootstrap/recovery | 구현 | manifest save/load, startup discovery, recovery-file 순차 replay가 baseline으로 연결된다. manifest가 가리키는 recovery file이 없으면 기본적으로 startup을 중단한다. |
 | server_cron 통합 | 부분 | SIGUSR1 수신은 구현되어 있고, 추가 save 정책 자동화는 별도 작업이다. |
 | LZF 압축 | 미구현 | RDB string 압축 (큰 값 전용) |
 | Manifest rewrite switch | 부분 | manifest candidate validation/cleanup helper와 manifest-backed rewrite 후 새 INCR 회전은 연결됐지만 BASE materialization과 full atomic manifest switch는 아직 남아 있다. |
@@ -284,6 +296,21 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
 - 종료 조건: 레거시 포맷으로 1회 부팅 후 즉시 `BGREWRITEAOF`를 실행해 버전 헤더가 있는 AOF로 재작성한다.
 - 재기동 검증: 우회 변수를 제거한 상태에서 재시작해도 정상 부팅되어야 릴리즈 가능으로 판정한다.
 
+## Incomplete Manifest Chain 정책
+
+- 기본값: `RATATOSK_ALLOW_INCOMPLETE_AOF_CHAIN`는 설정하지 않는다(또는 `false`)를 유지한다.
+- 기본 동작: manifest가 참조하는 `BASE` 또는 `INCR` recovery file 중 하나라도 없으면 startup을 실패시킨다.
+- 예외 허용: 수동 복구 창에서만 `RATATOSK_ALLOW_INCOMPLETE_AOF_CHAIN=true`를 단기 적용한다.
+- 운영 원칙: 우회 부팅은 “부분 복구 상태”일 수 있으므로, 부팅 직후 데이터 검증과 `BGREWRITEAOF` 또는 오프라인 복구 절차를 반드시 수행한다.
+
+## Shutdown Durability 정책
+
+- 기본값: `RATATOSK_SHUTDOWN_BEST_EFFORT`는 설정하지 않는다(또는 `false`)를 유지한다.
+- 기본 동작: appendonly 인스턴스는 종료 시 AOF flush가 성공해야 clean shutdown으로 간주한다.
+- 실패 동작: AOF flush가 실패하면 경고만 남기고 성공 종료하지 않고, 종료 결과를 실패로 돌린다.
+- 예외 허용: 운영 환경에서 durability보다 종료 진행이 더 중요한 경우에만 `RATATOSK_SHUTDOWN_BEST_EFFORT=true`를 단기 적용한다.
+- 관측성: shutdown flush는 success/error/best-effort 결과와 duration 메트릭을 남긴다.
+
 ---
 
 ## 릴리즈 체크리스트 (AOF/BGREWRITEAOF)
@@ -296,4 +323,6 @@ AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 A
    기대값: 부팅 실패 + `RATATOSK_ALLOW_LEGACY_AOF=true` 안내 메시지
 4. 레거시 AOF 마이그레이션 시나리오를 확인한다.
    1회성으로 `RATATOSK_ALLOW_LEGACY_AOF=true`로 부팅 -> `BGREWRITEAOF` 실행 -> 변수 제거 후 재기동
-5. 롤백 안전성 확인: 신규 빌드로 rewrite된 AOF로 재기동 후 기존 운영 변수셋(우회 변수 없음)에서 문제 없이 올라오는지 점검한다.
+5. manifest recovery chain 누락 기본 차단을 확인한다.
+   기대값: 부팅 실패 + `RATATOSK_ALLOW_INCOMPLETE_AOF_CHAIN=true` 안내 메시지
+6. 롤백 안전성 확인: 신규 빌드로 rewrite된 AOF로 재기동 후 기존 운영 변수셋(우회 변수 없음)에서 문제 없이 올라오는지 점검한다.

@@ -10,6 +10,7 @@ use fs2::available_space;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::ServerState;
+use crate::security::audit_health_snapshot;
 
 use super::{
     ClientState, CommandOutcome, CommandSpec, all_command_specs, cmd_client, command_spec_count,
@@ -35,6 +36,7 @@ fn generate_health_report(server: &ServerState) -> String {
     const MIN_HEALTH_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
     let connected_clients = server.stats.connected_clients();
+    let audit_status = audit_health_snapshot();
 
     let rdb_status = match server.last_rdb_save_status() {
         Some(Ok(())) => "ok",
@@ -82,6 +84,7 @@ fn generate_health_report(server: &ServerState) -> String {
         || disk_status == "low_space"
         || (aof_enabled && (!aof_writable || aof_write_latched))
         || aof_rewrite_status == "error"
+        || audit_status.dirty
     {
         "degraded"
     } else {
@@ -91,7 +94,7 @@ fn generate_health_report(server: &ServerState) -> String {
     let total_keys: usize = (0..server.db_count()).map(|idx| server.db(idx).len()).sum();
 
     let mut report = format!(
-        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|aof_writable:{}|aof_write_latched:{}|aof_rewrite_in_progress:{}|aof_rewrite_status:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
+        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|aof_writable:{}|aof_write_latched:{}|aof_rewrite_in_progress:{}|aof_rewrite_status:{}|audit_chain_dirty:{}|audit_recovery_status:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
         env!("BUILD_UNIX_TS"),
@@ -103,6 +106,8 @@ fn generate_health_report(server: &ServerState) -> String {
         aof_write_latched,
         aof_rewrite_in_progress,
         aof_rewrite_status,
+        audit_status.dirty,
+        audit_status.recovery_status,
         memory_used,
         maxmemory,
         disk_writable,
