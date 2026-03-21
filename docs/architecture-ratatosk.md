@@ -396,6 +396,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 | `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client output limit |
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
 | `RATATOSK_ALLOW_INSECURE_BIND` | unset | non-loopback bind opt-in |
+| `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | appendonly shutdown flush failure override |
 
 `CONFIG SET`을 통한 런타임 설정 변경:
 - `maxmemory`, `maxmemory-policy`, `maxmemory-samples`

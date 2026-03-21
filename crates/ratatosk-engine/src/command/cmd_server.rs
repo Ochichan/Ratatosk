@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, fs};
 
 use bytes::Bytes;
 
@@ -9,7 +9,7 @@ use crate::keyspace::{
     ReplicationMode, ServerState, StoredValue, purge_expired_key, purge_expired_keys,
 };
 use crate::object::now_us;
-use crate::security::next_audit_stamp;
+use crate::security::{audit_health_snapshot, next_audit_stamp};
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
@@ -1364,9 +1364,11 @@ pub(super) fn append_info_server_section(out: &mut String, server: &ServerState,
 }
 
 fn server_health_status(server: &ServerState) -> &'static str {
+    let audit_status = audit_health_snapshot();
     let persistence_healthy = !server.aof_write_latched()
         && server.last_rdb_save_status().is_none_or(Result::is_ok)
-        && server.last_aof_rewrite_status().is_none_or(Result::is_ok);
+        && server.last_aof_rewrite_status().is_none_or(Result::is_ok)
+        && !audit_status.dirty;
     let memory_healthy = server.config.maxmemory() == 0
         || server.stats.cached_memory_estimate() < server.config.maxmemory() as u64;
 
@@ -1375,6 +1377,11 @@ fn server_health_status(server: &ServerState) -> &'static str {
     } else {
         "degraded"
     }
+}
+
+fn file_size_or_zero(path: Option<&std::path::PathBuf>) -> u64 {
+    path.and_then(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .unwrap_or(0)
 }
 
 pub(super) fn append_info_clients_section(out: &mut String, server: &ServerState) {
@@ -1497,6 +1504,7 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
     use ratatosk_core::time::now_sec;
 
     out.push_str("# Persistence\r\n");
+    let audit_status = audit_health_snapshot();
 
     // RDB section
     out.push_str(&format!(
@@ -1556,8 +1564,22 @@ pub(super) fn append_info_persistence_section(out: &mut String, server: &ServerS
     if let Some(time_ms) = server.last_aof_rewrite_time_ms() {
         out.push_str(&format!("aof_last_rewrite_timestamp_ms:{time_ms}\r\n"));
     }
-    out.push_str("aof_current_size:0\r\n");
-    out.push_str("aof_base_size:0\r\n");
+    out.push_str(&format!(
+        "aof_current_size:{}\r\n",
+        file_size_or_zero(server.aof_current_path())
+    ));
+    out.push_str(&format!(
+        "aof_base_size:{}\r\n",
+        file_size_or_zero(server.aof_base_path())
+    ));
+    out.push_str(&format!(
+        "audit_chain_dirty:{}\r\n",
+        i32::from(audit_status.dirty)
+    ));
+    out.push_str(&format!(
+        "audit_recovery_status:{}\r\n",
+        audit_status.recovery_status
+    ));
 
     out.push_str("\r\n");
 }

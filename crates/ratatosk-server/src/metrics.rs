@@ -244,6 +244,25 @@ pub fn record_bgrewriteaof_task_timeout() {
     metrics::counter!("ratatosk_bgrewriteaof_task_timeouts_total").increment(1);
 }
 
+#[inline]
+pub fn record_shutdown_aof_flush_result(result: &str, reason: &str) {
+    metrics::counter!(
+        "ratatosk_shutdown_aof_flush_total",
+        "result" => result.to_string(),
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+#[inline]
+pub fn record_shutdown_aof_flush_duration_ms(duration_ms: f64, status: &str) {
+    metrics::histogram!(
+        "ratatosk_shutdown_aof_flush_duration_ms",
+        "status" => status.to_string()
+    )
+    .record(duration_ms);
+}
+
 /// Record rate-limited connection attempts.
 #[inline]
 pub fn record_rate_limited_connection() {

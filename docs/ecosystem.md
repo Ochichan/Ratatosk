@@ -107,6 +107,9 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client output limit |
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
 | `RATATOSK_ALLOW_INSECURE_BIND` | unset | non-loopback bind opt-in |
+| `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | allow shutdown to continue after appendonly flush failure |
+| `RATATOSK_AUDIT_LOG` | `/tmp/ratatosk-audit.log` | append-only audit event log path |
+| `RATATOSK_AUDIT_CHAIN_STATE` | `/tmp/ratatosk-audit-chain.state` | audit chain checkpoint path |
 
 런타임 `CONFIG SET` 지원:
 - `maxmemory`, `maxmemory-policy`, `maxmemory-samples`
@@ -173,6 +176,7 @@ Ratatosk은 선택적 의존성으로 취급한다.
 
 - loopback bind 기본 + insecure bind explicit opt-in.
 - AUTH brute force prevention: per-connection progressive delay (지수 백오프 + 지터, 최대 2초) + 5회 연속 실패 시 연결 종료, per-IP `AuthRateLimiter` (60초 윈도우 내 20회 실패 시 거부).
+- audit trail은 append log를 `flush + sync_all` 한 뒤 checkpoint state를 atomic rename으로 저장한다. checkpoint가 뒤처져도 startup에서 durable audit log를 우선해 복구한다.
 - `MONITOR`는 미지원 (`ERR MONITOR is not supported in this Ratatosk build`). 단, monitor notification은 `Arc<Notify>` 기반으로 등록된 클라이언트에게 전달됨.
 - TLS 종단은 프록시 계층(stunnel, nginx stream, envoy 등)에서 처리 권장.
 

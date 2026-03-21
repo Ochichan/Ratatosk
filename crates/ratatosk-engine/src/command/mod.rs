@@ -4791,7 +4791,10 @@ fn to_uppercase_bytes(input: &Bytes) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        fs,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
 
     use bytes::Bytes;
     use ratatosk_resp::frame::RespFrame;
@@ -4818,6 +4821,14 @@ mod tests {
     ) -> CommandOutcome {
         let mut access = ServerAccess::new_inline(server);
         execute(cmd(parts), &mut access, client)
+    }
+
+    fn unique_test_path(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ratatosk-{prefix}-{nanos}"))
     }
 
     fn assert_array_set_eq(actual: &RespFrame, expected: &[&str]) {
@@ -10073,6 +10084,69 @@ mod tests {
         assert!(
             text.contains("rdb_last_bgsave_status:ok"),
             "expected rdb_last_bgsave_status:ok: {text}"
+        );
+    }
+
+    #[test]
+    fn info_persistence_reports_real_aof_file_sizes() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let current_path = unique_test_path("aof-current");
+        let base_path = unique_test_path("aof-base");
+
+        fs::write(&current_path, b"123456789").expect("write current aof");
+        fs::write(&base_path, b"1234").expect("write base aof");
+
+        server.set_aof_enabled(true);
+        server.set_aof_current_path(Some(current_path.clone()));
+        server.set_aof_base_path(Some(base_path.clone()));
+
+        let reply = run(&["INFO", "persistence"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("aof_current_size:9"),
+            "expected aof_current_size to reflect file size: {text}"
+        );
+        assert!(
+            text.contains("aof_base_size:4"),
+            "expected aof_base_size to reflect file size: {text}"
+        );
+        assert!(
+            text.contains("audit_chain_dirty:"),
+            "expected audit_chain_dirty field in INFO persistence: {text}"
+        );
+        assert!(
+            text.contains("audit_recovery_status:"),
+            "expected audit_recovery_status field in INFO persistence: {text}"
+        );
+
+        let _ = fs::remove_file(&current_path);
+        let _ = fs::remove_file(&base_path);
+    }
+
+    #[test]
+    fn ping_health_reports_audit_status_fields() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let reply = run(&["PING", "HEALTH"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("|audit_chain_dirty:"),
+            "expected audit_chain_dirty in health report: {text}"
+        );
+        assert!(
+            text.contains("|audit_recovery_status:"),
+            "expected audit_recovery_status in health report: {text}"
         );
     }
 

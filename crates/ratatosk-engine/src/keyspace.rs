@@ -15,6 +15,7 @@ use ratatosk_core::time::now_ms as unix_ms_now;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering},
@@ -834,6 +835,8 @@ pub struct ServerState {
     aof_rewrite_in_progress: bool,
     last_aof_rewrite_status: Option<Result<(), String>>,
     last_aof_rewrite_time_ms: Option<i64>,
+    aof_current_path: Option<PathBuf>,
+    aof_base_path: Option<PathBuf>,
     /// Set of client IDs that are in MONITOR mode.
     monitor_clients: HashSet<i64>,
     /// Pending monitor output lines per client. Each entry is a pre-formatted
@@ -877,6 +880,8 @@ impl ServerState {
             aof_rewrite_in_progress: false,
             last_aof_rewrite_status: None,
             last_aof_rewrite_time_ms: None,
+            aof_current_path: None,
+            aof_base_path: None,
             monitor_clients: HashSet::new(),
             monitor_pending: HashMap::new(),
             monitor_notifiers: HashMap::new(),
@@ -1365,6 +1370,22 @@ impl ServerState {
         self.last_aof_rewrite_time_ms = None;
     }
 
+    pub fn aof_current_path(&self) -> Option<&PathBuf> {
+        self.aof_current_path.as_ref()
+    }
+
+    pub fn set_aof_current_path(&mut self, path: Option<PathBuf>) {
+        self.aof_current_path = path;
+    }
+
+    pub fn aof_base_path(&self) -> Option<&PathBuf> {
+        self.aof_base_path.as_ref()
+    }
+
+    pub fn set_aof_base_path(&mut self, path: Option<PathBuf>) {
+        self.aof_base_path = path;
+    }
+
     // -----------------------------------------------------------------------
     // MONITOR support
     // -----------------------------------------------------------------------
@@ -1626,6 +1647,8 @@ mod tests {
         assert!(!state.aof_rewrite_in_progress());
         assert!(state.last_aof_rewrite_status().is_none());
         assert!(state.last_aof_rewrite_time_ms().is_none());
+        assert!(state.aof_current_path().is_none());
+        assert!(state.aof_base_path().is_none());
     }
 
     #[test]
@@ -1673,12 +1696,23 @@ mod tests {
         state.set_last_aof_rewrite_time_ms(9_999);
         assert_eq!(state.last_aof_rewrite_time_ms(), Some(9_999));
 
+        let current = PathBuf::from("/tmp/appendonly.aof.current");
+        let base = PathBuf::from("/tmp/appendonly.aof.base");
+        state.set_aof_current_path(Some(current.clone()));
+        state.set_aof_base_path(Some(base.clone()));
+        assert_eq!(state.aof_current_path(), Some(&current));
+        assert_eq!(state.aof_base_path(), Some(&base));
+
         state.set_aof_rewrite_in_progress(false);
         state.clear_last_aof_rewrite_status();
         state.clear_last_aof_rewrite_time_ms();
+        state.set_aof_current_path(None);
+        state.set_aof_base_path(None);
         assert!(!state.aof_rewrite_in_progress());
         assert!(state.last_aof_rewrite_status().is_none());
         assert!(state.last_aof_rewrite_time_ms().is_none());
+        assert!(state.aof_current_path().is_none());
+        assert!(state.aof_base_path().is_none());
     }
 
     #[test]

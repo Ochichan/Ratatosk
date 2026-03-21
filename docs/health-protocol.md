@@ -56,13 +56,17 @@ Standard health response format used across all components.
 ### Ratatosk
 
 - **Endpoint**: `INFO server` section (field: `health_status`)
-- **Components**: persistence (AOF latch + last RDB/AOF rewrite status), memory (`maxmemory` headroom when configured)
+- **Components**: persistence (AOF latch + last RDB/AOF rewrite status + audit checkpoint state), memory (`maxmemory` headroom when configured)
 - **Contract version**: Exposed in `INFO server` as `bridge_contract_version`
 
 Current Ratatosk mapping:
-- `healthy`: persistence status is OK and memory headroom is within configured `maxmemory` budget
-- `degraded`: AOF is latched, last RDB/AOF rewrite status is error, or cached memory estimate exceeds configured `maxmemory`
+- `healthy`: persistence status is OK, audit chain is not dirty, and memory headroom is within configured `maxmemory` budget
+- `degraded`: AOF is latched, last RDB/AOF rewrite status is error, audit checkpoint is dirty, or cached memory estimate exceeds configured `maxmemory`
 - `unhealthy`: not currently emitted by Ratatosk `INFO server`; callers should treat absence of service reachability as unhealthy
+
+Ratatosk persistence/health surfaces also expose:
+- `INFO persistence`: `audit_chain_dirty`, `audit_recovery_status`
+- `PING HEALTH`: `audit_chain_dirty`, `audit_recovery_status`
 
 ### Muninn
 

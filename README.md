@@ -54,6 +54,27 @@ Recommended coexistence port when Redis may also be running:
 
 - `RATATOSK_PORT=6380`
 
+## Nix
+
+Ratatosk can also be built and run directly with Nix flakes.
+
+```bash
+nix build .#ratatosk
+nix run .#ratatosk
+nix develop
+```
+
+Available flake outputs:
+
+- `packages.<system>.ratatosk`: default release build of the `ratatosk` server binary
+- `apps.<system>.ratatosk`: run the packaged server with `nix run`
+- `devShells.<system>.default`: Rust + Nix development shell
+
+The package also installs:
+
+- example config: `$out/share/examples/ratatosk/ratatosk.conf`
+- docs bundle: `$out/share/doc/ratatosk`
+
 ## Quality Gate
 
 The repository is kept warning-free under the local quality gate below:
