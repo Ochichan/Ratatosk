@@ -324,6 +324,27 @@ async fn write_all_with_timeout(
     }
 }
 
+fn load_connection_runtime_config(server_state: &SharedServerState) -> (usize, usize, Duration) {
+    let config = server_state.config_cache.load();
+    (
+        config.query_buffer_limit(),
+        config.output_buffer_flush_threshold(),
+        Duration::from_secs(config.client_write_timeout_sec()),
+    )
+}
+
+fn reload_connection_runtime_config(
+    server_state: &SharedServerState,
+    query_buffer_limit: &mut usize,
+    output_buffer_flush_threshold: &mut usize,
+    write_timeout: &mut Duration,
+) {
+    let (query_limit, output_threshold, timeout) = load_connection_runtime_config(server_state);
+    *query_buffer_limit = query_limit;
+    *output_buffer_flush_threshold = output_threshold;
+    *write_timeout = timeout;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_with_blocking_retry(
     frame: RespFrame,
@@ -373,11 +394,15 @@ async fn run_with_blocking_retry(
                 close: false,
                 retry_blocking: None,
                 delay_ms: None,
+                config_dirty: false,
             }
         } else {
             let mut access = ServerAccess::new_inline(&mut server);
             execute(frame, &mut access, client_state)
         };
+        if outcome.config_dirty {
+            server_state.update_config_cache(&server.config);
+        }
         metrics::record_server_state_lock_hold_ms(
             "execute",
             lock_hold_start.elapsed().as_secs_f64() * 1000.0,
@@ -441,6 +466,7 @@ async fn run_with_blocking_retry(
                     close: false,
                     retry_blocking: None,
                     delay_ms: None,
+                    config_dirty: false,
                 });
             }
         }
@@ -507,11 +533,15 @@ async fn run_with_blocking_retry(
                     close: false,
                     retry_blocking: None,
                     delay_ms: None,
+                    config_dirty: false,
                 }
             } else {
                 let mut access = ServerAccess::new_inline(&mut server);
                 execute(frame, &mut access, client_state)
             };
+            if outcome.config_dirty {
+                server_state.update_config_cache(&server.config);
+            }
             metrics::record_server_state_lock_hold_ms(
                 "retry_execute",
                 lock_hold_start.elapsed().as_secs_f64() * 1000.0,
@@ -829,6 +859,7 @@ pub async fn handle_client_with_limits(
 
     {
         let mut server = server_state.meta.lock().await;
+        server.stats.mark_client_disconnected();
         server.pubsub.remove_client(client_id);
         server.replication_remove_client(client_id);
         server.tracking_remove_client(client_id);
@@ -869,16 +900,15 @@ async fn handle_client_inner(
     let (
         mut pubsub_rx,
         monitor_notifier,
-        query_buffer_limit,
-        output_buffer_flush_threshold,
-        write_timeout,
+        mut query_buffer_limit,
+        mut output_buffer_flush_threshold,
+        mut write_timeout,
     ) = {
         let mut server = server_state.meta.lock().await;
+        server.stats.mark_client_connected();
         let rx = server.pubsub.register_client(client_id);
         let mn = server.register_monitor_notifier(client_id);
-        let qbl = server.config.query_buffer_limit();
-        let obft = server.config.output_buffer_flush_threshold();
-        let wt = Duration::from_secs(server.config.client_write_timeout_sec());
+        let (qbl, obft, wt) = load_connection_runtime_config(server_state);
         (rx, mn, qbl, obft, wt)
     };
     refresh_client_snapshot(server_state, &client_state, &addr, &laddr, false).await;
@@ -945,41 +975,16 @@ async fn handle_client_inner(
 
         // Wait for either: a pubsub push message, a monitor notification,
         // or network input from the client.
-        let read = if io_limits.client_read_timeout_sec > 0 && !client_accepts_async_push {
+        let wait_result = if io_limits.client_read_timeout_sec > 0 && !client_accepts_async_push {
             let idle_duration = Duration::from_secs(io_limits.client_read_timeout_sec);
-            let read = tokio::select! {
+            tokio::select! {
                 msg = pubsub_rx.recv() => match msg {
-                    Some(m) => {
-                        if !encode_pubsub_message(
-                            m,
-                            &mut output,
-                            io_limits.output_buffer_limit_bytes,
-                            client_state.protocol_version(),
-                        ) {
-                            let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
-                            write_all_with_timeout(&mut stream, &response, write_timeout).await?;
-                            return Ok(());
-                        }
-                        write_all_with_timeout(&mut stream, &output, write_timeout).await?;
-                        output.clear();
-                        0
-                    }
-                    None => {
-                        // Sender dropped -- channel overflow, disconnect.
-                        tracing::warn!(
-                            client_id = client_id,
-                            "disconnecting pubsub client: push channel closed (overflow)"
-                        );
-                        let response = encode(&RespFrame::error_str(
-                            "ERR pubsub pending output buffer limit exceeded",
-                        ));
-                        write_all_with_timeout(&mut stream, &response, write_timeout).await?;
-                        return Ok(());
-                    }
+                    Some(m) => Ok(WaitResult::PubSubMsg(m)),
+                    None => Ok(WaitResult::PubSubClosed),
                 },
-                _ = monitor_notifier.notified() => 0,
+                _ = monitor_notifier.notified() => Ok(WaitResult::MonitorWake),
                 result = timeout(idle_duration, stream.read_buf(&mut input)) => match result {
-                    Ok(result) => result?,
+                    Ok(result) => result.map(WaitResult::NetworkRead),
                     Err(_) => {
                         tracing::debug!(
                             client_id = client_id,
@@ -989,55 +994,49 @@ async fn handle_client_inner(
                         return Ok(());
                     }
                 }
-            };
-            if read == 0 && input.is_empty() {
-                continue;
-            }
-            read
+            }?
         } else {
-            match wait_for_async_push_or_input(
+            wait_for_async_push_or_input(
                 &mut stream,
                 &mut input,
                 &mut pubsub_rx,
                 monitor_notifier.as_ref(),
             )
             .await?
-            {
-                WaitResult::PubSubMsg(msg) => {
-                    if !encode_pubsub_message(
-                        msg,
-                        &mut output,
-                        io_limits.output_buffer_limit_bytes,
-                        client_state.protocol_version(),
-                    ) {
-                        let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
-                        write_all_with_timeout(&mut stream, &response, write_timeout).await?;
-                        return Ok(());
-                    }
-                    write_all_with_timeout(&mut stream, &output, write_timeout).await?;
-                    output.clear();
-                    continue;
-                }
-                WaitResult::PubSubClosed => {
-                    tracing::warn!(
-                        client_id = client_id,
-                        "disconnecting pubsub client: push channel closed (overflow)"
-                    );
-                    let response = encode(&RespFrame::error_str(
-                        "ERR pubsub pending output buffer limit exceeded",
-                    ));
+        };
+
+        let read = match wait_result {
+            WaitResult::PubSubMsg(msg) => {
+                if !encode_pubsub_message(
+                    msg,
+                    &mut output,
+                    io_limits.output_buffer_limit_bytes,
+                    client_state.protocol_version(),
+                ) {
+                    let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
                     write_all_with_timeout(&mut stream, &response, write_timeout).await?;
                     return Ok(());
                 }
-                WaitResult::MonitorWake => {
-                    // Loop back to drain monitor messages at the top.
-                    continue;
-                }
-                WaitResult::NetworkRead(0) if input.is_empty() => {
-                    continue;
-                }
-                WaitResult::NetworkRead(n) => n,
+                write_all_with_timeout(&mut stream, &output, write_timeout).await?;
+                output.clear();
+                continue;
             }
+            WaitResult::PubSubClosed => {
+                tracing::warn!(
+                    client_id = client_id,
+                    "disconnecting pubsub client: push channel closed (overflow)"
+                );
+                let response = encode(&RespFrame::error_str(
+                    "ERR pubsub pending output buffer limit exceeded",
+                ));
+                write_all_with_timeout(&mut stream, &response, write_timeout).await?;
+                return Ok(());
+            }
+            WaitResult::MonitorWake => {
+                // Loop back to drain monitor messages at the top.
+                continue;
+            }
+            WaitResult::NetworkRead(n) => n,
         };
 
         if read == 0 {
@@ -1107,6 +1106,15 @@ async fn handle_client_inner(
 
         let mut should_close = false;
         for outcome in outcomes {
+            if outcome.config_dirty {
+                reload_connection_runtime_config(
+                    server_state,
+                    &mut query_buffer_limit,
+                    &mut output_buffer_flush_threshold,
+                    &mut write_timeout,
+                );
+            }
+
             // Apply progressive delay (e.g. AUTH failure backoff) before sending response.
             if let Some(delay_ms) = outcome.delay_ms {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -1218,6 +1226,7 @@ async fn handle_client_inner(
 }
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use ratatosk_engine::keyspace::{ServerState, SharedState};
     use std::{sync::Arc, time::Duration};
     use tokio::{
@@ -1234,14 +1243,15 @@ mod tests {
         setup_client_server_with_limits(ClientIoLimits::default()).await
     }
 
-    async fn setup_client_server_with_limits(
+    async fn setup_client_server_with_shared(
         io_limits: ClientIoLimits,
-    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+    ) -> (TcpStream, Arc<SharedState>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
         let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let shared_for_server = Arc::clone(&shared);
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
@@ -1249,12 +1259,19 @@ mod tests {
                 PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
                     .expect("persistence runtime"),
             );
-            handle_client_with_limits(socket, shared, persistence, io_limits)
+            handle_client_with_limits(socket, shared_for_server, persistence, io_limits)
                 .await
                 .expect("handle client");
         });
 
         let client = TcpStream::connect(addr).await.expect("connect client");
+        (client, shared, server_task)
+    }
+
+    async fn setup_client_server_with_limits(
+        io_limits: ClientIoLimits,
+    ) -> (TcpStream, tokio::task::JoinHandle<()>) {
+        let (client, _shared, server_task) = setup_client_server_with_shared(io_limits).await;
         (client, server_task)
     }
 
@@ -1424,6 +1441,208 @@ mod tests {
         let n = client.read(&mut eof).await.expect("read eof");
         assert_eq!(n, 0);
 
+        server_task.await.expect("server task complete");
+    }
+
+    #[tokio::test]
+    async fn peer_close_after_ping_cleans_up_connection_state() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+
+        client.write_all(b"PING\r\n").await.expect("write ping");
+        assert_eq!(read_reply(&mut client).await, b"+PONG\r\n");
+
+        drop(client);
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task complete");
+
+        assert_eq!(shared.stats.connected_clients(), 0);
+        assert_eq!(shared.stats.total_connections_received(), 1);
+
+        let server = shared.meta.lock().await;
+        assert_eq!(server.stats.connected_clients(), 0);
+        assert_eq!(server.stats.total_connections_received(), 1);
+        assert_eq!(server.connected_client_snapshots(), 0);
+        assert_eq!(server.blocked_clients(), 0);
+        assert_eq!(server.tracking_clients(), 0);
+        assert_eq!(server.monitor_client_count(), 0);
+        assert!(server.client_snapshot(1).is_none());
+        assert!(server.pubsub.client_channels(1).is_empty());
+        assert!(server.pubsub.client_shard_channels(1).is_empty());
+        assert!(server.pubsub.client_patterns(1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_close_after_subscribe_cleans_up_pubsub_state() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+
+        client
+            .write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n")
+            .await
+            .expect("subscribe");
+        let subscribe_reply = read_reply(&mut client).await;
+        assert!(
+            subscribe_reply
+                .windows(b"subscribe".len())
+                .any(|window| window == b"subscribe")
+        );
+
+        drop(client);
+
+        timeout(Duration::from_secs(1), server_task)
+            .await
+            .expect("server task timeout")
+            .expect("server task complete");
+
+        let server = shared.meta.lock().await;
+        assert_eq!(server.connected_client_snapshots(), 0);
+        assert!(server.client_snapshot(1).is_none());
+        assert!(server.pubsub.client_channels(1).is_empty());
+        assert_eq!(server.pubsub.numsub(&[Bytes::from("news")])[0].1, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_peer_closes_do_not_leave_connected_clients_behind() {
+        const CONNECTIONS: usize = 8;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let shared_for_accept = Arc::clone(&shared);
+
+        let accept_task = tokio::spawn(async move {
+            let persistence = Arc::new(
+                PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
+                    .expect("persistence runtime"),
+            );
+            let mut tasks = Vec::with_capacity(CONNECTIONS);
+
+            for _ in 0..CONNECTIONS {
+                let (socket, _) = listener.accept().await.expect("accept");
+                let shared = Arc::clone(&shared_for_accept);
+                let persistence = Arc::clone(&persistence);
+                tasks.push(tokio::spawn(async move {
+                    handle_client_with_limits(
+                        socket,
+                        shared,
+                        persistence,
+                        ClientIoLimits::default(),
+                    )
+                    .await
+                    .expect("handle client");
+                }));
+            }
+
+            for task in tasks {
+                task.await.expect("join client task");
+            }
+        });
+
+        for _ in 0..CONNECTIONS {
+            let mut client = TcpStream::connect(addr).await.expect("connect client");
+            client.write_all(b"PING\r\n").await.expect("write ping");
+            assert_eq!(read_reply(&mut client).await, b"+PONG\r\n");
+            drop(client);
+        }
+
+        timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("accept task timeout")
+            .expect("accept task complete");
+
+        assert_eq!(shared.stats.connected_clients(), 0);
+        assert_eq!(
+            shared.stats.total_connections_received(),
+            CONNECTIONS as u64
+        );
+
+        let server = shared.meta.lock().await;
+        assert_eq!(server.stats.connected_clients(), 0);
+        assert_eq!(
+            server.stats.total_connections_received(),
+            CONNECTIONS as u64
+        );
+        assert_eq!(server.connected_client_snapshots(), 0);
+    }
+
+    #[tokio::test]
+    async fn info_stats_reports_total_connections_received_from_runtime_stats() {
+        let (mut client, server_task) = setup_client_server().await;
+
+        client
+            .write_all(b"INFO stats\r\n")
+            .await
+            .expect("write info stats");
+        let info = read_reply(&mut client).await;
+        let info_text = String::from_utf8_lossy(&info);
+        assert!(
+            info_text.contains("total_connections_received:1"),
+            "{info_text}"
+        );
+
+        client.write_all(b"QUIT\r\n").await.expect("quit");
+        let _ = read_reply(&mut client).await;
+        server_task.await.expect("server task complete");
+    }
+
+    #[tokio::test]
+    async fn config_set_query_buffer_limit_applies_to_current_connection() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+
+        client
+            .write_all(b"CONFIG SET query-buffer-limit 1024\r\n")
+            .await
+            .expect("set query buffer limit");
+        assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
+        assert_eq!(shared.config_cache.load().query_buffer_limit(), 1024);
+
+        let payload = "x".repeat(1100);
+        let command = format!("ECHO {payload}\r\n");
+        client
+            .write_all(command.as_bytes())
+            .await
+            .expect("write oversized query");
+
+        let reply = read_reply(&mut client).await;
+        assert_eq!(reply, b"-ERR query buffer limit exceeded\r\n");
+
+        let mut eof = [0u8; 1];
+        let n = client.read(&mut eof).await.expect("read eof");
+        assert_eq!(n, 0);
+
+        server_task.await.expect("server task complete");
+    }
+
+    #[tokio::test]
+    async fn config_set_hz_round_trips_and_updates_config_cache() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+
+        client
+            .write_all(b"CONFIG SET hz 25\r\n")
+            .await
+            .expect("set hz");
+        assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
+        assert_eq!(shared.config_cache.load().hz(), 25);
+
+        client
+            .write_all(b"CONFIG GET hz\r\n")
+            .await
+            .expect("get hz");
+        assert_eq!(
+            read_reply(&mut client).await,
+            b"*2\r\n$2\r\nhz\r\n$2\r\n25\r\n"
+        );
+
+        client.write_all(b"QUIT\r\n").await.expect("quit");
+        let _ = read_reply(&mut client).await;
         server_task.await.expect("server task complete");
     }
 

@@ -34,6 +34,7 @@ pub struct StatsState {
     next_slowlog_id: i64,
     latency_events: HashMap<Bytes, LatencyHistory>,
     connected_clients: u64,
+    total_connections_received: u64,
     total_net_input_bytes: u64,
     total_net_output_bytes: u64,
     evicted_keys: u64,
@@ -58,6 +59,7 @@ impl Default for StatsState {
             next_slowlog_id: 0,
             latency_events: HashMap::new(),
             connected_clients: 0,
+            total_connections_received: 0,
             total_net_input_bytes: 0,
             total_net_output_bytes: 0,
             evicted_keys: 0,
@@ -88,6 +90,7 @@ impl StatsState {
     pub fn reset(&mut self) {
         self.total_commands_processed = 0;
         self.connected_clients = 0;
+        self.total_connections_received = 0;
         self.total_net_input_bytes = 0;
         self.total_net_output_bytes = 0;
         self.evicted_keys = 0;
@@ -102,8 +105,13 @@ impl StatsState {
         self.connected_clients
     }
 
+    pub fn total_connections_received(&self) -> u64 {
+        self.total_connections_received
+    }
+
     pub fn mark_client_connected(&mut self) {
         self.connected_clients = self.connected_clients.saturating_add(1);
+        self.total_connections_received = self.total_connections_received.saturating_add(1);
     }
 
     pub fn mark_client_disconnected(&mut self) {
@@ -351,6 +359,7 @@ impl StatsState {
 pub struct AtomicStatsState {
     total_commands_processed: AtomicU64,
     connected_clients: AtomicU64,
+    total_connections_received: AtomicU64,
     total_net_input_bytes: AtomicU64,
     total_net_output_bytes: AtomicU64,
     evicted_keys: AtomicU64,
@@ -366,6 +375,7 @@ impl Default for AtomicStatsState {
         Self {
             total_commands_processed: AtomicU64::new(0),
             connected_clients: AtomicU64::new(0),
+            total_connections_received: AtomicU64::new(0),
             total_net_input_bytes: AtomicU64::new(0),
             total_net_output_bytes: AtomicU64::new(0),
             evicted_keys: AtomicU64::new(0),
@@ -388,6 +398,9 @@ impl AtomicStatsState {
             .connected_clients
             .store(stats.connected_clients(), AtomicOrdering::Relaxed);
         atomic
+            .total_connections_received
+            .store(stats.total_connections_received(), AtomicOrdering::Relaxed);
+        atomic
             .total_net_input_bytes
             .store(stats.total_net_input_bytes(), AtomicOrdering::Relaxed);
         atomic
@@ -407,14 +420,25 @@ impl AtomicStatsState {
 
     pub fn mark_client_connected(&self) {
         self.connected_clients.fetch_add(1, AtomicOrdering::Relaxed);
+        self.total_connections_received
+            .fetch_add(1, AtomicOrdering::Relaxed);
     }
 
     pub fn mark_client_disconnected(&self) {
-        self.connected_clients.fetch_sub(1, AtomicOrdering::Relaxed);
+        let _ = self.connected_clients.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(1)),
+        );
     }
 
     pub fn connected_clients(&self) -> u64 {
         self.connected_clients.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn total_connections_received(&self) -> u64 {
+        self.total_connections_received
+            .load(AtomicOrdering::Relaxed)
     }
 
     pub fn add_net_input_bytes(&self, bytes: u64) {
@@ -489,6 +513,8 @@ impl AtomicStatsState {
         self.total_commands_processed
             .store(0, AtomicOrdering::Relaxed);
         self.connected_clients.store(0, AtomicOrdering::Relaxed);
+        self.total_connections_received
+            .store(0, AtomicOrdering::Relaxed);
         self.total_net_input_bytes.store(0, AtomicOrdering::Relaxed);
         self.total_net_output_bytes
             .store(0, AtomicOrdering::Relaxed);

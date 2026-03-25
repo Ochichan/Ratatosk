@@ -1,6 +1,9 @@
-# Ratatosk 자동실행 정리 (systemd --user)
+# Ratatosk 자동실행 정리
 
 이 문서는 "재부팅 후 Ratatosk 자동실행" 설정에서 필요한 핵심만 한 번에 보려고 만든 정리본입니다.
+
+- Linux: systemd --user (아래 섹션)
+- macOS: launchd (문서 하단 "macOS (launchd)" 섹션)
 
 ## 1) 지금 상태 해석
 
@@ -142,4 +145,97 @@ systemctl --user disable --now ratatosk-serve.service
 rm -f ~/.config/systemd/user/ratatosk-serve.service
 systemctl --user daemon-reload
 ./scripts/install-ratatosk-autostart.sh
+```
+
+---
+
+## macOS (launchd)
+
+macOS에서는 systemd 대신 launchd를 사용합니다.
+
+### 1) 설치/활성화 (한 번 실행)
+
+```bash
+cd ~/Documents/Projects/Ratatosk
+./scripts/install-ratatosk-autostart-macos.sh
+```
+
+이 스크립트가 하는 일:
+- 런처 설치: `~/.local/bin/ratatosk`
+- plist 설치: `~/Library/LaunchAgents/dev.ratatosk.serve.plist`
+- 데이터 디렉토리 생성: `<repo>/data/`
+- 로그 디렉토리 생성: `~/Library/Logs/Ratatosk/`
+- launchd agent 등록 + 시작
+
+### 2) 서비스 이름
+
+```
+dev.ratatosk.serve
+```
+
+### 3) 상태/로그 확인
+
+```bash
+launchctl print gui/$(id -u)/dev.ratatosk.serve
+launchctl list | grep ratatosk
+tail -f ~/Library/Logs/Ratatosk/ratatosk-serve.stderr.log
+```
+
+### 4) 포트 주의사항
+
+macOS autostart 기본 포트는 `6379`입니다 (Kirei bridges.toml과 일치).
+
+포트를 바꾸려면:
+
+```bash
+./scripts/set-ratatosk-autostart-port-macos.sh 6380
+```
+
+### 5) 복구
+
+```bash
+./scripts/recover-ratatosk-autostart-macos.sh
+```
+
+### 6) 빠른 진단 체크리스트
+
+1. plist 파일 존재 확인
+```bash
+ls -l ~/Library/LaunchAgents/dev.ratatosk.serve.plist
+```
+
+2. agent 로드 여부
+```bash
+launchctl list | grep ratatosk
+```
+
+3. 프로세스 포트 리슨 확인
+```bash
+lsof -i :6379
+```
+
+4. 클라이언트 ping 확인
+```bash
+redis-cli -p 6379 ping
+```
+
+### 7) 자주 막히는 지점
+
+- 서버가 바로 종료되고 재시작 반복:
+  `tail -50 ~/Library/Logs/Ratatosk/ratatosk-serve.stderr.log`로 에러 원인 확인.
+  포트 충돌(수동 실행 중)이 가장 흔한 원인.
+
+- `cargo` 명령을 찾지 못함:
+  plist의 PATH에 `~/.cargo/bin`이 포함되어 있는지 확인.
+  직접 빌드: `cargo build -p ratatosk-server --release`
+
+- FD limit 관련 에러:
+  plist에 `SoftResourceLimits.NumberOfFiles = 65536`이 설정되어 있는지 확인.
+  복구 스크립트로 재설치하면 자동 적용됨.
+
+### 8) 언인스톨
+
+```bash
+launchctl bootout gui/$(id -u)/dev.ratatosk.serve
+rm -f ~/Library/LaunchAgents/dev.ratatosk.serve.plist
 ```

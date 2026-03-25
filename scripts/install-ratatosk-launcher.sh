@@ -13,14 +13,8 @@ cat > "${LAUNCHER_PATH}" <<SCRIPT
 set -eu
 
 REPO_ROOT="${REPO_ROOT}"
-BIN_PATH="\${REPO_ROOT}/target/release/ratatosk"
 DEFAULT_MAX_CLIENTS=4096
 FD_HEADROOM=128
-
-if [ ! -x "\${BIN_PATH}" ]; then
-  echo "[ratatosk] Building release binary (ratatosk)..." >&2
-  cargo build --manifest-path "\${REPO_ROOT}/Cargo.toml" -p ratatosk-server --release >&2
-fi
 
 # Auto-tune max clients when no explicit value is provided. This prevents
 # startup preflight failures on systems where nofile is still 1024.
@@ -45,7 +39,7 @@ if [ -z "\${RATATOSK_MAX_CLIENTS:-}" ]; then
   esac
 fi
 
-exec "\${BIN_PATH}" "\$@"
+exec cargo run --manifest-path "\${REPO_ROOT}/Cargo.toml" -p ratatosk-server --bin ratatosk --release -- "\$@"
 SCRIPT
 
 chmod +x "${LAUNCHER_PATH}"
