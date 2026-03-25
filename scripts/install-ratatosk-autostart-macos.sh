@@ -25,7 +25,16 @@ mkdir -p "$(dirname "${PLIST_PATH}")"
 
 # --- idempotent re-install: unload existing agent ---
 
-launchctl bootout "${DOMAIN_TARGET}/${PLIST_LABEL}" 2>/dev/null || true
+launchctl bootout "${DOMAIN_TARGET}/${PLIST_LABEL}" 2>/dev/null \
+  || launchctl bootout "${DOMAIN_TARGET}" "${PLIST_PATH}" 2>/dev/null \
+  || true
+
+for _ in 1 2 3 4 5; do
+  if ! launchctl print "${DOMAIN_TARGET}/${PLIST_LABEL}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
 
 # --- generate plist ---
 
@@ -97,7 +106,8 @@ PLIST
 
 # --- load agent ---
 
-launchctl bootstrap "${DOMAIN_TARGET}" "${PLIST_PATH}"
+launchctl bootstrap "${DOMAIN_TARGET}" "${PLIST_PATH}" \
+  || { sleep 1; launchctl bootstrap "${DOMAIN_TARGET}" "${PLIST_PATH}"; }
 
 echo
 echo "Installed and started: ${PLIST_LABEL}"
