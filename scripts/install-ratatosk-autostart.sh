@@ -25,7 +25,7 @@ Type=simple
 WorkingDirectory=${REPO_ROOT}
 Environment=RATATOSK_BIND=127.0.0.1
 Environment=RATATOSK_PORT=6380
-Environment=RATATOSK_DATA_DIR=${REPO_ROOT}/data
+Environment=RATATOSK_DIR=${REPO_ROOT}/data
 LimitNOFILE=65535
 ExecStart=${LAUNCHER_PATH}
 Restart=always

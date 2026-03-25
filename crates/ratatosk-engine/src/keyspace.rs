@@ -662,8 +662,7 @@ impl SharedState {
 
     /// Total connections received (derived from client ID counter).
     pub fn total_connections_received(&self) -> u64 {
-        let current = self.next_client_id.load(AtomicOrdering::Relaxed);
-        current.saturating_sub(1) as u64
+        self.stats.total_connections_received()
     }
 }
 
@@ -905,7 +904,7 @@ impl ServerState {
     }
 
     pub fn total_connections_received(&self) -> u64 {
-        self.next_client_id.saturating_sub(1) as u64
+        self.stats.total_connections_received()
     }
 
     pub fn db_count(&self) -> usize {
@@ -1501,7 +1500,7 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::timeout;
 
-    use super::{PubSubState, ServerState, StatsState, StoredValue};
+    use super::{AtomicStatsState, PubSubState, ServerState, StatsState, StoredValue};
 
     #[test]
     fn remove_client_cleans_all_subscriptions() {
@@ -1742,19 +1741,48 @@ mod tests {
     fn stats_connected_clients_tracks_connect_disconnect() {
         let mut stats = StatsState::default();
         assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_connections_received(), 0);
 
         stats.mark_client_connected();
         stats.mark_client_connected();
         assert_eq!(stats.connected_clients(), 2);
+        assert_eq!(stats.total_connections_received(), 2);
 
         stats.mark_client_disconnected();
         assert_eq!(stats.connected_clients(), 1);
+        assert_eq!(stats.total_connections_received(), 2);
 
         stats.mark_client_disconnected();
         assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_connections_received(), 2);
 
         stats.mark_client_disconnected();
         assert_eq!(stats.connected_clients(), 0, "should not underflow");
+        assert_eq!(stats.total_connections_received(), 2);
+    }
+
+    #[test]
+    fn atomic_stats_connected_clients_tracks_connect_disconnect() {
+        let stats = AtomicStatsState::default();
+        assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_connections_received(), 0);
+
+        stats.mark_client_connected();
+        stats.mark_client_connected();
+        assert_eq!(stats.connected_clients(), 2);
+        assert_eq!(stats.total_connections_received(), 2);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 1);
+        assert_eq!(stats.total_connections_received(), 2);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_connections_received(), 2);
+
+        stats.mark_client_disconnected();
+        assert_eq!(stats.connected_clients(), 0, "should not underflow");
+        assert_eq!(stats.total_connections_received(), 2);
     }
 
     #[test]
@@ -1842,6 +1870,7 @@ mod tests {
 
         assert_eq!(stats.total_commands_processed(), 0);
         assert_eq!(stats.connected_clients(), 0);
+        assert_eq!(stats.total_connections_received(), 0);
         assert_eq!(stats.total_net_input_bytes(), 0);
         assert_eq!(stats.total_net_output_bytes(), 0);
         assert_eq!(stats.evicted_keys(), 0);

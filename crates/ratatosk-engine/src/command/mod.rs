@@ -3307,6 +3307,8 @@ pub struct CommandOutcome {
     /// Optional delay in milliseconds before sending the response.
     /// Used for progressive AUTH failure delay.
     pub delay_ms: Option<u64>,
+    /// Indicates that CONFIG state changed and lock-free config readers should refresh.
+    pub config_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3323,6 +3325,7 @@ impl CommandOutcome {
             close: false,
             retry_blocking: None,
             delay_ms: None,
+            config_dirty: false,
         }
     }
 
@@ -3332,6 +3335,7 @@ impl CommandOutcome {
             close: true,
             retry_blocking: None,
             delay_ms: None,
+            config_dirty: false,
         }
     }
 
@@ -3341,6 +3345,7 @@ impl CommandOutcome {
             close: false,
             retry_blocking: None,
             delay_ms: Some(delay_ms),
+            config_dirty: false,
         }
     }
 
@@ -3350,6 +3355,7 @@ impl CommandOutcome {
             close: true,
             retry_blocking: None,
             delay_ms: Some(delay_ms),
+            config_dirty: false,
         }
     }
 
@@ -3368,7 +3374,13 @@ impl CommandOutcome {
                 watch_keys,
             }),
             delay_ms: None,
+            config_dirty: false,
         }
+    }
+
+    fn with_config_dirty(mut self) -> Self {
+        self.config_dirty = true;
+        self
     }
 }
 

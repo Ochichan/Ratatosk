@@ -538,6 +538,7 @@ pub(super) fn cmd_config(
 
 enum ConfigSetOp {
     Timeout(i64),
+    Hz(u32),
     AppendOnly(bool),
     AppendFsync(Bytes),
     DbFilename(String),
@@ -613,6 +614,15 @@ pub(super) fn cmd_config_set(
                 } else {
                     return CommandOutcome::reply(err("ERR argument must be 'yes' or 'no'"));
                 }
+            }
+            b"HZ" => {
+                let parsed = match parse_i64(value) {
+                    Some(v) if (1..=500).contains(&v) => v,
+                    _ => {
+                        return CommandOutcome::reply(err("ERR Invalid value for hz (1..500)"));
+                    }
+                };
+                (ConfigSetOp::Hz(parsed as u32), "hz")
             }
             b"APPENDFSYNC" => {
                 let text = String::from_utf8_lossy(value).to_ascii_lowercase();
@@ -811,6 +821,7 @@ pub(super) fn cmd_config_set(
         );
         match op {
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),
+            ConfigSetOp::Hz(value) => server.config.set_hz(value),
             ConfigSetOp::AppendOnly(value) => server.config.set_appendonly(value),
             ConfigSetOp::AppendFsync(value) => server.config.set_appendfsync(value),
             ConfigSetOp::DbFilename(value) => server.config.set_dbfilename(value),
@@ -853,7 +864,7 @@ pub(super) fn cmd_config_set(
         server.config.pubsub_queue_soft_seconds(),
     );
 
-    CommandOutcome::reply(RespFrame::ok())
+    CommandOutcome::reply(RespFrame::ok()).with_config_dirty()
 }
 
 pub(super) fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
@@ -1404,7 +1415,7 @@ pub(super) fn append_info_stats_section(out: &mut String, server: &ServerState) 
     out.push_str("# Stats\r\n");
     out.push_str(&format!(
         "total_connections_received:{}\r\n",
-        server.total_connections_received()
+        server.stats.total_connections_received()
     ));
     out.push_str(&format!(
         "total_commands_processed:{}\r\n",

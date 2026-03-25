@@ -493,12 +493,12 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     );
 
     // server_cron timer — default 10 Hz (lock-free config read)
-    let cron_hz = server_state.config_cache.load().hz();
-    let cron_period = Duration::from_millis(1000 / u64::from(cron_hz.max(1)));
+    let mut cron_hz = server_state.config_cache.load().hz().max(1);
+    let mut cron_period = Duration::from_millis(1000 / u64::from(cron_hz));
     let mut cron_interval = tokio::time::interval(cron_period);
     cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cron_tick: u64 = 0;
-    let ops_sec_interval = u64::from(cron_hz.max(1));
+    let mut ops_sec_interval = u64::from(cron_hz);
 
     // SIGUSR1 signal handler (Unix only) for triggering RDB save
     #[cfg(unix)]
@@ -510,6 +510,21 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     };
 
     loop {
+        let configured_hz = server_state.config_cache.load().hz().max(1);
+        if configured_hz != cron_hz {
+            cron_hz = configured_hz;
+            cron_period = Duration::from_millis(1000 / u64::from(cron_hz));
+            cron_interval = tokio::time::interval(cron_period);
+            cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ops_sec_interval = u64::from(cron_hz);
+            tracing::info!(
+                target = "ratatosk::config",
+                hz = cron_hz,
+                period_ms = cron_period.as_millis(),
+                "server cron frequency updated"
+            );
+        }
+
         // Wrap SIGUSR1 as a future that resolves to a flag.
         // On non-unix, use a pending future that never resolves.
         #[cfg(unix)]

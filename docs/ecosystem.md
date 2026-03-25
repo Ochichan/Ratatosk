@@ -97,6 +97,17 @@ cargo run -p ratatosk-server --bin ratatosk --release
 - autostart unit은 기본 포트 `6380`을 사용해 수동 실행과 충돌을 피한다.
 - unit 파일 경로: `~/.config/systemd/user/ratatosk-serve.service`
 
+### Autostart (macOS launchd)
+
+```bash
+./scripts/install-ratatosk-autostart-macos.sh
+```
+
+- macOS 기본 포트: `6379` — Kirei bridges.toml 설정과 일치.
+- plist 경로: `~/Library/LaunchAgents/dev.ratatosk.serve.plist`
+- 로그 경로: `~/Library/Logs/Ratatosk/`
+- 데이터/audit 경로: `<repo>/data/`
+
 ## Runtime Configuration
 
 | Variable | Default | Description |
