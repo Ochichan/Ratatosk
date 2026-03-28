@@ -1,0 +1,54 @@
+name: Performance Guardrail
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  perf-guardrail:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: perf-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            perf-${{ runner.os }}-
+
+      - name: Run benchmark baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          SAMPLE_SIZE=20 ./scripts/bench_baseline.sh benchmarks-ci
+
+      - name: Check guardrails
+        shell: bash
+        run: |
+          set -euo pipefail
+          log_file="$(ls -1t benchmarks-ci/baseline-default-*.log | head -n 1)"
+          python3 scripts/perf_guardrail_check.py --log "$log_file"
+
+      - name: Upload benchmark logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-guardrail-logs
+          path: benchmarks-ci/*.log

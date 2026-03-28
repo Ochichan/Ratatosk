@@ -3,8 +3,10 @@ use std::{io, sync::Arc, time::Duration};
 #[cfg(target_os = "linux")]
 use std::fs;
 
+use bytes::Bytes;
 use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
+    acl::AclState,
     eviction::{
         EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction,
     },
@@ -33,6 +35,9 @@ const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
 const MEMORY_ESTIMATE_INTERVAL: u64 = 10;
 const DEFAULT_CONN_RATE_LIMIT_WINDOW_SECS: u64 = 10;
 const DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
+const ALLOW_DEFAULT_USER_NOPASS_ENV: &str = "RATATOSK_ALLOW_DEFAULT_USER_NOPASS";
+const DEFAULT_USER_PASSWORD_ENV: &str = "RATATOSK_DEFAULT_USER_PASSWORD";
+const DEFAULT_USER_PASSWORD_HASH_ENV: &str = "RATATOSK_DEFAULT_USER_PASSWORD_HASH";
 const SHUTDOWN_BEST_EFFORT_ENV: &str = "RATATOSK_SHUTDOWN_BEST_EFFORT";
 
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +84,120 @@ fn connection_rate_limit_max_attempts_from_env() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS)
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| {
+        value == "1"
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
+}
+
+fn load_acl_state_from_disk(
+    initial_state: &mut ServerState,
+    config: &ServerConfig,
+) -> io::Result<()> {
+    let path = AclState::file_path(&config.dir);
+    match AclState::load_from_file(&path)? {
+        Some(loaded_acl) => {
+            initial_state.acl = loaded_acl;
+            tracing::info!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                "loaded ACL state from disk"
+            );
+        }
+        None => {
+            tracing::debug!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                "no ACL file found; using in-memory defaults"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn bootstrap_default_user_for_bind(
+    initial_state: &mut ServerState,
+    config: &ServerConfig,
+) -> io::Result<()> {
+    if config.binds_to_loopback() {
+        return Ok(());
+    }
+
+    if initial_state.acl.default_user_is_password_protected() {
+        tracing::info!(
+            target = "ratatosk::security",
+            bind = %config.bind,
+            "using persisted ACL state for password-protected default user"
+        );
+        return Ok(());
+    }
+
+    if env_truthy(ALLOW_DEFAULT_USER_NOPASS_ENV) {
+        tracing::warn!(
+            target = "ratatosk::security",
+            bind = %config.bind,
+            env = ALLOW_DEFAULT_USER_NOPASS_ENV,
+            "default ACL user remains nopass on a non-loopback bind by explicit operator opt-in"
+        );
+        return Ok(());
+    }
+
+    let password_hash = if let Ok(hash) = std::env::var(DEFAULT_USER_PASSWORD_HASH_ENV) {
+        if hash.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{DEFAULT_USER_PASSWORD_HASH_ENV} must not be empty"),
+            ));
+        }
+        Bytes::from(hash)
+    } else if let Ok(password) = std::env::var(DEFAULT_USER_PASSWORD_ENV) {
+        if password.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{DEFAULT_USER_PASSWORD_ENV} must not be empty"),
+            ));
+        }
+        AclState::hash_password(password.as_bytes()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to hash {DEFAULT_USER_PASSWORD_ENV}"),
+            )
+        })?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "non-loopback bind '{}' requires {} or {} (or {}=true for an explicitly insecure deployment)",
+                config.bind,
+                DEFAULT_USER_PASSWORD_ENV,
+                DEFAULT_USER_PASSWORD_HASH_ENV,
+                ALLOW_DEFAULT_USER_NOPASS_ENV,
+            ),
+        ));
+    };
+
+    let default_user = initial_state
+        .acl
+        .get_or_create_user_mut(&Bytes::from_static(b"default"));
+    default_user.enabled = true;
+    default_user.nopass = false;
+    default_user.passwords.clear();
+    default_user.passwords.insert(password_hash);
+    default_user.allow_all_commands = true;
+
+    tracing::info!(
+        target = "ratatosk::security",
+        bind = %config.bind,
+        "configured default ACL user to require a password on non-loopback bind"
+    );
+
+    Ok(())
 }
 
 fn shutdown_best_effort_enabled() -> bool {
@@ -362,10 +481,13 @@ async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_s
     // 3. Ops/sec sampling
     *cron_tick = cron_tick.wrapping_add(1);
     if *cron_tick % ops_sec_interval == 0 {
+        server.stats.catch_up_from_atomic(&server_state.stats);
         let interval_secs =
             ops_sec_interval.saturating_mul(1000) / u64::from(server.config.hz().max(1)) / 1000;
         server.stats.sample_ops_per_sec(interval_secs.max(1));
     }
+
+    server_state.stats.catch_up_from_stats(&server.stats);
 }
 
 pub async fn run(config: ServerConfig) -> io::Result<()> {
@@ -437,6 +559,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     });
 
     let mut initial_state = ServerState::with_default_dbs();
+    load_acl_state_from_disk(&mut initial_state, &config)?;
+    bootstrap_default_user_for_bind(&mut initial_state, &config)?;
     initial_state.set_lazy_free_sender(lazy_free_tx);
     let server_state = Arc::new(SharedState::new(initial_state));
     apply_server_persistence_config(&server_state, &config).await;
@@ -714,15 +838,27 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 mod tests {
     use std::{
         io,
+        sync::{Mutex, OnceLock},
         time::{Duration, Instant},
     };
 
+    use bytes::Bytes;
+    use ratatosk_engine::{acl::AclState, keyspace::ServerState};
     use tokio::task::JoinSet;
 
     use super::{
-        SHUTDOWN_BEST_EFFORT_ENV, drain_client_tasks, finalize_shutdown_result,
-        shutdown_best_effort_enabled,
+        ALLOW_DEFAULT_USER_NOPASS_ENV, DEFAULT_USER_PASSWORD_ENV, SHUTDOWN_BEST_EFFORT_ENV,
+        ServerConfig, bootstrap_default_user_for_bind, drain_client_tasks,
+        finalize_shutdown_result, load_acl_state_from_disk, shutdown_best_effort_enabled,
     };
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
+    }
 
     #[tokio::test]
     async fn drain_client_tasks_completes_ready_tasks() {
@@ -783,5 +919,119 @@ mod tests {
                 || text.contains("shutdown_flush_error=flush timeout"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_bootstrap_password_by_default() {
+        let _guard = env_guard();
+        // SAFETY: test-only env isolation guarded by a process-wide mutex.
+        unsafe {
+            std::env::remove_var(DEFAULT_USER_PASSWORD_ENV);
+            std::env::remove_var(ALLOW_DEFAULT_USER_NOPASS_ENV);
+        }
+
+        let mut server = ServerState::with_default_dbs();
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            ..ServerConfig::default()
+        };
+
+        let error =
+            bootstrap_default_user_for_bind(&mut server, &config).expect_err("expected error");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn non_loopback_bind_bootstraps_default_user_password() {
+        let _guard = env_guard();
+        // SAFETY: test-only env isolation guarded by a process-wide mutex.
+        unsafe {
+            std::env::set_var(DEFAULT_USER_PASSWORD_ENV, "bootstrap-secret");
+            std::env::remove_var(ALLOW_DEFAULT_USER_NOPASS_ENV);
+        }
+
+        let mut server = ServerState::with_default_dbs();
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            ..ServerConfig::default()
+        };
+        bootstrap_default_user_for_bind(&mut server, &config).expect("bootstrap password");
+
+        let default_user = server
+            .acl
+            .get_user(&Bytes::from_static(b"default"))
+            .expect("default user");
+        assert!(!default_user.nopass);
+        assert_eq!(default_user.passwords.len(), 1);
+
+        // SAFETY: test-only env isolation guarded by a process-wide mutex.
+        unsafe {
+            std::env::remove_var(DEFAULT_USER_PASSWORD_ENV);
+        }
+    }
+
+    #[test]
+    fn load_acl_state_from_disk_restores_saved_acl_users() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = AclState::file_path(dir.path());
+
+        let mut acl = AclState::default();
+        let user = acl.get_or_create_user_mut(&Bytes::from_static(b"alice"));
+        user.enabled = true;
+        user.nopass = false;
+        user.passwords
+            .insert(Bytes::from_static(b"$argon2id$v=19$m=19456,t=2,p=1$hash"));
+        user.allow_all_commands = false;
+        user.allowed_categories.insert(Bytes::from_static(b"read"));
+        acl.save_to_file(&path).expect("persist ACL");
+
+        let config = ServerConfig {
+            dir: dir.path().to_path_buf(),
+            ..ServerConfig::default()
+        };
+        let mut server = ServerState::with_default_dbs();
+        load_acl_state_from_disk(&mut server, &config).expect("load ACL");
+
+        let alice = server
+            .acl
+            .get_user(&Bytes::from_static(b"alice"))
+            .expect("alice should be restored");
+        assert!(alice.enabled);
+        assert!(!alice.nopass);
+        assert!(!alice.allow_all_commands);
+        assert!(
+            alice
+                .passwords
+                .contains(b"$argon2id$v=19$m=19456,t=2,p=1$hash" as &[u8])
+        );
+        assert!(alice.allowed_categories.contains(b"read" as &[u8]));
+    }
+
+    #[test]
+    fn non_loopback_bind_accepts_preloaded_password_protected_default_user() {
+        let _guard = env_guard();
+        // SAFETY: test-only env isolation guarded by a process-wide mutex.
+        unsafe {
+            std::env::remove_var(DEFAULT_USER_PASSWORD_ENV);
+            std::env::remove_var(ALLOW_DEFAULT_USER_NOPASS_ENV);
+        }
+
+        let mut server = ServerState::with_default_dbs();
+        let default_user = server
+            .acl
+            .get_or_create_user_mut(&Bytes::from_static(b"default"));
+        default_user.enabled = true;
+        default_user.nopass = false;
+        default_user
+            .passwords
+            .insert(Bytes::from_static(b"$argon2id$v=19$m=19456,t=2,p=1$hash"));
+
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            ..ServerConfig::default()
+        };
+
+        bootstrap_default_user_for_bind(&mut server, &config)
+            .expect("preloaded ACL should satisfy non-loopback security check");
     }
 }

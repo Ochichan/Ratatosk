@@ -149,6 +149,10 @@ impl ServerConfig {
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.bind, self.port)
     }
+
+    pub fn binds_to_loopback(&self) -> bool {
+        is_loopback_bind(&self.bind)
+    }
 }
 
 #[derive(Debug, Error)]

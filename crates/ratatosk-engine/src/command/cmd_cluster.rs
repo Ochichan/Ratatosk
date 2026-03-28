@@ -152,7 +152,7 @@ fn cluster_help() -> CommandOutcome {
             b"CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(
-            b"Only INFO, MYID, KEYSLOT, COUNTKEYSINSLOT, GETKEYSINSLOT, and HELP are available in standalone mode.",
+            b"Standalone mode supports INFO, MYID, KEYSLOT, COUNTKEYSINSLOT, GETKEYSINSLOT, SLOTS, SHARDS, LINKS, and HELP.",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"COUNTKEYSINSLOT <slot>"))),
         RespFrame::BulkString(Some(Bytes::from_static(

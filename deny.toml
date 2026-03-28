@@ -1,12 +1,12 @@
 [advisories]
-unmaintained = "warn"
+unmaintained = "workspace"
 yanked = "warn"
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "ISC", "Zlib", "Unicode-3.0"]
-copyleft = "deny"
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "Unicode-3.0", "Zlib"]
 
 [bans]
+allow-wildcard-paths = true
 multiple-versions = "warn"
 wildcards = "deny"
 

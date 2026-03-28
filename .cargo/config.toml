@@ -1,0 +1,4 @@
+include = [{ path = "config.local.toml", optional = true }]
+
+# Keep developer-specific build acceleration settings out of versioned config.
+# Copy config.local.example.toml to config.local.toml to opt in locally.

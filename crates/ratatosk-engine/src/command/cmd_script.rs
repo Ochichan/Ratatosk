@@ -18,27 +18,27 @@ use super::{CommandOutcome, err, to_uppercase_bytes, wrong_arity};
 fn parse_keys_argv<'a>(
     args: &'a [Bytes],
     cmd_name: &str,
-) -> Result<(&'a [Bytes], &'a [Bytes]), CommandOutcome> {
+) -> Result<(&'a [Bytes], &'a [Bytes]), RespFrame> {
     // args[0] = script/sha, args[1] = numkeys, rest = keys... args...
     if args.len() < 2 {
-        return Err(wrong_arity(cmd_name));
+        return Err(err(&format!(
+            "ERR wrong number of arguments for '{cmd_name}' command"
+        )));
     }
 
     let numkeys_str = std::str::from_utf8(&args[1]).unwrap_or("");
     let numkeys: usize = match numkeys_str.parse() {
         Ok(n) => n,
         Err(_) => {
-            return Err(CommandOutcome::reply(err(
-                "ERR value is not an integer or out of range",
-            )));
+            return Err(err("ERR value is not an integer or out of range"));
         }
     };
 
     // Validate argument count: script + numkeys + numkeys keys + remaining argv
     if args.len() < 2 + numkeys {
-        return Err(CommandOutcome::reply(err(
+        return Err(err(
             "ERR Number of keys can't be greater than number of args",
-        )));
+        ));
     }
 
     let keys = &args[2..2 + numkeys];
@@ -57,7 +57,7 @@ pub(super) fn cmd_eval(
 ) -> CommandOutcome {
     let (keys, argv) = match parse_keys_argv(args, "eval") {
         Ok(pair) => pair,
-        Err(outcome) => return outcome,
+        Err(response) => return CommandOutcome::reply(response),
     };
 
     let script = &args[0];
@@ -82,7 +82,7 @@ pub(super) fn cmd_evalsha(
 ) -> CommandOutcome {
     let (keys, argv) = match parse_keys_argv(args, "evalsha") {
         Ok(pair) => pair,
-        Err(outcome) => return outcome,
+        Err(response) => return CommandOutcome::reply(response),
     };
 
     let sha = &args[0];
@@ -167,6 +167,8 @@ pub(super) fn cmd_script(args: &[Bytes], server: &mut ServerState) -> CommandOut
         b"LOAD" => script_load(&args[1..], server),
         b"EXISTS" => script_exists(&args[1..], server),
         b"FLUSH" => script_flush(&args[1..], server),
+        b"KILL" => script_kill(&args[1..]),
+        b"DEBUG" => script_debug(&args[1..]),
         b"HELP" => script_help(),
         _ => CommandOutcome::reply(err(
             "ERR unknown SCRIPT subcommand or wrong number of arguments",
@@ -239,10 +241,30 @@ fn script_flush(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
 
     CommandOutcome::reply(RespFrame::ok())
 }
+
+fn script_kill(args: &[Bytes]) -> CommandOutcome {
+    if !args.is_empty() {
+        return wrong_arity("script|kill");
+    }
+
+    CommandOutcome::reply(err("ERR SCRIPT KILL is not supported in this build"))
+}
+
+fn script_debug(args: &[Bytes]) -> CommandOutcome {
+    if args.len() != 1 {
+        return wrong_arity("script|debug");
+    }
+
+    CommandOutcome::reply(err("ERR SCRIPT DEBUG is not supported in this build"))
+}
+
 fn script_help() -> CommandOutcome {
     let lines: Vec<RespFrame> = vec![
         RespFrame::BulkString(Some(Bytes::from_static(
             b"SCRIPT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        ))),
+        RespFrame::BulkString(Some(Bytes::from_static(
+            b"LOAD, EXISTS, FLUSH, and HELP are available in this build. SCRIPT DEBUG and SCRIPT KILL are unsupported.",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"EXISTS <sha1> [<sha1> ...]"))),
         RespFrame::BulkString(Some(Bytes::from_static(
@@ -332,6 +354,9 @@ fn function_help() -> CommandOutcome {
     let lines: Vec<RespFrame> = vec![
         RespFrame::BulkString(Some(Bytes::from_static(
             b"FUNCTION <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+        ))),
+        RespFrame::BulkString(Some(Bytes::from_static(
+            b"LIST, DUMP, STATS, FLUSH, and HELP are available in this build. LOAD, DELETE, and RESTORE are unsupported.",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"DELETE <library-name>"))),
         RespFrame::BulkString(Some(Bytes::from_static(b"    Delete a function library."))),

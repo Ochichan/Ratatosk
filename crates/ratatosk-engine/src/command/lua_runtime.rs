@@ -59,7 +59,15 @@ pub(crate) fn eval_script(
     server: &mut ServerState,
     client: &mut ClientState,
 ) -> RespFrame {
-    match with_lua_runtime(|rt| rt.eval(source, keys, argv, server, client)) {
+    let request = EvalRequest {
+        source,
+        keys,
+        argv,
+        server,
+        client,
+    };
+
+    match with_lua_runtime(|rt| rt.eval(request)) {
         Ok(frame) => frame,
         Err(msg) => RespFrame::error_str(&msg),
     }
@@ -71,6 +79,14 @@ pub(crate) fn eval_script(
 
 struct LuaRuntime {
     lua: Lua,
+}
+
+struct EvalRequest<'a> {
+    source: &'a [u8],
+    keys: &'a [Bytes],
+    argv: &'a [Bytes],
+    server: &'a mut ServerState,
+    client: &'a mut ClientState,
 }
 
 impl LuaRuntime {
@@ -113,14 +129,15 @@ impl LuaRuntime {
     /// same scope, Rust's borrow checker won't allow two `&mut` closures.
     /// We use `RefCell` for interior mutability -- this is safe because Lua
     /// execution is single-threaded and the closures never overlap.
-    fn eval(
-        &self,
-        source: &[u8],
-        keys: &[Bytes],
-        argv: &[Bytes],
-        server: &mut ServerState,
-        client: &mut ClientState,
-    ) -> Result<RespFrame, String> {
+    fn eval(&self, request: EvalRequest<'_>) -> Result<RespFrame, String> {
+        let EvalRequest {
+            source,
+            keys,
+            argv,
+            server,
+            client,
+        } = request;
+
         // Wrap mutable references in RefCell for shared access by closures.
         let server_cell = RefCell::new(server);
         let client_cell = RefCell::new(client);
@@ -335,7 +352,7 @@ fn lua_multi_to_resp(values: &MultiValue) -> RespFrame {
 /// - number       -> Integer(truncated)
 /// - string       -> BulkString
 /// - table        -> if has "err" key: Error; if has "ok" key: SimpleString;
-///                   otherwise: Array (sequential integer keys)
+///   otherwise: Array (sequential integer keys)
 fn lua_value_to_resp(val: &Value) -> RespFrame {
     match val {
         Value::Nil => RespFrame::BulkString(None),
@@ -358,15 +375,11 @@ fn lua_value_to_resp(val: &Value) -> RespFrame {
 /// - sequential table      => Array frame
 fn table_to_resp(tbl: &mlua::Table) -> RespFrame {
     // Check for err/ok status tables first.
-    if let Ok(val) = tbl.raw_get::<Value>("err") {
-        if let Value::String(s) = val {
-            return RespFrame::Error(Bytes::copy_from_slice(&s.as_bytes()));
-        }
+    if let Ok(Value::String(s)) = tbl.raw_get::<Value>("err") {
+        return RespFrame::Error(Bytes::copy_from_slice(&s.as_bytes()));
     }
-    if let Ok(val) = tbl.raw_get::<Value>("ok") {
-        if let Value::String(s) = val {
-            return RespFrame::SimpleString(Bytes::copy_from_slice(&s.as_bytes()));
-        }
+    if let Ok(Value::String(s)) = tbl.raw_get::<Value>("ok") {
+        return RespFrame::SimpleString(Bytes::copy_from_slice(&s.as_bytes()));
     }
 
     // Sequential array table: iterate integer keys 1..n

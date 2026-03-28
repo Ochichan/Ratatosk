@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::{ServerState, purge_expired_key};
+use crate::keyspace::{AtomicStatsState, ServerState, purge_expired_key};
 
 use super::{
     ClientState, CommandOutcome, ServerAccess, TransactionState, WatchedKey, err, execute, now_ms,
@@ -29,6 +29,7 @@ pub(super) fn cmd_exec(
     args: &[Bytes],
     server: &mut ServerState,
     client: &mut ClientState,
+    atomic_stats: Option<&AtomicStatsState>,
 ) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("exec");
@@ -70,7 +71,7 @@ pub(super) fn cmd_exec(
                 .map(|value| RespFrame::BulkString(Some(value)))
                 .collect(),
         );
-        let mut access = ServerAccess::new_inline(server);
+        let mut access = ServerAccess::new_with_optional_atomic_stats(server, atomic_stats);
         let outcome = execute(frame, &mut access, client);
         replies.push(outcome.response);
     }
@@ -78,6 +79,9 @@ pub(super) fn cmd_exec(
     // Each queued command incremented total_commands_processed via execute(),
     // but Redis counts EXEC as a single command. Subtract the overcounted amount.
     server.stats.adjust_commands_processed_by(overcounted);
+    if let Some(stats) = atomic_stats {
+        stats.adjust_commands_processed_by(overcounted);
+    }
 
     CommandOutcome::reply(RespFrame::Array(replies))
 }

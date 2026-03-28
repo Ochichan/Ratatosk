@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-${{ runner.os }}-
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Build check
+        run: cargo check --workspace --quiet
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --quiet
+
+      - name: Cargo deny
+        run: cargo deny check advisories bans licenses sources
+
+      - name: Cargo audit
+        run: cargo audit
+
+  build:
+    needs: quality
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_suffix: linux
+          - os: macos-latest
+            archive_suffix: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-build-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            release-build-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build -p ratatosk-server --release
+
+      - name: Package release bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/pkg/docs
+          cp target/release/ratatosk release/pkg/
+          cp README.md CHANGELOG.md LICENSE ratatosk.conf release/pkg/
+          cp -R docs/. release/pkg/docs/
+          archive="release/ratatosk-${{ github.ref_name }}-${{ matrix.archive_suffix }}.tar.gz"
+          tar -czf "$archive" -C release/pkg .
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            shasum -a 256 "$archive" > "$archive.sha256"
+          else
+            sha256sum "$archive" > "$archive.sha256"
+          fi
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ratatosk-${{ github.ref_name }}-${{ matrix.archive_suffix }}
+          path: |
+            release/*.tar.gz
+            release/*.sha256
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/*.sha256

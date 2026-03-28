@@ -2,14 +2,14 @@ use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
-pub use crate::acl::{AclState, AclUser};
+pub use crate::acl::{AclState, AclUser, DefaultAclPolicyState};
 pub use crate::clients::{BlockingState, ClientRegistry, ClientSnapshot};
 use crate::config::ConfigState;
 pub use crate::pubsub::{PubSubMessage, PubSubState};
 pub use crate::replication::{
     ReplicaClientInfo, ReplicaClientState, ReplicationMode, ReplicationState,
 };
-pub use crate::stats::{AtomicStatsState, SlowlogEntry, StatsState};
+pub use crate::stats::{AtomicStatsState, HotStatsSnapshot, SlowlogEntry, StatsState};
 pub use crate::tracking::ClientTrackingState;
 use ratatosk_core::time::now_ms as unix_ms_now;
 use std::{
@@ -590,6 +590,9 @@ pub struct SharedState {
     /// Lock-free atomic counters for the hottest stats fields.
     pub stats: AtomicStatsState,
 
+    /// Cached default-user ACL policy used by lock-light auth paths.
+    pub default_acl_policy: DefaultAclPolicyState,
+
     /// Lock-free read access to the current config.  Updated via
     /// `store()` on CONFIG SET; readers call `load()` without any lock.
     pub config_cache: arc_swap::ArcSwap<ConfigState>,
@@ -610,7 +613,7 @@ impl SharedState {
     /// The atomic stats are initialized from the `ServerState`'s current
     /// counters, and the config cache is seeded from its `ConfigState`.
     pub fn new(server: ServerState) -> Self {
-        Self::with_data(DataState::default(), server)
+        Self::with_data(server.data.clone(), server)
     }
 
     /// Create with a specific number of databases.
@@ -624,6 +627,8 @@ impl SharedState {
         let started_at_ms = server.started_at_ms;
         let cluster_node_id = server.cluster_node_id.clone();
         let next_client_id = server.next_client_id;
+        let default_acl_policy = DefaultAclPolicyState::from_acl(&server.acl);
+        server.data = data.clone();
         // Clear next_client_id from inner state — allocation is now atomic.
         server.next_client_id = i64::MAX;
 
@@ -633,6 +638,7 @@ impl SharedState {
             data,
             meta: Mutex::new(server),
             stats,
+            default_acl_policy,
             config_cache: arc_swap::ArcSwap::from_pointee(config),
             next_client_id: AtomicI64::new(next_client_id),
             started_at_ms,
@@ -658,6 +664,15 @@ impl SharedState {
     /// is updated atomically with respect to the canonical `ConfigState`.
     pub fn update_config_cache(&self, config: &ConfigState) {
         self.config_cache.store(Arc::new(config.clone()));
+    }
+
+    /// Update the default-user ACL cache after ACL mutations.
+    pub fn update_acl_policy_cache(&self, acl: &AclState) {
+        self.default_acl_policy.refresh_from_acl(acl);
+    }
+
+    pub fn default_acl_policy(&self) -> &DefaultAclPolicyState {
+        &self.default_acl_policy
     }
 
     /// Total connections received (derived from client ID counter).
@@ -707,9 +722,10 @@ pub struct DbShard {
 ///
 /// Commands on different DBs execute in parallel. Same-DB reads share
 /// the lock; writes are exclusive. Lock ordering: always ascending index.
+#[derive(Clone)]
 pub struct DataState {
-    shards: Vec<parking_lot::RwLock<DbShard>>,
-    next_key_version: AtomicU64,
+    shards: Arc<[parking_lot::RwLock<DbShard>]>,
+    next_key_version: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for DataState {
@@ -737,8 +753,8 @@ impl DataState {
             shards.push(parking_lot::RwLock::new(DbShard::default()));
         }
         Self {
-            shards,
-            next_key_version: AtomicU64::new(1),
+            shards: Arc::from(shards),
+            next_key_version: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -774,9 +790,7 @@ impl DataState {
 
     /// All DBs write-locked in ascending order. For FLUSHALL, load_from_rdb.
     pub fn write_all_dbs(&self) -> Vec<parking_lot::RwLockWriteGuard<'_, DbShard>> {
-        (0..self.shards.len())
-            .map(|i| self.shards[i].write())
-            .collect()
+        self.shards.iter().map(parking_lot::RwLock::write).collect()
     }
 
     /// Allocate the next key version (atomic, lock-free).
@@ -1500,7 +1514,7 @@ mod tests {
     use bytes::Bytes;
     use tokio::time::timeout;
 
-    use super::{AtomicStatsState, PubSubState, ServerState, StatsState, StoredValue};
+    use super::{AtomicStatsState, PubSubState, ServerState, SharedState, StatsState, StoredValue};
 
     #[test]
     fn remove_client_cleans_all_subscriptions() {
@@ -1830,6 +1844,14 @@ mod tests {
         stats.add_keyspace_misses(5);
         assert_eq!(stats.keyspace_hits(), 12);
         assert_eq!(stats.keyspace_misses(), 6);
+
+        let atomic = AtomicStatsState::default();
+        atomic.mark_keyspace_hit();
+        atomic.mark_keyspace_miss();
+        atomic.add_keyspace_hits(4);
+        atomic.add_keyspace_misses(7);
+        assert_eq!(atomic.keyspace_hits(), 5);
+        assert_eq!(atomic.keyspace_misses(), 8);
     }
 
     #[test]
@@ -1896,6 +1918,157 @@ mod tests {
 
         assert_eq!(stats.cached_memory_estimate(), 67890);
         assert_eq!(stats.last_memory_estimate_tick(), 100);
+    }
+
+    #[test]
+    fn atomic_stats_catch_up_from_stats_only_moves_forward() {
+        let mut stats = StatsState::default();
+        stats.mark_command_processed();
+        stats.mark_command_processed();
+        stats.mark_client_connected();
+        stats.add_net_input_bytes(50);
+        stats.add_net_output_bytes(30);
+        stats.add_evicted_keys(2);
+        stats.add_expired_keys(1);
+        stats.mark_keyspace_hit();
+        stats.mark_keyspace_miss();
+        stats.sample_ops_per_sec(1);
+        stats.set_cached_memory_estimate(4096, 1);
+
+        let atomic = AtomicStatsState::default();
+        atomic.mark_command_processed();
+        atomic.mark_command_processed();
+        atomic.mark_command_processed();
+        atomic.add_net_input_bytes(100);
+        atomic.add_net_output_bytes(10);
+
+        atomic.catch_up_from_stats(&stats);
+
+        assert_eq!(atomic.total_commands_processed(), 3);
+        assert_eq!(atomic.total_connections_received(), 1);
+        assert_eq!(atomic.total_net_input_bytes(), 100);
+        assert_eq!(atomic.total_net_output_bytes(), 30);
+        assert_eq!(atomic.evicted_keys(), 2);
+        assert_eq!(atomic.expired_keys(), 1);
+        assert_eq!(atomic.keyspace_hits(), 1);
+        assert_eq!(atomic.keyspace_misses(), 1);
+        assert_eq!(atomic.instantaneous_ops_per_sec(), 2);
+        assert_eq!(atomic.cached_memory_estimate(), 4096);
+    }
+
+    #[test]
+    fn stats_state_catch_up_from_atomic_rehydrates_hot_counters() {
+        let mut stats = StatsState::default();
+        stats.mark_command_processed();
+        stats.mark_client_connected();
+        stats.add_net_input_bytes(10);
+        stats.add_net_output_bytes(20);
+        stats.sample_ops_per_sec(1);
+        stats.set_cached_memory_estimate(1024, 1);
+
+        let atomic = AtomicStatsState::default();
+        atomic.mark_command_processed();
+        atomic.mark_command_processed();
+        atomic.mark_client_connected();
+        atomic.mark_client_connected();
+        atomic.add_net_input_bytes(50);
+        atomic.add_net_output_bytes(75);
+        atomic.add_evicted_keys(3);
+        atomic.add_expired_keys(4);
+        for _ in 0..5 {
+            atomic.mark_keyspace_hit();
+        }
+        for _ in 0..6 {
+            atomic.mark_keyspace_miss();
+        }
+        atomic.set_instantaneous_ops_per_sec(11);
+        atomic.set_cached_memory_estimate(8192);
+
+        stats.catch_up_from_atomic(&atomic);
+
+        assert_eq!(stats.total_commands_processed(), 2);
+        assert_eq!(stats.connected_clients(), 2);
+        assert_eq!(stats.total_connections_received(), 2);
+        assert_eq!(stats.total_net_input_bytes(), 50);
+        assert_eq!(stats.total_net_output_bytes(), 75);
+        assert_eq!(stats.evicted_keys(), 3);
+        assert_eq!(stats.expired_keys(), 4);
+        assert_eq!(stats.keyspace_hits(), 5);
+        assert_eq!(stats.keyspace_misses(), 6);
+        assert_eq!(stats.instantaneous_ops_per_sec(), 11);
+        assert_eq!(stats.cached_memory_estimate(), 8192);
+    }
+
+    #[tokio::test]
+    async fn shared_state_data_and_meta_server_share_backing_store() {
+        let shared = SharedState::new(ServerState::with_default_dbs());
+        let outer_key = Bytes::from("outer-key");
+        let inner_key = Bytes::from("inner-key");
+
+        {
+            let mut shard = shared.data.write_db(0);
+            shard.data.insert(
+                outer_key.clone(),
+                StoredValue::string(Bytes::from("outer-value"), None),
+            );
+        }
+
+        {
+            let server = shared.meta.lock().await;
+            let outer_seen = {
+                let db = server.db(0);
+                db.get(&outer_key).and_then(StoredValue::as_string).cloned()
+            };
+            assert_eq!(outer_seen, Some(Bytes::from("outer-value")));
+
+            server.touch_key_version(0, outer_key.clone());
+
+            let mut db = server.db_mut(0);
+            db.insert(
+                inner_key.clone(),
+                StoredValue::string(Bytes::from("inner-value"), None),
+            );
+        }
+
+        {
+            let shard = shared.data.read_db(0);
+            let inner_seen = shard
+                .data
+                .get(&inner_key)
+                .and_then(StoredValue::as_string)
+                .cloned();
+            assert_eq!(inner_seen, Some(Bytes::from("inner-value")));
+            assert!(
+                shard
+                    .key_versions
+                    .get(&outer_key)
+                    .copied()
+                    .unwrap_or_default()
+                    > 0,
+                "key version written through inner ServerState should be visible through SharedState.data",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_state_acl_policy_cache_tracks_mutations() {
+        let shared = SharedState::new(ServerState::with_default_dbs());
+
+        assert!(shared.default_acl_policy().default_user_is_nopass_enabled());
+        assert!(shared.default_acl_policy().default_user_has_full_access());
+
+        {
+            let mut server = shared.meta.lock().await;
+            let user = server
+                .acl
+                .get_or_create_user_mut(&Bytes::from_static(b"default"));
+            user.nopass = false;
+            user.allow_all_commands = false;
+            shared.update_acl_policy_cache(&server.acl);
+        }
+
+        assert!(!shared.default_acl_policy().default_user_is_nopass_enabled());
+        assert!(!shared.default_acl_policy().default_user_has_full_access());
     }
 
     #[test]

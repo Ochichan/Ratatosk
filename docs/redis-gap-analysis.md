@@ -30,7 +30,7 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 2. Lua scripting은 feature-gated로 구현됐지만 (`lua-scripting`), Redis Functions는 아직 비어 있다.
 3. blocking command, client-side caching이 Redis 내부 모델과 다르다. Pub/Sub delivery는 mpsc push로 개선됨.
 4. persistence background work가 Redis의 fork/COW, multipart AOF 모델과 다르다.
-5. `SharedState`로 lock-free fast path를 분리하고, DB 접근은 per-DB `parking_lot::RwLock`으로 분리했다. Meta-state(pubsub, ACL 등)는 여전히 `Mutex<ServerState>`에 의존하지만, 서로 다른 DB에 대한 명령은 병렬 실행 가능하다.
+5. `SharedState`로 lock-free fast path를 분리하고, DB 접근은 per-DB `parking_lot::RwLock`으로 분리했다. Meta-state(pubsub, ACL 등)는 여전히 `Mutex<ServerState>`에 의존하고, 일반 command path는 여전히 그 mutex 영향 아래 있다.
 6. 여러 server/client/admin 명령이 실제 동작보다 "syntax-compatible shell"에 가깝다.
 
 현재 ledger tier summary:
@@ -240,12 +240,13 @@ Migration cost: high
 
 ### 6. Runtime concurrency 모델이 Redis와도 다르고, 멀티코어 확장 모델과도 다르다
 
-Ratatosk는 per-client tokio task를 띄우지만, 실제 명령 실행은 `SharedState` 내부의 `Mutex<ServerState>`를 잠그고 진행한다. `SharedState`가 `AtomicStatsState`, `ArcSwap<ConfigState>`, atomic `next_client_id`를 lock-free로 분리하여 요청당 ~9회의 lock 획득을 제거했지만, state mutation 자체는 여전히 단일 mutex 기반이다. Redis의 전통적인 장점은 단일 event loop 위에서 명확한 순서를 유지하는 데 있고, 최근 버전은 I/O thread 등 경계를 명확히 둔다. Ratatosk는 그 중간 형태라서 lock-free fast path 개선에도 불구하고 state mutation 병목은 남아 있다.
+Ratatosk는 per-client tokio task를 띄우지만, 실제 명령 실행은 여전히 `SharedState` 내부의 `Mutex<ServerState>`를 잠그고 진행한다. 최근 리팩터링으로 `SharedState.data`와 inner `ServerState.data`가 같은 `DataState` backing shard를 공유하게 되어 outer/inner data divergence 리스크는 줄었지만, command execution path의 기본 성질이 mutex-serialized라는 점은 그대로다. `SharedState`가 `AtomicStatsState`, `ArcSwap<ConfigState>`, atomic `next_client_id`를 lock-free로 분리하여 요청당 ~9회의 lock 획득을 제거했지만, state mutation 자체는 여전히 단일 mutex 기반이다. Redis의 전통적인 장점은 단일 event loop 위에서 명확한 순서를 유지하는 데 있고, 최근 버전은 I/O thread 등 경계를 명확히 둔다. Ratatosk는 그 중간 형태라서 lock-free fast path 개선에도 불구하고 state mutation 병목은 남아 있다.
 
 현재 코드:
 
 - shared state: `SharedState` (내부 `Mutex<ServerState>` + lock-free components): `crates/ratatosk-server/src/client.rs`
 - 일반 명령 실행 직전마다 내부 Mutex를 잡는다: `crates/ratatosk-server/src/client.rs`
+- outer `SharedState.data`와 inner `ServerState.data`는 이제 같은 `Arc`-backed shard storage를 공유한다: `crates/ratatosk-engine/src/keyspace.rs`
 - stats 갱신, config 읽기, client id 할당은 lock-free 경로로 분리됨
 - Pub/Sub delivery는 per-subscriber mpsc channel로 Mutex 밖에서 수행됨
 - accept loop는 클라이언트별 task를 무제한 생성하는 구조다: `crates/ratatosk-server/src/event_loop.rs`

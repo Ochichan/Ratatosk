@@ -35,3 +35,4 @@ __pycache__/
 *.pyc
 .cargo-home/
 .cargo-install/
+.cargo/config.local.toml
