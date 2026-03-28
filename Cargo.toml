@@ -58,7 +58,7 @@ crossbeam-channel = "0.5"
 arc-swap = "1"
 
 # Data structures
-hashbrown = "0.15"
+hashbrown = "0.16"
 smallvec = { version = "1", features = ["union"] }
 
 # CRC / integrity
