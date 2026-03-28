@@ -88,7 +88,7 @@ glob-match = "0.2"
 mlua = { version = "0.11", features = ["lua51", "vendored"] }
 
 # Benchmarks
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.7", features = ["html_reports"] }
 itoa = "1"
 memchr = "2"
 
