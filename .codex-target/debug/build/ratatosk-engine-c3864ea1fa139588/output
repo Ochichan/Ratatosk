@@ -1,0 +1,5 @@
+cargo:rerun-if-changed=../../.git/HEAD
+cargo:rerun-if-changed=../../.git/refs/heads
+cargo:rustc-env=GIT_HASH=3fd26849
+cargo:rustc-env=BUILD_UNIX_TS=1774636248
+cargo:rustc-env=CARGO_PKG_VERSION=0.1.0

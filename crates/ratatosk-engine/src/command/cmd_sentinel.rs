@@ -15,7 +15,12 @@ pub(super) fn cmd_sentinel(args: &[Bytes]) -> CommandOutcome {
 
     let sub = to_uppercase_bytes(&args[0]);
     match sub.as_slice() {
-        b"HELP" => sentinel_help(),
+        b"HELP" => {
+            if args.len() != 1 {
+                return wrong_arity("sentinel");
+            }
+            sentinel_help()
+        }
         _ => CommandOutcome::reply(err("ERR This instance is not configured as a Sentinel")),
     }
 }
@@ -26,7 +31,7 @@ fn sentinel_help() -> CommandOutcome {
             b"SENTINEL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(
-            b"This instance is not a Sentinel; HELP is informational and other subcommands are unsupported.",
+            b"Only SENTINEL HELP is available in this build; all other SENTINEL subcommands return an error.",
         ))),
         RespFrame::BulkString(Some(Bytes::from_static(b"MASTERS"))),
         RespFrame::BulkString(Some(Bytes::from_static(

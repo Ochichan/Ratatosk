@@ -12,8 +12,6 @@ use super::{
     wrong_arity,
 };
 
-const AUTH_FAILURE: &str = "ERR invalid username-password pair or user is disabled.";
-
 pub(super) fn cmd_acl(
     args: &[Bytes],
     server: &mut ServerState,
@@ -42,10 +40,12 @@ pub(super) fn cmd_acl(
                 ),
                 RespFrame::bulk_str("GETUSER <username> -- Return ACL rules for the user."),
                 RespFrame::bulk_str("LIST -- Show ACL rules for all users."),
-                RespFrame::bulk_str("LOAD -- Reload ACL rules (baseline no-op)."),
+                RespFrame::bulk_str("LOAD -- Reload ACL rules from disk."),
                 RespFrame::bulk_str("LOG [count|RESET] -- Show or reset ACL log."),
-                RespFrame::bulk_str("SAVE -- Persist ACL rules (baseline no-op)."),
-                RespFrame::bulk_str("SETUSER <username> [rule ...] -- Create/modify ACL user."),
+                RespFrame::bulk_str("SAVE -- Persist ACL rules to disk."),
+                RespFrame::bulk_str(
+                    "SETUSER <username> [rule ...] -- Create/modify ACL user (passwords and category grants only).",
+                ),
                 RespFrame::bulk_str("USERS -- List ACL users."),
                 RespFrame::bulk_str("WHOAMI -- Return the current ACL username."),
                 RespFrame::bulk_str("HELP -- Show this help."),
@@ -227,7 +227,7 @@ pub(super) fn cmd_acl(
                     } else if rule.starts_with(b"+@") || rule.starts_with(b"-@") {
                         return CommandOutcome::reply(err("ERR syntax error"));
                     } else if is_accepted_non_category_rule(rule) {
-                        // Accepted baseline tokens not enforced yet: key/channel scopes and command-level grants.
+                        return CommandOutcome::reply(unsupported_acl_rule(rule));
                     } else {
                         return CommandOutcome::reply(err("ERR syntax error"));
                     }
@@ -261,7 +261,7 @@ pub(super) fn cmd_acl(
                 rules = rule_count,
                 "ACL user updated"
             );
-            CommandOutcome::reply(RespFrame::ok())
+            CommandOutcome::reply(RespFrame::ok()).with_acl_dirty()
         }
         b"DELUSER" => {
             if args.len() < 2 {
@@ -290,7 +290,7 @@ pub(super) fn cmd_acl(
                 removed_users = removed,
                 "ACL users removed"
             );
-            CommandOutcome::reply(RespFrame::Integer(removed))
+            CommandOutcome::reply(RespFrame::Integer(removed)).with_acl_dirty()
         }
         b"GENPASS" => {
             if args.len() > 2 {
@@ -352,7 +352,31 @@ pub(super) fn cmd_acl(
             if args.len() != 1 {
                 return wrong_arity("acl");
             }
-            CommandOutcome::reply(RespFrame::ok())
+            let path = AclState::file_path(server.config.dir());
+            match subcommand.as_slice() {
+                b"LOAD" => match AclState::load_from_file(&path) {
+                    Ok(Some(loaded)) => {
+                        server.acl = loaded;
+                        CommandOutcome::reply(RespFrame::ok()).with_acl_dirty()
+                    }
+                    Ok(None) => CommandOutcome::reply(err(&format!(
+                        "ERR ACL file does not exist: {}",
+                        path.display()
+                    ))),
+                    Err(error) => {
+                        CommandOutcome::reply(err(&format!("ERR ACL LOAD failed: {}", error)))
+                    }
+                },
+                b"SAVE" => match server.acl.save_to_file(&path) {
+                    Ok(()) => CommandOutcome::reply(RespFrame::ok()),
+                    Err(error) => {
+                        CommandOutcome::reply(err(&format!("ERR ACL SAVE failed: {}", error)))
+                    }
+                },
+                _ => CommandOutcome::reply(err(
+                    "ERR unknown ACL subcommand or wrong number of arguments",
+                )),
+            }
         }
         b"DRYRUN" => {
             if args.len() < 3 {
@@ -373,142 +397,6 @@ pub(super) fn cmd_acl(
             "ERR unknown ACL subcommand or wrong number of arguments",
         )),
     }
-}
-
-pub(super) fn authenticate_client(
-    server: &ServerState,
-    username: &Bytes,
-    password: &Bytes,
-    client: &mut ClientState,
-) -> bool {
-    if server.acl.authenticate_user(username, password) {
-        client.authenticated = true;
-        client.acl_user = username.clone();
-        return true;
-    }
-    false
-}
-
-/// Maximum consecutive AUTH failures before disconnecting the client.
-const AUTH_FAILURE_THRESHOLD: u32 = 5;
-
-/// Compute progressive delay for AUTH failures using exponential backoff + jitter.
-/// delay_ms = min(100 * 2^(failures - 1), 2000) * jitter(0.8..1.2)
-fn auth_failure_delay_ms(failures: u32) -> u64 {
-    use rand::Rng;
-    let base = std::cmp::min(
-        100u64.saturating_mul(1u64 << (failures.saturating_sub(1))),
-        2000,
-    );
-    let jitter: f64 = rand::thread_rng().gen_range(0.8..1.2);
-    (base as f64 * jitter) as u64
-}
-
-fn auth_failure_outcome(failures: u32) -> CommandOutcome {
-    let delay = auth_failure_delay_ms(failures);
-    if failures >= AUTH_FAILURE_THRESHOLD {
-        CommandOutcome::close_with_delay(err(AUTH_FAILURE), delay)
-    } else {
-        CommandOutcome::reply_with_delay(err(AUTH_FAILURE), delay)
-    }
-}
-
-pub(super) fn cmd_auth(
-    args: &[Bytes],
-    server: &ServerState,
-    client: &mut ClientState,
-) -> CommandOutcome {
-    let username = args.first().map(|_| {
-        if args.len() == 1 {
-            Bytes::from_static(b"default")
-        } else {
-            args[0].clone()
-        }
-    });
-
-    let result = match args {
-        [password] => {
-            if authenticate_client(server, &Bytes::from_static(b"default"), password, client) {
-                client.reset_auth_failures();
-                CommandOutcome::reply(RespFrame::ok())
-            } else {
-                let failures = client.increment_auth_failures();
-                if failures >= AUTH_FAILURE_THRESHOLD {
-                    tracing::warn!(
-                        target = "ratatosk::security",
-                        client_id = client.id(),
-                        failures,
-                        "AUTH failure threshold reached, disconnecting client"
-                    );
-                }
-                auth_failure_outcome(failures)
-            }
-        }
-        [username, password] => {
-            if authenticate_client(server, username, password, client) {
-                client.reset_auth_failures();
-                CommandOutcome::reply(RespFrame::ok())
-            } else {
-                let failures = client.increment_auth_failures();
-                if failures >= AUTH_FAILURE_THRESHOLD {
-                    tracing::warn!(
-                        target = "ratatosk::security",
-                        client_id = client.id(),
-                        failures,
-                        "AUTH failure threshold reached, disconnecting client"
-                    );
-                }
-                auth_failure_outcome(failures)
-            }
-        }
-        _ => wrong_arity("auth"),
-    };
-
-    // Record auth metrics
-    let success = !matches!(result.response, RespFrame::Error(_));
-    let result_label = if success { "success" } else { "failure" };
-    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label.to_string())
-        .increment(1);
-
-    // Audit log for auth events
-    let username_text =
-        String::from_utf8_lossy(username.as_ref().unwrap_or(&Bytes::from_static(b"unknown")))
-            .into_owned();
-    let payload = format!(
-        "event=AUTH client_id={} username={} success={}",
-        client.id(),
-        username_text,
-        success
-    );
-    let stamp = next_audit_stamp("AUTH", &payload);
-    tracing::info!(
-        target = "ratatosk::audit",
-        event = "AUTH",
-        audit_seq = stamp.seq,
-        audit_prev_hash = %stamp.prev_hash,
-        audit_hash = %stamp.hash,
-        client_id = client.id(),
-        username = %username_text,
-        success,
-        "ACL authentication attempt"
-    );
-
-    result
-}
-
-pub(super) fn cmd_reset(
-    args: &[Bytes],
-    server: &mut ServerState,
-    client: &mut ClientState,
-) -> CommandOutcome {
-    if !args.is_empty() {
-        return wrong_arity("reset");
-    }
-
-    server.tracking_remove_client(client.id());
-    server.unregister_monitor(client.id());
-    client.reset_for_connection();
-    CommandOutcome::reply(RespFrame::simple_str("RESET"))
 }
 
 fn parse_acl_category_rule(rule: &Bytes, prefix: u8) -> Option<Bytes> {
@@ -544,6 +432,13 @@ fn is_accepted_non_category_rule(rule: &Bytes) -> bool {
         || rule.eq_ignore_ascii_case(b"allchannels")
 }
 
+fn unsupported_acl_rule(rule: &Bytes) -> RespFrame {
+    let rule_text = String::from_utf8_lossy(rule);
+    err(&format!(
+        "ERR ACL rule '{rule_text}' is not supported in this build"
+    ))
+}
+
 fn to_hex(raw: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(raw.len().saturating_mul(2));
@@ -557,6 +452,7 @@ fn to_hex(raw: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::cmd_auth_session::cmd_auth;
     use crate::keyspace::ServerState;
 
     #[test]
@@ -599,5 +495,83 @@ mod tests {
 
         // Verify client is not authenticated
         assert!(!client.authenticated);
+    }
+
+    #[test]
+    fn acl_save_and_load_roundtrip_acl_state() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut server = ServerState::new(16);
+        server.config.set_dir(dir.path().to_path_buf());
+        let client = ClientState::new(3);
+
+        assert_eq!(
+            cmd_acl(
+                &[
+                    Bytes::from_static(b"SETUSER"),
+                    Bytes::from_static(b"alice"),
+                    Bytes::from_static(b"on"),
+                    Bytes::from_static(b">secret"),
+                    Bytes::from_static(b"+@read"),
+                ],
+                &mut server,
+                &client,
+            )
+            .response,
+            RespFrame::ok()
+        );
+
+        assert_eq!(
+            cmd_acl(&[Bytes::from_static(b"SAVE")], &mut server, &client).response,
+            RespFrame::ok()
+        );
+
+        let mut loaded_server = ServerState::new(16);
+        loaded_server.config.set_dir(dir.path().to_path_buf());
+
+        assert_eq!(
+            cmd_acl(&[Bytes::from_static(b"LOAD")], &mut loaded_server, &client,).response,
+            RespFrame::ok()
+        );
+
+        let alice = loaded_server
+            .acl
+            .get_user(&Bytes::from_static(b"alice"))
+            .expect("alice should be loaded");
+        assert!(alice.enabled);
+        assert!(!alice.nopass);
+        assert!(alice.allowed_categories.contains(b"read" as &[u8]));
+    }
+
+    #[test]
+    fn acl_setuser_rejects_rules_that_are_not_enforced() {
+        let mut server = ServerState::new(16);
+        let client = ClientState::new(4);
+
+        assert_eq!(
+            cmd_acl(
+                &[
+                    Bytes::from_static(b"SETUSER"),
+                    Bytes::from_static(b"scoped"),
+                    Bytes::from_static(b"~cache:*"),
+                ],
+                &mut server,
+                &client,
+            )
+            .response,
+            RespFrame::error_str("ERR ACL rule '~cache:*' is not supported in this build")
+        );
+        assert_eq!(
+            cmd_acl(
+                &[
+                    Bytes::from_static(b"SETUSER"),
+                    Bytes::from_static(b"scoped"),
+                    Bytes::from_static(b"+get"),
+                ],
+                &mut server,
+                &client,
+            )
+            .response,
+            RespFrame::error_str("ERR ACL rule '+get' is not supported in this build")
+        );
     }
 }

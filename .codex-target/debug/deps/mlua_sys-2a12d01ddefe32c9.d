@@ -1,0 +1,11 @@
+/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/deps/mlua_sys-2a12d01ddefe32c9.d: /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/mod.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/compat.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lauxlib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lua.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lualib.rs
+
+/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/deps/libmlua_sys-2a12d01ddefe32c9.rmeta: /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/mod.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/compat.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lauxlib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lua.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lualib.rs
+
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lib.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/macros.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/mod.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/compat.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lauxlib.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lua.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/mlua-sys-0.10.0/src/lua51/lualib.rs:

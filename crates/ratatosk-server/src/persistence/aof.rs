@@ -533,8 +533,52 @@ mod tests {
     use ratatosk_engine::keyspace::StoredValue;
     use ratatosk_persist::aof::DEFAULT_AOF_MANIFEST_FILENAME;
     use ratatosk_persist::rdb;
+    use std::{
+        ffi::OsString,
+        sync::{Mutex, MutexGuard, OnceLock},
+    };
 
     use crate::config::ServerConfig;
+
+    fn env_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env test lock poisoned")
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: tests hold env_test_lock() while mutating process env.
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: tests hold env_test_lock() while mutating process env.
+            unsafe { env::remove_var(key) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = self.previous.as_ref() {
+                // SAFETY: tests hold env_test_lock() while mutating process env.
+                unsafe { env::set_var(self.key, value) };
+            } else {
+                // SAFETY: tests hold env_test_lock() while mutating process env.
+                unsafe { env::remove_var(self.key) };
+            }
+        }
+    }
 
     #[tokio::test]
     async fn from_config_bootstraps_manifest_backed_aof_on_empty_dir() {
@@ -787,15 +831,14 @@ mod tests {
     fn bootstrap_aof_layout_warns_but_keeps_legacy_without_migrate_env() {
         use ratatosk_persist::aof::DEFAULT_SINGLE_FILE_AOF_FILENAME;
 
+        let _env_lock = env_test_lock();
         let dir = tempfile::tempdir().expect("tmpdir");
         let legacy_path = dir.path().join(DEFAULT_SINGLE_FILE_AOF_FILENAME);
         let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
 
         std::fs::write(&legacy_path, b"").expect("write legacy");
 
-        // Ensure RATATOSK_MIGRATE_AOF is not set
-        // SAFETY: test-only; no other threads depend on this env var in this test.
-        unsafe { env::remove_var("RATATOSK_MIGRATE_AOF") };
+        let _migrate_env = ScopedEnvVar::remove("RATATOSK_MIGRATE_AOF");
 
         let (aof_path, manifest_opt) =
             bootstrap_aof_layout(dir.path(), &legacy_path, &manifest_path).expect("bootstrap");
@@ -807,6 +850,7 @@ mod tests {
 
     #[test]
     fn startup_aof_recovery_paths_fails_closed_when_manifest_file_is_missing() {
+        let _env_lock = env_test_lock();
         let dir = tempfile::tempdir().expect("tmpdir");
         let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
         let mut manifest = AofManifest::new(dir.path());
@@ -823,8 +867,7 @@ mod tests {
             aof_tx: None,
         };
 
-        // SAFETY: test-only env isolation for this process.
-        unsafe { env::remove_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV) };
+        let _override_env = ScopedEnvVar::remove(ALLOW_INCOMPLETE_AOF_CHAIN_ENV);
 
         let error = startup_aof_recovery_paths(&runtime).expect_err("startup should fail closed");
         let text = error.to_string();
@@ -835,6 +878,7 @@ mod tests {
 
     #[test]
     fn startup_aof_recovery_paths_allows_missing_manifest_file_with_override() {
+        let _env_lock = env_test_lock();
         let dir = tempfile::tempdir().expect("tmpdir");
         let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
         let mut manifest = AofManifest::new(dir.path());
@@ -854,14 +898,10 @@ mod tests {
             aof_tx: None,
         };
 
-        // SAFETY: test-only env isolation for this process.
-        unsafe { env::set_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV, "true") };
+        let _override_env = ScopedEnvVar::set(ALLOW_INCOMPLETE_AOF_CHAIN_ENV, "true");
 
         let files = startup_aof_recovery_paths(&runtime).expect("override should allow startup");
         assert_eq!(files, vec![existing_incr]);
-
-        // SAFETY: test-only env isolation for this process.
-        unsafe { env::remove_var(ALLOW_INCOMPLETE_AOF_CHAIN_ENV) };
     }
 
     #[tokio::test]

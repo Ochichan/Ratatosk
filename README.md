@@ -16,6 +16,8 @@ For the detailed implementation boundary, see:
 - `docs/architecture-ratatosk.md`
 - `docs/redis-gap-analysis.md`
 - `docs/redis-gap-ledger.md`
+- `docs/product-contract.md`
+- `docs/ship-readiness-plan.md`
 
 ## Workspace Layout
 
@@ -53,6 +55,12 @@ Default listener:
 Recommended coexistence port when Redis may also be running:
 
 - `RATATOSK_PORT=6380`
+
+Remote bind hardening:
+
+- non-loopback bind still requires `RATATOSK_ALLOW_INSECURE_BIND=true`
+- for non-loopback bind, set `RATATOSK_DEFAULT_USER_PASSWORD=...` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH=...`
+- `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true` is still available, but it is an explicitly insecure operator override
 
 ## Nix
 
@@ -94,4 +102,8 @@ CI mirrors the same baseline in `.github/workflows/rust-ci.yml`.
 - `docs/persistence.md`: RDB/AOF runtime model
 - `docs/eviction-and-expiry.md`: memory and TTL behavior
 - `docs/performance.md`: benchmark baseline and guardrails
+- `docs/observability.md`: metrics, alerting, dashboard starter pack
+- `docs/support-and-versioning-policy.md`: release, support, and semver policy
+- `docs/product-contract.md`: v1 standalone product boundary
+- `docs/ship-readiness-plan.md`: full ship-readiness scorecard and roadmap
 - `AUTOSTART_RUNBOOK_KO.md`: systemd user autostart guide

@@ -47,6 +47,21 @@ pub struct StatsState {
     last_memory_estimate_tick: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotStatsSnapshot {
+    pub total_commands_processed: u64,
+    pub connected_clients: u64,
+    pub total_connections_received: u64,
+    pub total_net_input_bytes: u64,
+    pub total_net_output_bytes: u64,
+    pub evicted_keys: u64,
+    pub expired_keys: u64,
+    pub keyspace_hits: u64,
+    pub keyspace_misses: u64,
+    pub instantaneous_ops_per_sec: u64,
+    pub cached_memory_estimate: u64,
+}
+
 impl Default for StatsState {
     fn default() -> Self {
         Self {
@@ -353,6 +368,51 @@ impl StatsState {
     pub fn last_memory_estimate_tick(&self) -> u64 {
         self.last_memory_estimate_tick
     }
+
+    pub fn hot_snapshot(&self) -> HotStatsSnapshot {
+        HotStatsSnapshot {
+            total_commands_processed: self.total_commands_processed,
+            connected_clients: self.connected_clients,
+            total_connections_received: self.total_connections_received,
+            total_net_input_bytes: self.total_net_input_bytes,
+            total_net_output_bytes: self.total_net_output_bytes,
+            evicted_keys: self.evicted_keys,
+            expired_keys: self.expired_keys,
+            keyspace_hits: self.keyspace_hits,
+            keyspace_misses: self.keyspace_misses,
+            instantaneous_ops_per_sec: self.instantaneous_ops_per_sec,
+            cached_memory_estimate: self.cached_memory_estimate,
+        }
+    }
+
+    pub fn catch_up_from_hot_snapshot(&mut self, snapshot: HotStatsSnapshot) {
+        self.total_commands_processed = self
+            .total_commands_processed
+            .max(snapshot.total_commands_processed);
+        self.connected_clients = snapshot.connected_clients;
+        self.total_connections_received = self
+            .total_connections_received
+            .max(snapshot.total_connections_received);
+        self.total_net_input_bytes = self
+            .total_net_input_bytes
+            .max(snapshot.total_net_input_bytes);
+        self.total_net_output_bytes = self
+            .total_net_output_bytes
+            .max(snapshot.total_net_output_bytes);
+        self.evicted_keys = self.evicted_keys.max(snapshot.evicted_keys);
+        self.expired_keys = self.expired_keys.max(snapshot.expired_keys);
+        self.keyspace_hits = self.keyspace_hits.max(snapshot.keyspace_hits);
+        self.keyspace_misses = self.keyspace_misses.max(snapshot.keyspace_misses);
+        self.instantaneous_ops_per_sec = snapshot.instantaneous_ops_per_sec;
+        self.cached_memory_estimate = snapshot.cached_memory_estimate;
+        self.prev_commands_snapshot = self
+            .prev_commands_snapshot
+            .min(self.total_commands_processed);
+    }
+
+    pub fn catch_up_from_atomic(&mut self, atomic: &AtomicStatsState) {
+        self.catch_up_from_hot_snapshot(atomic.hot_snapshot());
+    }
 }
 
 #[derive(Debug)]
@@ -389,6 +449,13 @@ impl Default for AtomicStatsState {
 }
 
 impl AtomicStatsState {
+    fn catch_up_counter(counter: &AtomicU64, target: u64) {
+        let current = counter.load(AtomicOrdering::Relaxed);
+        if target > current {
+            counter.fetch_add(target - current, AtomicOrdering::Relaxed);
+        }
+    }
+
     pub fn from_stats(stats: &StatsState) -> Self {
         let atomic = Self::default();
         atomic
@@ -416,6 +483,14 @@ impl AtomicStatsState {
 
     pub fn total_commands_processed(&self) -> u64 {
         self.total_commands_processed.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn adjust_commands_processed_by(&self, overcounted: u64) {
+        let _ = self.total_commands_processed.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_sub(overcounted)),
+        );
     }
 
     pub fn mark_client_connected(&self) {
@@ -479,12 +554,21 @@ impl AtomicStatsState {
         self.keyspace_hits.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
+    pub fn add_keyspace_hits(&self, count: u64) {
+        self.keyspace_hits.fetch_add(count, AtomicOrdering::Relaxed);
+    }
+
     pub fn keyspace_hits(&self) -> u64 {
         self.keyspace_hits.load(AtomicOrdering::Relaxed)
     }
 
     pub fn mark_keyspace_miss(&self) {
         self.keyspace_misses.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+
+    pub fn add_keyspace_misses(&self, count: u64) {
+        self.keyspace_misses
+            .fetch_add(count, AtomicOrdering::Relaxed);
     }
 
     pub fn keyspace_misses(&self) -> u64 {
@@ -509,6 +593,43 @@ impl AtomicStatsState {
         self.cached_memory_estimate.load(AtomicOrdering::Relaxed)
     }
 
+    pub fn hot_snapshot(&self) -> HotStatsSnapshot {
+        HotStatsSnapshot {
+            total_commands_processed: self.total_commands_processed(),
+            connected_clients: self.connected_clients(),
+            total_connections_received: self.total_connections_received(),
+            total_net_input_bytes: self.total_net_input_bytes(),
+            total_net_output_bytes: self.total_net_output_bytes(),
+            evicted_keys: self.evicted_keys(),
+            expired_keys: self.expired_keys(),
+            keyspace_hits: self.keyspace_hits(),
+            keyspace_misses: self.keyspace_misses(),
+            instantaneous_ops_per_sec: self.instantaneous_ops_per_sec(),
+            cached_memory_estimate: self.cached_memory_estimate(),
+        }
+    }
+
+    pub fn catch_up_from_stats(&self, stats: &StatsState) {
+        Self::catch_up_counter(
+            &self.total_commands_processed,
+            stats.total_commands_processed(),
+        );
+        Self::catch_up_counter(
+            &self.total_connections_received,
+            stats.total_connections_received(),
+        );
+        Self::catch_up_counter(&self.total_net_input_bytes, stats.total_net_input_bytes());
+        Self::catch_up_counter(&self.total_net_output_bytes, stats.total_net_output_bytes());
+        Self::catch_up_counter(&self.evicted_keys, stats.evicted_keys());
+        Self::catch_up_counter(&self.expired_keys, stats.expired_keys());
+        Self::catch_up_counter(&self.keyspace_hits, stats.keyspace_hits());
+        Self::catch_up_counter(&self.keyspace_misses, stats.keyspace_misses());
+        self.instantaneous_ops_per_sec
+            .store(stats.instantaneous_ops_per_sec(), AtomicOrdering::Relaxed);
+        self.cached_memory_estimate
+            .store(stats.cached_memory_estimate(), AtomicOrdering::Relaxed);
+    }
+
     pub fn reset(&self) {
         self.total_commands_processed
             .store(0, AtomicOrdering::Relaxed);
@@ -526,5 +647,49 @@ impl AtomicStatsState {
             .store(0, AtomicOrdering::Relaxed);
         self.cached_memory_estimate
             .store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+impl HotStatsSnapshot {
+    pub fn merged(inner: &StatsState, atomic: Option<&AtomicStatsState>) -> Self {
+        let inner = inner.hot_snapshot();
+        let Some(atomic) = atomic else {
+            return inner;
+        };
+        let atomic = atomic.hot_snapshot();
+
+        Self {
+            total_commands_processed: inner
+                .total_commands_processed
+                .max(atomic.total_commands_processed),
+            connected_clients: inner.connected_clients.max(atomic.connected_clients),
+            total_connections_received: inner
+                .total_connections_received
+                .max(atomic.total_connections_received),
+            total_net_input_bytes: inner
+                .total_net_input_bytes
+                .max(atomic.total_net_input_bytes),
+            total_net_output_bytes: inner
+                .total_net_output_bytes
+                .max(atomic.total_net_output_bytes),
+            evicted_keys: inner.evicted_keys.max(atomic.evicted_keys),
+            expired_keys: inner.expired_keys.max(atomic.expired_keys),
+            keyspace_hits: inner.keyspace_hits.max(atomic.keyspace_hits),
+            keyspace_misses: inner.keyspace_misses.max(atomic.keyspace_misses),
+            instantaneous_ops_per_sec: if atomic.instantaneous_ops_per_sec > 0
+                || inner.instantaneous_ops_per_sec == 0
+            {
+                atomic.instantaneous_ops_per_sec
+            } else {
+                inner.instantaneous_ops_per_sec
+            },
+            cached_memory_estimate: if atomic.cached_memory_estimate > 0
+                || inner.cached_memory_estimate == 0
+            {
+                atomic.cached_memory_estimate
+            } else {
+                inner.cached_memory_estimate
+            },
+        }
     }
 }

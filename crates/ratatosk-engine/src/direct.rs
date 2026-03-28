@@ -335,13 +335,12 @@ impl DirectDb<'_> {
             return Vec::new();
         }
 
-        let skip = len.saturating_sub(1).saturating_sub(stop_idx);
         let take_len = (stop_idx - start_idx + 1).min(limit);
 
         zset.by_score
             .keys()
             .rev()
-            .skip(skip)
+            .skip(start_idx)
             .take(take_len)
             .map(|e| (e.member.clone(), e.score.value()))
             .collect()
@@ -1450,6 +1449,22 @@ mod tests {
         assert_eq!(range[0], (Bytes::from("three"), 3.0));
         assert_eq!(range[1], (Bytes::from("two"), 2.0));
         assert_eq!(range[2], (Bytes::from("one"), 1.0));
+    }
+
+    #[test]
+    fn zrevrange_with_scores_honors_partial_rank_window() {
+        let mut server = make_server();
+        let mut db = server.direct(0);
+
+        db.zadd(b"myzset", 1.0, b"one");
+        db.zadd(b"myzset", 2.0, b"two");
+        db.zadd(b"myzset", 3.0, b"three");
+
+        let range = db.zrevrange_with_scores(b"myzset", 0, 1);
+        assert_eq!(
+            range,
+            vec![(Bytes::from("three"), 3.0), (Bytes::from("two"), 2.0)]
+        );
     }
 
     #[test]

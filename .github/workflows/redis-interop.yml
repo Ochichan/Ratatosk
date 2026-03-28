@@ -1,0 +1,39 @@
+name: Redis Interop
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  redis-interop:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: redis-interop-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            redis-interop-${{ runner.os }}-
+
+      - name: Install redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          redis-server --version
+
+      - name: Run supported-subset differential test
+        run: cargo test -p ratatosk-server redis_interop_supported_subset_matches_redis_when_available -- --nocapture

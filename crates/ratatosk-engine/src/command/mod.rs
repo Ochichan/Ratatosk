@@ -1,23 +1,56 @@
 mod cmd_acl;
+mod cmd_auth_session;
 mod cmd_bitmap;
+mod cmd_bitmap_bitfield;
 mod cmd_client;
+mod cmd_client_introspection;
+mod cmd_client_tracking;
 mod cmd_cluster;
+mod cmd_command_metadata;
 mod cmd_connection;
+mod cmd_connection_session;
 mod cmd_generic;
+mod cmd_generic_dump;
+mod cmd_generic_replication;
+mod cmd_generic_string;
 mod cmd_geo;
+mod cmd_geo_query;
+mod cmd_geo_radius;
 mod cmd_hash;
+mod cmd_hash_field_ops;
+mod cmd_hash_read;
 mod cmd_hash_ttl;
 mod cmd_hll;
 mod cmd_key;
+mod cmd_key_meta;
 mod cmd_list;
+mod cmd_list_blocking;
+mod cmd_list_pop;
 mod cmd_pubsub;
 mod cmd_script;
 mod cmd_sentinel;
 mod cmd_server;
+mod cmd_server_config;
+mod cmd_server_info;
+mod cmd_server_latency;
+mod cmd_server_maintenance;
+mod cmd_server_memory;
+mod cmd_server_replication;
+mod cmd_server_slowlog;
 mod cmd_set;
+mod cmd_set_algebra;
 mod cmd_sorted_set;
+mod cmd_sorted_set_pop;
+mod cmd_sorted_set_ranges;
+mod cmd_sorted_set_sampling;
+mod cmd_sorted_set_setops;
 mod cmd_stream;
+mod cmd_stream_admin;
+mod cmd_stream_groups;
+mod cmd_stream_lifecycle;
 mod cmd_string;
+mod cmd_string_access;
+mod cmd_string_numeric;
 mod cmd_transaction;
 #[cfg(feature = "lua-scripting")]
 mod lua_runtime;
@@ -37,7 +70,7 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::{
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
-    keyspace::{ClientSnapshot, ServerState},
+    keyspace::{AtomicStatsState, ClientSnapshot, DefaultAclPolicyState, ServerState},
     security::sanitize_error_message,
 };
 use registry::{
@@ -57,11 +90,68 @@ use registry::{
 /// `MappedRwLockWriteGuard` that auto-derefs to `&mut HashMap`.
 pub struct ServerAccess<'a> {
     pub meta: &'a mut ServerState,
+    pub atomic_stats: Option<&'a AtomicStatsState>,
+    pub default_acl_policy: Option<&'a DefaultAclPolicyState>,
 }
 
 impl<'a> ServerAccess<'a> {
     pub fn new_inline(server: &'a mut ServerState) -> Self {
-        Self { meta: server }
+        Self {
+            meta: server,
+            atomic_stats: None,
+            default_acl_policy: None,
+        }
+    }
+
+    pub fn new_with_atomic_stats(
+        server: &'a mut ServerState,
+        atomic_stats: &'a AtomicStatsState,
+    ) -> Self {
+        Self::new_with_runtime_caches(server, atomic_stats, None)
+    }
+
+    pub fn new_with_runtime_caches(
+        server: &'a mut ServerState,
+        atomic_stats: &'a AtomicStatsState,
+        default_acl_policy: Option<&'a DefaultAclPolicyState>,
+    ) -> Self {
+        Self {
+            meta: server,
+            atomic_stats: Some(atomic_stats),
+            default_acl_policy,
+        }
+    }
+
+    pub fn new_with_optional_atomic_stats(
+        server: &'a mut ServerState,
+        atomic_stats: Option<&'a AtomicStatsState>,
+    ) -> Self {
+        Self {
+            meta: server,
+            atomic_stats,
+            default_acl_policy: None,
+        }
+    }
+
+    fn mark_command_processed(&mut self) {
+        self.meta.stats.mark_command_processed();
+        if let Some(stats) = self.atomic_stats {
+            stats.mark_command_processed();
+        }
+    }
+
+    fn default_user_is_nopass_enabled(&self) -> bool {
+        self.default_acl_policy.map_or_else(
+            || self.meta.acl.default_user_is_nopass_enabled(),
+            DefaultAclPolicyState::default_user_is_nopass_enabled,
+        )
+    }
+
+    fn default_user_has_full_access(&self) -> bool {
+        self.default_acl_policy.map_or_else(
+            || self.meta.acl.default_user_has_full_access(),
+            DefaultAclPolicyState::default_user_has_full_access,
+        )
     }
 }
 
@@ -3309,6 +3399,8 @@ pub struct CommandOutcome {
     pub delay_ms: Option<u64>,
     /// Indicates that CONFIG state changed and lock-free config readers should refresh.
     pub config_dirty: bool,
+    /// Indicates that ACL state changed and cached ACL readers should refresh.
+    pub acl_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3326,6 +3418,7 @@ impl CommandOutcome {
             retry_blocking: None,
             delay_ms: None,
             config_dirty: false,
+            acl_dirty: false,
         }
     }
 
@@ -3336,6 +3429,7 @@ impl CommandOutcome {
             retry_blocking: None,
             delay_ms: None,
             config_dirty: false,
+            acl_dirty: false,
         }
     }
 
@@ -3346,6 +3440,7 @@ impl CommandOutcome {
             retry_blocking: None,
             delay_ms: Some(delay_ms),
             config_dirty: false,
+            acl_dirty: false,
         }
     }
 
@@ -3356,6 +3451,7 @@ impl CommandOutcome {
             retry_blocking: None,
             delay_ms: Some(delay_ms),
             config_dirty: false,
+            acl_dirty: false,
         }
     }
 
@@ -3375,11 +3471,17 @@ impl CommandOutcome {
             }),
             delay_ms: None,
             config_dirty: false,
+            acl_dirty: false,
         }
     }
 
     fn with_config_dirty(mut self) -> Self {
         self.config_dirty = true;
+        self
+    }
+
+    fn with_acl_dirty(mut self) -> Self {
+        self.acl_dirty = true;
         self
     }
 }
@@ -3470,6 +3572,19 @@ impl ClientState {
         self.id
     }
 
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    pub fn acl_user(&self) -> &Bytes {
+        &self.acl_user
+    }
+
+    pub fn authenticate_as(&mut self, user: Bytes) {
+        self.authenticated = true;
+        self.acl_user = user;
+    }
+
     pub fn has_pubsub_subscriptions(&self) -> bool {
         self.pubsub_subscriptions > 0
     }
@@ -3508,6 +3623,10 @@ impl ClientState {
 
     pub fn protocol_version(&self) -> i64 {
         self.protocol_version
+    }
+
+    pub fn in_multi(&self) -> bool {
+        self.tx_state.in_multi()
     }
 
     pub fn set_protocol_version(&mut self, protocol_version: i64) {
@@ -3613,6 +3732,15 @@ impl ClientState {
 
     pub fn set_lib_ver(&mut self, ver: Bytes) {
         self.lib_ver = Some(ver);
+    }
+
+    pub fn mark_command_metadata(&mut self, command: &Bytes, touch_interaction: bool) {
+        if touch_interaction {
+            self.last_interaction_ms = now_client_clock_ms();
+        }
+        if self.last_command.as_ref() != command.as_ref() {
+            self.last_command = command.clone();
+        }
     }
 
     pub fn snapshot_with_redirect(
@@ -3738,16 +3866,48 @@ impl Default for ClientState {
     }
 }
 
-pub fn execute(
-    frame: RespFrame,
+pub enum ExecuteArgvPrecheck {
+    Continue,
+    Reject(CommandOutcome),
+}
+
+fn allows_execute_without_auth(command: &[u8], spec: Option<CommandSpec>) -> bool {
+    command == b"HELLO"
+        || command == b"QUIT"
+        || spec.is_some_and(|candidate| candidate.flags.contains(&"no_auth"))
+}
+
+pub fn precheck_execute_argv_with_default_acl(
+    argv: &[Bytes],
+    default_acl_policy: &DefaultAclPolicyState,
+    client: &mut ClientState,
+) -> ExecuteArgvPrecheck {
+    if argv.is_empty() {
+        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(err("ERR empty command")));
+    }
+
+    let command = to_uppercase_stack(&argv[0]);
+    let spec = find_command_spec_upper(command.as_slice());
+
+    if !client.is_authenticated() && default_acl_policy.default_user_is_nopass_enabled() {
+        client.authenticate_as(Bytes::from_static(b"default"));
+    }
+
+    let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
+    if !client.is_authenticated() && !allow_without_auth {
+        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(err(
+            "NOAUTH Authentication required.",
+        )));
+    }
+
+    ExecuteArgvPrecheck::Continue
+}
+
+pub fn execute_argv(
+    argv: &[Bytes],
     access: &mut ServerAccess<'_>,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    let argv = match frame_to_argv(frame) {
-        Ok(argv) => argv,
-        Err(response) => return CommandOutcome::reply(response),
-    };
-
     if argv.is_empty() {
         return CommandOutcome::reply(err("ERR empty command"));
     }
@@ -3756,30 +3916,26 @@ pub fn execute(
     let command = to_uppercase_stack(command_raw);
     let spec = find_command_spec_upper(command.as_slice());
 
-    if !client.authenticated && access.meta.acl.default_user_is_nopass_enabled() {
-        client.authenticated = true;
-        client.acl_user = Bytes::from_static(b"default");
+    if !client.is_authenticated() && access.default_user_is_nopass_enabled() {
+        client.authenticate_as(Bytes::from_static(b"default"));
     }
 
-    let allow_without_auth = command.as_slice() == b"HELLO"
-        || command.as_slice() == b"QUIT"
-        || spec.is_some_and(|candidate| candidate.flags.contains(&"no_auth"));
+    let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
 
-    if !client.authenticated && !allow_without_auth {
+    if !client.is_authenticated() && !allow_without_auth {
         return CommandOutcome::reply(err("NOAUTH Authentication required."));
     }
 
-    if client.authenticated
+    if client.is_authenticated()
         && !allow_without_auth
-        && !(client.acl_user.as_ref() == b"default"
-            && access.meta.acl.default_user_has_full_access())
+        && !(client.acl_user().as_ref() == b"default" && access.default_user_has_full_access())
     {
         if let Some(candidate) = spec {
             let required_mask = acl_required_category_mask(candidate);
             if !access
                 .meta
                 .acl
-                .command_allowed_mask(&client.acl_user, required_mask)
+                .command_allowed_mask(client.acl_user(), required_mask)
             {
                 return CommandOutcome::reply(err(
                     "NOPERM this user has no permissions to run the command",
@@ -3788,16 +3944,16 @@ pub fn execute(
         }
     }
 
-    access.meta.stats.mark_command_processed();
+    access.mark_command_processed();
+
+    let atomic_stats = access.atomic_stats;
 
     // Rebind for dispatch table and tracking code.
     let server = &mut *access.meta;
-    if !matches!(command.as_slice(), b"PING" | b"ECHO") {
-        client.last_interaction_ms = now_client_clock_ms();
-    }
-    if client.last_command.as_ref() != command_raw.as_ref() {
-        client.last_command = command_raw.clone();
-    }
+    client.mark_command_metadata(
+        command_raw,
+        !matches!(command.as_slice(), b"PING" | b"ECHO"),
+    );
 
     const MAX_TX_QUEUE_SIZE: usize = 65536;
 
@@ -3807,7 +3963,7 @@ pub fn execute(
             b"EXEC" | b"DISCARD" | b"MULTI" | b"WATCH" | b"UNWATCH"
         )
     {
-        if let Err(response) = validate_queued_command(&argv, server, client) {
+        if let Err(response) = validate_queued_command(argv, server, client) {
             if let TransactionState::InTransaction { has_error, .. } = &mut client.tx_state {
                 *has_error = true;
             }
@@ -3819,7 +3975,7 @@ pub fn execute(
                 *has_error = true;
                 return CommandOutcome::reply(err("ERR transaction queue limit reached"));
             }
-            queue.push(argv.into_vec());
+            queue.push(argv.to_vec());
         }
         return CommandOutcome::reply(RespFrame::queued());
     }
@@ -3833,40 +3989,12 @@ pub fn execute(
         None
     };
 
-    // Fast dispatch for ultra-hot readonly commands to avoid large match fan-out.
-    if command.as_slice() == b"PING" {
-        let outcome = cmd_connection::cmd_ping(args, server);
-        if let Some(started) = started {
-            let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
-            if track_slowlog {
-                maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
-            }
-            if track_latency {
-                maybe_track_latency(server, command.as_slice(), elapsed_us);
-            }
-        }
-        return outcome;
-    }
-    if command.as_slice() == b"ECHO" {
-        let outcome = cmd_connection::cmd_echo(args);
-        if let Some(started) = started {
-            let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
-            if track_slowlog {
-                maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
-            }
-            if track_latency {
-                maybe_track_latency(server, command.as_slice(), elapsed_us);
-            }
-        }
-        return outcome;
-    }
-
     let outcome = match command.as_slice() {
-        b"PING" => cmd_connection::cmd_ping(args, server),
-        b"ECHO" => cmd_connection::cmd_echo(args),
-        b"HELLO" => cmd_connection::cmd_hello(args, server, client),
-        b"QUIT" => cmd_connection::cmd_quit(args),
-        b"COMMAND" => cmd_connection::cmd_command(args),
+        b"PING" => cmd_connection_session::cmd_ping(args, server, atomic_stats),
+        b"ECHO" => cmd_connection_session::cmd_echo(args),
+        b"HELLO" => cmd_connection_session::cmd_hello(args, server, client),
+        b"QUIT" => cmd_connection_session::cmd_quit(args),
+        b"COMMAND" => cmd_command_metadata::cmd_command(args),
         b"DEBUG" => cmd_connection::cmd_debug(args),
         b"LOLWUT" => cmd_connection::cmd_lolwut(args),
         b"MODULE" => cmd_connection::cmd_module(args),
@@ -3875,7 +4003,7 @@ pub fn execute(
         b"SHUTDOWN" => cmd_connection::cmd_shutdown(args),
         b"TRIMSLOTS" => cmd_connection::cmd_trimslots(args),
         b"MULTI" => cmd_transaction::cmd_multi(args, client),
-        b"EXEC" => cmd_transaction::cmd_exec(args, server, client),
+        b"EXEC" => cmd_transaction::cmd_exec(args, server, client, atomic_stats),
         b"DISCARD" => cmd_transaction::cmd_discard(args, client),
         b"WATCH" => cmd_transaction::cmd_watch(args, server, client),
         b"UNWATCH" => cmd_transaction::cmd_unwatch(args, client),
@@ -3893,98 +4021,98 @@ pub fn execute(
         b"XRANGE" => cmd_stream::cmd_xrange(args, server, client, false),
         b"XREVRANGE" => cmd_stream::cmd_xrange(args, server, client, true),
         b"XREAD" => cmd_stream::cmd_xread(args, server, client),
-        b"XGROUP" => cmd_stream::cmd_xgroup(args, server, client),
-        b"XREADGROUP" => cmd_stream::cmd_xreadgroup(args, server, client),
-        b"XACK" => cmd_stream::cmd_xack(args, server, client),
-        b"XPENDING" => cmd_stream::cmd_xpending(args, server, client),
-        b"XINFO" => cmd_stream::cmd_xinfo(args, server, client),
-        b"XTRIM" => cmd_stream::cmd_xtrim(args, server, client),
-        b"XDEL" => cmd_stream::cmd_xdel(args, server, client),
-        b"XSETID" => cmd_stream::cmd_xsetid(args, server, client),
-        b"XCLAIM" => cmd_stream::cmd_xclaim(args, server, client),
-        b"XAUTOCLAIM" => cmd_stream::cmd_xautoclaim(args, server, client),
-        b"XACKDEL" => cmd_stream::cmd_xackdel(args, server, client),
-        b"XCFGSET" => cmd_stream::cmd_xcfgset(args, server, client),
-        b"XDELEX" => cmd_stream::cmd_xdelex(args, server, client),
+        b"XGROUP" => cmd_stream_groups::cmd_xgroup(args, server, client),
+        b"XREADGROUP" => cmd_stream_groups::cmd_xreadgroup(args, server, client),
+        b"XACK" => cmd_stream_groups::cmd_xack(args, server, client),
+        b"XPENDING" => cmd_stream_groups::cmd_xpending(args, server, client),
+        b"XINFO" => cmd_stream_groups::cmd_xinfo(args, server, client),
+        b"XTRIM" => cmd_stream_lifecycle::cmd_xtrim(args, server, client),
+        b"XDEL" => cmd_stream_lifecycle::cmd_xdel(args, server, client),
+        b"XSETID" => cmd_stream_admin::cmd_xsetid(args, server, client),
+        b"XCLAIM" => cmd_stream_lifecycle::cmd_xclaim(args, server, client),
+        b"XAUTOCLAIM" => cmd_stream_lifecycle::cmd_xautoclaim(args, server, client),
+        b"XACKDEL" => cmd_stream_lifecycle::cmd_xackdel(args, server, client),
+        b"XCFGSET" => cmd_stream_admin::cmd_xcfgset(args, server, client),
+        b"XDELEX" => cmd_stream_lifecycle::cmd_xdelex(args, server, client),
         b"ACL" => cmd_acl::cmd_acl(args, server, client),
-        b"AUTH" => cmd_acl::cmd_auth(args, server, client),
+        b"AUTH" => cmd_auth_session::cmd_auth(args, server, client),
         b"CLIENT" => cmd_client::cmd_client(args, server, client),
-        b"RESET" => cmd_acl::cmd_reset(args, server, client),
+        b"RESET" => cmd_auth_session::cmd_reset(args, server, client),
         b"DBSIZE" => cmd_server::cmd_dbsize(args, server, client),
         b"TIME" => cmd_server::cmd_time(args),
-        b"INFO" => cmd_server::cmd_info(args, server, client),
+        b"INFO" => cmd_server_info::cmd_info(args, server, atomic_stats),
         b"MONITOR" => cmd_server::cmd_monitor(args, server, client),
-        b"ROLE" => cmd_server::cmd_role(args, server),
-        b"REPLCONF" => cmd_server::cmd_replconf(args, server, client),
-        b"SYNC" => cmd_server::cmd_sync(args),
-        b"PSYNC" => cmd_server::cmd_psync(args, server, client),
-        b"REPLICAOF" => cmd_server::cmd_replicaof(args, server),
-        b"SLAVEOF" => cmd_server::cmd_replicaof(args, server),
-        b"RESTORE-ASKING" => cmd_generic::cmd_restore(args, server, client),
-        b"LATENCY" => cmd_server::cmd_latency(args, server),
-        b"WAIT" => cmd_generic::cmd_wait(args, server),
-        b"WAITAOF" => cmd_generic::cmd_waitaof(args, server),
-        b"CONFIG" => cmd_server::cmd_config(args, server, client),
-        b"SLOWLOG" => cmd_server::cmd_slowlog(args, server),
-        b"MEMORY" => cmd_server::cmd_memory(args, server, client),
-        b"LASTSAVE" => cmd_server::cmd_lastsave(args, server),
-        b"SAVE" => cmd_server::cmd_save(args, server),
-        b"BGSAVE" => cmd_server::cmd_bgsave(args, server),
-        b"BGREWRITEAOF" => cmd_server::cmd_bgrewriteaof(args, server),
-        b"SFLUSH" => cmd_server::cmd_sflush(args),
-        b"SWAPDB" => cmd_server::cmd_swapdb(args, server),
-        b"FLUSHDB" => cmd_server::cmd_flushdb(args, server, client),
-        b"FLUSHALL" => cmd_server::cmd_flushall(args, server, client),
+        b"ROLE" => cmd_server_replication::cmd_role(args, server),
+        b"REPLCONF" => cmd_server_replication::cmd_replconf(args, server, client),
+        b"SYNC" => cmd_server_replication::cmd_sync(args),
+        b"PSYNC" => cmd_server_replication::cmd_psync(args, server, client),
+        b"REPLICAOF" => cmd_server_replication::cmd_replicaof(args, server),
+        b"SLAVEOF" => cmd_server_replication::cmd_replicaof(args, server),
+        b"RESTORE-ASKING" => cmd_generic_dump::cmd_restore(args, server, client),
+        b"LATENCY" => cmd_server_latency::cmd_latency(args, server),
+        b"WAIT" => cmd_generic_replication::cmd_wait(args, server),
+        b"WAITAOF" => cmd_generic_replication::cmd_waitaof(args, server),
+        b"CONFIG" => cmd_server_config::cmd_config(args, server, atomic_stats, client),
+        b"SLOWLOG" => cmd_server_slowlog::cmd_slowlog(args, server),
+        b"MEMORY" => cmd_server_memory::cmd_memory(args, server, client),
+        b"LASTSAVE" => cmd_server_maintenance::cmd_lastsave(args, server),
+        b"SAVE" => cmd_server_maintenance::cmd_save(args, server),
+        b"BGSAVE" => cmd_server_maintenance::cmd_bgsave(args, server),
+        b"BGREWRITEAOF" => cmd_server_maintenance::cmd_bgrewriteaof(args, server),
+        b"SFLUSH" => cmd_server_maintenance::cmd_sflush(args),
+        b"SWAPDB" => cmd_server_maintenance::cmd_swapdb(args, server),
+        b"FLUSHDB" => cmd_server_maintenance::cmd_flushdb(args, server, client),
+        b"FLUSHALL" => cmd_server_maintenance::cmd_flushall(args, server, client),
         b"RANDOMKEY" => cmd_generic::cmd_randomkey(args, server, client),
         b"TYPE" => cmd_generic::cmd_type(args, server, client),
         b"KEYS" => cmd_generic::cmd_keys(args, server, client),
         b"DELEX" => cmd_generic::cmd_delex(args, server, client),
         b"DIGEST" => cmd_generic::cmd_digest(args, server, client),
-        b"DUMP" => cmd_generic::cmd_dump(args, server, client),
-        b"RESTORE" => cmd_generic::cmd_restore(args, server, client),
-        b"MIGRATE" => cmd_generic::cmd_migrate(args),
-        b"LCS" => cmd_generic::cmd_lcs(args, server, client),
+        b"DUMP" => cmd_generic_dump::cmd_dump(args, server, client),
+        b"RESTORE" => cmd_generic_dump::cmd_restore(args, server, client),
+        b"MIGRATE" => cmd_generic_replication::cmd_migrate(args),
+        b"LCS" => cmd_generic_string::cmd_lcs(args, server, client),
         b"COPY" => cmd_key::cmd_copy(args, server, client),
         b"MOVE" => cmd_key::cmd_move(args, server, client),
         b"RENAME" => cmd_key::cmd_rename(args, server, client),
         b"RENAMENX" => cmd_key::cmd_renamenx(args, server, client),
         b"TOUCH" => cmd_key::cmd_touch(args, server, client),
         b"UNLINK" => cmd_key::cmd_unlink(args, server, client),
-        b"SCAN" => cmd_key::cmd_scan(args, server, client),
-        b"OBJECT" => cmd_key::cmd_object(args, server, client),
-        b"SORT" => cmd_key::cmd_sort(args, server, client, false),
-        b"SORT_RO" => cmd_key::cmd_sort(args, server, client, true),
-        b"SET" => cmd_string::cmd_set(args, server, client),
+        b"SCAN" => cmd_key_meta::cmd_scan(args, server, client),
+        b"OBJECT" => cmd_key_meta::cmd_object(args, server, client),
+        b"SORT" => cmd_key_meta::cmd_sort(args, server, client, false),
+        b"SORT_RO" => cmd_key_meta::cmd_sort(args, server, client, true),
+        b"SET" => cmd_string_access::cmd_set(args, server, client),
         b"HSET" => cmd_hash::cmd_hset(args, server, client),
-        b"HGET" => cmd_hash::cmd_hget(args, server, client),
-        b"HMGET" => cmd_hash::cmd_hmget(args, server, client),
-        b"HGETALL" => cmd_hash::cmd_hgetall(args, server, client),
-        b"HKEYS" => cmd_hash::cmd_hkeys(args, server, client),
-        b"HVALS" => cmd_hash::cmd_hvals(args, server, client),
+        b"HGET" => cmd_hash_read::cmd_hget(args, server, client),
+        b"HMGET" => cmd_hash_read::cmd_hmget(args, server, client),
+        b"HGETALL" => cmd_hash_read::cmd_hgetall(args, server, client),
+        b"HKEYS" => cmd_hash_read::cmd_hkeys(args, server, client),
+        b"HVALS" => cmd_hash_read::cmd_hvals(args, server, client),
         b"HINCRBY" => cmd_hash::cmd_hincrby(args, server, client),
         b"HINCRBYFLOAT" => cmd_hash::cmd_hincrbyfloat(args, server, client),
         b"HMSET" => cmd_hash::cmd_hmset(args, server, client),
         b"HSETNX" => cmd_hash::cmd_hsetnx(args, server, client),
-        b"HSTRLEN" => cmd_hash::cmd_hstrlen(args, server, client),
-        b"HRANDFIELD" => cmd_hash::cmd_hrandfield(args, server, client),
+        b"HSTRLEN" => cmd_hash_read::cmd_hstrlen(args, server, client),
+        b"HRANDFIELD" => cmd_hash_read::cmd_hrandfield(args, server, client),
         b"HDEL" => cmd_hash::cmd_hdel(args, server, client),
-        b"HEXISTS" => cmd_hash::cmd_hexists(args, server, client),
-        b"HLEN" => cmd_hash::cmd_hlen(args, server, client),
-        b"HSCAN" => cmd_hash::cmd_hscan(args, server, client),
+        b"HEXISTS" => cmd_hash_read::cmd_hexists(args, server, client),
+        b"HLEN" => cmd_hash_read::cmd_hlen(args, server, client),
+        b"HSCAN" => cmd_hash_read::cmd_hscan(args, server, client),
         b"LPUSH" => cmd_list::cmd_lpush(args, server, client),
         b"LPUSHX" => cmd_list::cmd_lpushx(args, server, client),
         b"RPUSH" => cmd_list::cmd_rpush(args, server, client),
         b"RPUSHX" => cmd_list::cmd_rpushx(args, server, client),
-        b"LPOP" => cmd_list::cmd_lpop(args, server, client),
-        b"RPOP" => cmd_list::cmd_rpop(args, server, client),
-        b"BLPOP" => cmd_list::cmd_blpop(args, server, client),
-        b"BRPOP" => cmd_list::cmd_brpop(args, server, client),
-        b"LMOVE" => cmd_list::cmd_lmove(args, server, client),
-        b"BLMOVE" => cmd_list::cmd_blmove(args, server, client),
-        b"RPOPLPUSH" => cmd_list::cmd_rpoplpush(args, server, client),
-        b"BRPOPLPUSH" => cmd_list::cmd_brpoplpush(args, server, client),
-        b"LMPOP" => cmd_list::cmd_lmpop(args, server, client),
-        b"BLMPOP" => cmd_list::cmd_blmpop(args, server, client),
+        b"LPOP" => cmd_list_pop::cmd_lpop(args, server, client),
+        b"RPOP" => cmd_list_pop::cmd_rpop(args, server, client),
+        b"BLPOP" => cmd_list_blocking::cmd_blpop(args, server, client),
+        b"BRPOP" => cmd_list_blocking::cmd_brpop(args, server, client),
+        b"LMOVE" => cmd_list_blocking::cmd_lmove(args, server, client),
+        b"BLMOVE" => cmd_list_blocking::cmd_blmove(args, server, client),
+        b"RPOPLPUSH" => cmd_list_blocking::cmd_rpoplpush(args, server, client),
+        b"BRPOPLPUSH" => cmd_list_blocking::cmd_brpoplpush(args, server, client),
+        b"LMPOP" => cmd_list_blocking::cmd_lmpop(args, server, client),
+        b"BLMPOP" => cmd_list_blocking::cmd_blmpop(args, server, client),
         b"LRANGE" => cmd_list::cmd_lrange(args, server, client),
         b"LLEN" => cmd_list::cmd_llen(args, server, client),
         b"LREM" => cmd_list::cmd_lrem(args, server, client),
@@ -4003,13 +4131,13 @@ pub fn execute(
         b"SRANDMEMBER" => cmd_set::cmd_srandmember(args, server, client),
         b"SSCAN" => cmd_set::cmd_sscan(args, server, client),
         b"SMOVE" => cmd_set::cmd_smove(args, server, client),
-        b"SDIFF" => cmd_set::cmd_sdiff(args, server, client),
-        b"SDIFFSTORE" => cmd_set::cmd_sdiffstore(args, server, client),
-        b"SINTER" => cmd_set::cmd_sinter(args, server, client),
-        b"SINTERCARD" => cmd_set::cmd_sintercard(args, server, client),
-        b"SINTERSTORE" => cmd_set::cmd_sinterstore(args, server, client),
-        b"SUNION" => cmd_set::cmd_sunion(args, server, client),
-        b"SUNIONSTORE" => cmd_set::cmd_sunionstore(args, server, client),
+        b"SDIFF" => cmd_set_algebra::cmd_sdiff(args, server, client),
+        b"SDIFFSTORE" => cmd_set_algebra::cmd_sdiffstore(args, server, client),
+        b"SINTER" => cmd_set_algebra::cmd_sinter(args, server, client),
+        b"SINTERCARD" => cmd_set_algebra::cmd_sintercard(args, server, client),
+        b"SINTERSTORE" => cmd_set_algebra::cmd_sinterstore(args, server, client),
+        b"SUNION" => cmd_set_algebra::cmd_sunion(args, server, client),
+        b"SUNIONSTORE" => cmd_set_algebra::cmd_sunionstore(args, server, client),
         // Sorted set
         b"ZADD" => cmd_sorted_set::cmd_zadd(args, server, client),
         b"ZREM" => cmd_sorted_set::cmd_zrem(args, server, client),
@@ -4017,54 +4145,54 @@ pub fn execute(
         b"ZCARD" => cmd_sorted_set::cmd_zcard(args, server, client),
         b"ZINCRBY" => cmd_sorted_set::cmd_zincrby(args, server, client),
         b"ZMSCORE" => cmd_sorted_set::cmd_zmscore(args, server, client),
-        b"ZRANGE" => cmd_sorted_set::cmd_zrange(args, server, client),
-        b"ZRANGEBYSCORE" => cmd_sorted_set::cmd_zrangebyscore(args, server, client),
-        b"ZREVRANGEBYSCORE" => cmd_sorted_set::cmd_zrevrangebyscore(args, server, client),
-        b"ZRANGEBYLEX" => cmd_sorted_set::cmd_zrangebylex(args, server, client),
-        b"ZREVRANGEBYLEX" => cmd_sorted_set::cmd_zrevrangebylex(args, server, client),
-        b"ZREVRANGE" => cmd_sorted_set::cmd_zrevrange(args, server, client),
-        b"ZRANGESTORE" => cmd_sorted_set::cmd_zrangestore(args, server, client),
-        b"ZCOUNT" => cmd_sorted_set::cmd_zcount(args, server, client),
-        b"ZLEXCOUNT" => cmd_sorted_set::cmd_zlexcount(args, server, client),
-        b"ZRANK" => cmd_sorted_set::cmd_zrank(args, server, client),
-        b"ZREVRANK" => cmd_sorted_set::cmd_zrevrank(args, server, client),
-        b"ZREMRANGEBYRANK" => cmd_sorted_set::cmd_zremrangebyrank(args, server, client),
-        b"ZREMRANGEBYSCORE" => cmd_sorted_set::cmd_zremrangebyscore(args, server, client),
-        b"ZREMRANGEBYLEX" => cmd_sorted_set::cmd_zremrangebylex(args, server, client),
-        b"ZUNION" => cmd_sorted_set::cmd_zunion(args, server, client),
-        b"ZUNIONSTORE" => cmd_sorted_set::cmd_zunionstore(args, server, client),
-        b"ZINTER" => cmd_sorted_set::cmd_zinter(args, server, client),
-        b"ZINTERSTORE" => cmd_sorted_set::cmd_zinterstore(args, server, client),
-        b"ZINTERCARD" => cmd_sorted_set::cmd_zintercard(args, server, client),
-        b"ZDIFF" => cmd_sorted_set::cmd_zdiff(args, server, client),
-        b"ZDIFFSTORE" => cmd_sorted_set::cmd_zdiffstore(args, server, client),
-        b"ZPOPMIN" => cmd_sorted_set::cmd_zpopmin(args, server, client),
-        b"ZPOPMAX" => cmd_sorted_set::cmd_zpopmax(args, server, client),
-        b"ZMPOP" => cmd_sorted_set::cmd_zmpop(args, server, client),
-        b"ZRANDMEMBER" => cmd_sorted_set::cmd_zrandmember(args, server, client),
-        b"ZSCAN" => cmd_sorted_set::cmd_zscan(args, server, client),
-        b"BZPOPMIN" => cmd_sorted_set::cmd_bzpopmin(args, server, client),
-        b"BZPOPMAX" => cmd_sorted_set::cmd_bzpopmax(args, server, client),
-        b"BZMPOP" => cmd_sorted_set::cmd_bzmpop(args, server, client),
+        b"ZRANGE" => cmd_sorted_set_ranges::cmd_zrange(args, server, client),
+        b"ZRANGEBYSCORE" => cmd_sorted_set_ranges::cmd_zrangebyscore(args, server, client),
+        b"ZREVRANGEBYSCORE" => cmd_sorted_set_ranges::cmd_zrevrangebyscore(args, server, client),
+        b"ZRANGEBYLEX" => cmd_sorted_set_ranges::cmd_zrangebylex(args, server, client),
+        b"ZREVRANGEBYLEX" => cmd_sorted_set_ranges::cmd_zrevrangebylex(args, server, client),
+        b"ZREVRANGE" => cmd_sorted_set_ranges::cmd_zrevrange(args, server, client),
+        b"ZRANGESTORE" => cmd_sorted_set_ranges::cmd_zrangestore(args, server, client),
+        b"ZCOUNT" => cmd_sorted_set_ranges::cmd_zcount(args, server, client),
+        b"ZLEXCOUNT" => cmd_sorted_set_ranges::cmd_zlexcount(args, server, client),
+        b"ZRANK" => cmd_sorted_set_ranges::cmd_zrank(args, server, client),
+        b"ZREVRANK" => cmd_sorted_set_ranges::cmd_zrevrank(args, server, client),
+        b"ZREMRANGEBYRANK" => cmd_sorted_set_ranges::cmd_zremrangebyrank(args, server, client),
+        b"ZREMRANGEBYSCORE" => cmd_sorted_set_ranges::cmd_zremrangebyscore(args, server, client),
+        b"ZREMRANGEBYLEX" => cmd_sorted_set_ranges::cmd_zremrangebylex(args, server, client),
+        b"ZUNION" => cmd_sorted_set_setops::cmd_zunion(args, server, client),
+        b"ZUNIONSTORE" => cmd_sorted_set_setops::cmd_zunionstore(args, server, client),
+        b"ZINTER" => cmd_sorted_set_setops::cmd_zinter(args, server, client),
+        b"ZINTERSTORE" => cmd_sorted_set_setops::cmd_zinterstore(args, server, client),
+        b"ZINTERCARD" => cmd_sorted_set_setops::cmd_zintercard(args, server, client),
+        b"ZDIFF" => cmd_sorted_set_setops::cmd_zdiff(args, server, client),
+        b"ZDIFFSTORE" => cmd_sorted_set_setops::cmd_zdiffstore(args, server, client),
+        b"ZPOPMIN" => cmd_sorted_set_pop::cmd_zpopmin(args, server, client),
+        b"ZPOPMAX" => cmd_sorted_set_pop::cmd_zpopmax(args, server, client),
+        b"ZMPOP" => cmd_sorted_set_pop::cmd_zmpop(args, server, client),
+        b"ZRANDMEMBER" => cmd_sorted_set_sampling::cmd_zrandmember(args, server, client),
+        b"ZSCAN" => cmd_sorted_set_sampling::cmd_zscan(args, server, client),
+        b"BZPOPMIN" => cmd_sorted_set_pop::cmd_bzpopmin(args, server, client),
+        b"BZPOPMAX" => cmd_sorted_set_pop::cmd_bzpopmax(args, server, client),
+        b"BZMPOP" => cmd_sorted_set_pop::cmd_bzmpop(args, server, client),
         // Geo
         b"GEOADD" => cmd_geo::cmd_geoadd(args, server, client),
         b"GEOPOS" => cmd_geo::cmd_geopos(args, server, client),
         b"GEODIST" => cmd_geo::cmd_geodist(args, server, client),
         b"GEOHASH" => cmd_geo::cmd_geohash(args, server, client),
-        b"GEOSEARCH" => cmd_geo::cmd_geosearch(args, server, client),
-        b"GEOSEARCHSTORE" => cmd_geo::cmd_geosearchstore(args, server, client),
-        b"GEORADIUS" => cmd_geo::cmd_georadius(args, server, client, false),
-        b"GEORADIUS_RO" => cmd_geo::cmd_georadius_ro(args, server, client),
-        b"GEORADIUSBYMEMBER" => cmd_geo::cmd_georadiusbymember(args, server, client, false),
-        b"GEORADIUSBYMEMBER_RO" => cmd_geo::cmd_georadiusbymember_ro(args, server, client),
+        b"GEOSEARCH" => cmd_geo_query::cmd_geosearch(args, server, client),
+        b"GEOSEARCHSTORE" => cmd_geo_query::cmd_geosearchstore(args, server, client),
+        b"GEORADIUS" => cmd_geo_radius::cmd_georadius(args, server, client, false),
+        b"GEORADIUS_RO" => cmd_geo_radius::cmd_georadius_ro(args, server, client),
+        b"GEORADIUSBYMEMBER" => cmd_geo_radius::cmd_georadiusbymember(args, server, client, false),
+        b"GEORADIUSBYMEMBER_RO" => cmd_geo_radius::cmd_georadiusbymember_ro(args, server, client),
         // Bitmap
         b"SETBIT" => cmd_bitmap::cmd_setbit(args, server, client),
         b"GETBIT" => cmd_bitmap::cmd_getbit(args, server, client),
         b"BITCOUNT" => cmd_bitmap::cmd_bitcount(args, server, client),
         b"BITPOS" => cmd_bitmap::cmd_bitpos(args, server, client),
         b"BITOP" => cmd_bitmap::cmd_bitop(args, server, client),
-        b"BITFIELD" => cmd_bitmap::cmd_bitfield(args, server, client),
-        b"BITFIELD_RO" => cmd_bitmap::cmd_bitfield_ro(args, server, client),
+        b"BITFIELD" => cmd_bitmap_bitfield::cmd_bitfield(args, server, client),
+        b"BITFIELD_RO" => cmd_bitmap_bitfield::cmd_bitfield_ro(args, server, client),
         // Hash field TTL
         b"HEXPIRE" => cmd_hash_ttl::cmd_hexpire(args, server, client),
         b"HEXPIREAT" => cmd_hash_ttl::cmd_hexpireat(args, server, client),
@@ -4075,9 +4203,9 @@ pub fn execute(
         b"HEXPIRETIME" => cmd_hash_ttl::cmd_hexpiretime(args, server, client),
         b"HPEXPIRETIME" => cmd_hash_ttl::cmd_hpexpiretime(args, server, client),
         b"HPERSIST" => cmd_hash_ttl::cmd_hpersist(args, server, client),
-        b"HGETDEL" => cmd_hash_ttl::cmd_hgetdel(args, server, client),
-        b"HGETEX" => cmd_hash_ttl::cmd_hgetex(args, server, client),
-        b"HSETEX" => cmd_hash_ttl::cmd_hsetex(args, server, client),
+        b"HGETDEL" => cmd_hash_field_ops::cmd_hgetdel(args, server, client),
+        b"HGETEX" => cmd_hash_field_ops::cmd_hgetex(args, server, client),
+        b"HSETEX" => cmd_hash_field_ops::cmd_hsetex(args, server, client),
         // Cluster
         b"CLUSTER" => cmd_cluster::cmd_cluster(args, server, client),
         b"READONLY" => cmd_cluster::cmd_readonly(args),
@@ -4114,30 +4242,30 @@ pub fn execute(
         b"SETNX" => cmd_string::cmd_setnx(args, server, client),
         b"MGET" => cmd_string::cmd_mget(args, server, client),
         b"MSET" => cmd_string::cmd_mset(args, server, client),
-        b"MSETEX" => cmd_generic::cmd_msetex(args, server, client),
+        b"MSETEX" => cmd_generic_string::cmd_msetex(args, server, client),
         b"MSETNX" => cmd_string::cmd_msetnx(args, server, client),
-        b"INCR" => cmd_string::cmd_incr(args, server, client),
-        b"INCRBY" => cmd_string::cmd_incrby(args, server, client),
-        b"DECR" => cmd_string::cmd_decr(args, server, client),
-        b"DECRBY" => cmd_string::cmd_decrby(args, server, client),
-        b"INCRBYFLOAT" => cmd_string::cmd_incrbyfloat(args, server, client),
-        b"SETEX" => cmd_string::cmd_setex_with_mode(
+        b"INCR" => cmd_string_numeric::cmd_incr(args, server, client),
+        b"INCRBY" => cmd_string_numeric::cmd_incrby(args, server, client),
+        b"DECR" => cmd_string_numeric::cmd_decr(args, server, client),
+        b"DECRBY" => cmd_string_numeric::cmd_decrby(args, server, client),
+        b"INCRBYFLOAT" => cmd_string_numeric::cmd_incrbyfloat(args, server, client),
+        b"SETEX" => cmd_string_access::cmd_setex_with_mode(
             args,
             server,
             client,
             ExpireMode::RelativeSeconds,
             "setex",
         ),
-        b"PSETEX" => cmd_string::cmd_setex_with_mode(
+        b"PSETEX" => cmd_string_access::cmd_setex_with_mode(
             args,
             server,
             client,
             ExpireMode::RelativeMilliseconds,
             "psetex",
         ),
-        b"GET" => cmd_string::cmd_get(args, server, client),
-        b"GETDEL" => cmd_string::cmd_getdel(args, server, client),
-        b"GETEX" => cmd_string::cmd_getex(args, server, client),
+        b"GET" => cmd_string_access::cmd_get(args, server, client),
+        b"GETDEL" => cmd_string_access::cmd_getdel(args, server, client),
+        b"GETEX" => cmd_string_access::cmd_getex(args, server, client),
         b"DEL" => cmd_key::cmd_del(args, server, client),
         b"EXISTS" => cmd_key::cmd_exists(args, server, client),
         b"SELECT" => cmd_key::cmd_select(args, server, client),
@@ -4197,10 +4325,77 @@ pub fn execute(
         }
     };
 
-    if let Some(started) = started {
-        let elapsed_us = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
+    let elapsed_us =
+        started.map(|started| i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX));
+    apply_post_execute_side_effects(
+        server,
+        client,
+        argv,
+        &outcome.response,
+        elapsed_us,
+        track_slowlog,
+        track_latency,
+    );
+
+    outcome
+}
+
+pub fn execute(
+    frame: RespFrame,
+    access: &mut ServerAccess<'_>,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    let argv = match frame_to_argv(frame) {
+        Ok(argv) => argv,
+        Err(response) => return CommandOutcome::reply(response),
+    };
+
+    execute_argv(&argv, access, client)
+}
+
+pub fn post_execute_tracking_flags(server: &ServerState, argv: &[Bytes]) -> (bool, bool) {
+    let Some(command_raw) = argv.first() else {
+        return (false, false);
+    };
+    let command = to_uppercase_stack(command_raw);
+    (
+        should_track_slowlog(server, command.as_slice()),
+        should_track_latency(server, command.as_slice()),
+    )
+}
+
+pub fn supports_readonly_batch_command(command_raw: &[u8]) -> bool {
+    let command = to_uppercase_stack(command_raw);
+    let Some(spec) = find_command_spec_upper(command.as_slice()) else {
+        return false;
+    };
+
+    spec.flags.contains(&"readonly")
+        && !spec.flags.contains(&"blocking")
+        && !spec.flags.contains(&"connection")
+        && !spec.flags.contains(&"pubsub")
+        && !matches!(command.as_slice(), b"WAIT" | b"WAITAOF")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_post_execute_side_effects(
+    server: &mut ServerState,
+    client: &mut ClientState,
+    argv: &[Bytes],
+    response: &RespFrame,
+    elapsed_us: Option<i64>,
+    track_slowlog: bool,
+    track_latency: bool,
+) {
+    let Some(command_raw) = argv.first() else {
+        return;
+    };
+    let command = to_uppercase_stack(command_raw);
+    let spec = find_command_spec_upper(command.as_slice());
+
+    if let Some(elapsed_us) = elapsed_us {
         if track_slowlog {
-            maybe_track_slowlog(server, command.as_slice(), &argv, elapsed_us);
+            maybe_track_slowlog(server, command.as_slice(), argv, elapsed_us);
         }
         if track_latency {
             maybe_track_latency(server, command.as_slice(), elapsed_us);
@@ -4209,29 +4404,20 @@ pub fn execute(
 
     if let Some(spec) = spec {
         if spec.flags.contains(&"write") {
-            maybe_track_write_version(
-                server,
-                client,
-                command.as_slice(),
-                &argv,
-                &outcome.response,
-                spec,
-            );
+            maybe_track_write_version(server, client, command.as_slice(), argv, response, spec);
         } else if spec.flags.contains(&"readonly") {
-            maybe_track_client_tracking_access(server, client, &argv, &outcome.response, spec);
+            maybe_track_client_tracking_access(server, client, argv, response, spec);
         }
     }
-    client.finish_tracking_command(command.as_slice(), &argv);
+    client.finish_tracking_command(command.as_slice(), argv);
 
     // MONITOR dispatch — broadcast formatted command to all monitoring clients.
     // The guard check (`has_monitors`) is a single HashSet::is_empty() check,
     // so the hot-path cost is negligible when no monitors are active.
     if server.has_monitors() && command.as_slice() != b"MONITOR" {
-        let line = format_monitor_line(server, client, &argv);
+        let line = format_monitor_line(server, client, argv);
         server.broadcast_monitor_message(client.id(), line);
     }
-
-    outcome
 }
 
 /// Format a Redis MONITOR output line.
@@ -4291,7 +4477,7 @@ fn maybe_track_client_tracking_access(
     }
 
     let target_client_id = server.tracking_target_client_id(client.id(), client.tracking_redirect);
-    cmd_connection::for_each_command_key_position(spec, argv.len(), |pos| {
+    cmd_command_metadata::for_each_command_key_position(spec, argv.len(), |pos| {
         if let Some(key) = argv.get(pos) {
             server.tracking_register_key(
                 client.id(),
@@ -4427,7 +4613,7 @@ fn validate_queued_command(
         return Err(err(&format!("ERR unknown command '{name}'")));
     };
 
-    if !cmd_connection::command_arity_matches(spec.arity, argv.len()) {
+    if !cmd_command_metadata::command_arity_matches(spec.arity, argv.len()) {
         return Err(err(&format!(
             "ERR wrong number of arguments for '{}' command",
             spec.name.to_ascii_lowercase(),
@@ -4588,7 +4774,7 @@ fn maybe_track_write_version(
         return;
     }
 
-    cmd_connection::for_each_command_key_position(spec, argv.len(), |pos| {
+    cmd_command_metadata::for_each_command_key_position(spec, argv.len(), |pos| {
         if let Some(key) = argv.get(pos) {
             server.touch_key_version(client.selected_db, key.clone());
             touched_keys.push((client.selected_db, key.clone()));
@@ -4778,10 +4964,10 @@ impl UpperBuf<'_> {
     }
 }
 
-pub(super) fn to_uppercase_stack(input: &Bytes) -> UpperBuf<'_> {
+pub(super) fn to_uppercase_stack(input: &[u8]) -> UpperBuf<'_> {
     // Fast path: most clients already send uppercase commands.
     if !input.iter().any(u8::is_ascii_lowercase) {
-        return UpperBuf::Borrowed(input.as_ref());
+        return UpperBuf::Borrowed(input);
     }
 
     if input.len() <= 32 {
@@ -4811,10 +4997,11 @@ mod tests {
     use bytes::Bytes;
     use ratatosk_resp::frame::RespFrame;
 
-    use crate::keyspace::{PubSubMessage, PubSubState};
+    use crate::keyspace::{DefaultAclPolicyState, PubSubMessage, PubSubState};
 
     use super::{
-        ClientState, CommandOutcome, ServerAccess, ServerState, command_spec_count, execute, now_ms,
+        AtomicStatsState, ClientState, CommandOutcome, ExecuteArgvPrecheck, ServerAccess,
+        ServerState, command_spec_count, execute, now_ms, precheck_execute_argv_with_default_acl,
     };
 
     fn cmd(parts: &[&str]) -> RespFrame {
@@ -4823,6 +5010,16 @@ mod tests {
 
     fn run(parts: &[&str], server: &mut ServerState, client: &mut ClientState) -> RespFrame {
         let mut access = ServerAccess::new_inline(server);
+        execute(cmd(parts), &mut access, client).response
+    }
+
+    fn run_with_atomic(
+        parts: &[&str],
+        server: &mut ServerState,
+        atomic_stats: &AtomicStatsState,
+        client: &mut ClientState,
+    ) -> RespFrame {
+        let mut access = ServerAccess::new_with_atomic_stats(server, atomic_stats);
         execute(cmd(parts), &mut access, client).response
     }
 
@@ -5468,7 +5665,21 @@ mod tests {
             RespFrame::Integer(1)
         );
 
+        let monitor_docs = run(&["COMMAND", "DOCS", "MONITOR"], &mut server, &mut client);
+        let RespFrame::Map(monitor_entries) = monitor_docs else {
+            panic!("COMMAND DOCS MONITOR should return map");
+        };
+        assert_eq!(monitor_entries.len(), 1);
+        let RespFrame::Map(monitor_docs) = &monitor_entries[0].1 else {
+            panic!("COMMAND DOCS MONITOR entry should return map");
+        };
+        assert!(monitor_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
         assert_eq!(run(&["MONITOR"], &mut server, &mut client), RespFrame::ok());
+        assert!(client.is_monitor());
+        assert_eq!(server.monitor_client_count(), 1);
 
         server.upsert_client_snapshot(ClientState::new(42).snapshot(
             Bytes::from_static(b"127.0.0.1:42"),
@@ -5546,6 +5757,27 @@ mod tests {
                 &mut client
             ),
             RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["CLIENT", "SETINFO", "LIB-VER", "1.0.0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        let client_info = run(&["CLIENT", "INFO"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(client_info)) = client_info else {
+            panic!("CLIENT INFO should return bulk string");
+        };
+        let client_info_text = String::from_utf8_lossy(&client_info);
+        assert!(
+            client_info_text.contains("lib-name=ratatosk"),
+            "{client_info_text}"
+        );
+        assert!(
+            client_info_text.contains("lib-ver=1.0.0"),
+            "{client_info_text}"
         );
         assert_eq!(
             run(&["CLIENT", "NO-EVICT", "ON"], &mut server, &mut client),
@@ -5852,6 +6084,87 @@ mod tests {
     }
 
     #[test]
+    fn acl_mutations_mark_outcome_acl_dirty() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        client.authenticated = true;
+        client.acl_user = Bytes::from_static(b"default");
+
+        let setuser = run_full(
+            &["ACL", "SETUSER", "alice", "on", ">secret", "+@all"],
+            &mut server,
+            &mut client,
+        );
+        assert!(setuser.acl_dirty);
+
+        let deluser = run_full(&["ACL", "DELUSER", "alice"], &mut server, &mut client);
+        assert!(deluser.acl_dirty);
+    }
+
+    #[test]
+    fn precheck_execute_argv_authenticates_default_nopass_user() {
+        let server = ServerState::with_default_dbs();
+        let default_acl_policy = DefaultAclPolicyState::from_acl(&server.acl);
+        let mut client = ClientState::new(1);
+
+        let precheck = precheck_execute_argv_with_default_acl(
+            &[Bytes::from_static(b"GET"), Bytes::from_static(b"key")],
+            &default_acl_policy,
+            &mut client,
+        );
+
+        assert!(matches!(precheck, ExecuteArgvPrecheck::Continue));
+        assert!(client.is_authenticated());
+        assert_eq!(client.acl_user(), &Bytes::from_static(b"default"));
+    }
+
+    #[test]
+    fn precheck_execute_argv_rejects_when_auth_is_required() {
+        let mut server = ServerState::with_default_dbs();
+        let default_user = server
+            .acl
+            .get_or_create_user_mut(&Bytes::from_static(b"default"));
+        default_user.nopass = false;
+        let default_acl_policy = DefaultAclPolicyState::from_acl(&server.acl);
+        let mut client = ClientState::new(2);
+
+        let precheck = precheck_execute_argv_with_default_acl(
+            &[Bytes::from_static(b"GET"), Bytes::from_static(b"key")],
+            &default_acl_policy,
+            &mut client,
+        );
+
+        let ExecuteArgvPrecheck::Reject(outcome) = precheck else {
+            panic!("precheck should reject when auth is required");
+        };
+        assert_eq!(
+            outcome.response,
+            RespFrame::error_str("NOAUTH Authentication required.")
+        );
+        assert!(!client.is_authenticated());
+    }
+
+    #[test]
+    fn precheck_execute_argv_allows_quit_without_auth() {
+        let mut server = ServerState::with_default_dbs();
+        let default_user = server
+            .acl
+            .get_or_create_user_mut(&Bytes::from_static(b"default"));
+        default_user.nopass = false;
+        let default_acl_policy = DefaultAclPolicyState::from_acl(&server.acl);
+        let mut client = ClientState::new(3);
+
+        let precheck = precheck_execute_argv_with_default_acl(
+            &[Bytes::from_static(b"QUIT")],
+            &default_acl_policy,
+            &mut client,
+        );
+
+        assert!(matches!(precheck, ExecuteArgvPrecheck::Continue));
+        assert!(!client.is_authenticated());
+    }
+
+    #[test]
     fn m0_admin_control_baseline_commands() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
@@ -5908,7 +6221,86 @@ mod tests {
         };
         assert!(cluster_slots_docs.iter().any(|(key, value)| {
             *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
+
+        let cluster_help = run(&["CLUSTER", "HELP"], &mut server, &mut client);
+        let RespFrame::Array(cluster_help_rows) = cluster_help else {
+            panic!("CLUSTER HELP should return array");
+        };
+        assert!(cluster_help_rows.iter().any(|row| {
+            *row == RespFrame::bulk_str(
+                "Standalone mode supports INFO, MYID, KEYSLOT, COUNTKEYSINSLOT, GETKEYSINSLOT, SLOTS, SHARDS, LINKS, and HELP."
+            )
+        }));
+        assert_eq!(
+            run(&["CLUSTER", "SLOTS"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["CLUSTER", "SHARDS"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["CLUSTER", "LINKS"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["CLUSTER", "NODES"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR Ratatosk is running in single-node mode; CLUSTER NODES is not available. See CLUSTER INFO for current status."
+            )
+        );
+
+        let client_setinfo_docs = run(
+            &["COMMAND", "DOCS", "CLIENT", "SETINFO"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(client_setinfo_entries) = client_setinfo_docs else {
+            panic!("COMMAND DOCS CLIENT SETINFO should return map");
+        };
+        assert_eq!(client_setinfo_entries.len(), 1);
+        let RespFrame::Map(client_setinfo_docs) = &client_setinfo_entries[0].1 else {
+            panic!("COMMAND DOCS CLIENT SETINFO entry should return map");
+        };
+        assert!(client_setinfo_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
+
+        let client_pause_docs = run(
+            &["COMMAND", "DOCS", "CLIENT", "PAUSE"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(client_pause_entries) = client_pause_docs else {
+            panic!("COMMAND DOCS CLIENT PAUSE should return map");
+        };
+        assert_eq!(client_pause_entries.len(), 1);
+        let RespFrame::Map(client_pause_docs) = &client_pause_entries[0].1 else {
+            panic!("COMMAND DOCS CLIENT PAUSE entry should return map");
+        };
+        assert!(client_pause_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
                 && *value == RespFrame::bulk_str("unsupported")
+        }));
+
+        let client_unblock_docs = run(
+            &["COMMAND", "DOCS", "CLIENT", "UNBLOCK"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(client_unblock_entries) = client_unblock_docs else {
+            panic!("COMMAND DOCS CLIENT UNBLOCK should return map");
+        };
+        assert_eq!(client_unblock_entries.len(), 1);
+        let RespFrame::Map(client_unblock_docs) = &client_unblock_entries[0].1 else {
+            panic!("COMMAND DOCS CLIENT UNBLOCK entry should return map");
+        };
+        assert!(client_unblock_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("syntax_only")
         }));
 
         let debug_help = run(&["DEBUG", "HELP"], &mut server, &mut client);
@@ -5926,6 +6318,38 @@ mod tests {
             panic!("MODULE HELP should return array");
         };
         assert!(!module_help_rows.is_empty());
+        let module_list_docs = run(
+            &["COMMAND", "DOCS", "MODULE", "LIST"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(module_list_entries) = module_list_docs else {
+            panic!("COMMAND DOCS MODULE LIST should return map");
+        };
+        assert_eq!(module_list_entries.len(), 1);
+        let RespFrame::Map(module_list_docs) = &module_list_entries[0].1 else {
+            panic!("COMMAND DOCS MODULE LIST entry should return map");
+        };
+        assert!(module_list_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
+        let module_load_docs = run(
+            &["COMMAND", "DOCS", "MODULE", "LOAD"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(module_load_entries) = module_load_docs else {
+            panic!("COMMAND DOCS MODULE LOAD should return map");
+        };
+        assert_eq!(module_load_entries.len(), 1);
+        let RespFrame::Map(module_load_docs) = &module_load_entries[0].1 else {
+            panic!("COMMAND DOCS MODULE LOAD entry should return map");
+        };
+        assert!(module_load_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("unsupported")
+        }));
         assert_eq!(
             run(&["MODULE", "LIST"], &mut server, &mut client),
             RespFrame::Array(vec![])
@@ -5939,6 +6363,22 @@ mod tests {
             run(&["HOTKEYS", "GET"], &mut server, &mut client),
             RespFrame::Array(vec![])
         );
+        let hotkeys_docs = run(
+            &["COMMAND", "DOCS", "HOTKEYS", "GET"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(hotkeys_entries) = hotkeys_docs else {
+            panic!("COMMAND DOCS HOTKEYS GET should return map");
+        };
+        assert_eq!(hotkeys_entries.len(), 1);
+        let RespFrame::Map(hotkeys_docs) = &hotkeys_entries[0].1 else {
+            panic!("COMMAND DOCS HOTKEYS GET entry should return map");
+        };
+        assert!(hotkeys_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
         assert_eq!(
             run(&["HOTKEYS", "START"], &mut server, &mut client),
             RespFrame::ok()
@@ -5958,6 +6398,18 @@ mod tests {
         };
         let lolwut_text = String::from_utf8_lossy(&lolwut_text).to_string();
         assert!(lolwut_text.contains("Ratatosk"));
+        let lolwut_docs = run(&["COMMAND", "DOCS", "LOLWUT"], &mut server, &mut client);
+        let RespFrame::Map(lolwut_entries) = lolwut_docs else {
+            panic!("COMMAND DOCS LOLWUT should return map");
+        };
+        assert_eq!(lolwut_entries.len(), 1);
+        let RespFrame::Map(lolwut_docs) = &lolwut_entries[0].1 else {
+            panic!("COMMAND DOCS LOLWUT entry should return map");
+        };
+        assert!(lolwut_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
 
         assert_eq!(
             run(&["BGREWRITEAOF"], &mut server, &mut client),
@@ -6007,6 +6459,18 @@ mod tests {
             run(&["TRIMSLOTS", "0"], &mut server, &mut client),
             RespFrame::Integer(0)
         );
+        let trimslots_docs = run(&["COMMAND", "DOCS", "TRIMSLOTS"], &mut server, &mut client);
+        let RespFrame::Map(trimslots_entries) = trimslots_docs else {
+            panic!("COMMAND DOCS TRIMSLOTS should return map");
+        };
+        assert_eq!(trimslots_entries.len(), 1);
+        let RespFrame::Map(trimslots_docs) = &trimslots_entries[0].1 else {
+            panic!("COMMAND DOCS TRIMSLOTS entry should return map");
+        };
+        assert!(trimslots_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
         assert_eq!(
             run(&["FAILOVER"], &mut server, &mut client),
             RespFrame::error_str("ERR FAILOVER is not supported in standalone mode")
@@ -6225,6 +6689,223 @@ mod tests {
         assert_eq!(
             run(&["CONFIG", "RESETSTAT"], &mut server, &mut client),
             RespFrame::ok()
+        );
+    }
+
+    #[test]
+    fn m0_script_and_function_surface_matches_capabilities() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        let script_load_docs = run(
+            &["COMMAND", "DOCS", "SCRIPT", "LOAD"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(script_load_entries) = script_load_docs else {
+            panic!("COMMAND DOCS SCRIPT LOAD should return map");
+        };
+        assert_eq!(script_load_entries.len(), 1);
+        let RespFrame::Map(script_load_docs) = &script_load_entries[0].1 else {
+            panic!("COMMAND DOCS SCRIPT LOAD entry should return map");
+        };
+        assert!(script_load_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
+
+        let script_kill_docs = run(
+            &["COMMAND", "DOCS", "SCRIPT", "KILL"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(script_kill_entries) = script_kill_docs else {
+            panic!("COMMAND DOCS SCRIPT KILL should return map");
+        };
+        assert_eq!(script_kill_entries.len(), 1);
+        let RespFrame::Map(script_kill_docs) = &script_kill_entries[0].1 else {
+            panic!("COMMAND DOCS SCRIPT KILL entry should return map");
+        };
+        assert!(script_kill_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("unsupported")
+        }));
+
+        let function_flush_docs = run(
+            &["COMMAND", "DOCS", "FUNCTION", "FLUSH"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(function_flush_entries) = function_flush_docs else {
+            panic!("COMMAND DOCS FUNCTION FLUSH should return map");
+        };
+        assert_eq!(function_flush_entries.len(), 1);
+        let RespFrame::Map(function_flush_docs) = &function_flush_entries[0].1 else {
+            panic!("COMMAND DOCS FUNCTION FLUSH entry should return map");
+        };
+        assert!(function_flush_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("baseline_local")
+        }));
+
+        let function_load_docs = run(
+            &["COMMAND", "DOCS", "FUNCTION", "LOAD"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(function_load_entries) = function_load_docs else {
+            panic!("COMMAND DOCS FUNCTION LOAD should return map");
+        };
+        assert_eq!(function_load_entries.len(), 1);
+        let RespFrame::Map(function_load_docs) = &function_load_entries[0].1 else {
+            panic!("COMMAND DOCS FUNCTION LOAD entry should return map");
+        };
+        assert!(function_load_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("unsupported")
+        }));
+
+        let script_help = run(&["SCRIPT", "HELP"], &mut server, &mut client);
+        let RespFrame::Array(script_help_rows) = script_help else {
+            panic!("SCRIPT HELP should return array");
+        };
+        assert!(script_help_rows.iter().any(|row| {
+            *row == RespFrame::bulk_str(
+                "LOAD, EXISTS, FLUSH, and HELP are available in this build. SCRIPT DEBUG and SCRIPT KILL are unsupported."
+            )
+        }));
+
+        let loaded = run(&["SCRIPT", "LOAD", "return 1"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(sha)) = loaded else {
+            panic!("SCRIPT LOAD should return sha");
+        };
+        let sha_text = String::from_utf8_lossy(&sha).into_owned();
+        assert_eq!(sha_text.len(), 40);
+        assert_eq!(
+            run(
+                &["SCRIPT", "EXISTS", sha_text.as_str()],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::Integer(1)])
+        );
+        assert_eq!(
+            run(&["SCRIPT", "KILL"], &mut server, &mut client),
+            RespFrame::error_str("ERR SCRIPT KILL is not supported in this build")
+        );
+        assert_eq!(
+            run(&["SCRIPT", "DEBUG", "YES"], &mut server, &mut client),
+            RespFrame::error_str("ERR SCRIPT DEBUG is not supported in this build")
+        );
+        assert_eq!(
+            run(&["SCRIPT", "FLUSH", "SYNC"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["SCRIPT", "EXISTS", sha_text.as_str()],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::Integer(0)])
+        );
+
+        let function_help = run(&["FUNCTION", "HELP"], &mut server, &mut client);
+        let RespFrame::Array(function_help_rows) = function_help else {
+            panic!("FUNCTION HELP should return array");
+        };
+        assert!(function_help_rows.iter().any(|row| {
+            *row == RespFrame::bulk_str(
+                "LIST, DUMP, STATS, FLUSH, and HELP are available in this build. LOAD, DELETE, and RESTORE are unsupported."
+            )
+        }));
+        assert_eq!(
+            run(&["FUNCTION", "LIST"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["FUNCTION", "DUMP"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+        let function_stats = run(&["FUNCTION", "STATS"], &mut server, &mut client);
+        let RespFrame::Array(function_stats_rows) = function_stats else {
+            panic!("FUNCTION STATS should return array");
+        };
+        assert_eq!(function_stats_rows.len(), 4);
+        assert_eq!(
+            run(&["FUNCTION", "FLUSH", "ASYNC"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &[
+                    "FUNCTION",
+                    "LOAD",
+                    "redis.register_function('f', function() return 1 end)",
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::error_str("ERR Function not supported in this build")
+        );
+    }
+
+    #[test]
+    fn sentinel_surface_matches_help_and_capabilities() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        let sentinel_help_docs = run(
+            &["COMMAND", "DOCS", "SENTINEL", "HELP"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(sentinel_help_entries) = sentinel_help_docs else {
+            panic!("COMMAND DOCS SENTINEL HELP should return map");
+        };
+        assert_eq!(sentinel_help_entries.len(), 1);
+        let RespFrame::Map(sentinel_help_docs) = &sentinel_help_entries[0].1 else {
+            panic!("COMMAND DOCS SENTINEL HELP entry should return map");
+        };
+        assert!(sentinel_help_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("syntax_only")
+        }));
+
+        let sentinel_masters_docs = run(
+            &["COMMAND", "DOCS", "SENTINEL", "MASTERS"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Map(sentinel_masters_entries) = sentinel_masters_docs else {
+            panic!("COMMAND DOCS SENTINEL MASTERS should return map");
+        };
+        assert_eq!(sentinel_masters_entries.len(), 1);
+        let RespFrame::Map(sentinel_masters_docs) = &sentinel_masters_entries[0].1 else {
+            panic!("COMMAND DOCS SENTINEL MASTERS entry should return map");
+        };
+        assert!(sentinel_masters_docs.iter().any(|(key, value)| {
+            *key == RespFrame::bulk_str("ratatosk_capability_tier")
+                && *value == RespFrame::bulk_str("unsupported")
+        }));
+
+        let sentinel_help = run(&["SENTINEL", "HELP"], &mut server, &mut client);
+        let RespFrame::Array(sentinel_help_rows) = sentinel_help else {
+            panic!("SENTINEL HELP should return array");
+        };
+        assert!(sentinel_help_rows.iter().any(|row| {
+            *row == RespFrame::bulk_str(
+                "Only SENTINEL HELP is available in this build; all other SENTINEL subcommands return an error."
+            )
+        }));
+
+        assert_eq!(
+            run(&["SENTINEL", "HELP", "EXTRA"], &mut server, &mut client),
+            RespFrame::error_str("ERR wrong number of arguments for 'sentinel' command")
+        );
+        assert_eq!(
+            run(&["SENTINEL", "MASTERS"], &mut server, &mut client),
+            RespFrame::error_str("ERR This instance is not configured as a Sentinel")
         );
     }
 
@@ -10059,6 +10740,95 @@ mod tests {
     }
 
     #[test]
+    fn info_stats_merges_atomic_hot_counters_when_inner_lags() {
+        let mut server = ServerState::with_default_dbs();
+        let atomic_stats = AtomicStatsState::default();
+        let mut client = ClientState::new(1);
+
+        atomic_stats.mark_command_processed();
+        atomic_stats.mark_client_connected();
+        atomic_stats.add_net_input_bytes(123);
+        atomic_stats.add_net_output_bytes(456);
+
+        let reply = run_with_atomic(&["INFO", "stats"], &mut server, &atomic_stats, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(
+            text.contains("total_commands_processed:2"),
+            "expected atomic + INFO command count, got: {text}"
+        );
+        assert!(
+            text.contains("total_connections_received:1"),
+            "expected atomic connection count, got: {text}"
+        );
+        assert!(
+            text.contains("total_net_input_bytes:123"),
+            "expected atomic input bytes, got: {text}"
+        );
+        assert!(
+            text.contains("total_net_output_bytes:456"),
+            "expected atomic output bytes, got: {text}"
+        );
+    }
+
+    #[test]
+    fn ping_health_merges_atomic_snapshot_for_visibility() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1024);
+
+        let atomic_stats = AtomicStatsState::default();
+        let mut client = ClientState::new(1);
+
+        atomic_stats.mark_client_connected();
+        atomic_stats.set_cached_memory_estimate(2048);
+
+        let reply = run_with_atomic(&["PING", "HEALTH"], &mut server, &atomic_stats, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+
+        assert!(text.contains("status:unhealthy"), "{text}");
+        assert!(text.contains("connected_clients:1"), "{text}");
+        assert!(text.contains("memory_used_bytes:2048"), "{text}");
+        assert!(text.contains("memory_status:critical"), "{text}");
+    }
+
+    #[test]
+    fn config_resetstat_resets_atomic_hot_counters_too() {
+        let mut server = ServerState::with_default_dbs();
+        let atomic_stats = AtomicStatsState::default();
+        let mut client = ClientState::new(1);
+
+        atomic_stats.mark_command_processed();
+        atomic_stats.mark_client_connected();
+        atomic_stats.add_net_input_bytes(50);
+        atomic_stats.add_net_output_bytes(25);
+
+        assert_eq!(
+            run_with_atomic(
+                &["CONFIG", "RESETSTAT"],
+                &mut server,
+                &atomic_stats,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+
+        assert_eq!(server.stats.total_commands_processed(), 0);
+        assert_eq!(server.stats.total_connections_received(), 0);
+        assert_eq!(server.stats.total_net_input_bytes(), 0);
+        assert_eq!(server.stats.total_net_output_bytes(), 0);
+        assert_eq!(atomic_stats.total_commands_processed(), 0);
+        assert_eq!(atomic_stats.total_connections_received(), 0);
+        assert_eq!(atomic_stats.total_net_input_bytes(), 0);
+        assert_eq!(atomic_stats.total_net_output_bytes(), 0);
+    }
+
+    #[test]
     fn info_keyspace_shows_db_with_keys() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::new(1);
@@ -10159,6 +10929,46 @@ mod tests {
         assert!(
             text.contains("|audit_recovery_status:"),
             "expected audit_recovery_status in health report: {text}"
+        );
+    }
+
+    #[test]
+    fn info_server_reports_unhealthy_when_aof_is_latched() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        server.set_aof_enabled(true);
+        server.set_aof_last_error("disk full");
+
+        let reply = run(&["INFO", "SERVER"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+        assert!(
+            text.contains("health_status:unhealthy"),
+            "expected unhealthy server status, got {text}"
+        );
+    }
+
+    #[test]
+    fn ping_health_reports_unhealthy_when_aof_is_latched() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        server.set_aof_enabled(true);
+        server.set_aof_last_error("disk full");
+
+        let reply = run(&["PING", "HEALTH"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+        assert!(
+            text.contains("status:unhealthy|"),
+            "expected unhealthy health report, got {text}"
+        );
+        assert!(
+            text.contains("|aof_write_latched:true|"),
+            "expected aof_write_latched in health report, got {text}"
         );
     }
 

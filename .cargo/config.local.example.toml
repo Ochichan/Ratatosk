@@ -1,0 +1,11 @@
+# Copy this file to .cargo/config.local.toml to opt in to local sccache usage.
+# macOS install: brew install sccache
+
+[build]
+rustc-wrapper = "sccache"
+
+[env]
+SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
+# Optional: set this to the shared parent directory that contains your local
+# checkouts if you want better cache reuse across multiple clones/worktrees.
+# SCCACHE_BASEDIRS = "/absolute/path/to/Projects"

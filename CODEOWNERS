@@ -1,0 +1,8 @@
+# Default ownership
+* @Ochichan
+
+# High-risk areas
+/.github/ @Ochichan
+/crates/ @Ochichan
+/scripts/ @Ochichan
+/docs/ @Ochichan

@@ -1,0 +1,3 @@
+cargo:rerun-if-changed=build
+cargo:rustc-link-search=native=/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/build/mlua-sys-d9488e84ead510f1/out/lib
+cargo:rustc-link-lib=static:-bundle=lua5.1

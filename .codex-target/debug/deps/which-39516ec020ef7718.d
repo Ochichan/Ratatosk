@@ -1,0 +1,12 @@
+/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/deps/which-39516ec020ef7718.d: /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/lib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/checker.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/error.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/finder.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/helper.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/sys.rs
+
+/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/deps/libwhich-39516ec020ef7718.rlib: /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/lib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/checker.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/error.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/finder.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/helper.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/sys.rs
+
+/Users/ochi/Documents/Projects/Ratatosk/.codex-target/debug/deps/libwhich-39516ec020ef7718.rmeta: /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/lib.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/checker.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/error.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/finder.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/helper.rs /Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/sys.rs
+
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/lib.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/checker.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/error.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/finder.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/helper.rs:
+/Users/ochi/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/which-8.0.2/src/sys.rs:

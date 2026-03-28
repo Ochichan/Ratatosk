@@ -1,0 +1,72 @@
+groups:
+  - name: ratatosk-single-node
+    rules:
+      - alert: RatatoskAofWritesLatched
+        expr: ratatosk_aof_write_latched > 0
+        for: 1m
+        labels:
+          severity: page
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk AOF writes are latched"
+          description: "Writes are being rejected because the AOF path is latched. Check persistence status, disk health, and recent AOF errors."
+
+      - alert: RatatoskAofWriteErrors
+        expr: increase(ratatosk_aof_write_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk is seeing AOF write errors"
+          description: "AOF append or flush operations are failing. Inspect disk writability and recent persistence logs."
+
+      - alert: RatatoskRdbSaveErrors
+        expr: increase(ratatosk_rdb_save_errors_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk RDB saves are failing"
+          description: "Background or foreground RDB save attempts are erroring. Verify persistence directory access and available space."
+
+      - alert: RatatoskAcceptErrorBurst
+        expr: increase(ratatosk_accept_errors_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: ticket
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk accept errors are spiking"
+          description: "TCP accept errors exceeded the burst threshold over the last 5 minutes."
+
+      - alert: RatatoskFdUtilizationHigh
+        expr: ratatosk_process_fd_utilization > 0.80
+        for: 10m
+        labels:
+          severity: ticket
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk file descriptor utilization is high"
+          description: "Open file descriptors are above 80 percent of the current limit."
+
+      - alert: RatatoskMemoryEstimateStale
+        expr: ratatosk_memory_estimate_age_ticks > 100
+        for: 10m
+        labels:
+          severity: ticket
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk memory estimate is stale"
+          description: "The cached memory estimate has not been refreshed recently, which weakens eviction and health signals."
+
+      - alert: RatatoskBlockingRetryDeadlinesExhausted
+        expr: increase(ratatosk_blocking_retry_deadline_exhausted_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+          service: ratatosk
+        annotations:
+          summary: "Ratatosk blocking retries are timing out"
+          description: "One or more blocking command retries exhausted their deadline window."

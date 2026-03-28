@@ -1,6 +1,6 @@
 # Ratatosk Architecture
 
-이 문서는 **현재 저장소 코드 기준**(2026-03-16) 아키텍처를 설명한다.
+이 문서는 **현재 저장소 코드 기준**(2026-03-26) 아키텍처를 설명한다.
 과거 계획 문서가 아니라 실제 구현 상태를 기준으로 작성했다.
 
 ## Snapshot
@@ -86,9 +86,11 @@ ratatosk-core
 
 - 명령 실행 전에 인증/ACL 검사.
 - `execute(frame, &mut access, &mut client_state)` 호출. `access`는 `ServerAccess` 래퍼로, `SharedState` 내부 `Mutex<ServerState>`를 잠근 뒤 생성된다.
-  DB 접근은 내부 per-DB `parking_lot::RwLock`을 통해 이루어지므로, 서로 다른 DB에 대한 명령은 잠재적으로 병렬 실행 가능하다.
-  stats/config 읽기/client id 할당은 lock-free.
-- `CommandOutcome { response, close, retry_blocking }`로 결과를 통일.
+  DB 값 자체는 per-DB `parking_lot::RwLock` 기반 `DataState`에 놓여 있고, `SharedState.data`와 inner `ServerState.data`는 같은 backing shard를 공유한다.
+  다만 현재 런타임의 대부분의 명령은 여전히 `meta` mutex를 잡은 상태에서 실행되므로, cross-DB 병렬성은 저장소 레이어의 잠재력이고 일반 command path의 기본 성질은 아니다.
+  예외적으로 `PING` / `ECHO` / `TIME` / `DBSIZE` / `TYPE` / `EXISTS` / `GET` / `MGET` / `STRLEN` / `BITCOUNT` / `GETBIT` / `GETRANGE` / `SUBSTR` / `HGET` / `HMGET` / `HGETALL` / `HKEYS` / `HVALS` / `HEXISTS` / `HLEN` / `HSTRLEN` / `SISMEMBER` / `SMISMEMBER` / `SCARD` / `ZSCORE` / `ZCARD` / `ZMSCORE` / `ZCOUNT` / `ZLEXCOUNT` / `ZRANGE` / `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` / `ZRANGEBYLEX` / `ZREVRANGEBYLEX` / `ZREVRANGE` / `ZRANK` / `ZREVRANK` / `LLEN` / `LINDEX` / `LRANGE` / `TTL` / `PTTL` / `EXPIRETIME` / `PEXPIRETIME`는 default ACL policy cache가 `nopass + full access`인 연결에 한해 lock-free fast path를 탈 수 있다. readonly pipeline이 이 커맨드들로만 이루어진 경우에도 batch 전체가 lock-free로 처리된다. fast path를 탈 수 없는 readonly batch는 더 이상 배치 전체를 한 번에 잠그지 않고, 명령별로 `meta` lock을 다시 잡으며 순차 실행한다. 이 batch gate는 이제 fast path 집합 외에도 non-blocking readonly command spec을 받아들이며, `WAIT` / `WAITAOF` / connection / pubsub 계열은 제외한다. 일반 단건 경로도 lock 밖에서 만든 argv를 재사용하므로, locked path에서 같은 RESP frame을 다시 파싱하지 않는다. 여기에 더해 default-user `nopass` 승격과 즉시 `NOAUTH`로 끝나는 요청은 공용 precheck helper로 먼저 걸러서, 불필요하게 `meta` lock을 잡지 않도록 했다. `PING HEALTH`처럼 서버 메타 상태가 필요한 변형은 여전히 locked path를 사용한다. 다만 fast path도 실행 후에는 공용 post-execute helper를 통해 slowlog/latency, client tracking reset, MONITOR broadcast를 맞추고, `MULTI` 안에서는 큐잉 의미론을 우회하지 않도록 비활성화된다. `EXISTS`와 `GET`은 atomic keyspace hit/miss counter까지 함께 갱신한다.
+  stats/config 읽기/client id 할당/default ACL cache는 lock-free.
+- `CommandOutcome { response, close, retry_blocking, config_dirty, acl_dirty }`로 결과를 통일한다.
 
 ### 5) Blocking command retry
 
@@ -113,8 +115,9 @@ ratatosk-core
 | Component | Type | 역할 |
 |-----------|------|------|
 | `atomic_stats` | `AtomicStatsState` | 10개 lock-free atomic counter (total_commands_processed, connected_clients, net_input/output_bytes, evicted/expired_keys, keyspace_hits/misses, ops_per_sec, cached_memory_estimate) |
+| `default_acl_policy` | `DefaultAclPolicyState` | default user의 `nopass` / full-access 여부를 lock-free로 캐시 |
 | `config_cache` | `arc_swap::ArcSwap<ConfigState>` | lock-free config 읽기 (`config_cache.load()`) |
-| `next_client_id` | `AtomicU64` | lock 없이 새 client ID 할당 |
+| `next_client_id` | `AtomicI64` | lock 없이 새 client ID 할당 |
 
 이 구조로 client 요청당 ~9회의 lock 획득이 제거된다.
 
@@ -137,12 +140,13 @@ Workspace dependency: `arc-swap = "1"`
 - `cluster_node_id`
 - `lazy_free_tx: Option<LazyFreeSender>` — 백그라운드 삭제 채널
 
-`DataState`는 DB별 `parking_lot::RwLock<DbShard>`를 관리한다:
+`DataState`는 DB별 `parking_lot::RwLock<DbShard>`를 관리하고, outer/inner state handle이 같은 backing store를 공유한다:
 
 ```rust
+#[derive(Clone)]
 pub struct DataState {
-    shards: Vec<parking_lot::RwLock<DbShard>>,
-    next_key_version: AtomicU64,
+    shards: Arc<[parking_lot::RwLock<DbShard>]>,
+    next_key_version: Arc<AtomicU64>,
 }
 
 pub struct DbShard {
@@ -160,6 +164,16 @@ pub struct DbShard {
 기본 DB 개수는 16(`DEFAULT_DB_COUNT`).
 
 Lock ordering invariant: **항상 ascending index 순서로 DB lock 획득** → deadlock 방지.
+
+### Hot Stats Synchronization
+
+hot counter는 `AtomicStatsState`가 가장 빠른 경로이고, inner `StatsState`는 두 방향으로 이를 따라간다.
+
+- command/runtime fast path는 outer atomic stats를 먼저 갱신할 수 있다.
+- `server_cron`은 sampling 전에 `StatsState::catch_up_from_atomic(...)`으로 inner 기준선을 따라잡는다.
+- client snapshot refresh와 `INFO`/`PING HEALTH`는 merged snapshot을 사용해 atomic/inner 괴리를 줄인다.
+
+즉 현재 모델은 “single stats source”까지는 아니지만, outer-only drift가 장시간 누적되지 않도록 역동기화 경로가 들어와 있다.
 
 ### StoredValue
 
@@ -300,8 +314,8 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 
 - 네트워크는 tokio per-client task로 동시 처리.
 - command execution은 `SharedState` 내부 `Mutex<ServerState>`를 잠근 뒤, per-DB `parking_lot::RwLock`을 통해 DB에 접근한다.
-  - **서로 다른 DB**에 대한 명령은 잠재적으로 병렬 실행 가능 (per-DB RwLock).
-  - **같은 DB** 내 읽기 명령은 동시 실행 가능 (RwLock read sharing).
+  - **서로 다른 DB**는 저장소 레이어에서 독립 lock을 가지지만, 일반 command path는 여전히 `meta` mutex 영향 아래 있다.
+  - **같은 DB** 내 읽기 명령은 저장소 레이어에서 read sharing이 가능하다.
   - 쓰기 명령은 해당 DB의 write lock을 획득.
 - **lock-free 경로** (Mutex 불필요):
   - `AtomicStatsState`: 10개 atomic counter (total_commands_processed, connected_clients 등) — 매 요청마다 lock 없이 갱신.
