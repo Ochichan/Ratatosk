@@ -2,6 +2,9 @@
 /target/
 *.rs.bk
 
+# Build artifacts (Codex sandbox target dir — never tracked)
+/.codex-target/
+
 # Nix
 /result
 /result-*
