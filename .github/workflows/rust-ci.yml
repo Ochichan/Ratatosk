@@ -29,14 +29,5 @@ jobs:
           restore-keys: |
             rust-ci-${{ runner.os }}-
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Build check
-        run: cargo check --workspace --quiet
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace --quiet
+      - name: Verify workspace
+        run: ./scripts/verify_workspace.sh

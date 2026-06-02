@@ -45,6 +45,7 @@ pub struct StatsState {
     instantaneous_ops_per_sec: u64,
     cached_memory_estimate: u64,
     last_memory_estimate_tick: u64,
+    memory_estimate_age_ticks: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +61,7 @@ pub struct HotStatsSnapshot {
     pub keyspace_misses: u64,
     pub instantaneous_ops_per_sec: u64,
     pub cached_memory_estimate: u64,
+    pub memory_estimate_age_ticks: u64,
 }
 
 impl Default for StatsState {
@@ -85,6 +87,7 @@ impl Default for StatsState {
             instantaneous_ops_per_sec: 0,
             cached_memory_estimate: 0,
             last_memory_estimate_tick: 0,
+            memory_estimate_age_ticks: 0,
         }
     }
 }
@@ -369,6 +372,17 @@ impl StatsState {
         self.last_memory_estimate_tick
     }
 
+    /// Cron-stamped age (in cron ticks) of the cached memory estimate as of the
+    /// last cron pass. Mirrors the `ratatosk_memory_estimate_age_ticks` Prometheus
+    /// gauge so `INFO memory` and Prometheus report the same drift value.
+    pub fn memory_estimate_age_ticks(&self) -> u64 {
+        self.memory_estimate_age_ticks
+    }
+
+    pub fn set_memory_estimate_age_ticks(&mut self, age_ticks: u64) {
+        self.memory_estimate_age_ticks = age_ticks;
+    }
+
     pub fn hot_snapshot(&self) -> HotStatsSnapshot {
         HotStatsSnapshot {
             total_commands_processed: self.total_commands_processed,
@@ -382,6 +396,7 @@ impl StatsState {
             keyspace_misses: self.keyspace_misses,
             instantaneous_ops_per_sec: self.instantaneous_ops_per_sec,
             cached_memory_estimate: self.cached_memory_estimate,
+            memory_estimate_age_ticks: self.memory_estimate_age_ticks,
         }
     }
 
@@ -606,6 +621,9 @@ impl AtomicStatsState {
             keyspace_misses: self.keyspace_misses(),
             instantaneous_ops_per_sec: self.instantaneous_ops_per_sec(),
             cached_memory_estimate: self.cached_memory_estimate(),
+            // Age is stamped by the cron on the inner StatsState only; the atomic
+            // fast-path side does not track it. merged() takes it from inner.
+            memory_estimate_age_ticks: 0,
         }
     }
 
@@ -690,6 +708,8 @@ impl HotStatsSnapshot {
             } else {
                 inner.cached_memory_estimate
             },
+            // Cron stamps this on the inner StatsState only; the atomic side is 0.
+            memory_estimate_age_ticks: inner.memory_estimate_age_ticks,
         }
     }
 }

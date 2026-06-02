@@ -16,6 +16,7 @@ pub(super) fn cmd_info(
 ) -> CommandOutcome {
     let mut include_server = false;
     let mut include_clients = false;
+    let mut include_memory = false;
     let mut include_stats = false;
     let mut include_keyspace = false;
     let mut include_persistence = false;
@@ -24,6 +25,7 @@ pub(super) fn cmd_info(
     if args.is_empty() {
         include_server = true;
         include_clients = true;
+        include_memory = true;
         include_stats = true;
         include_keyspace = true;
         include_persistence = true;
@@ -35,6 +37,7 @@ pub(super) fn cmd_info(
                 b"ALL" | b"DEFAULT" => {
                     include_server = true;
                     include_clients = true;
+                    include_memory = true;
                     include_stats = true;
                     include_keyspace = true;
                     include_persistence = true;
@@ -42,6 +45,7 @@ pub(super) fn cmd_info(
                 }
                 b"SERVER" => include_server = true,
                 b"CLIENTS" => include_clients = true,
+                b"MEMORY" => include_memory = true,
                 b"STATS" => include_stats = true,
                 b"KEYSPACE" => include_keyspace = true,
                 b"PERSISTENCE" => include_persistence = true,
@@ -60,6 +64,9 @@ pub(super) fn cmd_info(
     }
     if include_clients {
         append_info_clients_section(&mut out, server, stats);
+    }
+    if include_memory {
+        append_info_memory_section(&mut out, server, stats);
     }
     if include_stats {
         append_info_stats_section(&mut out, stats);
@@ -105,6 +112,16 @@ fn append_info_server_section(
         "bridge_contract_version:{}\r\n",
         crate::keyspace::BRIDGE_CONTRACT_VERSION
     ));
+    // Contract-relevant feature flags so operators can confirm the active
+    // compatibility boundary and security posture directly from INFO.
+    out.push_str(&format!(
+        "ratatosk_compatibility_mode:{}\r\n",
+        String::from_utf8_lossy(server.config.compatibility_mode())
+    ));
+    out.push_str(&format!(
+        "ratatosk_protected_mode:{}\r\n",
+        String::from_utf8_lossy(server.config.protected_mode())
+    ));
     out.push_str("\r\n");
 }
 
@@ -143,6 +160,51 @@ fn append_info_clients_section(out: &mut String, server: &ServerState, stats: Ho
     out.push_str(&format!(
         "tracking_clients:{}\r\n",
         server.tracking_clients()
+    ));
+    out.push_str("\r\n");
+}
+
+/// Render a byte count in Redis' `used_memory_human` style (e.g. `1.50M`).
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2}{}", UNITS[unit])
+}
+
+fn append_info_memory_section(out: &mut String, server: &ServerState, stats: HotStatsSnapshot) {
+    // `used_memory` here is Ratatosk's logical dataset estimate (the same value
+    // surfaced by `PING HEALTH` and used for maxmemory enforcement), not an
+    // allocator/RSS figure. allocator memory + fragmentation would require an
+    // RSS reader and are intentionally omitted rather than reported inaccurately.
+    let used_memory = stats.cached_memory_estimate;
+    let maxmemory = server.config.maxmemory() as u64;
+
+    out.push_str("# Memory\r\n");
+    out.push_str(&format!("used_memory:{used_memory}\r\n"));
+    out.push_str(&format!(
+        "used_memory_human:{}\r\n",
+        human_bytes(used_memory)
+    ));
+    out.push_str(&format!("maxmemory:{maxmemory}\r\n"));
+    out.push_str(&format!("maxmemory_human:{}\r\n", human_bytes(maxmemory)));
+    out.push_str(&format!(
+        "maxmemory_policy:{}\r\n",
+        String::from_utf8_lossy(server.config.maxmemory_policy())
+    ));
+    out.push_str("mem_used_memory_source:logical_estimate\r\n");
+    // Drift/staleness of the cached estimate, in cron ticks, as of the last cron
+    // pass — identical to the ratatosk_memory_estimate_age_ticks Prometheus gauge.
+    out.push_str(&format!(
+        "mem_estimate_age_ticks:{}\r\n",
+        stats.memory_estimate_age_ticks
     ));
     out.push_str("\r\n");
 }
@@ -273,7 +335,7 @@ fn append_info_keyspace_section(out: &mut String, server: &mut ServerState, now_
         let mut expires = 0u64;
         let mut ttl_sum = 0i64;
         for value in db.values() {
-            if let Some(expire_at_ms) = value.expire_at_ms {
+            if let Some(expire_at_ms) = value.expire_at_ms() {
                 if expire_at_ms > now_ms {
                     expires = expires.saturating_add(1);
                     ttl_sum = ttl_sum.saturating_add(expire_at_ms.saturating_sub(now_ms));

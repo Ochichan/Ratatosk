@@ -62,7 +62,7 @@ impl<'a> DirectDb<'a> {
             .server
             .db(self.db_idx)
             .get(key)
-            .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now));
+            .is_some_and(|v| v.expire_at_ms().is_some_and(|at| at <= now));
         if is_expired {
             let key_bytes = Bytes::copy_from_slice(key);
             purge_expired_key(&mut self.server.db_mut(self.db_idx), &key_bytes, now);
@@ -101,50 +101,47 @@ impl DirectDb<'_> {
 
         let result = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    if opts.xx {
-                        return 0;
-                    }
-                    let mut zset = SortedSet::default();
-                    zset.insert(member, score);
-                    vacant.insert(StoredValue::sorted_set(zset, None));
-                    1i64
-                }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let Some(zset) = occupied.get_mut().as_sorted_set_mut() else {
-                        return 0;
-                    };
-                    let existing_score = zset.score(&member);
-                    match existing_score {
-                        Some(old_score) => {
-                            if opts.nx {
-                                return 0;
-                            }
-                            if opts.gt && score <= old_score {
-                                return 0;
-                            }
-                            if opts.lt && score >= old_score {
-                                return 0;
-                            }
-                            if (score - old_score).abs() > f64::EPSILON
-                                || score.to_bits() != old_score.to_bits()
-                            {
-                                zset.insert(member, score);
-                                if opts.ch { 1 } else { 0 }
-                            } else {
-                                0
-                            }
+            if let Some(entry) = db.get_mut(&key) {
+                let Some(zset) = entry.as_sorted_set_mut() else {
+                    return 0;
+                };
+                let existing_score = zset.score(&member);
+                match existing_score {
+                    Some(old_score) => {
+                        if opts.nx {
+                            return 0;
                         }
-                        None => {
-                            if opts.xx {
-                                return 0;
-                            }
+                        if opts.gt && score <= old_score {
+                            return 0;
+                        }
+                        if opts.lt && score >= old_score {
+                            return 0;
+                        }
+                        if (score - old_score).abs() > f64::EPSILON
+                            || score.to_bits() != old_score.to_bits()
+                        {
                             zset.insert(member, score);
-                            1
+                            if opts.ch { 1 } else { 0 }
+                        } else {
+                            0
                         }
                     }
+                    None => {
+                        if opts.xx {
+                            return 0;
+                        }
+                        zset.insert(member, score);
+                        1
+                    }
                 }
+            } else {
+                if opts.xx {
+                    return 0;
+                }
+                let mut zset = SortedSet::default();
+                zset.insert(member, score);
+                db.insert(key.clone(), StoredValue::sorted_set(zset, None));
+                1i64
             }
         };
 
@@ -395,23 +392,20 @@ impl DirectDb<'_> {
 
         let new_score = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key_bytes.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    let mut zset = SortedSet::default();
-                    zset.insert(member_bytes, increment);
-                    vacant.insert(StoredValue::sorted_set(zset, None));
-                    increment
+            if let Some(entry) = db.get_mut(&key_bytes) {
+                let zset = entry.as_sorted_set_mut()?;
+                let old = zset.score(&member_bytes).unwrap_or(0.0);
+                let new_score = old + increment;
+                if new_score.is_nan() {
+                    return None;
                 }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let zset = occupied.get_mut().as_sorted_set_mut()?;
-                    let old = zset.score(&member_bytes).unwrap_or(0.0);
-                    let new_score = old + increment;
-                    if new_score.is_nan() {
-                        return None;
-                    }
-                    zset.insert(member_bytes, new_score);
-                    new_score
-                }
+                zset.insert(member_bytes, new_score);
+                new_score
+            } else {
+                let mut zset = SortedSet::default();
+                zset.insert(member_bytes, increment);
+                db.insert(key_bytes.clone(), StoredValue::sorted_set(zset, None));
+                increment
             }
         };
 
@@ -433,34 +427,31 @@ impl DirectDb<'_> {
 
         let added = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    let mut hash = HashMap::with_capacity(fields.len());
-                    for (field, value) in fields {
-                        hash.insert(field, HashFieldEntry::new(value));
-                    }
-                    let added = hash.len() as i64;
-                    vacant.insert(StoredValue::hash(hash, None));
-                    added
-                }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let Some(hash) = occupied.get_mut().as_hash_mut() else {
-                        return 0;
-                    };
-                    let mut added = 0i64;
-                    for (field, value) in fields {
-                        match hash.entry(field) {
-                            hashbrown::hash_map::Entry::Vacant(v) => {
-                                v.insert(HashFieldEntry::new(value));
-                                added += 1;
-                            }
-                            hashbrown::hash_map::Entry::Occupied(mut o) => {
-                                o.get_mut().value = value;
-                            }
+            if let Some(entry) = db.get_mut(&key) {
+                let Some(hash) = entry.as_hash_mut() else {
+                    return 0;
+                };
+                let mut added = 0i64;
+                for (field, value) in fields {
+                    match hash.entry(field) {
+                        hashbrown::hash_map::Entry::Vacant(v) => {
+                            v.insert(HashFieldEntry::new(value));
+                            added += 1;
+                        }
+                        hashbrown::hash_map::Entry::Occupied(mut o) => {
+                            o.get_mut().value = value;
                         }
                     }
-                    added
                 }
+                added
+            } else {
+                let mut hash = HashMap::with_capacity(fields.len());
+                for (field, value) in fields {
+                    hash.insert(field, HashFieldEntry::new(value));
+                }
+                let added = hash.len() as i64;
+                db.insert(key.clone(), StoredValue::hash(hash, None));
+                added
             }
         };
 
@@ -473,28 +464,25 @@ impl DirectDb<'_> {
 
         let added = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    let mut hash = HashMap::with_capacity(1);
-                    hash.insert(field, HashFieldEntry::new(value));
-                    vacant.insert(StoredValue::hash(hash, None));
-                    1i64
-                }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let Some(hash) = occupied.get_mut().as_hash_mut() else {
-                        return 0;
-                    };
-                    match hash.entry(field) {
-                        hashbrown::hash_map::Entry::Vacant(v) => {
-                            v.insert(HashFieldEntry::new(value));
-                            1i64
-                        }
-                        hashbrown::hash_map::Entry::Occupied(mut o) => {
-                            o.get_mut().value = value;
-                            0i64
-                        }
+            if let Some(entry) = db.get_mut(&key) {
+                let Some(hash) = entry.as_hash_mut() else {
+                    return 0;
+                };
+                match hash.entry(field) {
+                    hashbrown::hash_map::Entry::Vacant(v) => {
+                        v.insert(HashFieldEntry::new(value));
+                        1i64
+                    }
+                    hashbrown::hash_map::Entry::Occupied(mut o) => {
+                        o.get_mut().value = value;
+                        0i64
                     }
                 }
+            } else {
+                let mut hash = HashMap::with_capacity(1);
+                hash.insert(field, HashFieldEntry::new(value));
+                db.insert(key.clone(), StoredValue::hash(hash, None));
+                1i64
             }
         };
 
@@ -658,28 +646,25 @@ impl DirectDb<'_> {
 
         let added = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    let mut set = HashSet::with_capacity(members.len());
-                    for member in members {
-                        set.insert(member);
-                    }
-                    let added = set.len() as i64;
-                    vacant.insert(StoredValue::set(set, None));
-                    added
+            if let Some(entry) = db.get_mut(&key) {
+                if !entry.is_set() {
+                    return 0;
                 }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let Some(set) = occupied.get_mut().as_set_mut() else {
-                        return 0;
-                    };
-                    let mut added = 0i64;
-                    for member in members {
-                        if set.insert(member) {
-                            added += 1;
-                        }
+                let mut added = 0i64;
+                for member in members {
+                    if entry.set_insert_member(member).unwrap_or(false) {
+                        added += 1;
                     }
-                    added
                 }
+                added
+            } else {
+                let mut set = HashSet::with_capacity(members.len());
+                for member in members {
+                    set.insert(member);
+                }
+                let added = set.len() as i64;
+                db.insert(key.clone(), StoredValue::set(set, None));
+                added
             }
         };
 
@@ -694,19 +679,16 @@ impl DirectDb<'_> {
 
         let added = {
             let mut db = self.server.db_mut(self.db_idx);
-            match db.entry(key.clone()) {
-                hashbrown::hash_map::Entry::Vacant(vacant) => {
-                    let mut set = HashSet::with_capacity(1);
-                    set.insert(member);
-                    vacant.insert(StoredValue::set(set, None));
-                    true
+            if let Some(entry) = db.get_mut(&key) {
+                if !entry.is_set() {
+                    return false;
                 }
-                hashbrown::hash_map::Entry::Occupied(mut occupied) => {
-                    let Some(set) = occupied.get_mut().as_set_mut() else {
-                        return false;
-                    };
-                    set.insert(member)
-                }
+                entry.set_insert_member(member).unwrap_or(false)
+            } else {
+                let mut set = HashSet::with_capacity(1);
+                set.insert(member);
+                db.insert(key.clone(), StoredValue::set(set, None));
+                true
             }
         };
 
@@ -724,11 +706,10 @@ impl DirectDb<'_> {
             let Some(entry) = db.get_mut(&key) else {
                 return false;
             };
-            let Some(set) = entry.as_set_mut() else {
+            let Some(removed) = entry.set_remove_member(&member) else {
                 return false;
             };
-            let removed = set.remove(&member);
-            (removed, set.is_empty())
+            (removed, entry.set_is_empty().unwrap_or(false))
         };
 
         if removed {
@@ -782,10 +763,7 @@ impl DirectDb<'_> {
         let Some(entry) = db.get(key) else {
             return false;
         };
-        let Some(set) = entry.as_set() else {
-            return false;
-        };
-        set.contains(member) // &[u8] lookup via Borrow
+        entry.set_contains(member).unwrap_or(false)
     }
 
     /// Get all members of a set.
@@ -797,10 +775,7 @@ impl DirectDb<'_> {
         let Some(entry) = db.get(key) else {
             return Vec::new();
         };
-        let Some(set) = entry.as_set() else {
-            return Vec::new();
-        };
-        set.iter().cloned().collect()
+        entry.set_members().unwrap_or_default()
     }
 
     /// Get the number of members in a set.
@@ -812,10 +787,7 @@ impl DirectDb<'_> {
         let Some(entry) = db.get(key) else {
             return 0;
         };
-        let Some(set) = entry.as_set() else {
-            return 0;
-        };
-        set.len()
+        entry.set_len().unwrap_or(0)
     }
 }
 
@@ -897,11 +869,11 @@ impl DirectDb<'_> {
 
         {
             let mut db = self.server.db_mut(self.db_idx);
-            let hashbrown::hash_map::Entry::Vacant(vacant) = db.entry(key_bytes.clone()) else {
+            if db.contains_key(&key_bytes) {
                 return false;
-            };
+            }
             let value_bytes = Bytes::copy_from_slice(value);
-            vacant.insert(StoredValue::string(value_bytes, None));
+            db.insert(key_bytes.clone(), StoredValue::string(value_bytes, None));
         }
         self.touch_version(&key_bytes);
         true
@@ -921,7 +893,7 @@ impl DirectDb<'_> {
                     buf.extend_from_slice(existing);
                     buf.extend_from_slice(value);
                     let len = buf.len();
-                    entry.data = crate::keyspace::ValueData::String(buf.freeze());
+                    *entry.data_mut() = crate::keyspace::ValueData::String(buf.freeze());
                     Some(len)
                 } else {
                     None
@@ -1008,11 +980,7 @@ impl DirectDb<'_> {
         let key_bytes = Bytes::copy_from_slice(key);
 
         let mut db = self.server.db_mut(self.db_idx);
-        let Some(entry) = db.get_mut(&key_bytes) else {
-            return false;
-        };
-        entry.expire_at_ms = Some(expire_at_ms);
-        true
+        db.set_key_expiry(&key_bytes, Some(expire_at_ms))
     }
 
     /// Set an expiration time in seconds from now.
@@ -1025,7 +993,7 @@ impl DirectDb<'_> {
     pub fn ttl_ms(&mut self, key: &[u8]) -> Option<i64> {
         let db = self.server.db(self.db_idx);
         let entry = db.get(key)?;
-        let expire_at_ms = entry.expire_at_ms?;
+        let expire_at_ms = entry.expire_at_ms()?;
 
         let now = now_ms();
         let remaining = expire_at_ms - now;
@@ -1042,14 +1010,13 @@ impl DirectDb<'_> {
         let key_bytes = Bytes::copy_from_slice(key);
 
         let mut db = self.server.db_mut(self.db_idx);
-        let Some(entry) = db.get_mut(&key_bytes) else {
-            return false;
-        };
-        if entry.expire_at_ms.is_none() {
+        if db
+            .get(&key_bytes)
+            .is_none_or(|entry| entry.expire_at_ms().is_none())
+        {
             return false;
         }
-        entry.expire_at_ms = None;
-        true
+        db.set_key_expiry(&key_bytes, None)
     }
 
     /// Rename a key.

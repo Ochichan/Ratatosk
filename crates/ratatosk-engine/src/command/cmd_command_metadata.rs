@@ -138,7 +138,56 @@ fn requested_command_specs(args: &[Bytes]) -> Vec<Option<CommandSpec>> {
     specs
 }
 
-fn command_capability_tier(spec: CommandSpec) -> &'static str {
+/// Resolve the most specific command spec for the leading command in `argv`,
+/// folding a container command and its subcommand (e.g. `CLIENT PAUSE`,
+/// `CLUSTER SETSLOT`) into a single spec when one exists. Trailing arguments are
+/// ignored — only leading tokens that form a known command name are matched, so
+/// a key literally named after a subcommand (`GET CLIENT`) never misresolves.
+pub(super) fn resolve_leading_spec(argv: &[Bytes]) -> Option<CommandSpec> {
+    if argv.is_empty() {
+        return None;
+    }
+    let max_name_parts = all_command_specs()
+        .map(|spec| spec.name.split(' ').count())
+        .max()
+        .unwrap_or(1);
+    let remaining = argv.len();
+    for len in (1..=remaining.min(max_name_parts)).rev() {
+        if let Some(spec) = find_command_spec_parts(&argv[0..len]) {
+            return Some(spec);
+        }
+    }
+    None
+}
+
+/// Strict compatibility-mode gate.
+///
+/// Returns a structured error frame when `argv` names a command that strict mode
+/// must reject: any `unsupported`/`syntax_only` capability tier, plus the
+/// durability/replication metadata commands (`WAIT`/`WAITAOF`) whose Redis
+/// contract a single-node server cannot honour. Returns `None` — meaning "allow"
+/// — for every command Ratatosk genuinely implements. The caller only consults
+/// this when `compatibility-mode strict` is active.
+pub(super) fn strict_mode_error(argv: &[Bytes]) -> Option<RespFrame> {
+    let spec = resolve_leading_spec(argv)?;
+    let name = spec.name;
+    let reason = if matches!(name, "WAIT" | "WAITAOF") {
+        "requires replica-backed acknowledgement that a single-node server cannot provide"
+    } else {
+        match command_capability_tier(spec) {
+            "unsupported" => "command is not supported in this single-node Ratatosk build",
+            "syntax_only" => {
+                "command is only accepted syntactically and has no Redis-equivalent operational effect"
+            }
+            _ => return None,
+        }
+    };
+    Some(err(&format!(
+        "ERR command {name} is not supported in Ratatosk strict compatibility mode; reason={reason}"
+    )))
+}
+
+pub(super) fn command_capability_tier(spec: CommandSpec) -> &'static str {
     let name = spec.name;
 
     if matches!(
@@ -161,6 +210,11 @@ fn command_capability_tier(spec: CommandSpec) -> &'static str {
             | "FUNCTION LOAD"
             | "FUNCTION DELETE"
             | "FUNCTION RESTORE"
+            // Handlers below always return a "not supported" error on a single
+            // node, so the tier must say so (audited 2026-06-02).
+            | "DEBUG"
+            | "FAILOVER"
+            | "SHUTDOWN"
     ) {
         return "unsupported";
     }
@@ -189,7 +243,11 @@ fn command_capability_tier(spec: CommandSpec) -> &'static str {
         return "unsupported";
     }
 
-    if matches!(name, "ASKING" | "READONLY" | "READWRITE" | "CLIENT UNBLOCK") {
+    if matches!(
+        name,
+        // SFLUSH parses its mode and returns OK without flushing anything.
+        "ASKING" | "READONLY" | "READWRITE" | "CLIENT UNBLOCK" | "SFLUSH"
+    ) {
         return "syntax_only";
     }
 

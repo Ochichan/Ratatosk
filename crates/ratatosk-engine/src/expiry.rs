@@ -131,21 +131,16 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
     let mut rng = rand::thread_rng();
 
     for db_idx in 0..state.db_count() {
-        // Sampling phase: hold read guard, collect candidate keys, then release.
+        // Sampling phase: use expires index for O(volatile_count) instead of
+        // O(total_keys).  Read guard held on the shard, not the mapped HashMap.
         let (samples_to_take, sampled_keys) = {
-            let db = state.db(db_idx);
-            if db.is_empty() {
-                continue;
-            }
-
-            // First pass: count volatile keys without allocating
-            let volatile_count = db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count();
-
+            let shard = state.data.read_db(db_idx);
+            let volatile_count = shard.expires.len();
             if volatile_count == 0 {
                 continue;
             }
 
-            // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
+            // Reservoir sampling directly on the expires map.
             let samples_to_take = cycle_lookups.min(volatile_count);
             let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
             for i in samples_to_take..volatile_count {
@@ -156,24 +151,16 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
             }
             sample_indices.sort_unstable();
 
-            // Second pass: collect only sampled keys (small, bounded allocation)
             let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
-            let mut volatile_idx = 0;
-            let mut sample_cursor = 0;
-            for (key, value) in db.iter() {
-                if value.expire_at_ms.is_none() {
-                    continue;
-                }
-                if sample_cursor < sample_indices.len()
-                    && volatile_idx == sample_indices[sample_cursor]
-                {
+            let mut cursor = 0;
+            for (idx, (key, _)) in shard.expires.iter().enumerate() {
+                if cursor < sample_indices.len() && idx == sample_indices[cursor] {
                     sampled_keys.push(key.clone());
-                    sample_cursor += 1;
-                    if sample_cursor >= sample_indices.len() {
+                    cursor += 1;
+                    if cursor >= sample_indices.len() {
                         break;
                     }
                 }
-                volatile_idx += 1;
             }
 
             (samples_to_take, sampled_keys)
@@ -182,16 +169,24 @@ pub fn active_expire_cycle(state: &mut ServerState, now_ms: i64) -> usize {
         // Expiry phase: acquire write guard per key check+removal.
         let mut expired = 0usize;
         for key in sampled_keys {
-            let mut db = state.db_mut(db_idx);
-            let is_expired = db
+            let mut shard = state.data.write_db(db_idx);
+            let is_expired = shard
+                .data
                 .get(key.as_ref())
-                .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms));
+                .is_some_and(|v| v.expire_at_ms().is_some_and(|at| at <= now_ms));
 
             if is_expired {
-                db.remove(key.as_ref());
-                drop(db); // release write guard before touch_key_version
-                state.touch_key_version(db_idx, key);
-                expired += 1;
+                if let Some((owned_key, value)) = shard.data.remove_entry(key.as_ref()) {
+                    shard.expires.remove(owned_key.as_ref());
+                    let freed = crate::eviction::estimate_object_memory(&owned_key, &value);
+                    state.data.sub_memory(db_idx, freed);
+                    drop(shard);
+                    state.touch_key_version(db_idx, owned_key);
+                    expired += 1;
+                }
+            } else if !shard.data.contains_key(key.as_ref()) {
+                // Heal any stale expires-index entry left behind by older code paths.
+                shard.expires.remove(key.as_ref());
             }
         }
 
@@ -213,6 +208,14 @@ mod tests {
     use super::*;
     use crate::keyspace::StoredValue;
 
+    /// Insert into db 0 with expires index sync.
+    fn insert_tracked(state: &ServerState, key: Bytes, val: StoredValue) {
+        let expire = val.expire_at_ms();
+        let mut shard = state.data.write_db(0);
+        shard.sync_expires(&key, expire);
+        shard.data.insert(key, val);
+    }
+
     #[test]
     fn active_expire_cycle_removes_expired_keys() {
         let mut state = ServerState::with_default_dbs();
@@ -221,14 +224,16 @@ mod tests {
         // Add keys: some expired, some not
         for i in 0..10 {
             let key = Bytes::from(format!("expired:{i}"));
-            state.db_mut(0).insert(
+            insert_tracked(
+                &state,
                 key,
                 StoredValue::string(Bytes::from("v"), Some(now_ms - 1000)),
             );
         }
         for i in 0..10 {
             let key = Bytes::from(format!("alive:{i}"));
-            state.db_mut(0).insert(
+            insert_tracked(
+                &state,
                 key,
                 StoredValue::string(Bytes::from("v"), Some(now_ms + 10_000)),
             );
@@ -236,9 +241,7 @@ mod tests {
         // Keys without TTL
         for i in 0..5 {
             let key = Bytes::from(format!("persist:{i}"));
-            state
-                .db_mut(0)
-                .insert(key, StoredValue::string(Bytes::from("v"), None));
+            insert_tracked(&state, key, StoredValue::string(Bytes::from("v"), None));
         }
 
         // Run multiple cycles to ensure all expired keys are sampled

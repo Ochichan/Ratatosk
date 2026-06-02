@@ -77,7 +77,12 @@ pub fn parse_f64(raw: &Bytes) -> Option<f64> {
 }
 
 pub fn format_f64_for_redis(value: f64) -> Bytes {
-    Bytes::from(value.to_string())
+    // Use ryu for fast formatting, then strip trailing ".0" for integers
+    // to match Redis convention ("1" not "1.0").
+    let mut buf = ryu::Buffer::new();
+    let s = buf.format(value);
+    let trimmed = s.strip_suffix(".0").unwrap_or(s);
+    Bytes::copy_from_slice(trimmed.as_bytes())
 }
 
 pub fn normalize_range(len: usize, mut start: i64, mut end: i64) -> Option<(usize, usize)> {

@@ -85,7 +85,7 @@ pub(super) fn cmd_setbit(
         let Some(s) = existing.as_string() else {
             return wrong_type_response();
         };
-        (s.to_vec(), existing.expire_at_ms)
+        (s.to_vec(), existing.expire_at_ms())
     } else {
         (Vec::new(), None)
     };

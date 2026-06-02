@@ -9,6 +9,7 @@ publish = false
 [features]
 default = []
 mimalloc = ["dep:mimalloc", "ratatosk-engine/mimalloc"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
 [dependencies]
 ratatosk-core = { workspace = true }
@@ -17,6 +18,8 @@ ratatosk-engine = { workspace = true }
 ratatosk-persist = { workspace = true }
 bytes = { workspace = true }
 mimalloc = { workspace = true, optional = true }
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 mio = { workspace = true }

@@ -97,31 +97,6 @@ impl PersistenceRuntime {
     }
 }
 
-pub async fn apply_server_persistence_config(
-    server_state: &Arc<SharedState>,
-    config: &ServerConfig,
-) {
-    let mut state = server_state.meta.lock().await;
-    state.config.set_dir(config.dir.clone());
-    state.config.set_dbfilename(config.dbfilename.clone());
-    state
-        .config
-        .set_appendfsync(bytes::Bytes::from(config.appendfsync.clone()));
-    state.config.set_appendonly(config.appendonly);
-    state.set_aof_enabled(config.appendonly);
-
-    if !config.appendonly {
-        state.clear_aof_last_error();
-        state.set_aof_rewrite_in_progress(false);
-        state.clear_last_aof_rewrite_status();
-        state.clear_last_aof_rewrite_time_ms();
-        state.set_aof_current_path(None);
-        state.set_aof_base_path(None);
-    }
-
-    crate::metrics::set_aof_write_latched(state.aof_write_latched());
-}
-
 fn runtime_aof_file_paths(
     runtime: &PersistenceRuntime,
 ) -> io::Result<(Option<PathBuf>, Option<PathBuf>)> {
@@ -179,14 +154,15 @@ pub async fn load_startup_data(
 }
 
 pub async fn start_bgsave(server_state: Arc<SharedState>, rdb_path: PathBuf) -> bool {
-    let snapshot = {
+    {
         let mut state = server_state.meta.lock().await;
         if state.rdb_save_in_progress() {
             return false;
         }
         state.set_rdb_save_in_progress(true);
-        state.snapshot_dbs()
-    };
+    }
+
+    let snapshot = server_state.data.snapshot_all();
 
     crate::metrics::record_rdb_save(true);
 

@@ -187,25 +187,80 @@ fn generate_health_report(server: &ServerState, stats: HotStatsSnapshot) -> Stri
         None => "none",
     };
 
-    let status = if memory_status == "critical"
-        || disk_status == "error"
-        || (aof_enabled && (!aof_writable || aof_write_latched))
-    {
+    // Collect the exact conditions behind a non-healthy status so operators get a
+    // human-readable cause, not just a status word. Severity mirrors the status
+    // thresholds below: any `unhealthy_reasons` => unhealthy, otherwise any
+    // `degraded_reasons` => degraded.
+    let mut unhealthy_reasons: Vec<String> = Vec::new();
+    let mut degraded_reasons: Vec<String> = Vec::new();
+
+    if memory_status == "critical" {
+        unhealthy_reasons.push(format!(
+            "memory usage {memory_used}B exceeds maxmemory {maxmemory}B"
+        ));
+    }
+    if disk_status == "error" {
+        unhealthy_reasons.push(match disk_error.as_deref() {
+            Some(error) => format!("persistence directory is not writable: {error}"),
+            None => "persistence directory is not writable".to_string(),
+        });
+    }
+    if aof_enabled && !aof_writable {
+        unhealthy_reasons.push(match aof_error.as_deref() {
+            Some(error) => format!("AOF file is not writable: {error}"),
+            None => "AOF file is not writable".to_string(),
+        });
+    }
+    if aof_enabled && aof_write_latched {
+        unhealthy_reasons.push(match aof_latched_error.as_deref() {
+            Some(error) => format!("AOF writes are latched after an I/O error: {error}"),
+            None => "AOF writes are latched after an I/O error".to_string(),
+        });
+    }
+
+    if rdb_status == "error" {
+        degraded_reasons.push("last RDB save failed".to_string());
+    }
+    if disk_status == "low_space" {
+        degraded_reasons.push(format!(
+            "low disk space: {disk_available_bytes}B available is below the {MIN_HEALTH_DISK_BYTES}B threshold"
+        ));
+    }
+    if aof_rewrite_status == "error" {
+        degraded_reasons.push("last AOF rewrite failed".to_string());
+    }
+    if audit_status.dirty {
+        degraded_reasons.push(format!(
+            "audit chain integrity is dirty (recovery_status={})",
+            audit_status.recovery_status
+        ));
+    }
+
+    let status = if !unhealthy_reasons.is_empty() {
         "unhealthy"
-    } else if rdb_status == "error"
-        || disk_status == "low_space"
-        || aof_rewrite_status == "error"
-        || audit_status.dirty
-    {
+    } else if !degraded_reasons.is_empty() {
         "degraded"
     } else {
         "healthy"
     };
 
+    // The report is `|`-delimited with `;`-separated reasons, so neutralise both
+    // separators inside individual reason strings to keep the line parseable.
+    let reasons = if unhealthy_reasons.is_empty() && degraded_reasons.is_empty() {
+        "none".to_string()
+    } else {
+        unhealthy_reasons
+            .iter()
+            .chain(degraded_reasons.iter())
+            .map(|reason| reason.replace('|', "_").replace(';', ","))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+
     let total_keys: usize = (0..server.db_count()).map(|idx| server.db(idx).len()).sum();
 
     let mut report = format!(
-        "status:{status}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|aof_writable:{}|aof_write_latched:{}|aof_rewrite_in_progress:{}|aof_rewrite_status:{}|audit_chain_dirty:{}|audit_recovery_status:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
+        "status:{status}|reasons:{reasons}|version:{}|git_hash:{}|build_unix_ts:{}|connected_clients:{connected_clients}|db_count:{}|keys:{}|rdb_save_in_progress:{}|rdb_last_bgsave_status:{rdb_status}|aof_enabled:{}|aof_writable:{}|aof_write_latched:{}|aof_rewrite_in_progress:{}|aof_rewrite_status:{}|audit_chain_dirty:{}|audit_recovery_status:{}|memory_status:{memory_status}|memory_used_bytes:{}|maxmemory_bytes:{}|disk_status:{disk_status}|disk_writable:{}|disk_available_bytes:{}|uptime_seconds:{}",
         env!("CARGO_PKG_VERSION"),
         env!("GIT_HASH"),
         env!("BUILD_UNIX_TS"),

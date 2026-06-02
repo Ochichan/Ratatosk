@@ -42,13 +42,13 @@ pub(super) fn cmd_sadd(
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(set) = entry.as_set_mut() else {
+    if !entry.is_set() {
         return wrong_type_response();
-    };
+    }
 
     let mut added = 0i64;
     for member in &args[1..] {
-        if set.insert(member.clone()) {
+        if entry.set_insert_member(member.clone()).unwrap_or(false) {
             added += 1;
         }
     }
@@ -73,18 +73,18 @@ pub(super) fn cmd_srem(
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(set) = entry.as_set_mut() else {
+    if !entry.is_set() {
         return wrong_type_response();
-    };
+    }
 
     let mut removed = 0i64;
     for member in &args[1..] {
-        if set.remove(member) {
+        if entry.set_remove_member(member).unwrap_or(false) {
             removed += 1;
         }
     }
 
-    if set.is_empty() {
+    if entry.set_is_empty().unwrap_or(false) {
         db.remove(key);
     }
 
@@ -107,11 +107,11 @@ pub(super) fn cmd_sismember(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(set) = entry.as_set() else {
+    let Some(contains) = entry.set_contains(member) else {
         return wrong_type_response();
     };
 
-    CommandOutcome::reply(RespFrame::Integer(if set.contains(member) { 1 } else { 0 }))
+    CommandOutcome::reply(RespFrame::Integer(if contains { 1 } else { 0 }))
 }
 
 pub(super) fn cmd_smismember(
@@ -138,14 +138,20 @@ pub(super) fn cmd_smismember(
                 .collect::<Vec<_>>(),
         ));
     };
-    let Some(set) = entry.as_set() else {
+    if !entry.is_set() {
         return wrong_type_response();
-    };
+    }
 
     CommandOutcome::reply(RespFrame::Array(
         members
             .iter()
-            .map(|member| RespFrame::Integer(if set.contains(member) { 1 } else { 0 }))
+            .map(|member| {
+                RespFrame::Integer(if entry.set_contains(member).unwrap_or(false) {
+                    1
+                } else {
+                    0
+                })
+            })
             .collect::<Vec<_>>(),
     ))
 }
@@ -166,13 +172,13 @@ pub(super) fn cmd_smembers(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
     };
-    let Some(set) = entry.as_set() else {
+    let Some(set) = entry.set_members() else {
         return wrong_type_response();
     };
 
     CommandOutcome::reply(RespFrame::Array(
-        set.iter()
-            .map(|member| RespFrame::BulkString(Some(member.clone())))
+        set.into_iter()
+            .map(|member| RespFrame::BulkString(Some(member)))
             .collect::<Vec<_>>(),
     ))
 }
@@ -193,11 +199,11 @@ pub(super) fn cmd_scard(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(set) = entry.as_set() else {
+    let Some(len) = entry.set_len() else {
         return wrong_type_response();
     };
 
-    CommandOutcome::reply(RespFrame::Integer(set.len() as i64))
+    CommandOutcome::reply(RespFrame::Integer(len as i64))
 }
 
 pub(super) fn cmd_spop(
@@ -253,52 +259,51 @@ pub(super) fn cmd_spop(
                 CommandOutcome::reply(RespFrame::BulkString(None))
             };
         };
-        let Some(set) = entry.as_set_mut() else {
+        if !entry.is_set() {
             return wrong_type_response();
-        };
+        }
 
+        let members = entry.set_members().unwrap_or_default();
         match count {
             None => {
-                if set.is_empty() {
+                if members.is_empty() {
                     remove_key = true;
                     CommandOutcome::reply(RespFrame::BulkString(None))
                 } else {
-                    let idx = usize::try_from(now_us()).unwrap_or(0) % set.len();
-                    if let Some(member) = set.iter().nth(idx).cloned() {
-                        set.remove(&member);
-                        if set.is_empty() {
-                            remove_key = true;
-                        }
-                        CommandOutcome::reply(RespFrame::BulkString(Some(member)))
-                    } else {
+                    let idx = usize::try_from(now_us()).unwrap_or(0) % members.len();
+                    let member = members[idx].clone();
+                    let _ = entry.set_remove_member(&member);
+                    if entry.set_is_empty().unwrap_or(false) {
                         remove_key = true;
-                        CommandOutcome::reply(RespFrame::BulkString(None))
                     }
+                    CommandOutcome::reply(RespFrame::BulkString(Some(member)))
                 }
             }
             Some(requested) => {
-                if requested >= set.len() {
-                    let out: Vec<RespFrame> = set
-                        .drain()
+                if requested >= members.len() {
+                    let out: Vec<RespFrame> = entry
+                        .set_take_all_members()
+                        .unwrap_or_default()
+                        .into_iter()
                         .map(|member| RespFrame::BulkString(Some(member)))
                         .collect();
                     remove_key = true;
                     CommandOutcome::reply(RespFrame::Array(out))
                 } else {
-                    let start = usize::try_from(now_us()).unwrap_or(0) % set.len();
+                    let start = usize::try_from(now_us()).unwrap_or(0) % members.len();
                     let mut selected = Vec::with_capacity(requested);
-                    selected.extend(set.iter().skip(start).take(requested).cloned());
+                    selected.extend(members.iter().skip(start).take(requested).cloned());
                     if selected.len() < requested {
                         let remaining = requested - selected.len();
-                        selected.extend(set.iter().take(remaining).cloned());
+                        selected.extend(members.iter().take(remaining).cloned());
                     }
 
                     let mut out = Vec::with_capacity(selected.len());
                     for member in selected {
-                        set.remove(&member);
+                        let _ = entry.set_remove_member(&member);
                         out.push(RespFrame::BulkString(Some(member)));
                     }
-                    if set.is_empty() {
+                    if entry.set_is_empty().unwrap_or(false) {
                         remove_key = true;
                     }
                     CommandOutcome::reply(RespFrame::Array(out))
@@ -352,7 +357,7 @@ pub(super) fn cmd_srandmember(
             CommandOutcome::reply(RespFrame::BulkString(None))
         };
     };
-    let Some(set) = entry.as_set() else {
+    let Some(set) = entry.set_members() else {
         return wrong_type_response();
     };
 
@@ -368,7 +373,7 @@ pub(super) fn cmd_srandmember(
 
     match count {
         None => {
-            let Some(member) = set.iter().nth(start).cloned() else {
+            let Some(member) = set.get(start).cloned() else {
                 return CommandOutcome::reply(RespFrame::BulkString(None));
             };
             CommandOutcome::reply(RespFrame::BulkString(Some(member)))
@@ -447,11 +452,10 @@ pub(super) fn cmd_sscan(
     let Some(entry) = db.get(key) else {
         return scan_reply(0, vec![]);
     };
-    let Some(set) = entry.as_set() else {
+    let Some(mut members) = entry.set_members() else {
         return wrong_type_response();
     };
 
-    let mut members = set.iter().cloned().collect::<Vec<_>>();
     members.sort();
 
     let (next_cursor, matched_indexes) = scan_collect_indexes(&members, cursor, count, |member| {
@@ -488,10 +492,10 @@ pub(super) fn cmd_smove(
         let Some(entry) = db.get_mut(source) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
         };
-        let Some(set) = entry.as_set_mut() else {
+        let Some(contains) = entry.set_contains(member) else {
             return wrong_type_response();
         };
-        return CommandOutcome::reply(RespFrame::Integer(if set.contains(member) { 1 } else { 0 }));
+        return CommandOutcome::reply(RespFrame::Integer(if contains { 1 } else { 0 }));
     }
 
     if let Some(destination_entry) = db.get(destination) {
@@ -504,10 +508,10 @@ pub(super) fn cmd_smove(
         let Some(source_entry) = db.get_mut(source) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
         };
-        let Some(source_set) = source_entry.as_set_mut() else {
+        let Some(removed) = source_entry.set_remove_member(member) else {
             return wrong_type_response();
         };
-        source_set.remove(member)
+        removed
     };
 
     if !moved {
@@ -516,17 +520,16 @@ pub(super) fn cmd_smove(
 
     let source_empty = db
         .get(source)
-        .and_then(|entry| entry.as_set())
-        .is_some_and(|set| set.is_empty());
+        .and_then(|entry| entry.set_is_empty())
+        .unwrap_or(false);
     if source_empty {
         db.remove(source);
     }
 
     if let Some(destination_entry) = db.get_mut(destination) {
-        let Some(destination_set) = destination_entry.as_set_mut() else {
+        let Some(_) = destination_entry.set_insert_member(member.clone()) else {
             return wrong_type_response();
         };
-        destination_set.insert(member.clone());
     } else {
         let mut destination_set = HashSet::new();
         destination_set.insert(member.clone());

@@ -5,9 +5,12 @@ use crate::frame::RespFrame;
 
 const SHARED_OK: &[u8] = b"+OK\r\n";
 const SHARED_PONG: &[u8] = b"+PONG\r\n";
+const SHARED_QUEUED: &[u8] = b"+QUEUED\r\n";
 const SHARED_NULL_BULK: &[u8] = b"$-1\r\n";
 const SHARED_INT_ZERO: &[u8] = b":0\r\n";
 const SHARED_INT_ONE: &[u8] = b":1\r\n";
+const SHARED_INT_NEG_ONE: &[u8] = b":-1\r\n";
+const SHARED_INT_NEG_TWO: &[u8] = b":-2\r\n";
 
 pub fn encode(frame: &RespFrame) -> Bytes {
     if let Some(shared) = shared_encoding(frame) {
@@ -166,9 +169,12 @@ fn shared_encoding(frame: &RespFrame) -> Option<&'static [u8]> {
     match frame {
         RespFrame::SimpleString(value) if value.as_ref() == b"OK" => Some(SHARED_OK),
         RespFrame::SimpleString(value) if value.as_ref() == b"PONG" => Some(SHARED_PONG),
+        RespFrame::SimpleString(value) if value.as_ref() == b"QUEUED" => Some(SHARED_QUEUED),
         RespFrame::BulkString(None) => Some(SHARED_NULL_BULK),
         RespFrame::Integer(0) => Some(SHARED_INT_ZERO),
         RespFrame::Integer(1) => Some(SHARED_INT_ONE),
+        RespFrame::Integer(-1) => Some(SHARED_INT_NEG_ONE),
+        RespFrame::Integer(-2) => Some(SHARED_INT_NEG_TWO),
         _ => None,
     }
 }

@@ -195,16 +195,23 @@ impl EmbeddedPersistence {
         value: &StoredValue,
     ) -> io::Result<()> {
         // Write expire_at_ms
-        let expire = value.expire_at_ms.unwrap_or(-1i64);
+        let expire = value.expire_at_ms().unwrap_or(-1i64);
         writer.write_all(&expire.to_le_bytes())?;
         hasher.update(expire.to_le_bytes());
 
         // Write type tag and data
-        match &value.data {
+        match value.data() {
             ValueData::String(s) => {
                 writer.write_all(&[0u8])?;
                 hasher.update([0u8]);
                 Self::write_bytes_with_hash(writer, hasher, s)?;
+            }
+            ValueData::StringInt(n) => {
+                writer.write_all(&[0u8])?;
+                hasher.update([0u8]);
+                let mut buf = itoa::Buffer::new();
+                let rendered = buf.format(*n).as_bytes();
+                Self::write_bytes_with_hash(writer, hasher, rendered)?;
             }
             ValueData::Hash(h) => {
                 writer.write_all(&[1u8])?;
@@ -238,6 +245,18 @@ impl EmbeddedPersistence {
                 hasher.update(len.to_le_bytes());
                 for item in s {
                     Self::write_bytes_with_hash(writer, hasher, item)?;
+                }
+            }
+            ValueData::SetInt(s) => {
+                writer.write_all(&[3u8])?;
+                hasher.update([3u8]);
+                let len = s.len() as u64;
+                writer.write_all(&len.to_le_bytes())?;
+                hasher.update(len.to_le_bytes());
+                for item in s {
+                    let mut buf = itoa::Buffer::new();
+                    let rendered = Bytes::copy_from_slice(buf.format(*item).as_bytes());
+                    Self::write_bytes_with_hash(writer, hasher, &rendered)?;
                 }
             }
             ValueData::SortedSet(zset) => {
@@ -548,11 +567,21 @@ trait StoredValueExt {
 
 impl StoredValueExt for StoredValue {
     fn from_data(data: ValueData, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data,
-            expire_at_ms,
-            encoding: Encoding::Raw,
-            lru_clock: 0,
+        match data {
+            ValueData::String(value) => StoredValue::string(value, expire_at_ms),
+            ValueData::StringInt(value) => StoredValue::string_int(value, expire_at_ms),
+            ValueData::Hash(value) => StoredValue::hash(value, expire_at_ms),
+            ValueData::List(value) => StoredValue::list(value, expire_at_ms),
+            ValueData::Set(value) => StoredValue::set(value, expire_at_ms),
+            ValueData::SetInt(value) => {
+                StoredValue::new(ValueData::SetInt(value), expire_at_ms, Encoding::IntSet)
+            }
+            ValueData::SortedSet(value) => StoredValue::sorted_set(value, expire_at_ms),
+            ValueData::Stream { entries, groups } => StoredValue::new(
+                ValueData::Stream { entries, groups },
+                expire_at_ms,
+                Encoding::StreamTree,
+            ),
         }
     }
 }

@@ -8,7 +8,8 @@ use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
     acl::AclState,
     eviction::{
-        EvictionConfig, EvictionPolicy, estimate_used_memory, needs_eviction, perform_eviction,
+        EvictionConfig, EvictionPolicy, estimate_object_memory, estimate_used_memory,
+        needs_eviction, perform_eviction,
     },
     expiry::{active_expire_cycle, detect_clock_jump},
     keyspace::{ServerState, SharedState},
@@ -24,8 +25,8 @@ use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
     persistence::{
-        PersistenceRuntime, apply_server_persistence_config, drain_bgrewriteaof_tasks,
-        drain_bgsave_tasks, flush_aof, load_startup_data, start_bgsave, sync_server_aof_file_info,
+        PersistenceRuntime, drain_bgrewriteaof_tasks, drain_bgsave_tasks, flush_aof,
+        load_startup_data, start_bgsave, sync_server_aof_file_info,
     },
     rate_limiter::ConnectionRateLimiter,
 };
@@ -95,6 +96,101 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
+fn apply_startup_config(initial_state: &mut ServerState, config: &ServerConfig) {
+    initial_state.config.set_bind(config.bind.clone());
+    initial_state.config.set_port(config.port);
+    initial_state.config.set_max_clients(config.max_clients);
+    initial_state
+        .config
+        .set_output_buffer_limit_bytes(config.output_buffer_limit_bytes);
+    initial_state
+        .config
+        .set_shutdown_grace_period_ms(config.shutdown_grace_period_ms);
+    initial_state
+        .config
+        .set_client_timeout_sec(config.client_timeout_sec);
+    initial_state.config.set_timeout(config.timeout);
+    initial_state
+        .config
+        .set_compatibility_mode(Bytes::from(config.compatibility_mode.clone()));
+    initial_state
+        .config
+        .set_protected_mode(Bytes::from(config.protected_mode.clone()));
+    initial_state.config.set_appendonly(config.appendonly);
+    initial_state
+        .config
+        .set_save(Bytes::from(config.save.clone()));
+    initial_state.config.set_dir(config.dir.clone());
+    initial_state
+        .config
+        .set_dbfilename(config.dbfilename.clone());
+    initial_state
+        .config
+        .set_appendfsync(Bytes::from(config.appendfsync.clone()));
+    initial_state.config.set_maxmemory(config.maxmemory);
+    initial_state
+        .config
+        .set_maxmemory_policy(Bytes::from(config.maxmemory_policy.clone()));
+    initial_state
+        .config
+        .set_maxmemory_samples(config.maxmemory_samples);
+    initial_state.config.set_hz(config.hz);
+    initial_state
+        .config
+        .set_notify_keyspace_events(Bytes::from(config.notify_keyspace_events.clone()));
+    initial_state
+        .config
+        .set_lazyfree_lazy_expire(config.lazyfree_lazy_expire);
+    initial_state
+        .config
+        .set_lazyfree_lazy_server_del(config.lazyfree_lazy_server_del);
+    initial_state
+        .config
+        .set_lazyfree_lazy_user_del(config.lazyfree_lazy_user_del);
+    initial_state
+        .config
+        .set_tcp_keepalive(config.tcp_keepalive_sec);
+    initial_state
+        .config
+        .set_pubsub_queue_hard_limit(config.pubsub_queue_hard_limit);
+    initial_state
+        .config
+        .set_pubsub_queue_soft_limit(config.pubsub_queue_soft_limit);
+    initial_state
+        .config
+        .set_pubsub_queue_soft_seconds(config.pubsub_queue_soft_seconds);
+    initial_state
+        .config
+        .set_active_expire_cycle_lookups(config.active_expire_cycle_lookups);
+    initial_state
+        .config
+        .set_active_expire_cycle_threshold_pct(config.active_expire_cycle_threshold_pct);
+    initial_state
+        .config
+        .set_query_buffer_limit(config.query_buffer_limit);
+    initial_state
+        .config
+        .set_output_buffer_flush_threshold(config.output_buffer_flush_threshold);
+    initial_state
+        .config
+        .set_client_write_timeout_sec(config.client_write_timeout_sec);
+    initial_state
+        .stats
+        .set_slowlog_log_slower_than_us(config.slowlog_log_slower_than_us);
+    initial_state
+        .stats
+        .set_slowlog_max_len(config.slowlog_max_len);
+    initial_state
+        .stats
+        .set_latency_tracking_enabled(config.latency_tracking);
+    initial_state.pubsub.set_queue_limits(
+        config.pubsub_queue_hard_limit,
+        config.pubsub_queue_soft_limit,
+        config.pubsub_queue_soft_seconds,
+    );
+    initial_state.set_aof_enabled(config.appendonly);
+}
+
 fn load_acl_state_from_disk(
     initial_state: &mut ServerState,
     config: &ServerConfig,
@@ -138,12 +234,13 @@ fn bootstrap_default_user_for_bind(
         return Ok(());
     }
 
-    if env_truthy(ALLOW_DEFAULT_USER_NOPASS_ENV) {
+    if !config.protected_mode_enabled() || env_truthy(ALLOW_DEFAULT_USER_NOPASS_ENV) {
         tracing::warn!(
             target = "ratatosk::security",
             bind = %config.bind,
             env = ALLOW_DEFAULT_USER_NOPASS_ENV,
-            "default ACL user remains nopass on a non-loopback bind by explicit operator opt-in"
+            protected_mode = %config.protected_mode,
+            "default ACL user remains nopass on a non-loopback bind (protected-mode disabled or explicit operator opt-in)"
         );
         return Ok(());
     }
@@ -173,7 +270,7 @@ fn bootstrap_default_user_for_bind(
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "non-loopback bind '{}' requires {} or {} (or {}=true for an explicitly insecure deployment)",
+                "protected-mode is enabled and non-loopback bind '{}' requires {} or {} (set 'protected-mode no' or {}=true for an explicitly insecure deployment)",
                 config.bind,
                 DEFAULT_USER_PASSWORD_ENV,
                 DEFAULT_USER_PASSWORD_HASH_ENV,
@@ -446,21 +543,37 @@ async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_s
         tracing::debug!(expired, "active expiry cycle removed keys");
     }
 
-    // 2. Eviction check (with cached memory estimate)
+    // 2. Eviction check (incremental O(1) tracking + periodic full-scan correction)
     let eviction_config = build_eviction_config(&server);
     if eviction_config.maxmemory > 0 {
-        let used = if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
-            let estimate = estimate_used_memory(&server);
+        // Periodic full-scan correction to fix drift in incremental counters.
+        if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
+            let full_scan = estimate_used_memory(&server);
+            let tracked = server_state.data.estimated_memory();
+
+            // Correct per-DB counters when drift exceeds 5%.
+            if full_scan > 0 {
+                let drift_pct =
+                    (full_scan as f64 - tracked as f64).abs() / full_scan as f64 * 100.0;
+                if drift_pct > 5.0 {
+                    // Reset per-DB counters from full scan.
+                    for db_idx in 0..server.db_count() {
+                        let db = server.db(db_idx);
+                        let db_mem: usize =
+                            db.iter().map(|(k, v)| estimate_object_memory(k, v)).sum();
+                        server_state.data.reset_memory(db_idx, db_mem);
+                    }
+                }
+            }
+
             server
                 .stats
-                .set_cached_memory_estimate(estimate as u64, *cron_tick);
-            // Record memory metric
-            crate::metrics::set_memory_used(estimate as u64);
-            estimate
-        } else {
-            server.stats.cached_memory_estimate() as usize
-        };
+                .set_cached_memory_estimate(full_scan as u64, *cron_tick);
+            crate::metrics::set_memory_used(full_scan as u64);
+        }
 
+        // Use O(1) incremental estimate for eviction decisions.
+        let used = server_state.data.estimated_memory();
         if needs_eviction(used, &eviction_config) {
             let evicted = perform_eviction(&mut server, &eviction_config);
             if evicted > 0 {
@@ -477,6 +590,11 @@ async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_s
     let memory_estimate_age_ticks =
         (*cron_tick).saturating_sub(server.stats.last_memory_estimate_tick());
     crate::metrics::set_memory_estimate_age_ticks(memory_estimate_age_ticks);
+    // Stamp the same value into stats so INFO memory reports the identical drift
+    // (the INFO command has no access to the live cron tick).
+    server
+        .stats
+        .set_memory_estimate_age_ticks(memory_estimate_age_ticks);
 
     // 3. Ops/sec sampling
     *cron_tick = cron_tick.wrapping_add(1);
@@ -559,11 +677,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     });
 
     let mut initial_state = ServerState::with_default_dbs();
+    apply_startup_config(&mut initial_state, &config);
     load_acl_state_from_disk(&mut initial_state, &config)?;
     bootstrap_default_user_for_bind(&mut initial_state, &config)?;
     initial_state.set_lazy_free_sender(lazy_free_tx);
     let server_state = Arc::new(SharedState::new(initial_state));
-    apply_server_persistence_config(&server_state, &config).await;
 
     let persistence = Arc::new(PersistenceRuntime::from_config(&config).map_err(|error| {
         io::Error::new(
@@ -939,6 +1057,28 @@ mod tests {
         let error =
             bootstrap_default_user_for_bind(&mut server, &config).expect_err("expected error");
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn protected_mode_no_allows_nopass_default_user_on_non_loopback_bind() {
+        let _guard = env_guard();
+        // SAFETY: test-only env isolation guarded by a process-wide mutex.
+        unsafe {
+            std::env::remove_var(DEFAULT_USER_PASSWORD_ENV);
+            std::env::remove_var(ALLOW_DEFAULT_USER_NOPASS_ENV);
+        }
+
+        let mut server = ServerState::with_default_dbs();
+        let config = ServerConfig {
+            bind: "0.0.0.0".to_string(),
+            protected_mode: "no".to_string(),
+            ..ServerConfig::default()
+        };
+
+        // protected-mode no is the documented insecure opt-out: startup proceeds
+        // even though the default user is still nopass on an exposed bind.
+        bootstrap_default_user_for_bind(&mut server, &config)
+            .expect("protected-mode no should permit a nopass default user");
     }
 
     #[test]

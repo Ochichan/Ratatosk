@@ -23,11 +23,13 @@ pub(super) fn cmd_persist(
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
-    let Some(entry) = db.get_mut(key) else {
+    let removed = db
+        .get(key)
+        .is_some_and(|entry| entry.expire_at_ms().is_some());
+    if !db.set_key_expiry(key, None) {
         return CommandOutcome::reply(RespFrame::Integer(0));
-    };
+    }
 
-    let removed = entry.expire_at_ms.take().is_some();
     CommandOutcome::reply(RespFrame::Integer(if removed { 1 } else { 0 }))
 }
 
@@ -472,7 +474,7 @@ pub(super) fn cmd_expire_with_mode(
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
-    let Some(current_expire) = db.get(key).map(|entry| entry.expire_at_ms) else {
+    let Some(current_expire) = db.get(key).map(|entry| entry.expire_at_ms()) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
 
@@ -485,8 +487,7 @@ pub(super) fn cmd_expire_with_mode(
         return CommandOutcome::reply(RespFrame::Integer(1));
     }
 
-    if let Some(entry) = db.get_mut(key) {
-        entry.expire_at_ms = Some(target);
+    if db.set_key_expiry(key, Some(target)) {
         return CommandOutcome::reply(RespFrame::Integer(1));
     }
 
@@ -512,7 +513,7 @@ pub(super) fn cmd_ttl_with_mode(
         return CommandOutcome::reply(RespFrame::Integer(-2));
     };
 
-    let Some(expire_at_ms) = entry.expire_at_ms else {
+    let Some(expire_at_ms) = entry.expire_at_ms() else {
         return CommandOutcome::reply(RespFrame::Integer(-1));
     };
 
@@ -548,7 +549,7 @@ pub(super) fn cmd_expiretime_with_mode(
         return CommandOutcome::reply(RespFrame::Integer(-2));
     };
 
-    let Some(expire_at_ms) = entry.expire_at_ms else {
+    let Some(expire_at_ms) = entry.expire_at_ms() else {
         return CommandOutcome::reply(RespFrame::Integer(-1));
     };
 

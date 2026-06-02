@@ -19,6 +19,7 @@ hashbrown = { workspace = true }
 smallvec = { workspace = true }
 rand = { workspace = true }
 itoa = { workspace = true }
+ryu = { workspace = true }
 argon2 = { workspace = true }
 crossbeam-channel = { workspace = true }
 parking_lot = { workspace = true }
@@ -36,3 +37,4 @@ mlua = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+serde_json = { workspace = true }

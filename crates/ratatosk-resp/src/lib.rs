@@ -13,6 +13,8 @@
 
 pub mod encode;
 pub mod frame;
+#[doc(hidden)]
+pub mod fuzz_support;
 pub mod parse;
 
 pub use encode::{encode, encode_to_vec, encoded_len};

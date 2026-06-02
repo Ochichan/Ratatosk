@@ -1,0 +1,31 @@
+# cargo-fuzz crate for the RESP parser/encoder.
+#
+# This is a SEPARATE workspace (note the empty [workspace] table at the bottom),
+# so the normal `cargo build/test --workspace` at the repo root never compiles it
+# and the stable toolchain gates are unaffected. It requires a nightly toolchain
+# + cargo-fuzz (libFuzzer). See README.md for how to run it.
+[package]
+name = "ratatosk-resp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.ratatosk-resp]
+path = ".."
+
+[[bin]]
+name = "resp_parse"
+path = "fuzz_targets/resp_parse.rs"
+test = false
+doc = false
+bench = false
+
+# Detach from the parent workspace so the root `cargo build --workspace` ignores
+# this crate (libFuzzer instrumentation only builds under `cargo fuzz`).
+[workspace]

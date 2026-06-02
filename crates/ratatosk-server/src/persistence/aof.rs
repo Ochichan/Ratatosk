@@ -689,15 +689,15 @@ mod tests {
             loaded
                 .db(0)
                 .get(&Bytes::from("from-rdb"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("1"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("1"))
         );
         assert_eq!(
             loaded
                 .db(0)
                 .get(&Bytes::from("from-aof"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("2"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("2"))
         );
     }
 
@@ -765,8 +765,8 @@ mod tests {
                 loaded
                     .db(0)
                     .get(&Bytes::from(key))
-                    .and_then(|entry| entry.as_string()),
-                Some(&Bytes::from(value))
+                    .and_then(|entry| entry.as_string_bytes()),
+                Some(Bytes::from(value))
             );
         }
     }
@@ -970,15 +970,15 @@ mod tests {
             loaded
                 .db(0)
                 .get(&Bytes::from("pre"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("rewrite"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("rewrite"))
         );
         assert_eq!(
             loaded
                 .db(0)
                 .get(&Bytes::from("post"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("rewrite"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("rewrite"))
         );
     }
 }

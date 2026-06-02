@@ -409,11 +409,11 @@ mod tests {
 
         let hello = db.get(&Bytes::from("hello")).expect("hello exists");
         assert_eq!(hello.as_string(), Some(&Bytes::from("world")));
-        assert_eq!(hello.expire_at_ms, None);
+        assert_eq!(hello.expire_at_ms(), None);
 
         let foo = db.get(&Bytes::from("foo")).expect("foo exists");
         assert_eq!(foo.as_string(), Some(&Bytes::from("bar")));
-        assert_eq!(foo.expire_at_ms, Some(9999999));
+        assert_eq!(foo.expire_at_ms(), Some(9999999));
     }
 
     #[test]
@@ -622,15 +622,15 @@ mod tests {
             loaded
                 .db(0)
                 .get(&Bytes::from("k"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("v"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("v"))
         );
         assert_eq!(
             loaded
                 .db(1)
                 .get(&Bytes::from("n"))
-                .and_then(|v| v.as_string()),
-            Some(&Bytes::from("1"))
+                .and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("1"))
         );
     }
 }

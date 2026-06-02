@@ -168,6 +168,8 @@ pub(super) fn cmd_object(
                         "hashtable"
                     } else if entry.is_list() {
                         "quicklist"
+                    } else if matches!(entry.data(), crate::keyspace::ValueData::SetInt(_)) {
+                        "intset"
                     } else if entry.is_set() {
                         "hashtable"
                     } else if entry.is_sorted_set() {
@@ -312,8 +314,8 @@ pub(super) fn cmd_sort(
 
     let mut values = if let Some(list) = entry.as_list() {
         list.iter().cloned().collect::<Vec<_>>()
-    } else if let Some(set) = entry.as_set() {
-        set.iter().cloned().collect::<Vec<_>>()
+    } else if let Some(set) = entry.set_members() {
+        set
     } else {
         return wrong_type_response();
     };

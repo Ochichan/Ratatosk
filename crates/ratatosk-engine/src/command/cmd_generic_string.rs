@@ -42,15 +42,15 @@ pub(super) fn cmd_lcs(
 
     let left = match db.get(key1) {
         None => Bytes::new(),
-        Some(entry) => match entry.as_string() {
-            Some(v) => v.clone(),
+        Some(entry) => match entry.as_string_bytes() {
+            Some(v) => v,
             None => return wrong_type_response(),
         },
     };
     let right = match db.get(key2) {
         None => Bytes::new(),
-        Some(entry) => match entry.as_string() {
-            Some(v) => v.clone(),
+        Some(entry) => match entry.as_string_bytes() {
+            Some(v) => v,
             None => return wrong_type_response(),
         },
     };

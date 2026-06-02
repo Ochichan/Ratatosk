@@ -21,9 +21,7 @@ pub fn save(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
             format!("creating RDB file '{}': {e}", path.display()),
         )
     })?;
-    let state = ServerState::new(snapshot.len());
-    state.load_from_rdb(snapshot.clone());
-    RdbSaver::new(file).save_state(&state)
+    RdbSaver::new(file).save_snapshot(snapshot)
 }
 
 impl<W: Write> RdbSaver<W> {
@@ -34,48 +32,77 @@ impl<W: Write> RdbSaver<W> {
         }
     }
 
+    /// Write the full RDB file directly from a `DbSnapshot`, avoiding an
+    /// intermediate `ServerState` construction and the associated clone.
+    pub fn save_snapshot(mut self, snapshot: &DbSnapshot) -> io::Result<()> {
+        self.write_preamble()?;
+
+        for (db_idx, db) in snapshot.iter().enumerate() {
+            if db.is_empty() {
+                continue;
+            }
+            self.write_db(db_idx, db)?;
+        }
+
+        self.write_eof()
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB EOF/CRC: {e}")))
+    }
+
     /// Write the full RDB file from the given server state.
     pub fn save_state(mut self, state: &ServerState) -> io::Result<()> {
-        self.write_header()
-            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB header: {e}")))?;
-        self.write_aux(b"redis-ver", b"7.0.0")
-            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))?;
-        self.write_aux(b"ratatosk-ver", b"0.1.0")
-            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))?;
+        self.write_preamble()?;
 
         for db_idx in 0..state.db_count() {
             let db = state.db(db_idx);
             if db.is_empty() {
                 continue;
             }
-
-            self.write_select_db(db_idx).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("writing RDB SELECTDB for db {db_idx}: {e}"),
-                )
-            })?;
-
-            let expires_count = db.values().filter(|v| v.expire_at_ms.is_some()).count();
-            self.write_resize_db(db.len(), expires_count).map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("writing RDB RESIZEDB for db {db_idx}: {e}"),
-                )
-            })?;
-
-            for (key, value) in db.iter() {
-                self.write_key_value(key, value).map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("writing RDB key-value in db {db_idx}: {e}"),
-                    )
-                })?;
-            }
+            self.write_db(db_idx, &db)?;
         }
 
         self.write_eof()
             .map_err(|e| io::Error::new(e.kind(), format!("writing RDB EOF/CRC: {e}")))
+    }
+
+    fn write_preamble(&mut self) -> io::Result<()> {
+        self.write_header()
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB header: {e}")))?;
+        self.write_aux(b"redis-ver", b"7.0.0")
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))?;
+        self.write_aux(b"ratatosk-ver", b"0.1.0")
+            .map_err(|e| io::Error::new(e.kind(), format!("writing RDB aux fields: {e}")))
+    }
+
+    fn write_db(
+        &mut self,
+        db_idx: usize,
+        db: &hashbrown::HashMap<Bytes, StoredValue>,
+    ) -> io::Result<()> {
+        self.write_select_db(db_idx).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("writing RDB SELECTDB for db {db_idx}: {e}"),
+            )
+        })?;
+
+        let expires_count = db.values().filter(|v| v.expire_at_ms().is_some()).count();
+        self.write_resize_db(db.len(), expires_count).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("writing RDB RESIZEDB for db {db_idx}: {e}"),
+            )
+        })?;
+
+        for (key, value) in db.iter() {
+            self.write_key_value(key, value).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("writing RDB key-value in db {db_idx}: {e}"),
+                )
+            })?;
+        }
+
+        Ok(())
     }
 
     fn write_bytes(&mut self, data: &[u8]) -> io::Result<()> {
@@ -107,17 +134,23 @@ impl<W: Write> RdbSaver<W> {
 
     fn write_key_value(&mut self, key: &Bytes, value: &StoredValue) -> io::Result<()> {
         // Write expiry if present
-        if let Some(expire_ms) = value.expire_at_ms {
+        if let Some(expire_ms) = value.expire_at_ms() {
             self.write_bytes(&[RDB_OPCODE_EXPIRETIME_MS])?;
             self.write_bytes(&expire_ms.to_le_bytes())?;
         }
 
         // Write type byte + key + value data
-        match &value.data {
+        match value.data() {
             ValueData::String(s) => {
                 self.write_bytes(&[RDB_TYPE_STRING])?;
                 self.write_string(key)?;
                 self.write_string(s)?;
+            }
+            ValueData::StringInt(n) => {
+                self.write_bytes(&[RDB_TYPE_STRING])?;
+                self.write_string(key)?;
+                let mut buf = itoa::Buffer::new();
+                self.write_string(buf.format(*n).as_bytes())?;
             }
             ValueData::List(list) => {
                 self.write_bytes(&[RDB_TYPE_LIST])?;
@@ -133,6 +166,15 @@ impl<W: Write> RdbSaver<W> {
                 self.write_length(set.len() as u64)?;
                 for member in set {
                     self.write_string(member)?;
+                }
+            }
+            ValueData::SetInt(set) => {
+                self.write_bytes(&[RDB_TYPE_SET])?;
+                self.write_string(key)?;
+                self.write_length(set.len() as u64)?;
+                for member in set {
+                    let mut buf = itoa::Buffer::new();
+                    self.write_string(buf.format(*member).as_bytes())?;
                 }
             }
             ValueData::Hash(hash) => {

@@ -37,20 +37,19 @@ pub(super) fn cmd_sdiff(
     let Some(first_entry) = db.get(first_key) else {
         return CommandOutcome::reply(RespFrame::Array(vec![]));
     };
-    let Some(first_set) = first_entry.as_set() else {
+    let Some(mut result) = first_entry.set_as_hashset() else {
         return wrong_type_response();
     };
 
-    let mut result = first_set.clone();
     for key in others {
         purge_expired_key(&mut db, key, now);
         let Some(entry) = db.get(key) else {
             continue;
         };
-        let Some(other_set) = entry.as_set() else {
+        let Some(other_set) = entry.set_members() else {
             return wrong_type_response();
         };
-        for member in other_set {
+        for member in &other_set {
             result.remove(member);
         }
         if result.is_empty() {
@@ -81,17 +80,20 @@ pub(super) fn cmd_sinter(
         let Some(entry) = db.get(key) else {
             return CommandOutcome::reply(RespFrame::Array(vec![]));
         };
-        let Some(set) = entry.as_set() else {
+        if !entry.is_set() {
             return wrong_type_response();
-        };
-        sets.push(set);
+        }
+        sets.push(entry);
     }
 
     let mut smallest_idx = 0usize;
     let mut smallest_len = usize::MAX;
-    for (idx, set) in sets.iter().enumerate() {
-        if set.len() < smallest_len {
-            smallest_len = set.len();
+    for (idx, entry) in sets.iter().enumerate() {
+        let Some(len) = entry.set_len() else {
+            return wrong_type_response();
+        };
+        if len < smallest_len {
+            smallest_len = len;
             smallest_idx = idx;
         }
     }
@@ -100,10 +102,17 @@ pub(super) fn cmd_sinter(
         return CommandOutcome::reply(RespFrame::Array(vec![]));
     }
 
-    let base_set = sets.swap_remove(smallest_idx);
+    let Some(base_set) = sets[smallest_idx].set_members() else {
+        return wrong_type_response();
+    };
     let mut result = Vec::with_capacity(base_set.len());
-    for member in base_set {
-        if sets.iter().all(|set| set.contains(member)) {
+    for member in &base_set {
+        if sets
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != smallest_idx)
+            .all(|(_, entry)| entry.set_contains(member).unwrap_or(false))
+        {
             result.push(RespFrame::BulkString(Some(member.clone())));
         }
     }
@@ -168,11 +177,11 @@ pub(super) fn cmd_sintercard(
         let Some(entry) = db.get(key) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
         };
-        let Some(set) = entry.as_set() else {
+        let Some(len) = entry.set_len() else {
             return wrong_type_response();
         };
-        if set.len() < smallest_len {
-            smallest_len = set.len();
+        if len < smallest_len {
+            smallest_len = len;
             smallest_idx = i;
         }
     }
@@ -184,12 +193,12 @@ pub(super) fn cmd_sintercard(
     let Some(base_entry) = db.get(&keys[smallest_idx]) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(base_set) = base_entry.as_set() else {
+    let Some(base_set) = base_entry.set_members() else {
         return wrong_type_response();
     };
 
     let mut cardinality = 0i64;
-    for member in base_set {
+    for member in &base_set {
         let mut present_in_all = true;
         for (i, key) in keys.iter().enumerate() {
             if i == smallest_idx {
@@ -199,10 +208,10 @@ pub(super) fn cmd_sintercard(
                 present_in_all = false;
                 break;
             };
-            let Some(set) = entry.as_set() else {
+            let Some(contains) = entry.set_contains(member) else {
                 return wrong_type_response();
             };
-            if !set.contains(member) {
+            if !contains {
                 present_in_all = false;
                 break;
             }
@@ -237,10 +246,10 @@ pub(super) fn cmd_sunion(
         let Some(entry) = db.get(key) else {
             continue;
         };
-        let Some(set) = entry.as_set() else {
+        let Some(set) = entry.set_members() else {
             return wrong_type_response();
         };
-        result.extend(set.iter().cloned());
+        result.extend(set);
     }
 
     CommandOutcome::reply(set_result_array(result))
@@ -265,8 +274,8 @@ pub(super) fn cmd_sdiffstore(
 
     let mut result = match db.get(&source_keys[0]) {
         None => HashSet::new(),
-        Some(entry) => match entry.as_set() {
-            Some(set) => set.clone(),
+        Some(entry) => match entry.set_as_hashset() {
+            Some(set) => set,
             None => return wrong_type_response(),
         },
     };
@@ -276,10 +285,10 @@ pub(super) fn cmd_sdiffstore(
         let Some(entry) = db.get(key) else {
             continue;
         };
-        let Some(set) = entry.as_set() else {
+        let Some(set) = entry.set_members() else {
             return wrong_type_response();
         };
-        for member in set {
+        for member in &set {
             result.remove(member);
         }
         if result.is_empty() {
@@ -323,10 +332,10 @@ pub(super) fn cmd_sinterstore(
                 sets.clear();
                 break;
             };
-            let Some(set) = entry.as_set() else {
+            if !entry.is_set() {
                 return wrong_type_response();
-            };
-            sets.push(set);
+            }
+            sets.push(entry);
         }
 
         if sets.is_empty() {
@@ -334,9 +343,12 @@ pub(super) fn cmd_sinterstore(
         } else {
             let mut smallest_idx = 0usize;
             let mut smallest_len = usize::MAX;
-            for (idx, set) in sets.iter().enumerate() {
-                if set.len() < smallest_len {
-                    smallest_len = set.len();
+            for (idx, entry) in sets.iter().enumerate() {
+                let Some(len) = entry.set_len() else {
+                    return wrong_type_response();
+                };
+                if len < smallest_len {
+                    smallest_len = len;
                     smallest_idx = idx;
                 }
             }
@@ -344,10 +356,17 @@ pub(super) fn cmd_sinterstore(
             if smallest_len == 0 {
                 HashSet::new()
             } else {
-                let base_set = sets.swap_remove(smallest_idx);
+                let Some(base_set) = sets[smallest_idx].set_members() else {
+                    return wrong_type_response();
+                };
                 let mut result = HashSet::with_capacity(base_set.len());
-                for member in base_set {
-                    if sets.iter().all(|set| set.contains(member)) {
+                for member in &base_set {
+                    if sets
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != smallest_idx)
+                        .all(|(_, entry)| entry.set_contains(member).unwrap_or(false))
+                    {
                         result.insert(member.clone());
                     }
                 }
@@ -388,10 +407,10 @@ pub(super) fn cmd_sunionstore(
         let Some(entry) = db.get(key) else {
             continue;
         };
-        let Some(set) = entry.as_set() else {
+        let Some(set) = entry.set_members() else {
             return wrong_type_response();
         };
-        result.extend(set.iter().cloned());
+        result.extend(set);
     }
 
     let stored_len = result.len() as i64;

@@ -262,7 +262,10 @@ mod tests {
 
         let count = db.get(&Bytes::from("count"));
         assert!(count.is_some());
-        assert_eq!(count.and_then(|v| v.as_string()), Some(&Bytes::from("42")));
+        assert_eq!(
+            count.and_then(|v| v.as_string_bytes()),
+            Some(Bytes::from("42"))
+        );
     }
 
     #[test]

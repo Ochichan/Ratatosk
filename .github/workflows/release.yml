@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write # keyless cosign signing via GitHub OIDC (operator opt-in)
 
 jobs:
   quality:
@@ -36,17 +37,8 @@ jobs:
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Build check
-        run: cargo check --workspace --quiet
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace --quiet
+      - name: Verify workspace
+        run: ./scripts/verify_workspace.sh
 
       - name: Cargo deny
         run: cargo deny check advisories bans licenses sources
@@ -101,6 +93,26 @@ jobs:
             sha256sum "$archive" > "$archive.sha256"
           fi
 
+      # Keyless signing via GitHub OIDC (Sigstore) — no long-lived keys to manage.
+      # Operator opt-in: set repository variable RATATOSK_ENABLE_SIGNING=true.
+      # Produces <archive>.sig + <archive>.crt, verifiable with `cosign verify-blob`.
+      - name: Install cosign
+        if: vars.RATATOSK_ENABLE_SIGNING == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign release archives (keyless)
+        if: vars.RATATOSK_ENABLE_SIGNING == 'true'
+        env:
+          COSIGN_YES: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          for archive in release/*.tar.gz; do
+            cosign sign-blob --yes "$archive" \
+              --output-signature "$archive.sig" \
+              --output-certificate "$archive.crt"
+          done
+
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -108,6 +120,8 @@ jobs:
           path: |
             release/*.tar.gz
             release/*.sha256
+            release/*.sig
+            release/*.crt
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
@@ -115,3 +129,5 @@ jobs:
           files: |
             release/*.tar.gz
             release/*.sha256
+            release/*.sig
+            release/*.crt

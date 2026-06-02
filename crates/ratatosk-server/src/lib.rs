@@ -7,7 +7,8 @@
 //!   and lazy-free background thread management.
 //! - [`client`] — Per-client I/O task: read → parse → execute → write pipeline
 //!   with query buffer limits, output buffer limits, and pub/sub message drain.
-//! - [`config`] — Server configuration from environment variables.
+//! - [`config`] — Server configuration resolution from defaults, Redis-style
+//!   config files, and environment overrides.
 //! - [`io_thread`] — I/O thread pool (placeholder for future parallel I/O).
 
 pub mod breadcrumbs;

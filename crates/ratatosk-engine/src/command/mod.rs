@@ -3832,7 +3832,7 @@ impl ClientState {
         }
     }
 
-    fn reset_for_connection(&mut self) {
+    pub(crate) fn reset_for_connection(&mut self) {
         self.selected_db = 0;
         self.name = None;
         self.authenticated = false;
@@ -3978,6 +3978,16 @@ pub fn execute_argv(
             queue.push(argv.to_vec());
         }
         return CommandOutcome::reply(RespFrame::queued());
+    }
+
+    // Strict compatibility-mode gate (Phase 0 product-boundary guard): reject
+    // commands Ratatosk only accepts syntactically or whose Redis durability /
+    // replication contract a single node cannot honour, instead of returning a
+    // misleading success-shaped reply. Default `compat` mode skips this entirely.
+    if server.config.is_strict_compatibility() {
+        if let Some(strict_err) = cmd_command_metadata::strict_mode_error(argv) {
+            return CommandOutcome::reply(strict_err);
+        }
     }
 
     let args = &argv[1..];
@@ -5112,6 +5122,321 @@ mod tests {
         );
     }
 
+    fn assert_strict_blocked(frame: &RespFrame, command: &str) {
+        match frame {
+            RespFrame::Error(msg) => {
+                let text = String::from_utf8_lossy(msg);
+                assert!(
+                    text.contains("strict compatibility mode"),
+                    "expected strict-mode error for `{command}`, got: {text}"
+                );
+            }
+            other => panic!("expected strict-mode error for `{command}`, got {other:?}"),
+        }
+    }
+
+    fn assert_not_strict_blocked(frame: &RespFrame, command: &str) {
+        if let RespFrame::Error(msg) = frame {
+            let text = String::from_utf8_lossy(msg);
+            assert!(
+                !text.contains("strict compatibility mode"),
+                "command `{command}` should not be strict-blocked, got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_docs_exposes_capability_tier_for_every_command() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        let known_tiers = [
+            "behavioral_subset",
+            "baseline_local",
+            "syntax_only",
+            "unsupported",
+        ];
+
+        let docs = run(&["COMMAND", "DOCS"], &mut server, &mut client);
+        let RespFrame::Map(rows) = docs else {
+            panic!("COMMAND DOCS should return a map");
+        };
+
+        // Every registered command must appear with a capability tier; a missing
+        // tier is exactly the silent-success risk Phase 0 guards against.
+        assert_eq!(
+            rows.len(),
+            command_spec_count(),
+            "COMMAND DOCS must cover every registered command spec"
+        );
+
+        for (name, entry) in &rows {
+            let RespFrame::BulkString(Some(name)) = name else {
+                panic!("COMMAND DOCS entry name should be a bulk string");
+            };
+            let name = String::from_utf8_lossy(name);
+            let RespFrame::Map(fields) = entry else {
+                panic!("COMMAND DOCS entry for `{name}` should be a map");
+            };
+            let tier = fields.iter().find_map(|(key, value)| {
+                if *key == RespFrame::bulk_str("ratatosk_capability_tier") {
+                    if let RespFrame::BulkString(Some(tier)) = value {
+                        return Some(String::from_utf8_lossy(tier).into_owned());
+                    }
+                }
+                None
+            });
+            let tier = tier
+                .unwrap_or_else(|| panic!("`{name}` is missing ratatosk_capability_tier in DOCS"));
+            assert!(
+                known_tiers.contains(&tier.as_str()),
+                "`{name}` has unknown capability tier `{tier}`"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_mode_blocks_unsupported_and_metadata_commands() {
+        let mut server = ServerState::with_default_dbs();
+        server
+            .config
+            .set_compatibility_mode(Bytes::from_static(b"strict"));
+        let mut client = ClientState::default();
+
+        // WAIT/WAITAOF imply replica-backed acknowledgement; CLUSTER/SENTINEL/
+        // FUNCTION/FCALL are unsupported; READONLY/CLIENT UNBLOCK are syntax_only;
+        // CLIENT PAUSE is unsupported. All must surface a structured strict error.
+        for parts in [
+            vec!["WAIT", "0", "100"],
+            vec!["WAITAOF", "0", "0", "100"],
+            vec!["CLUSTER", "SETSLOT", "1", "STABLE"],
+            vec!["SENTINEL", "MASTERS"],
+            vec!["FUNCTION", "LOAD", "code"],
+            vec!["FCALL", "f", "0"],
+            vec!["READONLY"],
+            vec!["CLIENT", "UNBLOCK", "1"],
+            vec!["CLIENT", "PAUSE", "100"],
+        ] {
+            let frame = run(&parts, &mut server, &mut client);
+            assert_strict_blocked(&frame, &parts.join(" "));
+        }
+    }
+
+    #[test]
+    fn strict_mode_allows_supported_commands() {
+        let mut server = ServerState::with_default_dbs();
+        server
+            .config
+            .set_compatibility_mode(Bytes::from_static(b"strict"));
+        let mut client = ClientState::default();
+
+        assert_eq!(
+            run(&["SET", "k", "v"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["GET", "k"], &mut server, &mut client),
+            RespFrame::bulk_str("v")
+        );
+        // Introspection that clients rely on to discover capability tiers must
+        // stay available even in strict mode.
+        for parts in [
+            vec!["PING"],
+            vec!["CLIENT", "LIST"],
+            vec!["CONFIG", "GET", "compatibility-mode"],
+            vec!["CLUSTER", "INFO"],
+            vec!["COMMAND", "DOCS", "GET"],
+        ] {
+            let frame = run(&parts, &mut server, &mut client);
+            assert_not_strict_blocked(&frame, &parts.join(" "));
+        }
+    }
+
+    #[test]
+    fn compat_mode_is_default_and_does_not_block() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        assert!(!server.config.is_strict_compatibility());
+
+        // The same commands strict mode rejects pass through untouched by default.
+        for parts in [vec!["WAIT", "0", "0"], vec!["READONLY"]] {
+            let frame = run(&parts, &mut server, &mut client);
+            assert_not_strict_blocked(&frame, &parts.join(" "));
+        }
+    }
+
+    #[test]
+    fn capability_tier_matches_gap_ledger_for_every_spec() {
+        // 3-way consistency guard (ship gate #4): the tier the engine reports via
+        // COMMAND DOCS (`command_capability_tier`) must equal the gap-ledger
+        // source of truth for every command that exists both as a runtime spec
+        // and a ledger entry. Tiers were audited per-command on 2026-06-02.
+        let ledger_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/redis-gap-ledger.json"
+        );
+        let raw = std::fs::read_to_string(ledger_path).expect("read gap ledger");
+        let ledger: serde_json::Value = serde_json::from_str(&raw).expect("parse gap ledger");
+        let commands = ledger["commands"].as_array().expect("commands array");
+        let ledger_tier: std::collections::HashMap<&str, &str> = commands
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().expect("name"),
+                    c["capability_tier"].as_str().expect("tier"),
+                )
+            })
+            .collect();
+
+        let mut mismatches = Vec::new();
+        let mut checked = 0usize;
+        for spec in super::registry::all_command_specs() {
+            if let Some(expected) = ledger_tier.get(spec.name) {
+                checked += 1;
+                let actual = super::cmd_command_metadata::command_capability_tier(spec);
+                if actual != *expected {
+                    mismatches.push(format!("{}: code={actual} ledger={expected}", spec.name));
+                }
+            }
+        }
+        assert!(checked > 300, "expected to check most specs, got {checked}");
+        assert!(
+            mismatches.is_empty(),
+            "code vs gap-ledger capability-tier mismatches ({}):\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn strict_mode_blocks_every_unsupported_and_syntax_only_command() {
+        // Exhaustive guard (Phase 5): over the *entire* registered command set,
+        // strict mode must reject exactly the commands whose capability tier is
+        // `unsupported`/`syntax_only`, plus `WAIT`/`WAITAOF`, and nothing else.
+        // Any drift in the tier table or the strict policy flips a command here.
+        let mut blocked_total = 0usize;
+        for spec in super::registry::all_command_specs() {
+            let argv: Vec<Bytes> = spec
+                .name
+                .split(' ')
+                .map(|part| Bytes::copy_from_slice(part.as_bytes()))
+                .collect();
+            let blocked = super::cmd_command_metadata::strict_mode_error(&argv).is_some();
+            let tier = super::cmd_command_metadata::command_capability_tier(spec);
+            let policy_blocked = matches!(tier, "unsupported" | "syntax_only")
+                || matches!(spec.name, "WAIT" | "WAITAOF");
+            assert_eq!(
+                blocked, policy_blocked,
+                "strict-mode decision for `{}` (tier={tier}) disagrees with the documented policy",
+                spec.name
+            );
+            if blocked {
+                blocked_total += 1;
+            }
+        }
+        // Sanity: the blocked set is non-trivial (guards against a no-op policy).
+        assert!(
+            blocked_total >= 50,
+            "expected strict mode to block a substantial set, got {blocked_total}"
+        );
+    }
+
+    #[test]
+    fn config_set_compatibility_mode_toggles_strict_at_runtime() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // Default reports compat through CONFIG GET.
+        assert_eq!(
+            run(
+                &["CONFIG", "GET", "compatibility-mode"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("compatibility-mode"),
+                RespFrame::bulk_str("compat"),
+            ])
+        );
+
+        // WAIT is allowed in compat mode.
+        assert_not_strict_blocked(&run(&["WAIT", "0", "0"], &mut server, &mut client), "WAIT");
+
+        // Flip to strict at runtime and confirm the gate now fires.
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "compatibility-mode", "strict"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert!(server.config.is_strict_compatibility());
+        assert_strict_blocked(&run(&["WAIT", "0", "0"], &mut server, &mut client), "WAIT");
+
+        // Invalid values are rejected.
+        match run(
+            &["CONFIG", "SET", "compatibility-mode", "bogus"],
+            &mut server,
+            &mut client,
+        ) {
+            RespFrame::Error(_) => {}
+            other => panic!("expected error for invalid compatibility-mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_get_set_protected_mode_round_trips() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // Default reports yes through CONFIG GET.
+        assert_eq!(
+            run(
+                &["CONFIG", "GET", "protected-mode"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("protected-mode"),
+                RespFrame::bulk_str("yes"),
+            ])
+        );
+        assert!(server.config.is_protected_mode());
+
+        // Toggle to no at runtime and confirm CONFIG GET reflects it.
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "protected-mode", "no"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert!(!server.config.is_protected_mode());
+        assert_eq!(
+            run(
+                &["CONFIG", "GET", "protected-mode"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("protected-mode"),
+                RespFrame::bulk_str("no"),
+            ])
+        );
+
+        // Invalid values are rejected.
+        match run(
+            &["CONFIG", "SET", "protected-mode", "bogus"],
+            &mut server,
+            &mut client,
+        ) {
+            RespFrame::Error(_) => {}
+            other => panic!("expected error for invalid protected-mode, got {other:?}"),
+        }
+    }
+
     #[test]
     fn select_switches_database() {
         let mut server = ServerState::with_default_dbs();
@@ -6005,6 +6330,8 @@ mod tests {
         assert!(info_server_text.contains("redis_mode:standalone"));
         assert!(info_server_text.contains("health_status:healthy"));
         assert!(info_server_text.contains("bridge_contract_version:0.1"));
+        assert!(info_server_text.contains("ratatosk_compatibility_mode:compat"));
+        assert!(info_server_text.contains("ratatosk_protected_mode:yes"));
 
         let info_keyspace = run(&["INFO", "KEYSPACE"], &mut server, &mut client);
         let RespFrame::BulkString(Some(info_keyspace)) = info_keyspace else {
@@ -10969,6 +11296,60 @@ mod tests {
         assert!(
             text.contains("|aof_write_latched:true|"),
             "expected aof_write_latched in health report, got {text}"
+        );
+        assert!(
+            text.contains("|reasons:AOF writes are latched after an I/O error: disk full"),
+            "expected human-readable latch reason in health report, got {text}"
+        );
+    }
+
+    #[test]
+    fn ping_health_reports_no_reasons_when_healthy() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let reply = run(&["PING", "HEALTH"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+        assert!(
+            text.contains("status:healthy|"),
+            "expected healthy status, got {text}"
+        );
+        assert!(
+            text.contains("|reasons:none|"),
+            "expected reasons:none on a healthy server, got {text}"
+        );
+    }
+
+    #[test]
+    fn info_memory_section_reports_used_and_maxmemory() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+
+        let reply = run(&["INFO", "MEMORY"], &mut server, &mut client);
+        let RespFrame::BulkString(Some(body)) = &reply else {
+            panic!("expected BulkString, got {reply:?}");
+        };
+        let text = std::str::from_utf8(body).expect("valid utf8");
+        assert!(
+            text.contains("# Memory"),
+            "missing # Memory section: {text}"
+        );
+        assert!(text.contains("used_memory:"), "missing used_memory: {text}");
+        assert!(
+            text.contains("used_memory_human:"),
+            "missing used_memory_human: {text}"
+        );
+        assert!(text.contains("maxmemory:"), "missing maxmemory: {text}");
+        assert!(
+            text.contains("maxmemory_policy:noeviction"),
+            "missing maxmemory_policy: {text}"
+        );
+        assert!(
+            text.contains("mem_estimate_age_ticks:"),
+            "missing mem_estimate_age_ticks: {text}"
         );
     }
 

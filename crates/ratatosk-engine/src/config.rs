@@ -4,6 +4,12 @@ use bytes::Bytes;
 
 #[derive(Debug, Clone)]
 pub struct ConfigState {
+    bind: String,
+    port: u16,
+    max_clients: usize,
+    output_buffer_limit_bytes: usize,
+    shutdown_grace_period_ms: u64,
+    client_timeout_sec: u64,
     timeout: i64,
     appendonly: bool,
     save: Bytes,
@@ -27,11 +33,19 @@ pub struct ConfigState {
     query_buffer_limit: usize,
     output_buffer_flush_threshold: usize,
     client_write_timeout_sec: u64,
+    compatibility_mode: Bytes,
+    protected_mode: Bytes,
 }
 
 impl Default for ConfigState {
     fn default() -> Self {
         Self {
+            bind: "127.0.0.1".to_string(),
+            port: 6379,
+            max_clients: 4096,
+            output_buffer_limit_bytes: 8 * 1024 * 1024,
+            shutdown_grace_period_ms: 10_000,
+            client_timeout_sec: 0,
             timeout: 0,
             appendonly: false,
             save: Bytes::from_static(b"3600 1 300 100 60 10000"),
@@ -55,11 +69,61 @@ impl Default for ConfigState {
             query_buffer_limit: 1_048_576,
             output_buffer_flush_threshold: 16_384,
             client_write_timeout_sec: 5,
+            compatibility_mode: Bytes::from_static(b"compat"),
+            protected_mode: Bytes::from_static(b"yes"),
         }
     }
 }
 
 impl ConfigState {
+    pub fn bind(&self) -> &str {
+        &self.bind
+    }
+
+    pub fn set_bind(&mut self, value: String) {
+        self.bind = value;
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn set_port(&mut self, value: u16) {
+        self.port = value;
+    }
+
+    pub fn max_clients(&self) -> usize {
+        self.max_clients
+    }
+
+    pub fn set_max_clients(&mut self, value: usize) {
+        self.max_clients = value.max(1);
+    }
+
+    pub fn output_buffer_limit_bytes(&self) -> usize {
+        self.output_buffer_limit_bytes
+    }
+
+    pub fn set_output_buffer_limit_bytes(&mut self, value: usize) {
+        self.output_buffer_limit_bytes = value.max(1);
+    }
+
+    pub fn shutdown_grace_period_ms(&self) -> u64 {
+        self.shutdown_grace_period_ms
+    }
+
+    pub fn set_shutdown_grace_period_ms(&mut self, value: u64) {
+        self.shutdown_grace_period_ms = value.max(1);
+    }
+
+    pub fn client_timeout_sec(&self) -> u64 {
+        self.client_timeout_sec
+    }
+
+    pub fn set_client_timeout_sec(&mut self, value: u64) {
+        self.client_timeout_sec = value;
+    }
+
     pub fn timeout(&self) -> i64 {
         self.timeout
     }
@@ -242,5 +306,44 @@ impl ConfigState {
 
     pub fn set_client_write_timeout_sec(&mut self, value: u64) {
         self.client_write_timeout_sec = value.clamp(1, 3600);
+    }
+
+    pub fn compatibility_mode(&self) -> &Bytes {
+        &self.compatibility_mode
+    }
+
+    pub fn set_compatibility_mode(&mut self, value: Bytes) {
+        self.compatibility_mode = value;
+    }
+
+    /// True when the server runs in strict compatibility mode.
+    ///
+    /// In strict mode, commands that Ratatosk only accepts syntactically
+    /// (`syntax_only`/`unsupported` capability tier) or that imply a durability
+    /// or replication guarantee a single-node server cannot honour (`WAIT`,
+    /// `WAITAOF`) are rejected with a structured error instead of silently
+    /// returning a success-shaped reply. Default mode is `compat`.
+    pub fn is_strict_compatibility(&self) -> bool {
+        self.compatibility_mode.as_ref() == b"strict"
+    }
+
+    pub fn protected_mode(&self) -> &Bytes {
+        &self.protected_mode
+    }
+
+    pub fn set_protected_mode(&mut self, value: Bytes) {
+        self.protected_mode = value;
+    }
+
+    /// True when protected mode is enabled (the default).
+    ///
+    /// In protected mode, a non-loopback bind refuses to start while the
+    /// `default` ACL user is still `nopass`, unless an operator supplies a
+    /// password (`RATATOSK_DEFAULT_USER_PASSWORD`/`_HASH`) or explicitly opts
+    /// out (`protected-mode no` / `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true`).
+    /// This keeps small exposed deployments from silently accepting
+    /// unauthenticated traffic. Default mode is `yes`.
+    pub fn is_protected_mode(&self) -> bool {
+        self.protected_mode.as_ref().eq_ignore_ascii_case(b"yes")
     }
 }

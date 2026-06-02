@@ -1,6 +1,16 @@
 # Ratatosk
 
-Ratatosk is a standalone, Redis-compatible in-memory data server written in Rust.
+Ratatosk is a single-node, Redis-compatible, RESP2/RESP3 in-memory server for
+cache, Pub/Sub, and local durability. It is **not** a Redis Cluster, Sentinel, or
+replication-compatible drop-in replacement. Every command exposes a capability
+tier (`COMMAND DOCS`); the supported subset is tested against Redis/Valkey.
+
+The command surface is broad (420 entries) but **semantics vary by tier** —
+"command name exists" is not "identical to Redis". Run with
+`compatibility-mode strict` to make unsupported and syntax-only commands fail
+loudly instead of returning a misleading success. See
+[`docs/PRODUCT_CONTRACT.md`](docs/PRODUCT_CONTRACT.md) for the full boundary and
+tier policy.
 
 Current project boundary:
 
@@ -12,12 +22,11 @@ Current project boundary:
 
 For the detailed implementation boundary, see:
 
-- `docs/capability-declarations.md`
-- `docs/architecture-ratatosk.md`
-- `docs/redis-gap-analysis.md`
-- `docs/redis-gap-ledger.md`
-- `docs/product-contract.md`
-- `docs/ship-readiness-plan.md`
+- `docs/PRODUCT_CONTRACT.md` (product boundary, capability-tier policy, strict/compat mode — the single source of the contract)
+- `docs/architecture.md` (architecture, internals, capability declarations, Redis gap analysis, command ledger)
+- `docs/operations.md` (configuration, ecosystem, health, observability, product contract, ship readiness)
+- `docs/optimization.md` (performance baseline, RAM/CPU optimization plan and checklist)
+- `docs/RELEASE_ROADMAP.md` (live v1.0.0 GA execution tracker: phases, exit gates, ship gate, verification commands)
 
 ## Workspace Layout
 
@@ -48,6 +57,35 @@ For the detailed implementation boundary, see:
 cargo run -p ratatosk-server --bin ratatosk --release
 ```
 
+Ratatosk resolves configuration in this order:
+
+- built-in defaults
+- `--config /path/to/ratatosk.conf`
+- `RATATOSK_CONFIG=/path/to/ratatosk.conf`
+- auto-loaded `./ratatosk.conf` when present
+- environment variable overrides
+
+Disable implicit local config discovery when you want explicit startup only:
+
+- `--no-config-autoload`
+- `RATATOSK_DISABLE_CONFIG_AUTOLOAD=true`
+
+Useful operator commands:
+
+```bash
+# Validate the resolved configuration and startup preflight checks
+cargo run -p ratatosk-server --bin ratatosk -- --check-config
+
+# Inspect the effective config in Redis-style text form
+cargo run -p ratatosk-server --bin ratatosk -- --print-config text
+
+# Inspect the same config in JSON
+cargo run -p ratatosk-server --bin ratatosk -- --print-config json
+
+# Start with an explicit config file
+cargo run -p ratatosk-server --bin ratatosk -- --config ./ratatosk.conf
+```
+
 Default listener:
 
 - `127.0.0.1:6379`
@@ -59,8 +97,15 @@ Recommended coexistence port when Redis may also be running:
 Remote bind hardening:
 
 - non-loopback bind still requires `RATATOSK_ALLOW_INSECURE_BIND=true`
-- for non-loopback bind, set `RATATOSK_DEFAULT_USER_PASSWORD=...` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH=...`
-- `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true` is still available, but it is an explicitly insecure operator override
+- `protected-mode yes` (the default) makes a non-loopback bind refuse to start while the `default` ACL user is still `nopass`
+- for non-loopback bind, set `RATATOSK_DEFAULT_USER_PASSWORD=...` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH=...` to bootstrap a password
+- `protected-mode no` (or `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true`) is the explicitly insecure operator opt-out
+
+Config workflow:
+
+- the shipped [`ratatosk.conf`](ratatosk.conf) is a real startup config, not a placeholder
+- `CONFIG REWRITE` persists the current runtime config back to `ratatosk.conf` under the active `dir`
+- file values with spaces are emitted with quoting so generated configs round-trip cleanly
 
 ## Nix
 
@@ -98,12 +143,7 @@ CI mirrors the same baseline in `.github/workflows/rust-ci.yml`.
 
 ## Key Docs
 
-- `docs/ecosystem.md`: deployment and integration guidance
-- `docs/persistence.md`: RDB/AOF runtime model
-- `docs/eviction-and-expiry.md`: memory and TTL behavior
-- `docs/performance.md`: benchmark baseline and guardrails
-- `docs/observability.md`: metrics, alerting, dashboard starter pack
-- `docs/support-and-versioning-policy.md`: release, support, and semver policy
-- `docs/product-contract.md`: v1 standalone product boundary
-- `docs/ship-readiness-plan.md`: full ship-readiness scorecard and roadmap
+- `docs/architecture.md`: architecture, eviction/expiry, persistence, capability declarations, Redis gap analysis, command ledger
+- `docs/operations.md`: configuration, ecosystem integration, ports, health protocol, observability, product contract, versioning policy, ship readiness
+- `docs/optimization.md`: performance baseline, RAM/CPU optimization master plan, execution checklist
 - `AUTOSTART_RUNBOOK_KO.md`: systemd user autostart guide

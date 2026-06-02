@@ -14,6 +14,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 hashbrown = { workspace = true }
 crc = { workspace = true }
+itoa = { workspace = true }
 tempfile = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }

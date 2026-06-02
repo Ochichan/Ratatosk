@@ -104,7 +104,7 @@ pub fn estimate_idle_time(object_clock: u32, server_clock: u32) -> u32 {
 
 /// Touch (update) the LRU clock on a value.
 pub fn touch_lru_clock(value: &mut StoredValue, now_sec: u32) {
-    value.lru_clock = lru_clock(now_sec);
+    value.set_lru_clock(lru_clock(now_sec));
 }
 
 // ---------------------------------------------------------------------------
@@ -120,8 +120,9 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
     const ENTRY_OVERHEAD: usize = 64;
 
     let key_size = key.len();
-    let value_size = match &value.data {
+    let value_size = match value.data() {
         ValueData::String(s) => s.len(),
+        ValueData::StringInt(_) => 8, // i64 stored inline
         ValueData::List(l) => {
             let elem_overhead = l.len() * 24; // Bytes = 24 bytes on stack
             let content: usize = l.iter().map(|b| b.len()).sum();
@@ -137,6 +138,7 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
             let per_elem = 48; // HashSet entry overhead
             s.iter().map(|b| b.len() + per_elem).sum()
         }
+        ValueData::SetInt(s) => s.len() * std::mem::size_of::<i64>(),
         ValueData::SortedSet(z) => {
             // BTreeMap + HashMap dual indexing
             let per_entry = 128;
@@ -171,6 +173,10 @@ pub fn needs_eviction(used_memory: usize, config: &EvictionConfig) -> bool {
 }
 
 /// Estimate total memory used across all databases.
+///
+/// When incremental tracking is available (`DataState::estimated_memory`),
+/// prefer that O(1) path.  This full-scan variant is kept for periodic
+/// drift correction in `server_cron`.
 pub fn estimate_used_memory(state: &ServerState) -> usize {
     let mut total = 0usize;
     for db_idx in 0..state.db_count() {
@@ -191,13 +197,13 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
     }
 
     let start = std::time::Instant::now();
-    let memory_before = estimate_used_memory(state);
+    let memory_before = state.data.estimated_memory();
     let mut evicted = 0usize;
     let mut rng = rand::thread_rng();
 
     // Try up to 128 rounds to get below maxmemory
     for _ in 0..128 {
-        let used = estimate_used_memory(state);
+        let used = state.data.estimated_memory();
         if used <= config.maxmemory {
             break;
         }
@@ -212,7 +218,7 @@ pub fn perform_eviction(state: &mut ServerState, config: &EvictionConfig) -> usi
         evicted += 1;
     }
 
-    let memory_after = estimate_used_memory(state);
+    let memory_after = state.data.estimated_memory();
     let duration = start.elapsed();
 
     state.stats.add_evicted_keys(evicted as u64);
@@ -255,67 +261,89 @@ fn select_eviction_candidate(
     let mut best_score: u64 = 0; // higher = better candidate for eviction
 
     for db_idx in 0..state.db_count() {
-        let db = state.db(db_idx);
-        if db.is_empty() {
-            continue;
-        }
-
-        // First pass: count candidate keys without allocating
-        let candidate_count = if config.policy.is_volatile() {
-            db.iter().filter(|(_, v)| v.expire_at_ms.is_some()).count()
-        } else {
-            db.len()
-        };
-
-        if candidate_count == 0 {
-            continue;
-        }
-
-        // Use reservoir sampling (Algorithm R) to select random indices in O(k) space
-        // where k = samples_to_take, instead of O(n) for the full index array
-        let samples_to_take = samples.min(candidate_count);
-        let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
-        for i in samples_to_take..candidate_count {
-            let j = rng.gen_range(0..i + 1);
-            if j < samples_to_take {
-                sample_indices[j] = i;
-            }
-        }
-        sample_indices.sort_unstable();
-
-        // Second pass: collect only sampled keys (small, bounded allocation)
-        let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
-        let mut candidate_idx = 0;
-        let mut sample_cursor = 0;
-
-        for (key, value) in db.iter() {
-            // For volatile policies, skip keys without TTL
-            if config.policy.is_volatile() && value.expire_at_ms.is_none() {
+        if config.policy.is_volatile() {
+            let shard = state.data.read_db(db_idx);
+            if shard.data.is_empty() || shard.expires.is_empty() {
                 continue;
             }
 
-            if sample_cursor < sample_indices.len()
-                && candidate_idx == sample_indices[sample_cursor]
-            {
-                sampled_keys.push(key.clone());
-                sample_cursor += 1;
-                if sample_cursor >= sample_indices.len() {
-                    break;
+            let candidate_count = shard.expires.len();
+            let samples_to_take = samples.min(candidate_count);
+            let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
+            for i in samples_to_take..candidate_count {
+                let j = rng.gen_range(0..i + 1);
+                if j < samples_to_take {
+                    sample_indices[j] = i;
                 }
             }
-            candidate_idx += 1;
-        }
+            sample_indices.sort_unstable();
 
-        // Score sampled keys and track the best
-        for key in sampled_keys {
-            let Some(value) = db.get(&key) else {
+            let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
+            let mut sample_cursor = 0;
+            for (candidate_idx, (key, _)) in shard.expires.iter().enumerate() {
+                if sample_cursor < sample_indices.len()
+                    && candidate_idx == sample_indices[sample_cursor]
+                {
+                    sampled_keys.push(key.clone());
+                    sample_cursor += 1;
+                    if sample_cursor >= sample_indices.len() {
+                        break;
+                    }
+                }
+            }
+
+            for key in sampled_keys {
+                let Some(value) = shard.data.get(&key) else {
+                    continue;
+                };
+
+                let score = eviction_score(value, &config.policy);
+                if best_key.is_none() || score > best_score {
+                    best_score = score;
+                    best_key = Some((db_idx, key));
+                }
+            }
+        } else {
+            let db = state.db(db_idx);
+            if db.is_empty() {
                 continue;
-            };
+            }
 
-            let score = eviction_score(value, &config.policy);
-            if best_key.is_none() || score > best_score {
-                best_score = score;
-                best_key = Some((db_idx, key));
+            let candidate_count = db.len();
+            let samples_to_take = samples.min(candidate_count);
+            let mut sample_indices: Vec<usize> = (0..samples_to_take).collect();
+            for i in samples_to_take..candidate_count {
+                let j = rng.gen_range(0..i + 1);
+                if j < samples_to_take {
+                    sample_indices[j] = i;
+                }
+            }
+            sample_indices.sort_unstable();
+
+            let mut sampled_keys: Vec<Bytes> = Vec::with_capacity(samples_to_take);
+            let mut sample_cursor = 0;
+            for (candidate_idx, (key, _)) in db.iter().enumerate() {
+                if sample_cursor < sample_indices.len()
+                    && candidate_idx == sample_indices[sample_cursor]
+                {
+                    sampled_keys.push(key.clone());
+                    sample_cursor += 1;
+                    if sample_cursor >= sample_indices.len() {
+                        break;
+                    }
+                }
+            }
+
+            for key in sampled_keys {
+                let Some(value) = db.get(&key) else {
+                    continue;
+                };
+
+                let score = eviction_score(value, &config.policy);
+                if best_key.is_none() || score > best_score {
+                    best_score = score;
+                    best_key = Some((db_idx, key));
+                }
             }
         }
     }
@@ -330,13 +358,13 @@ fn eviction_score(value: &StoredValue, policy: &EvictionPolicy) -> u64 {
         EvictionPolicy::AllKeysLru | EvictionPolicy::VolatileLru => {
             // Higher idle time = more evictable
             // Use lru_clock directly — lower clock = older = higher score
-            let clock = value.lru_clock;
+            let clock = value.lru_clock();
             u64::from(LRU_CLOCK_MAX.wrapping_sub(clock))
         }
         EvictionPolicy::AllKeysLfu | EvictionPolicy::VolatileLfu => {
             // Lower frequency = more evictable → invert
             // lru_clock repurposed as LFU counter
-            let counter = value.lru_clock as u64;
+            let counter = value.lru_clock() as u64;
             u64::MAX.saturating_sub(counter)
         }
         EvictionPolicy::AllKeysRandom | EvictionPolicy::VolatileRandom => {
@@ -345,7 +373,7 @@ fn eviction_score(value: &StoredValue, policy: &EvictionPolicy) -> u64 {
         }
         EvictionPolicy::VolatileTtl => {
             // Closer TTL = more evictable (lower expire_at_ms = higher score)
-            match value.expire_at_ms {
+            match value.expire_at_ms() {
                 Some(ttl) => u64::MAX.saturating_sub(ttl as u64),
                 None => 0,
             }
@@ -362,12 +390,17 @@ mod tests {
     use super::*;
     use crate::keyspace::{HashFieldEntry, ServerState, StoredValue};
 
+    /// Insert a key into db 0 with memory tracking.
+    fn tracked_insert(state: &ServerState, key: Bytes, val: StoredValue) {
+        state.db_mut(0).insert(key, val);
+    }
+
     fn make_server_with_keys(count: usize) -> ServerState {
         let state = ServerState::with_default_dbs();
         for i in 0..count {
             let key = Bytes::from(format!("key:{i}"));
             let val = StoredValue::string(Bytes::from(format!("val:{i}")), None);
-            state.db_mut(0).insert(key, val);
+            tracked_insert(&state, key, val);
         }
         state
     }
@@ -411,14 +444,13 @@ mod tests {
         // Add keys without TTL
         for i in 0..20 {
             let key = Bytes::from(format!("persist:{i}"));
-            state
-                .db_mut(0)
-                .insert(key, StoredValue::string(Bytes::from("v"), None));
+            tracked_insert(&state, key, StoredValue::string(Bytes::from("v"), None));
         }
         // Add keys with TTL
         for i in 0..5 {
             let key = Bytes::from(format!("volatile:{i}"));
-            state.db_mut(0).insert(
+            tracked_insert(
+                &state,
                 key,
                 StoredValue::string(Bytes::from("v"), Some(999_999_999_999)),
             );
@@ -446,11 +478,13 @@ mod tests {
     #[test]
     fn volatile_ttl_prefers_closest_expiry() {
         let mut state = ServerState::with_default_dbs();
-        state.db_mut(0).insert(
+        tracked_insert(
+            &state,
             Bytes::from("far"),
             StoredValue::string(Bytes::from("v"), Some(999_999_999_999)),
         );
-        state.db_mut(0).insert(
+        tracked_insert(
+            &state,
             Bytes::from("near"),
             StoredValue::string(Bytes::from("v"), Some(1)),
         );

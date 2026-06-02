@@ -95,7 +95,7 @@ pub(super) fn cmd_delex(
     let Some(entry) = db.get(key).cloned() else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(value) = entry.as_string() else {
+    let Some(value) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
     let should_delete = match args {
@@ -162,7 +162,7 @@ pub(super) fn cmd_digest(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
     };
-    let Some(value) = entry.as_string() else {
+    let Some(value) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 

@@ -30,6 +30,8 @@ bytes = "1"
 
 # Allocator experiments
 mimalloc = "0.1"
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = "0.6"
 
 # Error handling
 thiserror = "2"
@@ -90,6 +92,7 @@ mlua = { version = "0.11", features = ["lua51", "vendored"] }
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
 itoa = "1"
+ryu = "1"
 memchr = "2"
 
 [profile.release]

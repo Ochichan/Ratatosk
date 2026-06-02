@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use itoa::Buffer;
 
 use ratatosk_resp::frame::RespFrame;
 
@@ -83,13 +82,16 @@ pub(super) fn cmd_incrbyfloat(
     purge_expired_key(&mut db, key, now);
 
     let (base, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        if let Some(n) = existing.as_int() {
+            (n as f64, existing.expire_at_ms())
+        } else if let Some(s) = existing.as_string() {
+            let Some(parsed) = parse_f64(s) else {
+                return CommandOutcome::reply(err("ERR value is not a valid float"));
+            };
+            (parsed, existing.expire_at_ms())
+        } else {
             return wrong_type_response();
-        };
-        let Some(parsed) = parse_f64(s) else {
-            return CommandOutcome::reply(err("ERR value is not a valid float"));
-        };
-        (parsed, existing.expire_at_ms)
+        }
     } else {
         (0.0, None)
     };
@@ -117,13 +119,17 @@ pub(super) fn cmd_incr_decr_with_delta(
     purge_expired_key(&mut db, key, now);
 
     let (current, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        // Fast path: already integer-encoded.
+        if let Some(n) = existing.as_int() {
+            (n, existing.expire_at_ms())
+        } else if let Some(s) = existing.as_string() {
+            let Some(parsed) = parse_i64(s) else {
+                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+            };
+            (parsed, existing.expire_at_ms())
+        } else {
             return wrong_type_response();
-        };
-        let Some(parsed) = parse_i64(s) else {
-            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-        };
-        (parsed, existing.expire_at_ms)
+        }
     } else {
         (0, None)
     };
@@ -132,13 +138,6 @@ pub(super) fn cmd_incr_decr_with_delta(
         return CommandOutcome::reply(err("ERR increment or decrement would overflow"));
     };
 
-    let mut buf = Buffer::new();
-    db.insert(
-        key.clone(),
-        StoredValue::string(
-            Bytes::copy_from_slice(buf.format(next).as_bytes()),
-            expire_at_ms,
-        ),
-    );
+    db.insert(key.clone(), StoredValue::string_int(next, expire_at_ms));
     CommandOutcome::reply(RespFrame::Integer(next))
 }

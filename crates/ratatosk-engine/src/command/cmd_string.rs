@@ -26,7 +26,7 @@ pub(super) fn cmd_append(
         let Some(s) = existing.as_string() else {
             return wrong_type_response();
         };
-        (s.clone(), existing.expire_at_ms)
+        (s.clone(), existing.expire_at_ms())
     } else {
         (Bytes::new(), None)
     };
@@ -142,7 +142,7 @@ pub(super) fn cmd_setrange(
         let Some(s) = existing.as_string() else {
             return wrong_type_response();
         };
-        (s.to_vec(), existing.expire_at_ms)
+        (s.to_vec(), existing.expire_at_ms())
     } else {
         (Vec::new(), None)
     };
@@ -184,7 +184,7 @@ pub(super) fn cmd_getset(
     let previous = db.insert(key.clone(), StoredValue::string(value.clone(), None));
 
     CommandOutcome::reply(RespFrame::BulkString(
-        previous.and_then(|entry| entry.as_string().cloned()),
+        previous.and_then(|entry| entry.as_string_bytes()),
     ))
 }
 
@@ -224,7 +224,7 @@ pub(super) fn cmd_mget(
 
     for key in args {
         purge_expired_key(&mut db, key, now);
-        let value = db.get(key).and_then(|entry| entry.as_string().cloned());
+        let value = db.get(key).and_then(|entry| entry.as_string_bytes());
         out.push(RespFrame::BulkString(value));
     }
 

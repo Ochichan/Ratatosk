@@ -83,9 +83,12 @@ fn estimate_value_memory_usage(key: &Bytes, value: &StoredValue) -> i64 {
 
     let mut total = key.len().saturating_add(64);
 
-    match &value.data {
+    match value.data() {
         ValueData::String(v) => {
             total = total.saturating_add(v.len());
+        }
+        ValueData::StringInt(_) => {
+            total = total.saturating_add(8);
         }
         ValueData::Hash(hash) => {
             total = total.saturating_add(48);
@@ -107,6 +110,10 @@ fn estimate_value_memory_usage(key: &Bytes, value: &StoredValue) -> i64 {
             for item in set {
                 total = total.saturating_add(item.len()).saturating_add(16);
             }
+        }
+        ValueData::SetInt(set) => {
+            total = total.saturating_add(24);
+            total = total.saturating_add(set.len().saturating_mul(std::mem::size_of::<i64>()));
         }
         ValueData::SortedSet(zset) => {
             total = total.saturating_add(64);

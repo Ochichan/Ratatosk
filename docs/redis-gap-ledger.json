@@ -62,7 +62,7 @@
       "path": "acl-dryrun.json",
       "summary": "Simulates the execution of a command by a user, without executing the command.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 ACL baseline implemented (syntax/arity validation with standalone OK simulation)."
@@ -127,7 +127,7 @@
       "path": "acl-load.json",
       "summary": "Reloads the rules from the configured ACL file.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 ACL baseline implemented (standalone no-op OK)."
@@ -153,7 +153,7 @@
       "path": "acl-save.json",
       "summary": "Saves the effective ACL rules in the configured ACL file.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 ACL baseline implemented (standalone no-op OK)."
@@ -582,7 +582,7 @@
       "path": "client-pause.json",
       "summary": "Suspends commands processing.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "unsupported",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 client-admin baseline implemented: timeout/mode parsing with no-op pause semantics."
@@ -595,7 +595,7 @@
       "path": "client-reply.json",
       "summary": "Instructs the server whether to reply to commands.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 client baseline implemented: ON/OFF/SKIP parsing and local reply mode state."
@@ -608,7 +608,7 @@
       "path": "client-setinfo.json",
       "summary": "Sets information specific to the client or connection.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 client baseline implemented: LIB-NAME/LIB-VER metadata accepted (no-op)."
@@ -673,7 +673,7 @@
       "path": "client-unpause.json",
       "summary": "Resumes processing commands from paused clients.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "unsupported",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 client-admin baseline implemented: explicit unpause no-op semantics."
@@ -686,7 +686,7 @@
       "path": "cluster.json",
       "summary": "A container for Redis Cluster commands.",
       "status": "done",
-      "capability_tier": "unsupported",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -881,7 +881,7 @@
       "path": "cluster-links.json",
       "summary": "Returns a list of all TCP links to and from peer nodes.",
       "status": "done",
-      "capability_tier": "unsupported",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1037,7 +1037,7 @@
       "path": "cluster-shards.json",
       "summary": "Returns the mapping of cluster slots to shards.",
       "status": "done",
-      "capability_tier": "unsupported",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1076,7 +1076,7 @@
       "path": "cluster-slots.json",
       "summary": "Returns the mapping of cluster slots to nodes.",
       "status": "done",
-      "capability_tier": "unsupported",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1609,7 +1609,7 @@
       "path": "function.json",
       "summary": "A container for function commands.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1635,7 +1635,7 @@
       "path": "function-dump.json",
       "summary": "Dumps all libraries into a serialized binary payload.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1648,7 +1648,7 @@
       "path": "function-flush.json",
       "summary": "Deletes all libraries and functions.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1661,7 +1661,7 @@
       "path": "function-help.json",
       "summary": "Returns helpful text about the different subcommands.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1687,7 +1687,7 @@
       "path": "function-list.json",
       "summary": "Returns information about all libraries.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -1726,7 +1726,7 @@
       "path": "function-stats.json",
       "summary": "Returns information about a function during execution.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -2155,7 +2155,7 @@
       "path": "hotkeys.json",
       "summary": "A container for hotkeys tracking commands.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (GET/RESET/START/STOP/HELP container)."
@@ -2168,7 +2168,7 @@
       "path": "hotkeys-get.json",
       "summary": "Returns lists of top K hotkeys depending on metrics chosen in HOTKEYS START command.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (returns empty sample list)."
@@ -2181,7 +2181,7 @@
       "path": "hotkeys-reset.json",
       "summary": "Release the resources used for hotkey tracking.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (no-op OK)."
@@ -2194,7 +2194,7 @@
       "path": "hotkeys-start.json",
       "summary": "Starts hotkeys tracking.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (no-op OK)."
@@ -2207,7 +2207,7 @@
       "path": "hotkeys-stop.json",
       "summary": "Stops hotkeys tracking.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (no-op OK)."
@@ -2649,7 +2649,7 @@
       "path": "lolwut.json",
       "summary": "Displays computer art and the Redis version",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 informational baseline implemented (static ascii-text response with VERSION option)."
@@ -2883,7 +2883,7 @@
       "path": "module.json",
       "summary": "A container for module commands.",
       "status": "done",
-      "capability_tier": "unsupported",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 module baseline implemented (HELP/LIST supported, load/unload return unsupported)."
@@ -2896,7 +2896,7 @@
       "path": "module-help.json",
       "summary": "Returns helpful text about the different subcommands.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 module baseline implemented (help text)."
@@ -2909,7 +2909,7 @@
       "path": "module-list.json",
       "summary": "Returns all loaded modules.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 module baseline implemented (returns empty list)."
@@ -2961,7 +2961,7 @@
       "path": "monitor.json",
       "summary": "Listens for all requests received by the server in real-time.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 baseline implemented: MONITOR command accepted with standalone OK response."
@@ -3689,7 +3689,7 @@
       "path": "script-debug.json",
       "summary": "Sets the debug mode of server-side Lua scripts.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -3702,7 +3702,7 @@
       "path": "script-exists.json",
       "summary": "Determines whether server-side Lua scripts exist in the script cache.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -3715,7 +3715,7 @@
       "path": "script-flush.json",
       "summary": "Removes all server-side Lua scripts from the script cache.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -3728,7 +3728,7 @@
       "path": "script-help.json",
       "summary": "Returns helpful text about the different subcommands.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -3741,7 +3741,7 @@
       "path": "script-kill.json",
       "summary": "Terminates a server-side Lua script during execution.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -3754,7 +3754,7 @@
       "path": "script-load.json",
       "summary": "Loads a server-side Lua script to the script cache.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "baseline_local",
       "milestone": "m5-advanced",
       "owner": "",
       "notes": ""
@@ -4586,7 +4586,7 @@
       "path": "trimslots.json",
       "summary": "Trim the keys that belong to specified slots.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
       "notes": "M0 admin baseline implemented (integer argument parse + no-op 0 result)."
@@ -4664,7 +4664,7 @@
       "path": "wait.json",
       "summary": "Blocks until the asynchronous replication of all preceding write commands sent by the connection is completed.",
       "status": "done",
-      "capability_tier": "syntax_only",
+      "capability_tier": "baseline_local",
       "milestone": "m1-kv-core",
       "owner": "",
       "notes": "M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking timeout semantics."

@@ -92,7 +92,7 @@ pub(super) fn cmd_set(
         if get_old {
             return match existing_entry {
                 Some(entry) if entry.is_string() => {
-                    CommandOutcome::reply(RespFrame::BulkString(entry.as_string().cloned()))
+                    CommandOutcome::reply(RespFrame::BulkString(entry.as_string_bytes()))
                 }
                 Some(_) => wrong_type_response(),
                 None => CommandOutcome::reply(RespFrame::BulkString(None)),
@@ -106,14 +106,14 @@ pub(super) fn cmd_set(
     }
 
     let previous_value = if get_old {
-        existing_entry.and_then(|entry| entry.as_string().cloned())
+        existing_entry.and_then(|entry| entry.as_string_bytes())
     } else {
         None
     };
 
     let expire_at_ms = match expire_policy {
         SetExpirePolicy::None => None,
-        SetExpirePolicy::KeepTtl => existing_entry.and_then(|entry| entry.expire_at_ms),
+        SetExpirePolicy::KeepTtl => existing_entry.and_then(|entry| entry.expire_at_ms()),
         SetExpirePolicy::AtMs(ts) => Some(ts),
     };
 
@@ -151,7 +151,7 @@ pub(super) fn cmd_get(
         match db.get(key) {
             None => Err(false),
             Some(entry) if !entry.is_string() => Err(true),
-            Some(entry) => Ok(entry.as_string().cloned()),
+            Some(entry) => Ok(entry.as_string_bytes()),
         }
     };
 
@@ -220,9 +220,7 @@ pub(super) fn cmd_getdel(
         return wrong_type_response();
     }
 
-    let value = db
-        .remove(key)
-        .and_then(|removed| removed.as_string().cloned());
+    let value = db.remove(key).and_then(|removed| removed.as_string_bytes());
     CommandOutcome::reply(RespFrame::BulkString(value))
 }
 
@@ -248,22 +246,20 @@ pub(super) fn cmd_getex(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::BulkString(None));
     };
-    let Some(current_value) = entry.as_string().cloned() else {
+    let Some(current_value) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
     match policy {
         GetExPolicy::KeepTtl => {}
         GetExPolicy::Persist => {
-            if let Some(entry) = db.get_mut(key) {
-                entry.expire_at_ms = None;
-            }
+            let _ = db.set_key_expiry(key, None);
         }
         GetExPolicy::AtMs(expire_at_ms) => {
             if expire_at_ms <= now {
                 db.remove(key);
-            } else if let Some(entry) = db.get_mut(key) {
-                entry.expire_at_ms = Some(expire_at_ms);
+            } else {
+                let _ = db.set_key_expiry(key, Some(expire_at_ms));
             }
         }
     }

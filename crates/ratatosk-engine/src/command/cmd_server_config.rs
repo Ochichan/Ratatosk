@@ -83,6 +83,8 @@ enum ConfigSetOp {
     QueryBufferLimit(usize),
     OutputBufferFlushThreshold(usize),
     ClientWriteTimeoutSec(u64),
+    CompatibilityMode(Bytes),
+    ProtectedMode(Bytes),
 }
 
 fn cmd_config_get(args: &[Bytes], server: &ServerState) -> CommandOutcome {
@@ -162,6 +164,32 @@ fn cmd_config_set(
                         return CommandOutcome::reply(err(
                             "ERR argument must be 'always', 'everysec', or 'no'",
                         ));
+                    }
+                }
+            }
+            b"COMPATIBILITY-MODE" => {
+                let text = String::from_utf8_lossy(value).to_ascii_lowercase();
+                match text.as_str() {
+                    "compat" | "strict" => (
+                        ConfigSetOp::CompatibilityMode(Bytes::from(text)),
+                        "compatibility-mode",
+                    ),
+                    _ => {
+                        return CommandOutcome::reply(err(
+                            "ERR argument must be 'compat' or 'strict'",
+                        ));
+                    }
+                }
+            }
+            b"PROTECTED-MODE" => {
+                let text = String::from_utf8_lossy(value).to_ascii_lowercase();
+                match text.as_str() {
+                    "yes" | "no" => (
+                        ConfigSetOp::ProtectedMode(Bytes::from(text)),
+                        "protected-mode",
+                    ),
+                    _ => {
+                        return CommandOutcome::reply(err("ERR argument must be 'yes' or 'no'"));
                     }
                 }
             }
@@ -382,6 +410,8 @@ fn cmd_config_set(
             ConfigSetOp::ClientWriteTimeoutSec(value) => {
                 server.config.set_client_write_timeout_sec(value)
             }
+            ConfigSetOp::CompatibilityMode(value) => server.config.set_compatibility_mode(value),
+            ConfigSetOp::ProtectedMode(value) => server.config.set_protected_mode(value),
         }
     }
 
@@ -397,6 +427,30 @@ fn cmd_config_set(
 fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
     vec![
         (
+            Bytes::from_static(b"bind"),
+            Bytes::from(server.config.bind().to_string()),
+        ),
+        (
+            Bytes::from_static(b"port"),
+            Bytes::from(server.config.port().to_string()),
+        ),
+        (
+            Bytes::from_static(b"maxclients"),
+            Bytes::from(server.config.max_clients().to_string()),
+        ),
+        (
+            Bytes::from_static(b"output-buffer-limit-bytes"),
+            Bytes::from(server.config.output_buffer_limit_bytes().to_string()),
+        ),
+        (
+            Bytes::from_static(b"shutdown-grace-ms"),
+            Bytes::from(server.config.shutdown_grace_period_ms().to_string()),
+        ),
+        (
+            Bytes::from_static(b"client-timeout-sec"),
+            Bytes::from(server.config.client_timeout_sec().to_string()),
+        ),
+        (
             Bytes::from_static(b"appendonly"),
             Bytes::from(if server.config.appendonly() {
                 "yes"
@@ -407,6 +461,14 @@ fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
         (
             Bytes::from_static(b"appendfsync"),
             server.config.appendfsync().clone(),
+        ),
+        (
+            Bytes::from_static(b"compatibility-mode"),
+            server.config.compatibility_mode().clone(),
+        ),
+        (
+            Bytes::from_static(b"protected-mode"),
+            server.config.protected_mode().clone(),
         ),
         (
             Bytes::from_static(b"databases"),
@@ -529,6 +591,31 @@ fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
     ]
 }
 
+fn format_config_scalar_value(value: &str) -> String {
+    if value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '#' | '"' | '\\'))
+    {
+        let mut escaped = String::with_capacity(value.len() + 2);
+        escaped.push('"');
+        for ch in value.chars() {
+            match ch {
+                '\\' => escaped.push_str("\\\\"),
+                '"' => escaped.push_str("\\\""),
+                '\n' => escaped.push_str("\\n"),
+                '\r' => escaped.push_str("\\r"),
+                '\t' => escaped.push_str("\\t"),
+                other => escaped.push(other),
+            }
+        }
+        escaped.push('"');
+        return escaped;
+    }
+
+    value.to_string()
+}
+
 fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     use std::io::Write;
 
@@ -561,15 +648,62 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
 
     writeln!(file, "# Network").map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "bind 127.0.0.1").map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "port 6379").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "bind {}",
+        format_config_scalar_value(server.config.bind())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "port {}", server.config.port()).map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "maxclients {}", server.config.max_clients())
+        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "output-buffer-limit-bytes {}",
+        server.config.output_buffer_limit_bytes()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "shutdown-grace-ms {}",
+        server.config.shutdown_grace_period_ms()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "client-timeout-sec {}",
+        server.config.client_timeout_sec()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "timeout {}", server.config.timeout())
+        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "compatibility-mode {}",
+        String::from_utf8_lossy(server.config.compatibility_mode())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "protected-mode {}",
+        String::from_utf8_lossy(server.config.protected_mode())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
 
     writeln!(file, "# Persistence").map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "dir {}", server.config.dir().display())
-        .map_err(|e| format!("writing config: {e}"))?;
-    writeln!(file, "dbfilename {}", server.config.dbfilename())
-        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "dir {}",
+        format_config_scalar_value(&server.config.dir().display().to_string())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "dbfilename {}",
+        format_config_scalar_value(server.config.dbfilename())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
     writeln!(
         file,
         "appendonly {}",
@@ -586,6 +720,12 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
         String::from_utf8_lossy(server.config.appendfsync())
     )
     .map_err(|e| format!("writing config: {e}"))?;
+    let save = String::from_utf8_lossy(server.config.save());
+    if save.is_empty() {
+        writeln!(file, "save \"\"").map_err(|e| format!("writing config: {e}"))?;
+    } else {
+        writeln!(file, "save {save}").map_err(|e| format!("writing config: {e}"))?;
+    }
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
 
     writeln!(file, "# Memory management").map_err(|e| format!("writing config: {e}"))?;
@@ -595,6 +735,107 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
         file,
         "maxmemory-policy {}",
         String::from_utf8_lossy(server.config.maxmemory_policy())
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "maxmemory-samples {}",
+        server.config.maxmemory_samples()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "lazyfree-lazy-expire {}",
+        if server.config.lazyfree_lazy_expire() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "lazyfree-lazy-server-del {}",
+        if server.config.lazyfree_lazy_server_del() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "lazyfree-lazy-user-del {}",
+        if server.config.lazyfree_lazy_user_del() {
+            "yes"
+        } else {
+            "no"
+        }
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file).map_err(|e| format!("writing config: {e}"))?;
+
+    writeln!(file, "# Runtime").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "hz {}", server.config.hz()).map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "active-expire-cycle-lookups {}",
+        server.config.active_expire_cycle_lookups()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "active-expire-cycle-threshold-pct {}",
+        server.config.active_expire_cycle_threshold_pct()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "query-buffer-limit {}",
+        server.config.query_buffer_limit()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "output-buffer-flush-threshold {}",
+        server.config.output_buffer_flush_threshold()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "client-write-timeout-sec {}",
+        server.config.client_write_timeout_sec()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "tcp-keepalive {}", server.config.tcp_keepalive())
+        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file).map_err(|e| format!("writing config: {e}"))?;
+
+    writeln!(file, "# Pub/Sub and notifications").map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "notify-keyspace-events {}",
+        format_config_scalar_value(&String::from_utf8_lossy(
+            server.config.notify_keyspace_events()
+        ))
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "pubsub-queue-hard-limit {}",
+        server.config.pubsub_queue_hard_limit()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "pubsub-queue-soft-limit {}",
+        server.config.pubsub_queue_soft_limit()
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(
+        file,
+        "pubsub-queue-soft-seconds {}",
+        server.config.pubsub_queue_soft_seconds()
     )
     .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file).map_err(|e| format!("writing config: {e}"))?;
@@ -640,9 +881,15 @@ mod tests {
     #[test]
     fn rewrite_config_file_persists_current_runtime_settings() {
         let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("data with spaces");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
         let mut server = ServerState::with_default_dbs();
-        server.config.set_dir(dir.path().to_path_buf());
-        server.config.set_dbfilename("snapshot.rdb".to_string());
+        server.config.set_bind("0.0.0.0".to_string());
+        server.config.set_port(6381);
+        server.config.set_dir(config_dir.clone());
+        server
+            .config
+            .set_dbfilename("snapshot data.rdb".to_string());
         server.config.set_appendonly(true);
         server
             .config
@@ -650,11 +897,13 @@ mod tests {
 
         rewrite_config_file(&server).expect("rewrite config file");
 
-        let config_path = dir.path().join("ratatosk.conf");
+        let config_path = config_dir.join("ratatosk.conf");
         let contents = std::fs::read_to_string(&config_path).expect("read rewritten config");
         assert!(contents.contains("# Auto-generated by CONFIG REWRITE"));
-        assert!(contents.contains(&format!("dir {}", dir.path().display())));
-        assert!(contents.contains("dbfilename snapshot.rdb"));
+        assert!(contents.contains("bind 0.0.0.0"));
+        assert!(contents.contains("port 6381"));
+        assert!(contents.contains(&format!("dir \"{}\"", config_dir.display())));
+        assert!(contents.contains("dbfilename \"snapshot data.rdb\""));
         assert!(contents.contains("appendonly yes"));
         assert!(contents.contains("appendfsync always"));
     }

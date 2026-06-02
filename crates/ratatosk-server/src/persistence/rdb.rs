@@ -5,13 +5,14 @@ use ratatosk_engine::keyspace::SharedState;
 use ratatosk_persist::rdb;
 
 pub async fn run_save(server_state: &Arc<SharedState>, rdb_path: &Path) -> io::Result<()> {
-    let snapshot = {
+    {
         let state = server_state.meta.lock().await;
         if state.rdb_save_in_progress() {
             return Err(io::Error::other("background save already in progress"));
         }
-        state.snapshot_dbs()
-    };
+    }
+
+    let snapshot = server_state.data.snapshot_all();
 
     crate::metrics::record_rdb_save(false);
 

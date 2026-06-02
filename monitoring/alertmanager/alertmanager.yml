@@ -1,0 +1,97 @@
+# Ratatosk single-node Alertmanager configuration.
+#
+# This routes the alerts defined in monitoring/prometheus/ratatosk-alerts.yml.
+# Those rules carry two labels Alertmanager keys off of:
+#   - service:  always "ratatosk"
+#   - severity: "page"   (urgent, wake someone)  or
+#               "ticket" (non-urgent, file work)
+#
+# IMPORTANT: every receiver below points at PLACEHOLDER endpoints. Replace the
+# example webhook URLs with your real pager / ticketing integrations before use.
+# This is a starter config for a single Alertmanager instance (no clustering).
+
+global:
+  # How long to wait before declaring a firing alert resolved once its source
+  # series stops reporting. Keep this comfortably above the Prometheus scrape
+  # plus rule-evaluation interval so transient gaps do not flap.
+  resolve_timeout: 5m
+
+# ---------------------------------------------------------------------------
+# Routing tree.
+# Alerts are first grouped, then matched against child routes by severity.
+# Anything that does not match a child falls through to the default receiver.
+# ---------------------------------------------------------------------------
+route:
+  # Group related alerts into a single notification so a multi-alert incident
+  # does not spam N separate messages.
+  group_by: ['alertname', 'service']
+
+  # Defaults inherited by child routes unless they override them.
+  group_wait: 30s        # wait this long for more alerts in a new group
+  group_interval: 5m     # wait between batches for an existing group
+  repeat_interval: 4h    # re-notify cadence if an alert stays firing
+
+  # Fallback receiver for anything not matched below (e.g. unexpected labels).
+  receiver: 'default'
+
+  routes:
+    # Scope the whole tree to Ratatosk so this config can be merged into a
+    # shared Alertmanager without grabbing other services' alerts.
+    - matchers:
+        - service = "ratatosk"
+      receiver: 'default'
+      routes:
+        # Urgent: page a human fast and keep nudging.
+        - matchers:
+            - severity = "page"
+          receiver: 'pager'
+          group_wait: 10s
+          group_interval: 2m
+          repeat_interval: 1h
+
+        # Non-urgent: file a ticket, notify slowly, repeat rarely.
+        - matchers:
+            - severity = "ticket"
+          receiver: 'tickets'
+          group_wait: 1m
+          group_interval: 10m
+          repeat_interval: 12h
+
+# ---------------------------------------------------------------------------
+# Receivers.
+# All URLs are EXAMPLES — swap in your real integration endpoints.
+# ---------------------------------------------------------------------------
+receivers:
+  # Catch-all. With no notifier configured it deliberately drops the alert so
+  # misrouted notifications are silent rather than failing the config. Add a
+  # webhook here if you want a visible "unrouted alert" signal.
+  - name: 'default'
+
+  # Urgent path (severity=page). Point this at your on-call pager bridge.
+  - name: 'pager'
+    webhook_configs:
+      # EXAMPLE ENDPOINT — replace with your real pager webhook
+      # (e.g. an Alertmanager-to-PagerDuty/Opsgenie adapter or a local relay).
+      - url: 'http://127.0.0.1:5001/ratatosk/page'
+        send_resolved: true
+
+  # Non-urgent path (severity=ticket). Point this at your ticketing intake.
+  - name: 'tickets'
+    webhook_configs:
+      # EXAMPLE ENDPOINT — replace with your real ticketing webhook
+      # (e.g. a Jira/GitHub-issue creation relay).
+      - url: 'http://127.0.0.1:5002/ratatosk/ticket'
+        send_resolved: true
+
+# ---------------------------------------------------------------------------
+# Inhibition.
+# If a page is already firing for an (alertname, service) pair, suppress any
+# lower-severity ticket for the SAME alert+service so we do not double-notify
+# while someone is already actively paged on it.
+# ---------------------------------------------------------------------------
+inhibit_rules:
+  - source_matchers:
+      - severity = "page"
+    target_matchers:
+      - severity = "ticket"
+    equal: ['alertname', 'service']

@@ -106,7 +106,7 @@ pub(super) fn cmd_restore(
         return CommandOutcome::reply(RespFrame::ok());
     }
 
-    value.expire_at_ms = expire_at_ms;
+    value.set_expire_at_ms(expire_at_ms);
     db.insert(key.clone(), value);
 
     CommandOutcome::reply(RespFrame::ok())
@@ -162,10 +162,16 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
     let mut out = Vec::new();
     out.extend_from_slice(DUMP_MAGIC_CURRENT);
 
-    match &entry.data {
+    match entry.data() {
         ValueData::String(value) => {
             out.push(b's');
             put_bytes(&mut out, value);
+        }
+        ValueData::StringInt(n) => {
+            out.push(b's');
+            let mut buf = itoa::Buffer::new();
+            let rendered = Bytes::copy_from_slice(buf.format(*n).as_bytes());
+            put_bytes(&mut out, &rendered);
         }
         ValueData::Hash(hash) => {
             out.push(b'h');
@@ -194,6 +200,15 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
             put_u32(&mut out, items.len());
             for item in items {
                 put_bytes(&mut out, &item);
+            }
+        }
+        ValueData::SetInt(set) => {
+            out.push(b't');
+            put_u32(&mut out, set.len());
+            for item in set {
+                let mut buf = itoa::Buffer::new();
+                let rendered = Bytes::copy_from_slice(buf.format(*item).as_bytes());
+                put_bytes(&mut out, &rendered);
             }
         }
         ValueData::SortedSet(zset) => {

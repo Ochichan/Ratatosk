@@ -51,7 +51,7 @@ pub(super) fn cmd_pfadd(
             Ok(b) => b,
             Err(outcome) => return outcome,
         };
-        (hll_bytes.to_vec(), entry.expire_at_ms)
+        (hll_bytes.to_vec(), entry.expire_at_ms())
     } else {
         (Vec::new(), None)
     };
@@ -119,7 +119,7 @@ pub(super) fn cmd_pfcount(
         let count = hll::hll_count_and_cache(&mut data);
 
         // Write the updated cache back only when needed.
-        let expire_at_ms = entry.expire_at_ms;
+        let expire_at_ms = entry.expire_at_ms();
         if hll_bytes.as_ref() != data.as_slice() {
             db.insert(
                 key.clone(),
@@ -174,7 +174,7 @@ pub(super) fn cmd_pfmerge(
             Ok(b) => b,
             Err(outcome) => return outcome,
         };
-        (hll_bytes.to_vec(), entry.expire_at_ms)
+        (hll_bytes.to_vec(), entry.expire_at_ms())
     } else {
         (hll::hll_create(), None)
     };

@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering as AtomicOrdering},
     },
 };
 use tokio::sync::{Mutex, Notify};
@@ -332,10 +332,50 @@ pub enum Encoding {
     QuickList = 4,
     /// Hash table (hash / set full encoding).
     HashTable = 5,
+    /// Integer set (small set of i64 members).
+    IntSet = 6,
     /// Skip list + hash table (sorted set full encoding).
     SkipList = 10,
     /// Radix tree (stream type).
     StreamTree = 12,
+}
+
+impl Encoding {
+    /// Reconstruct from the 4-bit value stored in the packed field.
+    #[inline]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Raw,
+            1 => Self::Int,
+            4 => Self::QuickList,
+            5 => Self::HashTable,
+            6 => Self::IntSet,
+            10 => Self::SkipList,
+            12 => Self::StreamTree,
+            _ => Self::Raw, // defensive fallback
+        }
+    }
+}
+
+const SET_MAX_INTSET_ENTRIES: usize = 512;
+
+fn bytes_to_intset_member(value: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(value).ok()?;
+    let parsed = text.parse::<i64>().ok()?;
+    let mut buf = itoa::Buffer::new();
+    (buf.format(parsed).as_bytes() == value).then_some(parsed)
+}
+
+fn intset_member_to_bytes(value: i64) -> Bytes {
+    let mut buf = itoa::Buffer::new();
+    Bytes::copy_from_slice(buf.format(value).as_bytes())
+}
+
+fn intset_to_hashset(values: &[i64]) -> HashSet<Bytes> {
+    values
+        .iter()
+        .map(|value| intset_member_to_bytes(*value))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -345,9 +385,14 @@ pub enum Encoding {
 #[derive(Debug, Clone)]
 pub enum ValueData {
     String(Bytes),
+    /// Integer-encoded string — saves 24 bytes per key vs `String(Bytes)`
+    /// for values that fit in an `i64`.
+    StringInt(i64),
     Hash(HashMap<Bytes, HashFieldEntry>),
     List(VecDeque<Bytes>),
     Set(HashSet<Bytes>),
+    /// Compact representation for small sets whose members all fit in `i64`.
+    SetInt(Vec<i64>),
     SortedSet(SortedSet),
     Stream {
         entries: Vec<StreamEntry>,
@@ -357,172 +402,385 @@ pub enum ValueData {
 
 #[derive(Debug, Clone)]
 pub struct StoredValue {
-    pub data: ValueData,
-    pub expire_at_ms: Option<i64>,
-    /// Internal encoding tag for RDB serialization and future compact encodings.
-    pub encoding: Encoding,
-    /// 24-bit LRU clock (seconds, wrapping) or LFU counter, used by eviction.
-    pub lru_clock: u32,
+    /// Boxed payload — keeps `StoredValue` at 24 bytes on the stack
+    /// regardless of the largest `ValueData` variant.
+    data: Box<ValueData>,
+    /// Millisecond-precision Unix expiry.  `0` means *no expiry*
+    /// (Unix-epoch-zero is never a valid real-world deadline).
+    expire_at_ms: i64,
+    /// Packed: high 4 bits = `Encoding` discriminant, low 28 bits = LRU/LFU clock.
+    encoding_and_lru: u32,
 }
 
+/// Bit layout helpers for `encoding_and_lru`.
+const LRU_BITS: u32 = 28;
+const LRU_MASK: u32 = (1 << LRU_BITS) - 1;
+
 impl StoredValue {
-    pub fn string(value: Bytes, expire_at_ms: Option<i64>) -> Self {
+    // -- constructors --------------------------------------------------------
+
+    /// General-purpose constructor used by crate internals and the persistence layer.
+    pub fn new(data: ValueData, expire_at_ms: Option<i64>, encoding: Encoding) -> Self {
         Self {
-            data: ValueData::String(value),
-            expire_at_ms,
-            encoding: Encoding::Raw,
-            lru_clock: 0,
+            data: Box::new(data),
+            expire_at_ms: expire_at_ms.unwrap_or(0),
+            encoding_and_lru: (encoding as u32) << LRU_BITS,
         }
+    }
+
+    pub fn string(value: Bytes, expire_at_ms: Option<i64>) -> Self {
+        // Try integer encoding: saves 24 bytes (Bytes overhead) per key.
+        if let Ok(s) = std::str::from_utf8(&value) {
+            // Reject leading zeros ("007"), "+0", empty, or whitespace.
+            let dominated_by_leading_zero = s.len() > 1 && s.starts_with('0');
+            if !s.is_empty()
+                && !s.starts_with('+')
+                && !dominated_by_leading_zero
+                && !s.starts_with("-0")
+            {
+                if let Ok(n) = s.parse::<i64>() {
+                    return Self::new(ValueData::StringInt(n), expire_at_ms, Encoding::Int);
+                }
+            }
+        }
+        Self::new(ValueData::String(value), expire_at_ms, Encoding::Raw)
+    }
+
+    /// Create a StoredValue with an explicit integer value.
+    pub fn string_int(value: i64, expire_at_ms: Option<i64>) -> Self {
+        Self::new(ValueData::StringInt(value), expire_at_ms, Encoding::Int)
     }
 
     pub fn hash(fields: HashMap<Bytes, HashFieldEntry>, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data: ValueData::Hash(fields),
-            expire_at_ms,
-            encoding: Encoding::HashTable,
-            lru_clock: 0,
-        }
+        Self::new(ValueData::Hash(fields), expire_at_ms, Encoding::HashTable)
     }
 
     pub fn sorted_set(zset: SortedSet, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data: ValueData::SortedSet(zset),
-            expire_at_ms,
-            encoding: Encoding::SkipList,
-            lru_clock: 0,
-        }
+        Self::new(ValueData::SortedSet(zset), expire_at_ms, Encoding::SkipList)
     }
 
     pub fn list(values: VecDeque<Bytes>, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data: ValueData::List(values),
-            expire_at_ms,
-            encoding: Encoding::QuickList,
-            lru_clock: 0,
-        }
+        Self::new(ValueData::List(values), expire_at_ms, Encoding::QuickList)
     }
 
     pub fn set(values: HashSet<Bytes>, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data: ValueData::Set(values),
-            expire_at_ms,
-            encoding: Encoding::HashTable,
-            lru_clock: 0,
+        if values.len() <= SET_MAX_INTSET_ENTRIES {
+            let mut ints = Vec::with_capacity(values.len());
+            for value in &values {
+                let Some(member) = bytes_to_intset_member(value.as_ref()) else {
+                    return Self::new(ValueData::Set(values), expire_at_ms, Encoding::HashTable);
+                };
+                ints.push(member);
+            }
+            ints.sort_unstable();
+            ints.dedup();
+            return Self::new(ValueData::SetInt(ints), expire_at_ms, Encoding::IntSet);
         }
+
+        Self::new(ValueData::Set(values), expire_at_ms, Encoding::HashTable)
     }
 
     pub fn stream(entries: Vec<StreamEntry>, expire_at_ms: Option<i64>) -> Self {
-        Self {
-            data: ValueData::Stream {
+        Self::new(
+            ValueData::Stream {
                 entries,
                 groups: HashMap::new(),
             },
             expire_at_ms,
-            encoding: Encoding::StreamTree,
-            lru_clock: 0,
+            Encoding::StreamTree,
+        )
+    }
+
+    // -- field accessors (replaces pub fields) -------------------------------
+
+    /// Read access to the inner `ValueData`.
+    #[inline]
+    pub fn data(&self) -> &ValueData {
+        &self.data
+    }
+
+    /// Mutable access to the inner `ValueData`.
+    #[inline]
+    pub fn data_mut(&mut self) -> &mut ValueData {
+        &mut self.data
+    }
+
+    /// Returns `Some(ms)` if an expiry is set, `None` otherwise.
+    #[inline]
+    pub fn expire_at_ms(&self) -> Option<i64> {
+        if self.expire_at_ms > 0 {
+            Some(self.expire_at_ms)
+        } else {
+            None
         }
     }
 
+    /// Set or clear the expiry.
+    #[inline]
+    pub fn set_expire_at_ms(&mut self, ms: Option<i64>) {
+        self.expire_at_ms = ms.unwrap_or(0);
+    }
+
+    /// The internal encoding tag.
+    #[inline]
+    pub fn encoding(&self) -> Encoding {
+        Encoding::from_u8((self.encoding_and_lru >> LRU_BITS) as u8)
+    }
+
+    /// Set the encoding tag.
+    #[inline]
+    pub fn set_encoding(&mut self, enc: Encoding) {
+        self.encoding_and_lru = ((enc as u32) << LRU_BITS) | (self.encoding_and_lru & LRU_MASK);
+    }
+
+    /// The 28-bit LRU clock or LFU counter.
+    #[inline]
+    pub fn lru_clock(&self) -> u32 {
+        self.encoding_and_lru & LRU_MASK
+    }
+
+    /// Set the LRU clock / LFU counter.
+    #[inline]
+    pub fn set_lru_clock(&mut self, clock: u32) {
+        self.encoding_and_lru = (self.encoding_and_lru & !LRU_MASK) | (clock & LRU_MASK);
+    }
+
+    // -- type predicates -----------------------------------------------------
+
     pub fn is_string(&self) -> bool {
-        matches!(self.data, ValueData::String(_))
+        matches!(*self.data, ValueData::String(_) | ValueData::StringInt(_))
     }
 
     pub fn is_hash(&self) -> bool {
-        matches!(self.data, ValueData::Hash(_))
+        matches!(*self.data, ValueData::Hash(_))
     }
 
     pub fn is_list(&self) -> bool {
-        matches!(self.data, ValueData::List(_))
+        matches!(*self.data, ValueData::List(_))
     }
 
     pub fn is_set(&self) -> bool {
-        matches!(self.data, ValueData::Set(_))
+        matches!(*self.data, ValueData::Set(_) | ValueData::SetInt(_))
     }
 
     pub fn is_stream(&self) -> bool {
-        matches!(self.data, ValueData::Stream { .. })
+        matches!(*self.data, ValueData::Stream { .. })
     }
 
     pub fn is_sorted_set(&self) -> bool {
-        matches!(self.data, ValueData::SortedSet(_))
+        matches!(*self.data, ValueData::SortedSet(_))
     }
 
     pub fn type_name(&self) -> &'static str {
-        match &self.data {
-            ValueData::String(_) => "string",
+        match &*self.data {
+            ValueData::String(_) | ValueData::StringInt(_) => "string",
             ValueData::Hash(_) => "hash",
             ValueData::List(_) => "list",
-            ValueData::Set(_) => "set",
+            ValueData::Set(_) | ValueData::SetInt(_) => "set",
             ValueData::SortedSet(_) => "zset",
             ValueData::Stream { .. } => "stream",
         }
     }
 
+    /// Returns the raw `Bytes` reference for `String` variant only.
+    /// For `StringInt`, use [`as_string_bytes()`] which materialises the value.
     pub fn as_string(&self) -> Option<&Bytes> {
-        match &self.data {
+        match &*self.data {
             ValueData::String(v) => Some(v),
             _ => None,
         }
     }
 
+    /// Returns the string representation as owned `Bytes`, handling both
+    /// `String` (cheap clone) and `StringInt` (itoa materialisation).
+    pub fn as_string_bytes(&self) -> Option<Bytes> {
+        match &*self.data {
+            ValueData::String(v) => Some(v.clone()),
+            ValueData::StringInt(n) => {
+                let mut buf = itoa::Buffer::new();
+                Some(Bytes::copy_from_slice(buf.format(*n).as_bytes()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the `i64` value if this is a `StringInt`.
+    pub fn as_int(&self) -> Option<i64> {
+        match &*self.data {
+            ValueData::StringInt(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     pub fn as_hash(&self) -> Option<&HashMap<Bytes, HashFieldEntry>> {
-        match &self.data {
+        match &*self.data {
             ValueData::Hash(h) => Some(h),
             _ => None,
         }
     }
 
     pub fn as_hash_mut(&mut self) -> Option<&mut HashMap<Bytes, HashFieldEntry>> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::Hash(h) => Some(h),
             _ => None,
         }
     }
 
     pub fn as_sorted_set(&self) -> Option<&SortedSet> {
-        match &self.data {
+        match &*self.data {
             ValueData::SortedSet(z) => Some(z),
             _ => None,
         }
     }
 
     pub fn as_sorted_set_mut(&mut self) -> Option<&mut SortedSet> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::SortedSet(z) => Some(z),
             _ => None,
         }
     }
 
     pub fn as_list(&self) -> Option<&VecDeque<Bytes>> {
-        match &self.data {
+        match &*self.data {
             ValueData::List(l) => Some(l),
             _ => None,
         }
     }
 
     pub fn as_list_mut(&mut self) -> Option<&mut VecDeque<Bytes>> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::List(l) => Some(l),
             _ => None,
         }
     }
 
     pub fn as_set(&self) -> Option<&HashSet<Bytes>> {
-        match &self.data {
+        match &*self.data {
             ValueData::Set(s) => Some(s),
             _ => None,
         }
     }
 
     pub fn as_set_mut(&mut self) -> Option<&mut HashSet<Bytes>> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::Set(s) => Some(s),
             _ => None,
         }
     }
 
+    pub fn set_len(&self) -> Option<usize> {
+        match &*self.data {
+            ValueData::Set(set) => Some(set.len()),
+            ValueData::SetInt(set) => Some(set.len()),
+            _ => None,
+        }
+    }
+
+    pub fn set_is_empty(&self) -> Option<bool> {
+        self.set_len().map(|len| len == 0)
+    }
+
+    pub fn set_contains(&self, member: &[u8]) -> Option<bool> {
+        match &*self.data {
+            ValueData::Set(set) => Some(set.contains(member)),
+            ValueData::SetInt(set) => {
+                let member = bytes_to_intset_member(member);
+                Some(member.is_some_and(|value| set.binary_search(&value).is_ok()))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_members(&self) -> Option<Vec<Bytes>> {
+        match &*self.data {
+            ValueData::Set(set) => Some(set.iter().cloned().collect()),
+            ValueData::SetInt(set) => Some(
+                set.iter()
+                    .map(|value| intset_member_to_bytes(*value))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    pub fn set_as_hashset(&self) -> Option<HashSet<Bytes>> {
+        match &*self.data {
+            ValueData::Set(set) => Some(set.clone()),
+            ValueData::SetInt(set) => Some(intset_to_hashset(set)),
+            _ => None,
+        }
+    }
+
+    pub fn set_insert_member(&mut self, member: Bytes) -> Option<bool> {
+        let mut new_data: Option<ValueData> = None;
+        let inserted = match &mut *self.data {
+            ValueData::Set(set) => set.insert(member),
+            ValueData::SetInt(set) => match bytes_to_intset_member(member.as_ref()) {
+                Some(int_member) => match set.binary_search(&int_member) {
+                    Ok(_) => false,
+                    Err(pos) => {
+                        if set.len() >= SET_MAX_INTSET_ENTRIES {
+                            let mut upgraded_set = intset_to_hashset(set);
+                            let inserted = upgraded_set.insert(member);
+                            new_data = Some(ValueData::Set(upgraded_set));
+                            inserted
+                        } else {
+                            set.insert(pos, int_member);
+                            true
+                        }
+                    }
+                },
+                None => {
+                    let mut upgraded_set = intset_to_hashset(set);
+                    let inserted = upgraded_set.insert(member);
+                    new_data = Some(ValueData::Set(upgraded_set));
+                    inserted
+                }
+            },
+            _ => return None,
+        };
+
+        if let Some(data) = new_data {
+            *self.data = data;
+            self.set_encoding(Encoding::HashTable);
+        }
+        Some(inserted)
+    }
+
+    pub fn set_remove_member(&mut self, member: &Bytes) -> Option<bool> {
+        match &mut *self.data {
+            ValueData::Set(set) => Some(set.remove(member)),
+            ValueData::SetInt(set) => {
+                let Some(int_member) = bytes_to_intset_member(member.as_ref()) else {
+                    return Some(false);
+                };
+                match set.binary_search(&int_member) {
+                    Ok(pos) => {
+                        set.remove(pos);
+                        Some(true)
+                    }
+                    Err(_) => Some(false),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub fn set_take_all_members(&mut self) -> Option<Vec<Bytes>> {
+        match &mut *self.data {
+            ValueData::Set(set) => Some(set.drain().collect()),
+            ValueData::SetInt(set) => Some(
+                std::mem::take(set)
+                    .into_iter()
+                    .map(intset_member_to_bytes)
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
     pub fn as_stream(&self) -> Option<(&Vec<StreamEntry>, &HashMap<Bytes, StreamGroup>)> {
-        match &self.data {
+        match &*self.data {
             ValueData::Stream { entries, groups } => Some((entries, groups)),
             _ => None,
         }
@@ -531,35 +789,35 @@ impl StoredValue {
     pub fn as_stream_mut(
         &mut self,
     ) -> Option<(&mut Vec<StreamEntry>, &mut HashMap<Bytes, StreamGroup>)> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::Stream { entries, groups } => Some((entries, groups)),
             _ => None,
         }
     }
 
     pub fn as_stream_entries(&self) -> Option<&Vec<StreamEntry>> {
-        match &self.data {
+        match &*self.data {
             ValueData::Stream { entries, .. } => Some(entries),
             _ => None,
         }
     }
 
     pub fn as_stream_entries_mut(&mut self) -> Option<&mut Vec<StreamEntry>> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::Stream { entries, .. } => Some(entries),
             _ => None,
         }
     }
 
     pub fn as_stream_groups(&self) -> Option<&HashMap<Bytes, StreamGroup>> {
-        match &self.data {
+        match &*self.data {
             ValueData::Stream { groups, .. } => Some(groups),
             _ => None,
         }
     }
 
     pub fn as_stream_groups_mut(&mut self) -> Option<&mut HashMap<Bytes, StreamGroup>> {
-        match &mut self.data {
+        match &mut *self.data {
             ValueData::Stream { groups, .. } => Some(groups),
             _ => None,
         }
@@ -697,11 +955,12 @@ pub const LAZY_FREE_THRESHOLD: usize = 64;
 
 /// Check whether a `StoredValue` is large enough to warrant lazy free.
 pub fn should_lazy_free(value: &StoredValue) -> bool {
-    match &value.data {
-        ValueData::String(_) => false,
+    match value.data() {
+        ValueData::String(_) | ValueData::StringInt(_) => false,
         ValueData::List(l) => l.len() >= LAZY_FREE_THRESHOLD,
         ValueData::Hash(h) => h.len() >= LAZY_FREE_THRESHOLD,
         ValueData::Set(s) => s.len() >= LAZY_FREE_THRESHOLD,
+        ValueData::SetInt(s) => s.len() >= LAZY_FREE_THRESHOLD,
         ValueData::SortedSet(z) => z.len() >= LAZY_FREE_THRESHOLD,
         ValueData::Stream { entries, .. } => entries.len() >= LAZY_FREE_THRESHOLD,
     }
@@ -711,11 +970,35 @@ pub fn should_lazy_free(value: &StoredValue) -> bool {
 // DbShard + DataState — per-DB data grouping
 // ---------------------------------------------------------------------------
 
-/// One logical database — data + WATCH versions.
+/// One logical database — data + WATCH versions + expires index.
 #[derive(Debug, Clone, Default)]
 pub struct DbShard {
     pub data: HashMap<Bytes, StoredValue>,
     pub key_versions: HashMap<Bytes, u64>,
+    /// Keys with a TTL. Maps key → `expire_at_ms` for O(1) volatile-count
+    /// and efficient sampling in the active-expiry cycle.
+    pub expires: HashMap<Bytes, i64>,
+}
+
+impl DbShard {
+    /// Synchronise the expires side-index after setting or clearing a TTL.
+    #[inline]
+    pub fn sync_expires(&mut self, key: &Bytes, expire_at_ms: Option<i64>) {
+        match expire_at_ms {
+            Some(ms) if ms > 0 => {
+                self.expires.insert(key.clone(), ms);
+            }
+            _ => {
+                self.expires.remove(key);
+            }
+        }
+    }
+
+    /// Number of keys that have a TTL (O(1)).
+    #[inline]
+    pub fn volatile_count(&self) -> usize {
+        self.expires.len()
+    }
 }
 
 /// The DB layer — per-DB `parking_lot::RwLock` for concurrent access.
@@ -726,6 +1009,9 @@ pub struct DbShard {
 pub struct DataState {
     shards: Arc<[parking_lot::RwLock<DbShard>]>,
     next_key_version: Arc<AtomicU64>,
+    /// Per-DB estimated memory in bytes — updated incrementally on insert/remove,
+    /// corrected periodically via full scan in `server_cron`.
+    db_memory_bytes: Arc<[AtomicUsize]>,
 }
 
 impl std::fmt::Debug for DataState {
@@ -749,13 +1035,47 @@ impl Default for DataState {
 impl DataState {
     pub fn new(db_count: usize) -> Self {
         let mut shards = Vec::with_capacity(db_count);
+        let mut mem = Vec::with_capacity(db_count);
         for _ in 0..db_count {
             shards.push(parking_lot::RwLock::new(DbShard::default()));
+            mem.push(AtomicUsize::new(0));
         }
         Self {
             shards: Arc::from(shards),
             next_key_version: Arc::new(AtomicU64::new(1)),
+            db_memory_bytes: Arc::from(mem),
         }
+    }
+
+    // -- incremental memory tracking -----------------------------------------
+
+    /// O(1) total estimated memory across all databases.
+    pub fn estimated_memory(&self) -> usize {
+        self.db_memory_bytes
+            .iter()
+            .map(|a| a.load(AtomicOrdering::Relaxed))
+            .sum()
+    }
+
+    /// Add `bytes` to the estimated memory for a specific database.
+    pub fn add_memory(&self, db_idx: usize, bytes: usize) {
+        self.db_memory_bytes[db_idx].fetch_add(bytes, AtomicOrdering::Relaxed);
+    }
+
+    /// Subtract `bytes` from the estimated memory for a specific database.
+    pub fn sub_memory(&self, db_idx: usize, bytes: usize) {
+        // Use saturating semantics to avoid underflow from drift.
+        let _ = self.db_memory_bytes[db_idx].fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |cur| Some(cur.saturating_sub(bytes)),
+        );
+    }
+
+    /// Reset the estimated memory for a specific database (used during
+    /// periodic full-scan correction and after FLUSHDB).
+    pub fn reset_memory(&self, db_idx: usize, bytes: usize) {
+        self.db_memory_bytes[db_idx].store(bytes, AtomicOrdering::Relaxed);
     }
 
     pub fn db_count(&self) -> usize {
@@ -809,14 +1129,146 @@ impl DataState {
     }
 
     /// Load RDB data into all DBs. Acquires all write locks in order.
+    /// Resets per-DB memory counters to match the loaded data.
     pub fn load_from_snapshot(&self, snapshot: DbSnapshot) {
         let mut guards = self.write_all_dbs();
         for (i, db_data) in snapshot.into_iter().enumerate() {
             if i < guards.len() {
                 guards[i].data = db_data;
                 guards[i].key_versions.clear();
+
+                // Rebuild expires index + memory estimate from loaded data.
+                guards[i].expires.clear();
+                let mut mem = 0usize;
+                let mut new_expires = HashMap::new();
+                for (k, v) in &guards[i].data {
+                    mem += crate::eviction::estimate_object_memory(k, v);
+                    if let Some(ms) = v.expire_at_ms() {
+                        new_expires.insert(k.clone(), ms);
+                    }
+                }
+                guards[i].expires = new_expires;
+                self.reset_memory(i, mem);
             }
         }
+    }
+}
+
+/// Write guard for a single DB that keeps auxiliary indexes and memory tracking
+/// in sync for top-level key insert/remove operations.
+pub struct DbWriteGuard<'a> {
+    db_idx: usize,
+    data_state: &'a DataState,
+    shard: parking_lot::RwLockWriteGuard<'a, DbShard>,
+}
+
+impl<'a> DbWriteGuard<'a> {
+    fn new(
+        db_idx: usize,
+        data_state: &'a DataState,
+        shard: parking_lot::RwLockWriteGuard<'a, DbShard>,
+    ) -> Self {
+        Self {
+            db_idx,
+            data_state,
+            shard,
+        }
+    }
+
+    /// Insert or replace a top-level key while keeping the expires side-index
+    /// and incremental memory estimate in sync.
+    pub fn insert(&mut self, key: Bytes, value: StoredValue) -> Option<StoredValue> {
+        let new_mem = crate::eviction::estimate_object_memory(&key, &value);
+        self.shard.sync_expires(&key, value.expire_at_ms());
+        let old = self.shard.data.insert(key.clone(), value);
+
+        match &old {
+            Some(old_value) => {
+                let old_mem = crate::eviction::estimate_object_memory(&key, old_value);
+                if new_mem >= old_mem {
+                    self.data_state.add_memory(self.db_idx, new_mem - old_mem);
+                } else {
+                    self.data_state.sub_memory(self.db_idx, old_mem - new_mem);
+                }
+            }
+            None => self.data_state.add_memory(self.db_idx, new_mem),
+        }
+
+        old
+    }
+
+    /// Remove a top-level key while keeping the expires side-index and
+    /// incremental memory estimate in sync.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<StoredValue>
+    where
+        Bytes: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let (owned_key, value) = self.shard.data.remove_entry(key)?;
+
+        self.shard.expires.remove(&owned_key);
+        let freed = crate::eviction::estimate_object_memory(&owned_key, &value);
+        self.data_state.sub_memory(self.db_idx, freed);
+        Some(value)
+    }
+
+    /// Update the TTL metadata for an existing key and keep the expires side-index
+    /// in sync.
+    pub fn set_key_expiry(&mut self, key: &Bytes, expire_at_ms: Option<i64>) -> bool {
+        let Some(entry) = self.shard.data.get_mut(key) else {
+            return false;
+        };
+        entry.set_expire_at_ms(expire_at_ms);
+        self.shard.sync_expires(key, expire_at_ms);
+        true
+    }
+
+    /// Remove the key if it is expired, updating tracking structures.
+    pub fn purge_expired_key(&mut self, key: &Bytes, now_ms: i64) -> bool {
+        if self
+            .shard
+            .data
+            .get(key.as_ref())
+            .is_some_and(|value| value.expire_at_ms().is_some_and(|ts| ts <= now_ms))
+        {
+            self.remove(key.as_ref());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Purge all expired keys from the DB while keeping tracking structures in sync.
+    pub fn purge_expired_keys(&mut self, now_ms: i64) {
+        let expired_keys = self
+            .shard
+            .data
+            .iter()
+            .filter(|(_, value)| value.expire_at_ms().is_some_and(|ts| ts <= now_ms))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+
+        for key in expired_keys {
+            self.remove(&key);
+        }
+    }
+
+    pub fn shard(&self) -> &DbShard {
+        &self.shard
+    }
+}
+
+impl std::ops::Deref for DbWriteGuard<'_> {
+    type Target = HashMap<Bytes, StoredValue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shard.data
+    }
+}
+
+impl std::ops::DerefMut for DbWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.shard.data
     }
 }
 
@@ -933,18 +1385,17 @@ impl ServerState {
         parking_lot::RwLockReadGuard::map(self.data.read_db(idx), |s| &s.data)
     }
 
-    /// Acquire a write lock on a DB, returning a mapped guard to the inner HashMap.
-    pub fn db_mut(
-        &self,
-        idx: usize,
-    ) -> parking_lot::MappedRwLockWriteGuard<'_, HashMap<Bytes, StoredValue>> {
-        parking_lot::RwLockWriteGuard::map(self.data.write_db(idx), |s| &mut s.data)
+    /// Acquire a write lock on a DB with tracked top-level key mutations.
+    pub fn db_mut(&self, idx: usize) -> DbWriteGuard<'_> {
+        DbWriteGuard::new(idx, &self.data, self.data.write_db(idx))
     }
 
     pub fn clear_db(&self, idx: usize) {
         let mut shard = self.data.write_db(idx);
         shard.data.clear();
         shard.key_versions.clear();
+        shard.expires.clear();
+        self.data.reset_memory(idx, 0);
     }
 
     pub fn swap_dbs(&self, left: usize, right: usize) {
@@ -953,9 +1404,11 @@ impl ServerState {
     }
 
     pub fn clear_all_dbs(&self) {
-        for mut shard in self.data.write_all_dbs() {
+        for (i, mut shard) in self.data.write_all_dbs().into_iter().enumerate() {
             shard.data.clear();
             shard.key_versions.clear();
+            shard.expires.clear();
+            self.data.reset_memory(i, 0);
         }
     }
 
@@ -980,11 +1433,14 @@ impl ServerState {
 
     pub fn lazy_free_del(&self, db_idx: usize, key: &Bytes) -> bool {
         let mut shard = self.data.write_db(db_idx);
-        let Some(value) = shard.data.remove(key) else {
+        let Some((owned_key, value)) = shard.data.remove_entry(key) else {
             return false;
         };
+        shard.expires.remove(&owned_key);
+        let freed = crate::eviction::estimate_object_memory(&owned_key, &value);
+        self.data.sub_memory(db_idx, freed);
         let version = self.data.alloc_key_version();
-        shard.key_versions.insert(key.clone(), version);
+        shard.key_versions.insert(owned_key, version);
         drop(shard);
         self.try_lazy_free(value);
         true
@@ -994,6 +1450,8 @@ impl ServerState {
         let mut shard = self.data.write_db(db_idx);
         let old_db = std::mem::take(&mut shard.data);
         shard.key_versions.clear();
+        shard.expires.clear();
+        self.data.reset_memory(db_idx, 0);
         drop(shard);
 
         if let Some(tx) = self.lazy_free_tx() {
@@ -1476,24 +1934,12 @@ impl ServerState {
 // Free functions
 // ---------------------------------------------------------------------------
 
-pub fn purge_expired_key(
-    db: &mut impl std::ops::DerefMut<Target = HashMap<Bytes, StoredValue>>,
-    key: &Bytes,
-    now_ms: i64,
-) {
-    if db
-        .get(key.as_ref())
-        .is_some_and(|v| v.expire_at_ms.is_some_and(|at| at <= now_ms))
-    {
-        db.remove(key.as_ref());
-    }
+pub fn purge_expired_key(db: &mut DbWriteGuard<'_>, key: &Bytes, now_ms: i64) {
+    db.purge_expired_key(key, now_ms);
 }
 
-pub fn purge_expired_keys(
-    db: &mut impl std::ops::DerefMut<Target = HashMap<Bytes, StoredValue>>,
-    now_ms: i64,
-) {
-    db.retain(|_, value| value.expire_at_ms.is_none_or(|ts| ts > now_ms));
+pub fn purge_expired_keys(db: &mut DbWriteGuard<'_>, now_ms: i64) {
+    db.purge_expired_keys(now_ms);
 }
 
 fn generate_cluster_node_id() -> Bytes {
@@ -1512,9 +1958,97 @@ mod tests {
     use std::{path::PathBuf, time::Duration};
 
     use bytes::Bytes;
+    use hashbrown::HashSet;
     use tokio::time::timeout;
 
-    use super::{AtomicStatsState, PubSubState, ServerState, SharedState, StatsState, StoredValue};
+    use super::{
+        AtomicStatsState, Encoding, PubSubState, ServerState, SharedState, StatsState, StoredValue,
+        ValueData,
+    };
+
+    #[test]
+    fn stored_value_is_compact() {
+        // Phase 1 invariant: StoredValue must stay at 24 bytes.
+        assert_eq!(
+            std::mem::size_of::<StoredValue>(),
+            24,
+            "StoredValue grew beyond 24 bytes — check Box<ValueData> / field packing"
+        );
+        // ValueData enum size must not regress.
+        assert_eq!(
+            std::mem::size_of::<ValueData>(),
+            72,
+            "ValueData size changed — new variant may have increased the enum"
+        );
+    }
+
+    #[test]
+    fn encoding_roundtrip() {
+        let cases = [
+            Encoding::Raw,
+            Encoding::Int,
+            Encoding::QuickList,
+            Encoding::HashTable,
+            Encoding::IntSet,
+            Encoding::SkipList,
+            Encoding::StreamTree,
+        ];
+        for enc in cases {
+            assert_eq!(Encoding::from_u8(enc as u8), enc);
+        }
+    }
+
+    #[test]
+    fn small_integer_sets_use_intset_encoding() {
+        let mut members = HashSet::new();
+        members.insert(Bytes::from("1"));
+        members.insert(Bytes::from("2"));
+        members.insert(Bytes::from("3"));
+
+        let value = StoredValue::set(members, None);
+        assert_eq!(value.encoding(), Encoding::IntSet);
+        assert!(matches!(value.data(), ValueData::SetInt(values) if values == &vec![1, 2, 3]));
+        assert_eq!(value.set_len(), Some(3));
+        assert_eq!(value.set_contains(b"2"), Some(true));
+        assert_eq!(value.set_contains(b"x"), Some(false));
+    }
+
+    #[test]
+    fn intset_upgrades_when_non_integer_member_is_inserted() {
+        let mut members = HashSet::new();
+        members.insert(Bytes::from("1"));
+        members.insert(Bytes::from("2"));
+
+        let mut value = StoredValue::set(members, None);
+        assert_eq!(value.encoding(), Encoding::IntSet);
+
+        assert_eq!(value.set_insert_member(Bytes::from("hello")), Some(true));
+        assert_eq!(value.encoding(), Encoding::HashTable);
+        assert!(matches!(value.data(), ValueData::Set(_)));
+        assert_eq!(value.set_contains(b"hello"), Some(true));
+    }
+
+    #[test]
+    fn expire_sentinel_roundtrip() {
+        let val = StoredValue::string(Bytes::from("x"), None);
+        assert_eq!(val.expire_at_ms(), None);
+
+        let val = StoredValue::string(Bytes::from("x"), Some(12345));
+        assert_eq!(val.expire_at_ms(), Some(12345));
+    }
+
+    #[test]
+    fn lru_clock_packing() {
+        let mut val = StoredValue::string(Bytes::from("x"), None);
+        assert_eq!(val.lru_clock(), 0);
+        val.set_lru_clock(0x0FFF_FFFF); // max 28-bit
+        assert_eq!(val.lru_clock(), 0x0FFF_FFFF);
+        assert_eq!(val.encoding(), Encoding::Raw);
+
+        val.set_encoding(Encoding::SkipList);
+        assert_eq!(val.encoding(), Encoding::SkipList);
+        assert_eq!(val.lru_clock(), 0x0FFF_FFFF); // unchanged
+    }
 
     #[test]
     fn remove_client_cleans_all_subscriptions() {
