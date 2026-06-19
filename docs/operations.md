@@ -932,6 +932,7 @@ breaking change는 아래를 포함해야 한다.
 
 - release binary
 - checksum
+- `ratatosk-sidecar-evidence.json` (binary SHA-256, source pin, sidecar health/dynamic-port/shutdown contract)
 - README and docs bundle
 - example config
 

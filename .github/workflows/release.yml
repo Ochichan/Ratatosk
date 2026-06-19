@@ -85,6 +85,33 @@ jobs:
           cp target/release/ratatosk release/pkg/
           cp README.md CHANGELOG.md LICENSE ratatosk.conf release/pkg/
           cp -R docs/. release/pkg/docs/
+
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            binary_sha256="$(shasum -a 256 release/pkg/ratatosk | awk '{print $1}')"
+          else
+            binary_sha256="$(sha256sum release/pkg/ratatosk | awk '{print $1}')"
+          fi
+          generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          cat > release/pkg/ratatosk-sidecar-evidence.json <<EOF
+          {
+            "schema_version": 1,
+            "component": "ratatosk",
+            "source_pin": "${{ github.sha }}",
+            "release_ref": "${{ github.ref_name }}",
+            "target": "${{ matrix.archive_suffix }}",
+            "generated_at": "${generated_at}",
+            "binary": {
+              "path": "ratatosk",
+              "sha256": "${binary_sha256}"
+            },
+            "sidecar_contract": {
+              "health_probe": "PING / PING HEALTH",
+              "dynamic_port": "RATATOSK_PORT=0 + RATATOSK_BOUND_ADDR_FILE",
+              "shutdown": "SIGTERM graceful shutdown within RATATOSK_SHUTDOWN_GRACE_MS"
+            }
+          }
+          EOF
+
           archive="release/ratatosk-${{ github.ref_name }}-${{ matrix.archive_suffix }}.tar.gz"
           tar -czf "$archive" -C release/pkg .
           if [[ "$RUNNER_OS" == "macOS" ]]; then
