@@ -428,6 +428,9 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_AUDIT_LOG` | `/tmp/ratatosk-audit.log` | append-only audit event log path |
 | `RATATOSK_AUDIT_CHAIN_STATE` | `/tmp/ratatosk-audit-chain.state` | audit chain checkpoint path |
 
+On Unix, SIGTERM enters the graceful shutdown path and should exit successfully
+after clients/background tasks drain within `RATATOSK_SHUTDOWN_GRACE_MS`.
+
 런타임 `CONFIG SET` 지원:
 - `timeout`, `hz`, `appendonly`, `appendfsync` (always/everysec/no)
 - `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`, `save`

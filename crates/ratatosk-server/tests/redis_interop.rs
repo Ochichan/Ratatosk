@@ -3,7 +3,7 @@ use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -13,6 +13,30 @@ use ratatosk_resp::{RespFrame, encode_to_vec, parse};
 
 struct ChildGuard {
     child: Child,
+}
+
+impl ChildGuard {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "child process {} did not exit within {timeout:?}",
+                self.id()
+            ),
+        ))
+    }
 }
 
 impl Drop for ChildGuard {
@@ -346,6 +370,34 @@ fn ratatosk_port_zero_advertises_bound_sidecar_port() -> io::Result<()> {
     assert_eq!(
         send_frame(&mut client, array(&["PING"]))?,
         RespFrame::pong()
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ratatosk_exits_successfully_on_sigterm() -> io::Result<()> {
+    let ratatosk_dir = tempfile::tempdir()?;
+
+    let (mut ratatosk, ratatosk_port) = spawn_ratatosk_server_on_dynamic_port(ratatosk_dir.path())?;
+    let mut client = connect_client(ratatosk_port)?;
+    assert_eq!(
+        send_frame(&mut client, array(&["PING"]))?,
+        RespFrame::pong()
+    );
+    drop(client);
+
+    let status = Command::new("kill")
+        .arg("-TERM")
+        .arg(ratatosk.id().to_string())
+        .status()?;
+    assert!(status.success(), "failed to send SIGTERM: {status}");
+
+    let status = ratatosk.wait_for_exit(Duration::from_secs(10))?;
+    assert!(
+        status.success(),
+        "ratatosk should exit 0 after SIGTERM: {status}"
     );
 
     Ok(())
