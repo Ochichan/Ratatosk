@@ -2142,10 +2142,8 @@ pub(super) async fn try_run_readonly_batch(
 
         let lock_hold_start = std::time::Instant::now();
         server.stats.catch_up_from_atomic(&server_state.stats);
-        for ((argv, outcome), elapsed_us) in argvs
-            .iter()
-            .zip(outcomes.iter())
-            .zip(elapsed_us_by_command.into_iter())
+        for ((argv, outcome), elapsed_us) in
+            argvs.iter().zip(outcomes.iter()).zip(elapsed_us_by_command)
         {
             let (track_slowlog, track_latency) = post_execute_tracking_flags(&server, argv);
             apply_post_execute_side_effects(

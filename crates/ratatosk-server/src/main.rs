@@ -354,7 +354,7 @@ fn prune_crash_files(dir: &Path, max_files: usize, max_total_bytes: u64) -> io::
         });
     }
 
-    crash_files.sort_by(|left, right| right.modified.cmp(&left.modified));
+    crash_files.sort_by_key(|crash_file| std::cmp::Reverse(crash_file.modified));
 
     let mut kept_files = 0usize;
     let mut kept_bytes = 0u64;

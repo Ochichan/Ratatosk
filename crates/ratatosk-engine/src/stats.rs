@@ -199,11 +199,7 @@ impl StatsState {
     pub fn sample_ops_per_sec(&mut self, interval_secs: u64) {
         let current = self.total_commands_processed;
         let delta = current.saturating_sub(self.prev_commands_snapshot);
-        self.instantaneous_ops_per_sec = if interval_secs > 0 {
-            delta / interval_secs
-        } else {
-            delta
-        };
+        self.instantaneous_ops_per_sec = delta.checked_div(interval_secs).unwrap_or(delta);
         self.prev_commands_snapshot = current;
     }
 

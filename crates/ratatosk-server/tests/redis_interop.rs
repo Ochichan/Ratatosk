@@ -144,6 +144,125 @@ fn array(parts: &[&str]) -> RespFrame {
     RespFrame::Array(parts.iter().map(|part| bulk(part)).collect())
 }
 
+fn bulk_text(frame: RespFrame) -> io::Result<String> {
+    match frame {
+        RespFrame::BulkString(Some(value)) => String::from_utf8(value.to_vec()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("bulk string is not valid UTF-8: {error}"),
+            )
+        }),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected bulk string, got {other:?}"),
+        )),
+    }
+}
+
+#[test]
+fn scholar_v1_sidecar_wire_contract_smoke() -> io::Result<()> {
+    let ratatosk_dir = tempfile::tempdir()?;
+    let ratatosk_port = reserve_port()?;
+
+    let _ratatosk = spawn_ratatosk_server(ratatosk_port, ratatosk_dir.path())?;
+    wait_for_tcp_listener(ratatosk_port)?;
+
+    let mut client = connect_client(ratatosk_port)?;
+
+    assert_eq!(
+        send_frame(&mut client, array(&["PING"]))?,
+        RespFrame::pong()
+    );
+
+    let health = bulk_text(send_frame(&mut client, array(&["PING", "HEALTH"]))?)?;
+    assert!(
+        health.contains("status:") && health.contains("reasons:"),
+        "PING HEALTH should expose status and reasons, got {health:?}"
+    );
+
+    let info = bulk_text(send_frame(&mut client, array(&["INFO", "server"]))?)?;
+    assert!(
+        info.contains("# Server\r\n")
+            && info.contains("redis_mode:standalone\r\n")
+            && info.contains("ratatosk_compatibility_mode:")
+            && info.contains("ratatosk_protected_mode:"),
+        "INFO server should expose the sidecar contract fields, got {info:?}"
+    );
+
+    assert_eq!(
+        send_frame(&mut client, array(&["DBSIZE"]))?,
+        RespFrame::Integer(0)
+    );
+    assert_eq!(
+        send_frame(
+            &mut client,
+            array(&["SET", "nexus:cache:search:1", "payload", "EX", "60"])
+        )?,
+        RespFrame::ok()
+    );
+    assert_eq!(
+        send_frame(&mut client, array(&["GET", "nexus:cache:search:1"]))?,
+        bulk("payload")
+    );
+    match send_frame(&mut client, array(&["TTL", "nexus:cache:search:1"]))? {
+        RespFrame::Integer(ttl) if (0..=60).contains(&ttl) => {}
+        other => panic!("expected TTL for short-lived cache key to be 0..=60, got {other:?}"),
+    }
+    assert_eq!(
+        send_frame(&mut client, array(&["DEL", "nexus:cache:search:1"]))?,
+        RespFrame::Integer(1)
+    );
+    assert_eq!(
+        send_frame(&mut client, array(&["GET", "nexus:cache:search:1"]))?,
+        RespFrame::BulkString(None)
+    );
+
+    assert_eq!(
+        send_frame(&mut client, array(&["INCR", "nexus:quota:provider:window"]))?,
+        RespFrame::Integer(1)
+    );
+    assert_eq!(
+        send_frame(
+            &mut client,
+            array(&["EXPIRE", "nexus:quota:provider:window", "30"])
+        )?,
+        RespFrame::Integer(1)
+    );
+    match send_frame(&mut client, array(&["TTL", "nexus:quota:provider:window"]))? {
+        RespFrame::Integer(ttl) if (0..=30).contains(&ttl) => {}
+        other => panic!("expected TTL for provider quota key to be 0..=30, got {other:?}"),
+    }
+
+    let xadd_id = bulk_text(send_frame(
+        &mut client,
+        array(&["XADD", "nexus:telemetry", "*", "event", "search.completed"]),
+    )?)?;
+    assert!(
+        xadd_id.contains('-'),
+        "XADD should return a stream entry id, got {xadd_id:?}"
+    );
+
+    let mut subscriber = connect_client(ratatosk_port)?;
+    assert_eq!(
+        send_frame(&mut subscriber, array(&["SUBSCRIBE", "nexus:events"]))?,
+        RespFrame::Array(vec![
+            bulk("subscribe"),
+            bulk("nexus:events"),
+            RespFrame::Integer(1),
+        ])
+    );
+    assert_eq!(
+        send_frame(&mut client, array(&["PUBLISH", "nexus:events", "changed"]))?,
+        RespFrame::Integer(1)
+    );
+    assert_eq!(
+        read_frame(&mut subscriber)?,
+        RespFrame::Array(vec![bulk("message"), bulk("nexus:events"), bulk("changed"),])
+    );
+
+    Ok(())
+}
+
 #[test]
 fn redis_interop_supported_subset_matches_redis_when_available() -> io::Result<()> {
     let ratatosk_dir = tempfile::tempdir()?;
