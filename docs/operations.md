@@ -289,7 +289,8 @@ re-evaluate the already-bound socket.
 - Non-loopback `bind` still requires `RATATOSK_ALLOW_INSECURE_BIND=true`
 - For non-loopback bind, also set `RATATOSK_DEFAULT_USER_PASSWORD` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH`
 - `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true` is still available, but it is explicitly insecure
-- `--check-config` validates both config parsing and startup preflight access to persistence and audit paths
+- `--check-config` validates config parsing plus startup preflight access to persistence, audit paths,
+  and the optional `RATATOSK_BOUND_ADDR_FILE` sidecar handoff path
 - Inspection commands avoid starting the metrics listener so `--print-config json` remains machine-readable
 
 ---

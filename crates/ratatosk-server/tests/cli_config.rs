@@ -34,6 +34,7 @@ where
         "RATATOSK_DIR",
         "RATATOSK_METRICS_BIND",
         "RATATOSK_ALLOW_NO_METRICS",
+        "RATATOSK_BOUND_ADDR_FILE",
     ] {
         command.env_remove(name);
     }
@@ -143,6 +144,36 @@ fn check_config_fails_for_invalid_auto_loaded_local_config() -> io::Result<()> {
     let stderr = stderr_text(&output);
     assert!(stderr.contains("parsing config file"));
     assert!(stderr.contains("directive 'hz' requires a value in 1..=500"));
+
+    Ok(())
+}
+
+#[test]
+fn check_config_fails_for_unwritable_bound_addr_file_parent() -> io::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let blocker = temp.path().join("not-a-directory");
+    fs::write(&blocker, "x")?;
+    let bound_addr_file = blocker.join("bound-addr.json");
+
+    let output = run_ratatosk(
+        temp.path(),
+        ["--check-config"],
+        &[(
+            "RATATOSK_BOUND_ADDR_FILE",
+            Some(bound_addr_file.to_str().unwrap()),
+        )],
+    )?;
+
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    let stderr = stderr_text(&output);
+    assert!(
+        stderr.contains("running startup preflight checks"),
+        "stderr did not include preflight context:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("bound address handoff parent is not a directory"),
+        "stderr did not include bound address handoff failure:\n{stderr}"
+    );
 
     Ok(())
 }

@@ -27,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 
 const DEFAULT_CRASH_MAX_FILES: usize = 64;
 const DEFAULT_CRASH_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const BOUND_ADDR_FILE_ENV: &str = "RATATOSK_BOUND_ADDR_FILE";
 #[cfg(target_os = "linux")]
 const DEFAULT_FD_HEADROOM: usize = 128;
 
@@ -417,6 +418,7 @@ fn run_startup_preflight(config: &ServerConfig, emit_logs: bool) -> anyhow::Resu
     validate_fd_headroom(config, emit_logs)?;
     validate_persistence_dir_access(config, emit_logs)?;
     validate_audit_log_access(emit_logs)?;
+    validate_bound_addr_file_access(emit_logs)?;
     Ok(())
 }
 
@@ -488,6 +490,56 @@ fn validate_appendable_file_path(label: &str, path: &Path) -> anyhow::Result<()>
         .append(true)
         .open(path)
         .with_context(|| format!("opening {} path for append: {}", label, path.display()))?;
+
+    Ok(())
+}
+
+fn validate_bound_addr_file_access(emit_logs: bool) -> anyhow::Result<()> {
+    let Some(path) = std::env::var_os(BOUND_ADDR_FILE_ENV) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("{BOUND_ADDR_FILE_ENV} must not be empty"));
+    }
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    if !parent.exists() {
+        return Err(anyhow!(
+            "bound address handoff directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    if !parent.is_dir() {
+        return Err(anyhow!(
+            "bound address handoff parent is not a directory: {}",
+            parent.display()
+        ));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        anyhow!("{BOUND_ADDR_FILE_ENV} must point to a bound address handoff file")
+    })?;
+    let probe = path.with_file_name(format!(
+        ".{}.preflight.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    std::fs::write(&probe, b"ok").with_context(|| {
+        format!(
+            "writing bound address handoff probe file: {}",
+            probe.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe);
+
+    if emit_logs {
+        tracing::info!(
+            target = "ratatosk::startup",
+            bound_addr_file = %path.display(),
+            "bound address handoff preflight passed"
+        );
+    }
 
     Ok(())
 }
