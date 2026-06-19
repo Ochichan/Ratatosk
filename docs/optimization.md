@@ -223,7 +223,7 @@ fn option_matches(bytes: &[u8], expected: &[u8]) -> bool {
 >   - Phase 3 — expires side-index (`DbShard.expires: HashMap<Bytes, i64>`, `sync_expires()`)
 >   - Phase 4A — `ValueData::StringInt(i64)` / `Encoding::Int`
 >   - Phase 4B — `ValueData::SetInt(Vec<i64>)` / `Encoding::IntSet`
->   - Phase 6 — `mimalloc`을 기본 global allocator로 사용, `jemalloc`은 feature로 선택 가능
+>   - Phase 6 — `mimalloc`/`jemalloc` 모두 feature로 선택 가능 (`mimalloc`, `jemalloc` feature). 기본 빌드는 `default = []`라 어떤 allocator feature도 켜지지 않으며 시스템 allocator를 사용한다
 > - ⏳ 미반영:
 >   - Phase 4C — Listpack 인코딩 (코드에 Listpack 변형 없음)
 >   - Phase 7 — SortedSet 전용 SkipList (현재 `SortedSet`은 `BTreeMap` + `HashMap` 기반)
@@ -1500,10 +1500,12 @@ hashbrown HashMap shell = 40 bytes
 
 - [x] `StoredValue` 필드 private + `Box<ValueData>` + i64 sentinel + packed u32 적용:
   ```rust
-  pub fn expire_at_ms_opt(&self) -> Option<i64> { self.expire_at_ms }
-  pub fn has_expiry(&self) -> bool { self.expire_at_ms.is_some() }
-  pub fn set_expire(&mut self, ms: Option<i64>) { self.expire_at_ms = ms; }
-  pub fn lru_clock_value(&self) -> u32 { self.lru_clock }
+  pub fn expire_at_ms(&self) -> Option<i64> { if self.expire_at_ms > 0 { Some(self.expire_at_ms) } else { None } }
+  pub fn set_expire_at_ms(&mut self, ms: Option<i64>) { self.expire_at_ms = ms.unwrap_or(0); }
+  pub fn encoding(&self) -> Encoding { Encoding::from_u8((self.encoding_and_lru >> LRU_BITS) as u8) }
+  pub fn set_encoding(&mut self, enc: Encoding) { self.encoding_and_lru = ((enc as u32) << LRU_BITS) | (self.encoding_and_lru & LRU_MASK); }
+  pub fn lru_clock(&self) -> u32 { self.encoding_and_lru & LRU_MASK }
+  pub fn set_lru_clock(&mut self, clock: u32) { self.encoding_and_lru = (self.encoding_and_lru & !LRU_MASK) | (clock & LRU_MASK); }
   pub fn set_lru_clock_value(&mut self, c: u32) { self.lru_clock = c; }
   pub fn encoding_value(&self) -> Encoding { self.encoding }
   pub fn set_encoding_value(&mut self, e: Encoding) { self.encoding = e; }
@@ -1521,7 +1523,7 @@ hashbrown HashMap shell = 40 bytes
       data: Box<ValueData>,    // 8B
       expire_at_ms: i64,       // 8B (0 = no expiry)
       encoding_and_lru: u32,   // 4B (4bit encoding + 28bit lru)
-      _pad: u32,               // 4B alignment → 총 24B
+      // 정렬 패딩 4B → 총 24B (명시적 _pad 필드 없음)
   }
   ```
 - [x] `Encoding::from_u8()` 추가 (4-bit packed field 복원)
@@ -1633,7 +1635,7 @@ hashbrown HashMap shell = 40 bytes
 - [x] `DbShard::sync_expires(&mut self, key, expire_at_ms)` 추가
 - [x] `DbShard::volatile_count()` O(1) 추가:
   ```rust
-  pub fn sync_expire_index(&mut self, key: &Bytes, expire_at_ms: Option<i64>) {
+  pub fn sync_expires(&mut self, key: &Bytes, expire_at_ms: Option<i64>) {
       match expire_at_ms {
           Some(ms) if ms > 0 => { self.expires.insert(key.clone(), ms); }
           _ => { self.expires.remove(key); }

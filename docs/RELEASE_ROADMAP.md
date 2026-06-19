@@ -55,7 +55,7 @@
 
 **구현 완료 (검증된 강점) ✅**
 
-- 메모리: `StoredValue` 24B 레이아웃, incremental memory tracking(eviction CPU −99%), expires side-index(active expiry CPU −90%), `StringInt`, `SetInt`, mimalloc 기본 + jemalloc feature.
+- 메모리: `StoredValue` 24B 레이아웃, incremental memory tracking(eviction CPU −99%), expires side-index(active expiry CPU −90%), `StringInt`, `SetInt`, mimalloc/jemalloc 선택 가능(opt-in feature; 기본 빌드는 시스템 할당자).
 - 동시성: per-DB `parking_lot::RwLock`, atomic stats(요청당 lock 취득 ~9개 감소), arc_swap config 캐시.
 - persistence: RDB(per-DB read-lock clone), AOF manifest 구조 + recovery 순서, fsync 정책(Always/EverySec/No), `BGREWRITEAOF`(stream rewrite), shutdown AOF flush, RDB clone 제거(optimization Phase 0).
 - 보안/공급망: non-loopback bind 시 `RATATOSK_ALLOW_INSECURE_BIND` + password 필수, AUTH brute-force 완화(progressive delay + per-IP `AuthRateLimiter`), audit log + chain checkpoint, `cargo audit` green, `cargo deny check` green, Dependabot, CODEOWNERS, gitleaks workflow.

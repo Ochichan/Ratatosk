@@ -38,8 +38,8 @@ modest and honest — "safe within this workload", not "fastest in the world".
 | Objective | Target (28-day window) | Measured by |
 |---|---|---|
 | Process availability | **99.9%** of 1m windows healthy | `avg_over_time((ratatosk_aof_write_latched == bool 0)[28d])` + `up` |
-| Read p99 latency | **≤ 1 ms** at ≤ 50k ops/s pipelined | command-duration histogram, `cmd` label = read |
-| Write p99 latency | **≤ 2 ms** (`appendfsync everysec`) | command-duration histogram, `cmd` label = write |
+| Read p99 latency | **≤ 1 ms** at ≤ 50k ops/s pipelined | command-duration histogram, `command` label = read |
+| Write p99 latency | **≤ 2 ms** (`appendfsync everysec`) | command-duration histogram, `command` label = write |
 | Durable-write loss window | **≤ 1 s** of acknowledged writes (`everysec`); **0** (`always`) | durability contract, `docs/operations.md` |
 | AOF write error budget | **0** sustained write errors | `increase(ratatosk_aof_write_errors_total[5m]) == 0` |
 | Memory estimate freshness | **< 100 ticks** stale | `ratatosk_memory_estimate_age_ticks` |

@@ -130,7 +130,7 @@ bind-time guard is evaluated **at startup** in
 `crates/ratatosk-server/src/event_loop.rs` (`bootstrap_default_user_for_bind`);
 `CONFIG GET/SET protected-mode` exposes and updates the introspectable value
 (persisted by `CONFIG REWRITE`) but does not re-evaluate a running server's bind.
-Tests: `cargo test -p ratatosk-server -- protected_mode bootstrap`.
+Tests: `cargo test -p ratatosk-server -- protected_mode bootstrap` (bind-guard tests) and `cargo test -p ratatosk-engine -- config_get_set_protected_mode_round_trips` (CONFIG GET/SET round-trip).
 
 The active mode is observable at runtime: `INFO server` exposes
 `ratatosk_protected_mode`, and `CONFIG GET protected-mode` returns it.

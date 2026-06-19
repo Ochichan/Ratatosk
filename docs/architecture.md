@@ -13,7 +13,7 @@
 
 # Part 1: Architecture
 
-이 문서는 **현재 저장소 코드 기준**(2026-03-26) 아키텍처를 설명한다.
+이 문서는 **현재 저장소 코드 기준**(2026-06-02) 아키텍처를 설명한다.
 과거 계획 문서가 아니라 실제 구현 상태를 기준으로 작성했다.
 
 ## Snapshot
@@ -108,7 +108,7 @@ ratatosk-core
 ### 5) Blocking command retry
 
 - 블로킹 명령은 `retry_blocking`으로 재시도 지시를 반환.
-- 서버 루프는 lock을 놓은 뒤 sleep/backoff(10ms → 200ms) 후 재실행.
+- 서버 루프는 lock을 놓은 뒤 deadline까지 남은 시간과 500ms 폴링 상한(`BLOCKING_RETRY_POLL_CAP`) 중 작은 값만큼 대기한 후 재실행 (지수 백오프 아님 — FIFO wake-one 의미론이라 불필요).
 - timeout deadline을 넘기면 마지막 응답을 반환.
 
 ### 6) Encode / Flush
@@ -160,11 +160,13 @@ Workspace dependency: `arc-swap = "1"`
 pub struct DataState {
     shards: Arc<[parking_lot::RwLock<DbShard>]>,
     next_key_version: Arc<AtomicU64>,
+    db_memory_bytes: Arc<[AtomicUsize]>, // per-DB estimated memory in bytes
 }
 
 pub struct DbShard {
     pub data: HashMap<Bytes, StoredValue>,
     pub key_versions: HashMap<Bytes, u64>,
+    pub expires: HashMap<Bytes, i64>, // TTL side-index (key -> expire_at_ms)
 }
 ```
 
@@ -302,11 +304,11 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 
 ### AUTH brute force prevention
 
-`crates/ratatosk-engine/src/command/cmd_acl.rs`, `crates/ratatosk-server/src/client.rs`:
+`crates/ratatosk-engine/src/command/cmd_auth_session.rs`, `crates/ratatosk-server/src/rate_limiter.rs`:
 
 - **progressive delay**: 실패 횟수에 따라 응답 전 지수 지연을 적용한다. `delay_ms = min(100 × 2^(failures-1), 2000) × jitter(0.8..1.2)`. `tokio::time::sleep`으로 비동기 대기하므로 OS 스레드를 차단하지 않는다.
 - per-connection: 5회 연속 AUTH 실패 시 지연 후 연결을 종료한다 (`CommandOutcome::close_with_delay`).
-- per-IP: `AuthRateLimiter`가 IP별 실패를 추적하며, 60초 윈도우 내 20회 실패 시 해당 IP의 신규 AUTH 시도를 거부한다.
+- per-IP: per-IP AUTH 실패 추적 한도(`AuthRateLimiter`, 60초 윈도우 / 20회)는 `crates/ratatosk-server/src/rate_limiter.rs`에 정의되어 있으나 현재 런타임 경로에 연결되어 있지 않다(데드 코드). 실제 accept 경로에 연결된 것은 IP별 *연결 시도* 횟수를 제한하는 `ConnectionRateLimiter`뿐이다.
 
 ### Sanitization helpers
 
@@ -368,9 +370,14 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 | `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | appendonly shutdown flush failure override |
 
 `CONFIG SET`을 통한 런타임 설정 변경:
-- `maxmemory`, `maxmemory-policy`, `maxmemory-samples`
-- `hz`, `notify-keyspace-events`, `tcp-keepalive`
-- `lazyfree-lazy-expire`, `lazyfree-lazy-server-del`, `lazyfree-lazy-user-del`
+- `hz`, `timeout`, `appendonly`, `appendfsync`, `save`
+- `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`
+- `slowlog-log-slower-than`, `slowlog-max-len`, `latency-tracking`
+- `active-expire-cycle-lookups`, `active-expire-cycle-threshold-pct`
+- `query-buffer-limit`, `output-buffer-flush-threshold`, `client-write-timeout-sec`
+- `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
+
+(`maxmemory*`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET` 전용이며 `CONFIG SET`은 'ERR Unknown option'을 반환한다.)
 - `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 
 ## Build / Run / Test
@@ -417,7 +424,7 @@ cargo run -p ratatosk-server --bin ratatosk
 # Part 2: Eviction & Expiry Detail
 
 Ratatosk의 메모리 관리 및 키 만료 시스템.
-기준: 2026-03-16 코드 상태.
+기준: 2026-06-02 코드 상태.
 
 ## 개요
 
@@ -453,9 +460,13 @@ Redis 호환 8가지 maxmemory 정책:
 ### 설정
 
 ```
-CONFIG SET maxmemory 100mb
-CONFIG SET maxmemory-policy allkeys-lru
-CONFIG SET maxmemory-samples 5
+```
+# maxmemory 계열은 런타임 CONFIG SET 미지원 — ratatosk.conf로만 설정한다
+maxmemory 100mb
+maxmemory-policy allkeys-lru
+maxmemory-samples 5
+# 런타임에는 CONFIG GET maxmemory 등 조회만 가능
+```
 ```
 
 | 설정 | 기본값 | 설명 |
@@ -479,7 +490,7 @@ Redis와 동일한 근사 알고리즘을 사용한다:
 
 ## LRU Clock
 
-`StoredValue.lru_clock` 필드에 저장.
+LRU/LFU 클럭은 `StoredValue`의 `encoding_and_lru` 필드(상위 4비트=Encoding, 하위 28비트=LRU/LFU 클럭 영역)에 패킹되며 `lru_clock()` / `set_lru_clock()` 접근자로 읽고 쓴다.
 
 ```
 24-bit wrapping seconds: (unix_sec / 1) & 0xFFFFFF
@@ -577,7 +588,7 @@ MissedTickBehavior: Skip
 매 tick 수행 순서:
 
 1. **Active expiry cycle** — `active_expire_cycle(&mut server, now_ms)`
-2. **Eviction check** — `maxmemory > 0`이면 `estimate_used_memory()` → `perform_eviction()`
+2. **Eviction check** — `maxmemory > 0`이면 O(1) 증분 추정치(`estimated_memory()`)로 `needs_eviction()` 판정 → `perform_eviction()`. 전체 DB 스캔(`estimate_used_memory()`)은 매 10 tick마다 증분 카운터 드리프트(>5%) 보정 용도로만 호출된다.
 
 ### Signal Handling
 
@@ -647,6 +658,7 @@ CONFIG SET notify-keyspace-events "KEA"
 | `x` | expired 이벤트 |
 | `e` | evicted 이벤트 |
 | `t` | stream 명령 (XADD 등) |
+| `m` | key miss 이벤트 (A 단축키에는 미포함) |
 | `A` | 모든 이벤트 (`g$lshzxet`와 동일) |
 
 `K` 또는 `E` 중 하나 이상이 설정되어야 알림이 활성화된다.
@@ -695,7 +707,7 @@ crates/ratatosk-server/src/persistence/
 └── util.rs  — check_disk_space, validate_working_directory, env_truthy
 ```
 
-기준: 2026-03-16 코드 상태.
+기준: 2026-06-02 코드 상태.
 
 ## 개요
 
@@ -859,10 +871,11 @@ writer.append_command(0, &[
 Redis 7+ 호환 manifest 기반 AOF 관리. AOF를 BASE + INCR 파일로 분리한다.
 
 ```
-appendonlydir/
+<dir>/
+  appendonly.aof.manifest     (manifest: BASE/INCR 목록)
   appendonly.aof.1.incr.aof   (INCR: 증분 append)
   appendonly.aof.2.incr.aof   (INCR: 증분 append)
-  base.aof                    (BASE: rewrite 결과)
+  appendonly.aof.base.aof     (BASE: rewrite 결과)
 ```
 
 주요 API:
@@ -942,18 +955,18 @@ Legacy single-file AOF 모드에서는 `aof_current_size`만 의미가 있으며
 
 | 모듈 | 테스트 수 | 주요 검증 |
 |------|-----------|-----------|
-| `rdb/saver` | 3 | 빈 상태, string 키, expiry 직렬화 |
-| `rdb/loader` | 8 | 6가지 타입 roundtrip, CRC 불일치, magic 검증, 다중 DB |
+| `rdb/saver` | 4 | 빈 상태, string 키, expiry 직렬화, writer 에러 컨텍스트 |
+| `rdb/loader` | 12 | 6가지 타입 roundtrip, CRC 불일치, magic 검증, 빈 reader, 다중 DB, 파일 roundtrip |
 | `rdb/checksum` | 3 | deterministic, 빈 입력, known value |
 | `atomic` | 2 | 정상 쓰기, 에러 시 원본 보존 |
-| `aof/writer` | 4 | RESP 정확성, SELECT 자동 삽입, DB 유지, fsync policy roundtrip |
-| `aof/manifest` | 4 | 빈 manifest, 순차 INCR, BASE 설정, recovery 순서 |
-| `aof/recovery` | 4 | 상태 복원, DB select, 빈 파일, 절단 파일 graceful 처리 |
+| `aof/writer` | 5 | RESP 정확성, SELECT 자동 삽입, DB 유지, open 에러 컨텍스트, fsync policy roundtrip |
+| `aof/manifest` | 5 | 빈 manifest, 순차 INCR, BASE 설정, recovery 순서, 파일 roundtrip |
+| `aof/recovery` | 5 | 상태 복원, DB select, 빈 파일, 누락 파일 에러 컨텍스트, 절단 파일 graceful 처리 |
 
-합계: 30개 테스트.
+합계: 36개 테스트.
 
 ---
-## 운영 상태 (2026-03-16)
+## 운영 상태 (2026-06-02)
 
 | 항목 | 상태 | 설명 |
 |------|------|------|
@@ -1014,7 +1027,7 @@ Legacy single-file AOF 모드에서는 `aof_current_size`만 의미가 있으며
 
 Deployment model, distribution boundaries, and honest limitations for Ratatosk.
 
-Last updated: 2026-03-16
+Last updated: 2026-06-02
 
 ---
 
@@ -1043,9 +1056,10 @@ Ratatosk accepts cluster-related commands at the protocol level for client compa
 | `CLUSTER KEYSLOT` | Computes CRC16 hash slot (local calculation only) |
 | `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` | Operates on local keyspace |
 | `CLUSTER HELP` | Lists subcommands with standalone caveat |
+| `CLUSTER SLOTS` / `SHARDS` / `LINKS` | Return an empty array (no slots/shards/bus links in standalone mode) |
 | All other `CLUSTER` subcommands | Return `ERR` (disabled in standalone mode) |
 | `READONLY` / `READWRITE` / `ASKING` | Return `OK` (no-op) |
-| `SENTINEL` (all subcommands except `HELP`) | Return `ERR not configured as a Sentinel` |
+| `SENTINEL` (all subcommands except `HELP`) | Return `ERR This instance is not configured as a Sentinel` |
 
 There is no cluster bus, no node table, no slot migration, no MOVED/ASK redirection, and no gossip protocol. Cluster-aware Redis clients will not function correctly against Ratatosk.
 
@@ -1100,9 +1114,9 @@ Recovery order on startup: RDB load, then AOF replay. Both operate on the local 
 |----------|-------|
 | Network I/O | Per-client tokio tasks (concurrent) |
 | State mutation | `SharedState` wrapping `Mutex<ServerState>` (serialized) |
-| Lock-free stats | `AtomicStatsState` — 10 atomic counters (no lock per request) |
+| Lock-free stats | `AtomicStatsState` — 11 atomic counters (no lock per request) |
 | Lock-free config reads | `arc_swap::ArcSwap<ConfigState>` via `config_cache.load()` |
-| Lock-free client ID | `AtomicU64` for new connection ID allocation |
+| Lock-free client ID | `AtomicI64` for new connection ID allocation |
 | Pub/Sub delivery | Per-subscriber `tokio::sync::mpsc::channel` (push, no polling) |
 | Background threads | Lazy-free, RDB save, AOF rewrite |
 | I/O thread pool | Placeholder only (not active) |
@@ -1139,7 +1153,7 @@ When `lua-scripting` is disabled, `EVAL` and `EVALSHA` return unsupported errors
 
 ## Capability Tier Summary
 
-From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-03-16:
+From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-06-02:
 
 | Tier | Count | Meaning |
 |------|-------|---------|
@@ -1177,7 +1191,7 @@ It is **not** suited for:
 
 # Part 5: Redis Gap Analysis
 
-기준일: 2026-03-16 (updated with ecosystem hardening changes)
+기준일: 2026-06-02 (updated with ecosystem hardening changes)
 
 이 문서는 현재 Ratatosk 코드베이스와 Redis 공식 문서를 대조해, "명령 이름이 존재하는가"가 아니라 "Redis가 약속하는 동작 계약과 운영 모델을 얼마나 실제로 충족하는가"를 정리한다.
 
@@ -1262,11 +1276,11 @@ Redis 공식 문서는 replication을 비동기 복제와 partial resynchronizat
 현재 코드:
 
 - `MONITOR`는 `+OK`를 반환하고 연결을 monitor 모드로 등록한 뒤, 실행된 명령을 등록된 monitor 클라이언트로 broadcast한다 (baseline): `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `ROLE`은 이제 master/replica 모드, logical replication offset, 등록된 replica 목록을 반영한다: `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `REPLCONF`는 LISTENING-PORT/CAPA/IP-ADDRESS/ACK/GETACK를 per-client replica metadata에 연결한다: `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `PSYNC`는 ERR를 반환한다 (standalone mode): `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `REPLICAOF`/`SLAVEOF`는 `NO ONE` 이외의 인자에 대해 ERR를 반환한다. `NO ONE`은 여전히 수용된다: `crates/ratatosk-engine/src/command/cmd_server.rs`
-- `WAIT`/`WAITAOF`는 tracked replica ACK offset과 local AOF health를 즉시 반영하지만, 여전히 timeout 동안 ACK를 기다리는 blocking semantics는 없다: `crates/ratatosk-engine/src/command/cmd_generic.rs`
+- `ROLE`은 이제 master/replica 모드, logical replication offset, 등록된 replica 목록을 반영한다: `crates/ratatosk-engine/src/command/cmd_server_replication.rs`
+- `REPLCONF`는 LISTENING-PORT/CAPA/IP-ADDRESS/ACK/GETACK를 per-client replica metadata에 연결한다: `crates/ratatosk-engine/src/command/cmd_server_replication.rs`
+- `PSYNC`는 ERR를 반환한다 (standalone mode): `crates/ratatosk-engine/src/command/cmd_server_replication.rs`
+- `REPLICAOF`/`SLAVEOF`는 `NO ONE` 이외의 인자에 대해 ERR를 반환한다. `NO ONE`은 여전히 수용된다: `crates/ratatosk-engine/src/command/cmd_server_replication.rs`
+- `WAIT`/`WAITAOF`는 tracked replica ACK offset과 local AOF health를 즉시 반영하지만, 여전히 timeout 동안 ACK를 기다리는 blocking semantics는 없다: `crates/ratatosk-engine/src/command/cmd_generic_replication.rs`
 
 실제 영향:
 
@@ -1293,9 +1307,9 @@ Redis 공식 문서에서 Sentinel은 분산 감시/쿼럼/자동 failover 시�
 
 현재 코드:
 
-- `CLUSTER`는 `INFO`, `MYID`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `HELP`만 처리하고 나머지는 disabled 에러다: `crates/ratatosk-engine/src/command/cmd_cluster.rs:14-31`, `:248-252`
+- `CLUSTER`는 `INFO`, `MYID`, `KEYSLOT`, `COUNTKEYSINSLOT`, `GETKEYSINSLOT`, `HELP`를 처리하고, `SLOTS`/`SHARDS`/`LINKS`는 빈 배열, `NODES`/`REPLICAS`/`SLAVES`는 single-node 에러, 그 외 서브커맨드는 disabled 에러다: `crates/ratatosk-engine/src/command/cmd_cluster.rs:24-37`, `:283-291`
 - `CLUSTER INFO`도 `cluster_enabled:0`과 zeroed counters를 돌려준다: `crates/ratatosk-engine/src/command/cmd_cluster.rs:39-58`
-- `READONLY`, `READWRITE`, `ASKING`은 모두 단순 `OK`: `crates/ratatosk-engine/src/command/cmd_cluster.rs:258-277`
+- `READONLY`, `READWRITE`, `ASKING`은 모두 단순 `OK`: `crates/ratatosk-engine/src/command/cmd_cluster.rs:293-313`
 - `SENTINEL`은 `HELP` 외에는 항상 "not configured as a Sentinel" 에러다: `crates/ratatosk-engine/src/command/cmd_sentinel.rs:11-20`
 - 그런데 help text에는 Redis Sentinel의 전체 운영 서브커맨드가 나열돼 있다: `crates/ratatosk-engine/src/command/cmd_sentinel.rs:23-123`
 
@@ -1331,8 +1345,8 @@ Redis 공식 문서는 `EVAL`의 atomic execution과 Lua integration을, Functio
 
 **Redis Functions는 아직 비어 있다:**
 
-- `FCALL`은 항상 function not found: `crates/ratatosk-engine/src/command/cmd_script.rs:149-158`
-- `FUNCTION LOAD/DELETE/RESTORE`는 unsupported, `LIST`는 빈 배열, `DUMP`는 null, `STATS`는 빈 엔진 목록이다: `crates/ratatosk-engine/src/command/cmd_script.rs:160-260`
+- `FCALL`은 항상 function not found: `crates/ratatosk-engine/src/command/cmd_script.rs:292-301`
+- `FUNCTION LOAD/DELETE/RESTORE`는 unsupported, `LIST`는 빈 배열, `DUMP`는 null, `STATS`는 빈 엔진 목록이다: `crates/ratatosk-engine/src/command/cmd_script.rs:303-416`
 
 실제 영향:
 
@@ -1481,10 +1495,10 @@ Fix:
 
 현재 코드:
 
-- `CLIENT PAUSE` / `UNPAUSE`는 ERR를 반환한다: `crates/ratatosk-engine/src/command/cmd_client.rs:212-243`
-- `CLIENT UNBLOCK`은 항상 `0`: `crates/ratatosk-engine/src/command/cmd_client.rs:245-266`
-- `CLIENT SETINFO`는 `lib-name`/`lib-ver`를 `ClientState`에 저장하고, `CLIENT LIST` 출력에 반영한다: `crates/ratatosk-engine/src/command/cmd_client.rs:367-378`
-- `CLIENT REPLY`는 I/O loop에서 실제 적용된다. `off`는 응답을 억제하고, `skip`은 다음 응답 하나를 억제하며, push notification은 영향받지 않는다: `crates/ratatosk-engine/src/command/cmd_client.rs:402-417`
+- `CLIENT PAUSE` / `UNPAUSE`는 ERR를 반환한다: `crates/ratatosk-engine/src/command/cmd_client.rs:197-213`
+- `CLIENT UNBLOCK`은 항상 `0`: `crates/ratatosk-engine/src/command/cmd_client.rs:215-236`
+- `CLIENT SETINFO`는 `lib-name`/`lib-ver`를 `ClientState`에 저장하고, `CLIENT LIST` 출력에 반영한다: `crates/ratatosk-engine/src/command/cmd_client_tracking.rs`
+- `CLIENT REPLY`는 I/O loop에서 실제 적용된다. `off`는 응답을 억제하고, `skip`은 다음 응답 하나를 억제하며, push notification은 영향받지 않는다: `crates/ratatosk-engine/src/command/cmd_client_tracking.rs`
 
 영향:
 
@@ -1537,7 +1551,7 @@ Fix:
 현재 코드:
 
 - `MONITOR`는 `+OK`를 반환하고 연결을 monitor 모드로 등록한다 (`register_monitor` + `set_monitor`). 이후 실행되는 명령은 Redis 형식의 MONITOR 라인(`+<ts>.<us> [db addr] "CMD" "arg"...`)으로 등록된 monitor 클라이언트에게 broadcast된다: `crates/ratatosk-engine/src/command/cmd_server.rs` (`cmd_monitor`), broadcast는 `crates/ratatosk-engine/src/command/mod.rs` (`format_monitor_line` / `broadcast_monitor_message`)
-- `LATENCY GRAPH`는 16행 ASCII art를 출력하며 normalized min-max scaling을 적용한다. `LATENCY DOCTOR`는 이벤트별 median/avg/min/max 통계를 출력한다. `LATENCY HISTOGRAM`은 coarse summary다: `crates/ratatosk-engine/src/command/cmd_server.rs:233-368`
+- `LATENCY GRAPH`는 16행 ASCII art를 출력하며 normalized min-max scaling을 적용한다. `LATENCY DOCTOR`는 이벤트별 median/avg/min/max 통계를 출력한다. `LATENCY HISTOGRAM`은 coarse summary다: `crates/ratatosk-engine/src/command/cmd_server_latency.rs`
 - `MEMORY DOCTOR`: 실제 진단 구현 완료. 빈 인스턴스 감지, dataset 대비 overhead 비율 분석. 정상 시 `"Sam, I have no memory problems"`, 문제 시 항목별 진단 보고.
 - `MEMORY MALLOC-STATS`: `#[cfg(feature = "mimalloc")]` 활성화 시 `mi_stats_merge()` + `mi_stats_print_out()` FFI로 mimalloc 통계 출력. 미활성화 시 allocator 정보 메시지 반환.
 - `MEMORY PURGE`: `#[cfg(feature = "mimalloc")]` 활성화 시 `mi_collect(true)`로 적극적 메모리 회수. 미활성화 시 OK 반환.
@@ -1837,17 +1851,17 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | Group | distributed_parity | behavioral_subset | baseline_local | syntax_only | unsupported | total |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | bitmap | 0 | 7 | 0 | 0 | 0 | 7 |
-| cluster | 0 | 0 | 6 | 3 | 26 | 35 |
-| connection | 0 | 11 | 10 | 5 | 0 | 26 |
-| generic | 0 | 32 | 1 | 1 | 0 | 34 |
+| cluster | 0 | 0 | 10 | 3 | 22 | 35 |
+| connection | 0 | 11 | 12 | 1 | 2 | 26 |
+| generic | 0 | 32 | 2 | 0 | 0 | 34 |
 | geo | 0 | 10 | 0 | 0 | 0 | 10 |
 | hash | 0 | 28 | 0 | 0 | 0 | 28 |
 | hyperloglog | 0 | 5 | 0 | 0 | 0 | 5 |
 | list | 0 | 22 | 0 | 0 | 0 | 22 |
 | pubsub | 0 | 15 | 0 | 0 | 0 | 15 |
-| scripting | 0 | 5 | 1 | 8 | 9 | 23 |
+| scripting | 0 | 1 | 11 | 0 | 11 | 23 |
 | sentinel | 0 | 0 | 0 | 1 | 21 | 22 |
-| server | 0 | 36 | 27 | 12 | 8 | 83 |
+| server | 0 | 34 | 41 | 1 | 7 | 83 |
 | set | 0 | 17 | 0 | 0 | 0 | 17 |
 | sorted_set | 0 | 35 | 0 | 0 | 0 | 35 |
 | stream | 0 | 28 | 0 | 0 | 0 | 28 |

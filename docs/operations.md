@@ -8,7 +8,7 @@
 
 # Ratatosk Product Contract (v1)
 
-기준일: 2026-03-26
+기준일: 2026-06-02
 
 이 문서는 Ratatosk v1이 무엇을 보장하고, 무엇을 보장하지 않는지 명확히 선언한다.
 목표는 "single-node Ratatosk GA"이며, "Redis drop-in distributed replacement"가 아니다.
@@ -301,9 +301,9 @@ re-evaluate the already-bound socket.
 # Ratatosk Ecosystem Integration
 
 Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Sub 이벤트 버스 역할을 맡는다.
-이 문서는 **현재 코드 상태**(2026-03-16)와 외부 프로젝트 통합 기준을 정리한다.
+이 문서는 **현재 코드 상태**(2026-06-02)와 외부 프로젝트 통합 기준을 정리한다.
 
-## Implementation Status (2026-03-16)
+## Implementation Status (2026-06-02)
 
 기준 파일: `docs/redis-gap-ledger.json`
 
@@ -423,11 +423,13 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_AUDIT_CHAIN_STATE` | `/tmp/ratatosk-audit-chain.state` | audit chain checkpoint path |
 
 런타임 `CONFIG SET` 지원:
-- `maxmemory`, `maxmemory-policy`, `maxmemory-samples`
-- `hz`, `notify-keyspace-events`, `tcp-keepalive`
-- `lazyfree-lazy-expire`, `lazyfree-lazy-server-del`, `lazyfree-lazy-user-del`
-- `appendfsync` (always/everysec/no)
-- `pubsub-queue-hard-limit` (mpsc channel capacity)
+- `timeout`, `hz`, `appendonly`, `appendfsync` (always/everysec/no)
+- `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`, `save`
+- `slowlog-log-slower-than`, `slowlog-max-len`, `latency-tracking`
+- `pubsub-queue-hard-limit` (mpsc channel capacity), `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
+- `active-expire-cycle-lookups`, `active-expire-cycle-threshold-pct`
+- `query-buffer-limit`, `output-buffer-flush-threshold`, `client-write-timeout-sec`
+- `maxmemory`/`maxmemory-policy`/`maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET`에서만 노출되며 런타임 `CONFIG SET`으로는 변경할 수 없다(catch-all에서 `ERR Unknown option` 반환).
 
 ## Recommended Key Naming
 
@@ -442,17 +444,14 @@ cargo run -p ratatosk-server --bin ratatosk --release
 - 캐시 키는 TTL을 기본값으로 둔다(무기한 키 금지).
 - Pub/Sub 채널은 도메인 prefix로 분리한다(`conductor:events:*`).
 
-### Key Prefix Enforcement
+### Key Prefix Convention
 
-Ratatosk supports optional key prefix enforcement via `CONFIG SET enforce-key-prefix`:
+Ratatosk does **not** implement built-in key-prefix enforcement — there is no
+`enforce-key-prefix` directive and any key name is accepted. The prefixes below
+are an operational **convention** for services that coexist on one instance,
+enforced by clients/operators rather than by the server:
 
-| Value | Behavior |
-|-------|----------|
-| `no` (default) | No enforcement; any key name accepted |
-| `warn` | Log a warning when a key without `service:` prefix is written |
-| `yes` | Reject writes to keys that don't match `<service>:*` pattern |
-
-Known prefixes: `conductor:`, `ironclaw:`, `cc:`, `muninn:`, `rustmux:`.
+- `conductor:`, `ironclaw:`, `cc:`, `muninn:`, `rustmux:`
 
 ## Integration Playbooks
 
@@ -762,7 +761,7 @@ Upstream services should:
 
 # Ratatosk Observability Guide
 
-기준일: 2026-03-26
+기준일: 2026-06-02
 
 이 문서는 Ratatosk single-node 운영에 필요한 최소 관측성 구성을 정리한다.
 
@@ -1071,8 +1070,8 @@ README가 이미 선언하듯 Ratatosk의 현재 경계는 다음과 같다.
 
 근거:
 
-- [architecture doc](./architecture-ratatosk.md#L83-L91)
-- [capability doc](./capability-declarations.md#L85-L99)
+- [architecture doc](./architecture.md)
+- [capability doc](./PRODUCT_CONTRACT.md)
 
 #### 부족한 점
 
@@ -1119,7 +1118,7 @@ README가 이미 선언하듯 Ratatosk의 현재 경계는 다음과 같다.
 근거:
 
 - [README](../README.md#L3-L11)
-- [ecosystem status](./ecosystem.md#L8-L37)
+- [ecosystem status](./operations.md)
 
 #### 부족한 점
 
@@ -1170,7 +1169,7 @@ gap-ledger 기준:
 
 근거:
 
-- [capability declarations](./capability-declarations.md#L23-L79)
+- [capability declarations](./PRODUCT_CONTRACT.md)
 - [Redis replication docs](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/)
 - [WAIT docs](https://redis.io/docs/latest/commands/wait/)
 - [WAITAOF docs](https://redis.io/docs/latest/commands/waitaof/)
@@ -1219,7 +1218,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 
 근거:
 
-- [persistence status](./persistence.md#L275-L328)
+- [persistence status](./operations.md)
 - [startup replay gate](../crates/ratatosk-server/src/persistence/aof.rs#L294-L351)
 - [AOF bootstrap](../crates/ratatosk-server/src/persistence/aof.rs#L477-L513)
 
@@ -1230,7 +1229,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 
 근거:
 
-- [Ratatosk persistence status](./persistence.md#L277-L289)
+- [Ratatosk persistence status](./operations.md)
 - [Redis persistence docs](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
 
 #### 부족한 점
@@ -1314,19 +1313,19 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 
 - [config insecure bind guard](../crates/ratatosk-server/src/config.rs#L195-L198)
 - [rate limiter](../crates/ratatosk-server/src/rate_limiter.rs#L1-L163)
-- [security defaults doc](./ecosystem.md#L186-L192)
+- [security defaults doc](./operations.md)
 - [security workflow](../.github/workflows/security.yml#L1-L35)
 
 주의할 점:
 
 - loopback/개발 환경에서는 default ACL user가 여전히 `nopass` + full access다.
 - built-in TLS가 없다.
-- SBOM / provenance는 아직 없다.
+- SBOM 생성 workflow(`.github/workflows/sbom.yml`)는 추가됐지만 release artifact signing/provenance는 아직 없다.
 
 근거:
 
 - [default ACL user](../crates/ratatosk-engine/src/acl.rs#L21-L29)
-- [TLS note](./ecosystem-ports.md#L21-L31)
+- [TLS note](./operations.md)
 - [cargo-deny docs](https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html)
 - [CODEOWNERS docs](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners)
 - [Dependabot docs](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-dependabot-version-updates)
@@ -1372,19 +1371,19 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 근거:
 
 - [metrics exporter](../crates/ratatosk-server/src/metrics.rs#L1-L29)
-- [health protocol](./health-protocol.md#L54-L69)
+- [health protocol](./operations.md)
 - [panic hook and crash files](../crates/ratatosk-server/src/main.rs#L110-L180)
 - [startup preflight](../crates/ratatosk-server/src/main.rs#L305-L420)
 
 하지만:
 
-- Alertmanager config, SLO/SLI 문서는 아직 없다.
+- Alertmanager config(`monitoring/alertmanager/alertmanager.yml`)와 SLO/SLI 문서(`docs/SLO.md`)는 추가됐다.
 - metrics와 `INFO` stats가 같은 truth source를 보지 않는다.
 
 근거:
 
 - [health status implementation](../crates/ratatosk-engine/src/command/cmd_server.rs#L1367-L1390)
-- [health protocol note](./health-protocol.md#L62-L69)
+- [health protocol note](./operations.md)
 - [Prometheus instrumentation docs](https://prometheus.io/docs/practices/instrumentation/)
 - [Prometheus alerting docs](https://prometheus.io/docs/practices/alerting/)
 - [Alertmanager docs](https://prometheus.io/docs/alerting/latest/alertmanager/)
@@ -1418,7 +1417,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 - perf guardrail checker가 있다.
 - canonical log 기준 guardrail은 PASS다.
 
-근거: [performance doc](./performance.md#L1-L56)
+근거: [performance doc](./optimization.md)
 
 #### 부족한 점
 
@@ -1456,7 +1455,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 근거:
 
 - [README Nix section](../README.md#L57-L76)
-- [ecosystem deployment baseline](./ecosystem.md#L80-L112)
+- [ecosystem deployment baseline](./operations.md)
 - [autostart runbook](../AUTOSTART_RUNBOOK_KO.md#L1-L176)
 
 #### 부족한 점
