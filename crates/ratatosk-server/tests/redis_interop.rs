@@ -1,4 +1,5 @@
 use std::{
+    fs,
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
     path::Path,
@@ -77,6 +78,77 @@ fn spawn_ratatosk_server(port: u16, dir: &Path) -> io::Result<ChildGuard> {
         .spawn()?;
 
     Ok(ChildGuard { child })
+}
+
+fn spawn_ratatosk_server_on_dynamic_port(dir: &Path) -> io::Result<(ChildGuard, u16)> {
+    let metrics_port = reserve_port()?;
+    let bound_addr_file = dir.join("ratatosk-bound-addr.json");
+    let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
+        )
+    })?;
+
+    let mut child = Command::new(bin)
+        .env("RATATOSK_BIND", "127.0.0.1")
+        .env("RATATOSK_PORT", "0")
+        .env("RATATOSK_DIR", dir)
+        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env("RATATOSK_ALLOW_NO_METRICS", "true")
+        .env("RATATOSK_BOUND_ADDR_FILE", &bound_addr_file)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let port = wait_for_bound_port_file(&bound_addr_file, &mut child)?;
+
+    Ok((ChildGuard { child }, port))
+}
+
+fn wait_for_bound_port_file(path: &Path, child: &mut Child) -> io::Result<u16> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                if let Some(port) = bound_port_from_file(&contents) {
+                    return Ok(port);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid bound address file {}: {contents:?}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "ratatosk exited before writing bound address file {}: {status}",
+                path.display()
+            )));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out waiting for bound address file {}",
+            path.display()
+        ),
+    ))
+}
+
+fn bound_port_from_file(contents: &str) -> Option<u16> {
+    let payload: serde_json::Value = serde_json::from_str(contents).ok()?;
+    let port = payload.get("bound_port")?.as_u64()?;
+    u16::try_from(port).ok()
 }
 
 fn spawn_redis_server(port: u16, dir: &Path) -> io::Result<Option<ChildGuard>> {
@@ -258,6 +330,22 @@ fn scholar_v1_sidecar_wire_contract_smoke() -> io::Result<()> {
     assert_eq!(
         read_frame(&mut subscriber)?,
         RespFrame::Array(vec![bulk("message"), bulk("nexus:events"), bulk("changed"),])
+    );
+
+    Ok(())
+}
+
+#[test]
+fn ratatosk_port_zero_advertises_bound_sidecar_port() -> io::Result<()> {
+    let ratatosk_dir = tempfile::tempdir()?;
+
+    let (_ratatosk, ratatosk_port) = spawn_ratatosk_server_on_dynamic_port(ratatosk_dir.path())?;
+    assert_ne!(ratatosk_port, 0);
+
+    let mut client = connect_client(ratatosk_port)?;
+    assert_eq!(
+        send_frame(&mut client, array(&["PING"]))?,
+        RespFrame::pong()
     );
 
     Ok(())

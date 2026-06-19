@@ -40,6 +40,7 @@ const ALLOW_DEFAULT_USER_NOPASS_ENV: &str = "RATATOSK_ALLOW_DEFAULT_USER_NOPASS"
 const DEFAULT_USER_PASSWORD_ENV: &str = "RATATOSK_DEFAULT_USER_PASSWORD";
 const DEFAULT_USER_PASSWORD_HASH_ENV: &str = "RATATOSK_DEFAULT_USER_PASSWORD_HASH";
 const SHUTDOWN_BEST_EFFORT_ENV: &str = "RATATOSK_SHUTDOWN_BEST_EFFORT";
+const BOUND_ADDR_FILE_ENV: &str = "RATATOSK_BOUND_ADDR_FILE";
 
 #[derive(Debug, Clone, Copy)]
 enum ShutdownSignal {
@@ -189,6 +190,37 @@ fn apply_startup_config(initial_state: &mut ServerState, config: &ServerConfig) 
         config.pubsub_queue_soft_seconds,
     );
     initial_state.set_aof_enabled(config.appendonly);
+}
+
+fn write_bound_addr_file_if_requested(bound_addr: std::net::SocketAddr) -> io::Result<()> {
+    let Some(path) = std::env::var_os(BOUND_ADDR_FILE_ENV) else {
+        return Ok(());
+    };
+    let path = std::path::PathBuf::from(path);
+    if path.as_os_str().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{BOUND_ADDR_FILE_ENV} must not be empty"),
+        ));
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{BOUND_ADDR_FILE_ENV} must point to a file path"),
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+    let payload = format!(
+        "{{\"bound_addr\":\"{bound_addr}\",\"bound_port\":{}}}\n",
+        bound_addr.port()
+    );
+
+    std::fs::write(&tmp_path, payload).and_then(|()| std::fs::rename(&tmp_path, &path))
 }
 
 fn load_acl_state_from_disk(
@@ -609,11 +641,31 @@ async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_s
 }
 
 pub async fn run(config: ServerConfig) -> io::Result<()> {
-    let listen_addr = config.listen_addr();
-    let listener = TcpListener::bind(&listen_addr).await.map_err(|error| {
+    let requested_addr = config.listen_addr();
+    let listener = TcpListener::bind(&requested_addr).await.map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!("binding TCP listener on {listen_addr}: {error}"),
+            format!("binding TCP listener on {requested_addr}: {error}"),
+        )
+    })?;
+    let bound_addr = listener.local_addr().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("reading bound TCP listener address for {requested_addr}: {error}"),
+        )
+    })?;
+    let listen_addr = bound_addr.to_string();
+    tracing::info!(
+        target = "ratatosk::startup",
+        requested_addr = %requested_addr,
+        bound_addr = %bound_addr,
+        bound_port = bound_addr.port(),
+        "ratatosk listener bound"
+    );
+    write_bound_addr_file_if_requested(bound_addr).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("writing bound TCP listener address file: {error}"),
         )
     })?;
 

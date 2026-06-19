@@ -386,6 +386,10 @@ cargo run -p ratatosk-server --bin ratatosk --release
 - default bind/port: `127.0.0.1:6379`
 - **Recommended coexistence port**: `6380` -- avoids collision with a co-located Redis instance.
   Set `RATATOSK_PORT=6380` when running alongside Redis. A startup warning is emitted when using port 6379.
+- **Dynamic sidecar port**: `RATATOSK_PORT=0` asks the OS to choose an ephemeral loopback port.
+  Sidecar supervisors should set `RATATOSK_BOUND_ADDR_FILE=/path/to/bound-addr.json`; Ratatosk
+  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` after the TCP listener binds.
+  The structured startup log event `ratatosk listener bound` also includes `bound_port`.
 
 ### Autostart (systemd --user)
 
@@ -413,7 +417,8 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | Variable | Default | Description |
 | --- | --- | --- |
 | `RATATOSK_BIND` | `127.0.0.1` | listen address |
-| `RATATOSK_PORT` | `6379` | listen port |
+| `RATATOSK_PORT` | `6379` | listen port; `0` selects an OS-assigned ephemeral port |
+| `RATATOSK_BOUND_ADDR_FILE` | unset | optional sidecar handoff file for the actual bound address/port when using `RATATOSK_PORT=0` |
 | `RATATOSK_MAX_CLIENTS` | `4096` | concurrent connection cap |
 | `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client output limit |
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
