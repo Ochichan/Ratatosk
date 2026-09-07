@@ -23,6 +23,12 @@ struct BroadcastWatcher {
 }
 
 impl ClientTrackingState {
+    /// True when any client tracks keys or prefixes, so writes must be
+    /// reported through [`Self::invalidate_keys`].
+    pub fn has_watchers(&self) -> bool {
+        !self.key_watchers.is_empty() || !self.broadcast_watchers.is_empty()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn track_key(
         &mut self,

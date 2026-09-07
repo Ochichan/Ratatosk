@@ -1641,6 +1641,12 @@ impl ServerState {
         self.blocking.clear(client_id);
     }
 
+    /// True when at least one client observes key writes (CLIENT TRACKING or
+    /// a blocking pop), so write paths must collect the keys they touch.
+    pub fn write_observers_active(&self) -> bool {
+        self.tracking.has_watchers() || self.blocking.has_waiters()
+    }
+
     pub fn notify_blocked_clients<I>(&self, db_idx: usize, keys: I)
     where
         I: IntoIterator<Item = Bytes>,

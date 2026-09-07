@@ -41,6 +41,12 @@ pub struct BlockingState {
 }
 
 impl BlockingState {
+    /// True when any client is blocked on a key, so writes must be reported
+    /// through [`Self::notify_keys`].
+    pub fn has_waiters(&self) -> bool {
+        !self.key_waiters.is_empty()
+    }
+
     pub fn register(&mut self, client_id: i64, keys: Vec<(usize, Bytes)>) -> Arc<Notify> {
         self.clear(client_id);
 

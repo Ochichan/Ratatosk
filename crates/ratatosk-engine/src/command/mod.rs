@@ -4337,9 +4337,11 @@ pub fn execute_argv(
 
     let elapsed_us =
         started.map(|started| i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX));
-    apply_post_execute_side_effects(
+    apply_post_execute_side_effects_with_spec(
         server,
         client,
+        command.as_slice(),
+        spec,
         argv,
         &outcome.response,
         elapsed_us,
@@ -4402,29 +4404,55 @@ pub fn apply_post_execute_side_effects(
     };
     let command = to_uppercase_stack(command_raw);
     let spec = find_command_spec_upper(command.as_slice());
+    apply_post_execute_side_effects_with_spec(
+        server,
+        client,
+        command.as_slice(),
+        spec,
+        argv,
+        response,
+        elapsed_us,
+        track_slowlog,
+        track_latency,
+    );
+}
 
+/// Post-execute bookkeeping for callers that already resolved the upper-cased
+/// command name and its spec, so the dispatch path does not look them up twice.
+#[allow(clippy::too_many_arguments)]
+fn apply_post_execute_side_effects_with_spec(
+    server: &mut ServerState,
+    client: &mut ClientState,
+    command: &[u8],
+    spec: Option<CommandSpec>,
+    argv: &[Bytes],
+    response: &RespFrame,
+    elapsed_us: Option<i64>,
+    track_slowlog: bool,
+    track_latency: bool,
+) {
     if let Some(elapsed_us) = elapsed_us {
         if track_slowlog {
-            maybe_track_slowlog(server, command.as_slice(), argv, elapsed_us);
+            maybe_track_slowlog(server, command, argv, elapsed_us);
         }
         if track_latency {
-            maybe_track_latency(server, command.as_slice(), elapsed_us);
+            maybe_track_latency(server, command, elapsed_us);
         }
     }
 
     if let Some(spec) = spec {
         if spec.flags.contains(&"write") {
-            maybe_track_write_version(server, client, command.as_slice(), argv, response, spec);
+            maybe_track_write_version(server, client, command, argv, response, spec);
         } else if spec.flags.contains(&"readonly") {
             maybe_track_client_tracking_access(server, client, argv, response, spec);
         }
     }
-    client.finish_tracking_command(command.as_slice(), argv);
+    client.finish_tracking_command(command, argv);
 
     // MONITOR dispatch — broadcast formatted command to all monitoring clients.
     // The guard check (`has_monitors`) is a single HashSet::is_empty() check,
     // so the hot-path cost is negligible when no monitors are active.
-    if server.has_monitors() && command.as_slice() != b"MONITOR" {
+    if server.has_monitors() && command != b"MONITOR" {
         let line = format_monitor_line(server, client, argv);
         server.broadcast_monitor_message(client.id(), line);
     }
@@ -4500,17 +4528,45 @@ fn maybe_track_client_tracking_access(
     });
 }
 
+/// Keys touched by a write, collected for tracking invalidation and
+/// blocked-client wakeups.
+///
+/// Stays empty without allocating when no client observes writes, which is
+/// the common case on the hot write path.
+struct TouchedKeys {
+    keys: Vec<(usize, Bytes)>,
+    observed: bool,
+}
+
+impl TouchedKeys {
+    fn new(server: &ServerState) -> Self {
+        Self {
+            keys: Vec::new(),
+            observed: server.write_observers_active(),
+        }
+    }
+
+    fn push(&mut self, db_idx: usize, key: &Bytes) {
+        if self.observed {
+            self.keys.push((db_idx, key.clone()));
+        }
+    }
+}
+
 fn invalidate_tracked_keys(
     server: &mut ServerState,
     writer_client_id: i64,
-    touched_keys: Vec<(usize, Bytes)>,
+    touched_keys: TouchedKeys,
 ) {
+    if touched_keys.keys.is_empty() {
+        return;
+    }
     let mut keys_by_db = HashBrownMap::<usize, Vec<Bytes>>::new();
-    for (db_idx, key) in touched_keys {
+    for (db_idx, key) in touched_keys.keys {
         keys_by_db.entry(db_idx).or_default().push(key);
     }
     for (db_idx, keys) in keys_by_db {
-        server.notify_blocked_clients(db_idx, keys.clone());
+        server.notify_blocked_clients(db_idx, keys.iter().cloned());
         server.tracking_invalidate_keys(writer_client_id, db_idx, keys);
     }
 }
@@ -4690,12 +4746,12 @@ fn maybe_track_write_version(
         return;
     }
 
-    let mut touched_keys = Vec::<(usize, Bytes)>::new();
+    let mut touched_keys = TouchedKeys::new(server);
 
     if command == b"SET" {
         if let Some(key) = argv.get(1) {
             server.touch_key_version(client.selected_db, key.clone());
-            touched_keys.push((client.selected_db, key.clone()));
+            touched_keys.push(client.selected_db, key);
         }
         invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
@@ -4708,7 +4764,7 @@ fn maybe_track_write_version(
             if argv[idx].eq_ignore_ascii_case(b"STORE") {
                 if let Some(dest_key) = argv.get(idx + 1) {
                     server.touch_key_version(client.selected_db, dest_key.clone());
-                    touched_keys.push((client.selected_db, dest_key.clone()));
+                    touched_keys.push(client.selected_db, dest_key);
                 }
                 break;
             }
@@ -4737,7 +4793,7 @@ fn maybe_track_write_version(
                 idx += 1;
             }
             server.touch_key_version(target_db, target_key.clone());
-            touched_keys.push((target_db, target_key.clone()));
+            touched_keys.push(target_db, target_key);
         }
         invalidate_tracked_keys(server, client.id(), touched_keys);
         server.advance_replication_offset();
@@ -4747,12 +4803,12 @@ fn maybe_track_write_version(
     if command == b"MOVE" {
         if let Some(key) = argv.get(1) {
             server.touch_key_version(client.selected_db, key.clone());
-            touched_keys.push((client.selected_db, key.clone()));
+            touched_keys.push(client.selected_db, key);
             if let Some(target_db_raw) = argv.get(2) {
                 if let Some(target_db) = parse_usize(target_db_raw) {
                     if target_db < server.db_count() {
                         server.touch_key_version(target_db, key.clone());
-                        touched_keys.push((target_db, key.clone()));
+                        touched_keys.push(target_db, key);
                     }
                 }
             }
@@ -4776,7 +4832,7 @@ fn maybe_track_write_version(
                 break;
             }
             server.touch_key_version(client.selected_db, argv[idx].clone());
-            touched_keys.push((client.selected_db, argv[idx].clone()));
+            touched_keys.push(client.selected_db, &argv[idx]);
             idx = idx.saturating_add(2);
         }
         invalidate_tracked_keys(server, client.id(), touched_keys);
@@ -4787,7 +4843,7 @@ fn maybe_track_write_version(
     cmd_command_metadata::for_each_command_key_position(spec, argv.len(), |pos| {
         if let Some(key) = argv.get(pos) {
             server.touch_key_version(client.selected_db, key.clone());
-            touched_keys.push((client.selected_db, key.clone()));
+            touched_keys.push(client.selected_db, key);
         }
     });
     invalidate_tracked_keys(server, client.id(), touched_keys);
