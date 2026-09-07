@@ -1026,12 +1026,12 @@ impl DirectDb<'_> {
         let now = now_ms();
         self.purge_if_expired_write(&old_key_bytes, now);
 
+        if !self
+            .server
+            .db_mut(self.db_idx)
+            .rename(&old_key_bytes, &new_key_bytes)
         {
-            let mut db = self.server.db_mut(self.db_idx);
-            let Some(value) = db.remove(&old_key_bytes) else {
-                return false;
-            };
-            db.insert(new_key_bytes.clone(), value);
+            return false;
         }
         self.touch_version(&old_key_bytes);
         self.touch_version(&new_key_bytes);

@@ -180,9 +180,9 @@ pub(super) fn cmd_rename_with_mode(
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, source, now);
 
-    let Some(value) = db.get(source).cloned() else {
+    if !db.contains_key(source) {
         return CommandOutcome::reply(err("ERR no such key"));
-    };
+    }
 
     if source == target {
         return if only_if_missing {
@@ -197,8 +197,7 @@ pub(super) fn cmd_rename_with_mode(
         return CommandOutcome::reply(RespFrame::Integer(0));
     }
 
-    db.remove(source);
-    db.insert(target.clone(), value);
+    db.rename(source, target);
 
     if only_if_missing {
         CommandOutcome::reply(RespFrame::Integer(1))
@@ -247,17 +246,19 @@ pub(super) fn cmd_move(
         }
     }
 
-    let moved_value = {
+    // Estimate once while taking the value; the target database adds the
+    // same figure back instead of walking the value a second time.
+    let moved = {
         let mut source_db = server.db_mut(client.selected_db);
-        source_db.remove(key)
+        source_db.take_with_estimate(key)
     };
 
-    let Some(moved_value) = moved_value else {
+    let Some((moved_value, estimate)) = moved else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
 
     let mut target_db = server.db_mut(target_db_index);
-    target_db.insert(key.clone(), moved_value);
+    target_db.insert_with_estimate(key.clone(), moved_value, estimate);
     CommandOutcome::reply(RespFrame::Integer(1))
 }
 

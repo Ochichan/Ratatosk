@@ -1212,6 +1212,53 @@ impl<'a> DbWriteGuard<'a> {
         Some(value)
     }
 
+    /// Move a top-level key to a new name within this database without
+    /// walking the value.
+    ///
+    /// The payload does not change, so only the key-length share of the
+    /// memory estimate moves; a value already stored under `target` is
+    /// released with full accounting. Returns `false` when `source` is absent.
+    pub fn rename(&mut self, source: &Bytes, target: &Bytes) -> bool {
+        let Some((_, value)) = self.shard.data.remove_entry(source) else {
+            return false;
+        };
+        self.shard.expires.remove(source);
+        self.remove(target);
+
+        if target.len() >= source.len() {
+            self.data_state
+                .add_memory(self.db_idx, target.len() - source.len());
+        } else {
+            self.data_state
+                .sub_memory(self.db_idx, source.len() - target.len());
+        }
+
+        self.shard.sync_expires(target, value.expire_at_ms());
+        self.shard.data.insert(target.clone(), value);
+        true
+    }
+
+    /// Remove a top-level key and return it with its memory estimate, so a
+    /// caller moving it to another database can account for it once.
+    pub fn take_with_estimate(&mut self, key: &Bytes) -> Option<(StoredValue, usize)> {
+        let (owned_key, value) = self.shard.data.remove_entry(key)?;
+
+        self.shard.expires.remove(&owned_key);
+        let freed = crate::eviction::estimate_object_memory(&owned_key, &value);
+        self.data_state.sub_memory(self.db_idx, freed);
+        Some((value, freed))
+    }
+
+    /// Insert a value whose memory estimate was computed by
+    /// [`Self::take_with_estimate`] under the same key. The key must be
+    /// absent; callers check that before taking the value.
+    pub fn insert_with_estimate(&mut self, key: Bytes, value: StoredValue, estimate: usize) {
+        debug_assert!(!self.shard.data.contains_key(&key));
+        self.shard.sync_expires(&key, value.expire_at_ms());
+        self.shard.data.insert(key, value);
+        self.data_state.add_memory(self.db_idx, estimate);
+    }
+
     /// Update the TTL metadata for an existing key and keep the expires side-index
     /// in sync.
     pub fn set_key_expiry(&mut self, key: &Bytes, expire_at_ms: Option<i64>) -> bool {
@@ -1961,7 +2008,7 @@ fn generate_cluster_node_id() -> Bytes {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, time::Duration};
+    use std::{path::PathBuf, sync::atomic::Ordering as AtomicOrdering, time::Duration};
 
     use bytes::Bytes;
     use hashbrown::HashSet;
@@ -2861,5 +2908,108 @@ mod tests {
             state.db(3).contains_key(&Bytes::from("alive")),
             "DB 3 key should be untouched"
         );
+    }
+
+    fn list_of(len: usize) -> StoredValue {
+        let values = (0..len)
+            .map(|i| Bytes::from(format!("v{i}")))
+            .collect::<std::collections::VecDeque<_>>();
+        StoredValue::list(values, None)
+    }
+
+    #[test]
+    fn rename_moves_key_and_only_key_length_share_of_memory() {
+        let server = ServerState::with_default_dbs();
+        let source = Bytes::from_static(b"src");
+        let target = Bytes::from_static(b"target");
+        {
+            let mut db = server.db_mut(0);
+            let mut value = list_of(1024);
+            value.set_expire_at_ms(Some(i64::MAX));
+            db.insert(source.clone(), value);
+        }
+        let before = server.data.estimated_memory();
+
+        assert!(server.db_mut(0).rename(&source, &target));
+
+        let shard = server.data.read_db(0);
+        assert!(!shard.data.contains_key(&source));
+        let moved = shard.data.get(&target).expect("renamed key present");
+        assert_eq!(moved.as_list().map(|list| list.len()), Some(1024));
+        assert_eq!(moved.expire_at_ms(), Some(i64::MAX));
+        assert!(!shard.expires.contains_key(&source));
+        assert_eq!(shard.expires.get(&target), Some(&i64::MAX));
+        // "target" is three bytes longer than "src"; the payload is unchanged.
+        assert_eq!(server.data.estimated_memory(), before + 3);
+    }
+
+    #[test]
+    fn rename_onto_existing_target_releases_its_memory() {
+        let server = ServerState::with_default_dbs();
+        let source = Bytes::from_static(b"src");
+        let target = Bytes::from_static(b"dst");
+        let old_target = StoredValue::string(Bytes::from_static(b"stale-value"), None);
+        let old_target_mem = crate::eviction::estimate_object_memory(&target, &old_target);
+        {
+            let mut db = server.db_mut(0);
+            db.insert(source.clone(), list_of(64));
+            db.insert(target.clone(), old_target);
+        }
+        let before = server.data.estimated_memory();
+
+        assert!(server.db_mut(0).rename(&source, &target));
+
+        let shard = server.data.read_db(0);
+        assert_eq!(
+            shard
+                .data
+                .get(&target)
+                .and_then(|v| v.as_list())
+                .map(|l| l.len()),
+            Some(64)
+        );
+        assert_eq!(server.data.estimated_memory(), before - old_target_mem);
+    }
+
+    #[test]
+    fn rename_of_missing_key_is_a_noop() {
+        let server = ServerState::with_default_dbs();
+        let before = server.data.estimated_memory();
+        assert!(
+            !server
+                .db_mut(0)
+                .rename(&Bytes::from_static(b"nope"), &Bytes::from_static(b"x"))
+        );
+        assert_eq!(server.data.estimated_memory(), before);
+    }
+
+    #[test]
+    fn take_and_insert_with_estimate_moves_memory_between_databases() {
+        let server = ServerState::with_default_dbs();
+        let key = Bytes::from_static(b"k");
+        server.db_mut(0).insert(key.clone(), list_of(256));
+        let db0_before = server.data.db_memory_bytes[0].load(AtomicOrdering::Relaxed);
+        let db1_before = server.data.db_memory_bytes[1].load(AtomicOrdering::Relaxed);
+        let total_before = server.data.estimated_memory();
+
+        let (value, estimate) = server
+            .db_mut(0)
+            .take_with_estimate(&key)
+            .expect("key present in db 0");
+        assert_eq!(
+            server.data.db_memory_bytes[0].load(AtomicOrdering::Relaxed),
+            db0_before - estimate
+        );
+        server
+            .db_mut(1)
+            .insert_with_estimate(key.clone(), value, estimate);
+
+        assert!(!server.data.read_db(0).data.contains_key(&key));
+        assert!(server.data.read_db(1).data.contains_key(&key));
+        assert_eq!(
+            server.data.db_memory_bytes[1].load(AtomicOrdering::Relaxed),
+            db1_before + estimate
+        );
+        assert_eq!(server.data.estimated_memory(), total_before);
     }
 }

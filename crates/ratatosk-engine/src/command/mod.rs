@@ -8583,6 +8583,48 @@ mod tests {
     }
 
     #[test]
+    fn rename_keeps_ttl_and_replaces_existing_target() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        assert_eq!(
+            run(
+                &["SET", "src", "fresh", "PX", "100000"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "dst", "stale"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["RENAME", "src", "dst"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+
+        assert_eq!(
+            run(&["GET", "dst"], &mut server, &mut client),
+            RespFrame::bulk_str("fresh")
+        );
+        assert_eq!(
+            run(&["EXISTS", "src"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        assert_eq!(
+            run(&["DBSIZE"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        let RespFrame::Integer(pttl) = run(&["PTTL", "dst"], &mut server, &mut client) else {
+            panic!("PTTL must return an integer");
+        };
+        assert!(
+            (1..=100_000).contains(&pttl),
+            "TTL must survive RENAME, got {pttl}"
+        );
+    }
+    #[test]
     fn m1_additional_kv_core_commands() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
