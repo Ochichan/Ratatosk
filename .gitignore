@@ -40,14 +40,9 @@ __pycache__/
 .cargo-install/
 .cargo/config.local.toml
 
-# ---------------------------------------------------------------------------
-# Maintainer-private material — never published.
-# Agent harness, personal notes, and integration plans for private projects.
-# ---------------------------------------------------------------------------
+# Local-only material (agent harness, maintainer notes, private experiments)
+# is excluded through .git/info/exclude, not listed here.
 /AGENTS.md
-/docs/ai/
 /.command-center/
 /settings.local.json
-/.DS_Store
-
-
+/docs/ai/
