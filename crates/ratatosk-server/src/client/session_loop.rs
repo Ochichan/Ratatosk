@@ -1,6 +1,11 @@
 use super::shared_support::{append_encoded_frame, flush_pending_input_bytes};
 use super::*;
 
+pub(super) struct ProtocolCommandOutcome {
+    outcome: CommandOutcome,
+    protocol_version: i64,
+}
+
 async fn write_output_limit_error(
     stream: &mut TcpStream,
     write_timeout: Duration,
@@ -67,7 +72,12 @@ pub(super) async fn drain_preloop_async_output(
     if !monitor_pending.is_empty() {
         for line in monitor_pending {
             let frame = RespFrame::SimpleString(line);
-            if !append_encoded_frame(output, &frame, output_limit_bytes) {
+            if !append_encoded_frame(
+                output,
+                &frame,
+                output_limit_bytes,
+                client_state.protocol_version(),
+            ) {
                 tracing::warn!(
                     client_id = client_state.id(),
                     output_limit_bytes = output_limit_bytes,
@@ -134,9 +144,15 @@ pub(super) async fn execute_client_pipeline(
     stream: &TcpStream,
     addr: &Bytes,
     laddr: &Bytes,
-) -> io::Result<Vec<CommandOutcome>> {
+) -> io::Result<Vec<ProtocolCommandOutcome>> {
     match try_run_readonly_batch(parsed_frames, server_state, client_state).await {
-        Ok(outcomes) => Ok(outcomes),
+        Ok(outcomes) => Ok(outcomes
+            .into_iter()
+            .map(|outcome| ProtocolCommandOutcome {
+                outcome,
+                protocol_version: client_state.protocol_version(),
+            })
+            .collect()),
         Err(frames) => {
             let mut outcomes = Vec::with_capacity(frames.len());
             for frame in frames {
@@ -160,7 +176,10 @@ pub(super) async fn execute_client_pipeline(
                         ),
                     )
                 })?;
-                outcomes.push(outcome);
+                outcomes.push(ProtocolCommandOutcome {
+                    outcome,
+                    protocol_version: client_state.protocol_version(),
+                });
             }
             Ok(outcomes)
         }
@@ -169,7 +188,7 @@ pub(super) async fn execute_client_pipeline(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_command_outcomes(
-    outcomes: Vec<CommandOutcome>,
+    outcomes: Vec<ProtocolCommandOutcome>,
     stream: &mut TcpStream,
     server_state: &SharedServerState,
     client_state: &mut ClientState,
@@ -180,7 +199,11 @@ pub(super) async fn apply_command_outcomes(
     write_timeout: &mut Duration,
 ) -> io::Result<Option<bool>> {
     let mut should_close = false;
-    for outcome in outcomes {
+    for ProtocolCommandOutcome {
+        outcome,
+        protocol_version,
+    } in outcomes
+    {
         if outcome.config_dirty {
             reload_connection_runtime_config(
                 server_state,
@@ -205,7 +228,12 @@ pub(super) async fn apply_command_outcomes(
         };
 
         if !suppress {
-            if !append_encoded_frame(output, &outcome.response, output_limit_bytes) {
+            if !append_encoded_frame(
+                output,
+                &outcome.response,
+                output_limit_bytes,
+                protocol_version,
+            ) {
                 tracing::warn!(
                     client_id = client_state.id(),
                     output_limit_bytes = output_limit_bytes,
@@ -267,7 +295,12 @@ pub(super) async fn drain_post_command_async_output(
         };
         for line in monitor_msgs {
             let frame = RespFrame::SimpleString(line);
-            if !append_encoded_frame(output, &frame, output_limit_bytes) {
+            if !append_encoded_frame(
+                output,
+                &frame,
+                output_limit_bytes,
+                client_state.protocol_version(),
+            ) {
                 tracing::warn!(
                     client_id = client_state.id(),
                     output_limit_bytes = output_limit_bytes,

@@ -533,6 +533,24 @@ async fn flush_persistence_before_shutdown(
     }
 }
 
+async fn flush_everysec_persistence(
+    server_state: &Arc<SharedState>,
+    persistence: &PersistenceRuntime,
+) {
+    // Keep this ordered with writes and runtime CONFIG changes. The timer is
+    // required even when clients stop writing after their last acknowledgement.
+    let mut state = server_state.meta.lock().await;
+    if !state.aof_enabled() || state.config.appendfsync().as_ref() != b"everysec" {
+        return;
+    }
+    if let Err(error) = flush_aof(persistence).await {
+        let detail = format!("periodic AOF fsync failed: {error}");
+        state.set_aof_last_error(detail.clone());
+        crate::metrics::set_aof_write_latched(true);
+        tracing::error!(target = "ratatosk::aof", error = %detail, "AOF writes latched");
+    }
+}
+
 fn finalize_shutdown_result(
     fatal_error: Option<io::Error>,
     shutdown_flush_error: Option<io::Error>,
@@ -793,6 +811,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     cron_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cron_tick: u64 = 0;
     let mut ops_sec_interval = u64::from(cron_hz);
+    let mut aof_fsync_interval = tokio::time::interval(Duration::from_secs(1));
+    aof_fsync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // SIGUSR1 signal handler (Unix only) for triggering RDB save
     #[cfg(unix)]
@@ -932,6 +952,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 emit_fd_metrics();
                 server_cron(&server_state, &mut cron_tick, ops_sec_interval).await;
             }
+            _ = aof_fsync_interval.tick() => {
+                flush_everysec_persistence(&server_state, &persistence).await;
+            }
             _ = sigusr1_recv => {
                 if start_bgsave(Arc::clone(&server_state), persistence.rdb_path.clone()).await {
                     tracing::info!("SIGUSR1 received: background RDB save started");
@@ -979,7 +1002,8 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         );
     }
 
-    if let Err(error) = flush_persistence_before_shutdown(config.appendonly, &persistence).await {
+    let aof_enabled = server_state.meta.lock().await.aof_enabled();
+    if let Err(error) = flush_persistence_before_shutdown(aof_enabled, &persistence).await {
         shutdown_flush_error = Some(error);
     }
 

@@ -84,8 +84,6 @@ fn encode_pubsub_messages(
     output_limit_bytes: usize,
     protocol_version: i64,
 ) -> bool {
-    let use_push = protocol_version >= 3;
-
     for message in messages {
         let frame = match message {
             PubSubMessage::Message { channel, payload } => {
@@ -94,11 +92,7 @@ fn encode_pubsub_messages(
                     RespFrame::BulkString(Some(channel)),
                     RespFrame::BulkString(Some(payload)),
                 ];
-                if use_push {
-                    RespFrame::Push(inner)
-                } else {
-                    RespFrame::Array(inner)
-                }
+                RespFrame::Push(inner)
             }
             PubSubMessage::SMessage { channel, payload } => {
                 let inner = vec![
@@ -106,11 +100,7 @@ fn encode_pubsub_messages(
                     RespFrame::BulkString(Some(channel)),
                     RespFrame::BulkString(Some(payload)),
                 ];
-                if use_push {
-                    RespFrame::Push(inner)
-                } else {
-                    RespFrame::Array(inner)
-                }
+                RespFrame::Push(inner)
             }
             PubSubMessage::PMessage {
                 pattern,
@@ -123,11 +113,7 @@ fn encode_pubsub_messages(
                     RespFrame::BulkString(Some(channel)),
                     RespFrame::BulkString(Some(payload)),
                 ];
-                if use_push {
-                    RespFrame::Push(inner)
-                } else {
-                    RespFrame::Array(inner)
-                }
+                RespFrame::Push(inner)
             }
             PubSubMessage::Invalidate { keys } => {
                 let inner = vec![
@@ -138,27 +124,14 @@ fn encode_pubsub_messages(
                             .collect(),
                     ),
                 ];
-                if use_push {
-                    RespFrame::Push(inner)
-                } else {
-                    RespFrame::Array(inner)
-                }
+                RespFrame::Push(inner)
             }
-            PubSubMessage::TrackingRedirectBroken { redirect_client_id } => {
-                if use_push {
-                    RespFrame::Push(vec![
-                        RespFrame::bulk_str("tracking-redir-broken"),
-                        RespFrame::Integer(redirect_client_id),
-                    ])
-                } else {
-                    RespFrame::Array(vec![
-                        RespFrame::bulk_str("tracking-redir-broken"),
-                        RespFrame::Integer(redirect_client_id),
-                    ])
-                }
-            }
+            PubSubMessage::TrackingRedirectBroken { redirect_client_id } => RespFrame::Push(vec![
+                RespFrame::bulk_str("tracking-redir-broken"),
+                RespFrame::Integer(redirect_client_id),
+            ]),
         };
-        if !append_encoded_frame(output, &frame, output_limit_bytes) {
+        if !append_encoded_frame(output, &frame, output_limit_bytes, protocol_version) {
             return false;
         }
     }

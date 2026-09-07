@@ -7,6 +7,7 @@ use ratatosk_engine::keyspace::{DbSnapshot, ServerState, StoredValue, ValueData}
 
 use super::checksum::Crc64Digest;
 use super::format::*;
+use crate::atomic::atomic_write;
 
 /// RDB saver: serializes a `ServerState` snapshot to binary RDB format.
 pub struct RdbSaver<W: Write> {
@@ -22,6 +23,14 @@ pub fn save(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
         )
     })?;
     RdbSaver::new(file).save_snapshot(snapshot)
+}
+
+/// Save a materialized snapshot with an atomic replace.
+///
+/// AOF BASE snapshots are published through a manifest switch, so exposing a
+/// partially-written base would make a previously durable lineage unreadable.
+pub fn save_atomic(snapshot: &DbSnapshot, path: &Path) -> io::Result<()> {
+    atomic_write(path, |file| RdbSaver::new(file).save_snapshot(snapshot))
 }
 
 impl<W: Write> RdbSaver<W> {
@@ -178,12 +187,23 @@ impl<W: Write> RdbSaver<W> {
                 }
             }
             ValueData::Hash(hash) => {
-                self.write_bytes(&[RDB_TYPE_HASH])?;
+                let has_ttl = hash.values().any(|entry| entry.expire_at_ms.is_some());
+                self.write_bytes(&[if has_ttl {
+                    RDB_TYPE_RATATOSK_HASH_TTL
+                } else {
+                    RDB_TYPE_HASH
+                }])?;
                 self.write_string(key)?;
                 self.write_length(hash.len() as u64)?;
                 for (field, entry) in hash {
                     self.write_string(field)?;
                     self.write_string(&entry.value)?;
+                    if has_ttl {
+                        self.write_bytes(&[u8::from(entry.expire_at_ms.is_some())])?;
+                        if let Some(deadline) = entry.expire_at_ms {
+                            self.write_bytes(&deadline.to_le_bytes())?;
+                        }
+                    }
                 }
             }
             ValueData::SortedSet(zset) => {
@@ -196,9 +216,8 @@ impl<W: Write> RdbSaver<W> {
                     self.write_bytes(&score_bytes)?;
                 }
             }
-            ValueData::Stream { entries, .. } => {
-                // Simplified stream serialization: store as a list of entries
-                self.write_bytes(&[RDB_TYPE_STREAM])?;
+            ValueData::Stream { entries, groups } => {
+                self.write_bytes(&[RDB_TYPE_RATATOSK_STREAM_GROUPS])?;
                 self.write_string(key)?;
                 self.write_length(entries.len() as u64)?;
                 for entry in entries {
@@ -210,6 +229,30 @@ impl<W: Write> RdbSaver<W> {
                     for (field_key, field_val) in &entry.fields {
                         self.write_string(field_key)?;
                         self.write_string(field_val)?;
+                    }
+                }
+                self.write_length(groups.len() as u64)?;
+                for (name, group) in groups {
+                    self.write_string(name)?;
+                    self.write_bytes(&group.last_delivered_id.ms.to_le_bytes())?;
+                    self.write_bytes(&group.last_delivered_id.seq.to_le_bytes())?;
+                    self.write_length(group.consumers.len() as u64)?;
+                    for (name, consumer) in &group.consumers {
+                        self.write_string(name)?;
+                        self.write_bytes(&consumer.seen_time_ms.to_le_bytes())?;
+                        self.write_length(consumer.pending.len() as u64)?;
+                        for id in &consumer.pending {
+                            self.write_bytes(&id.ms.to_le_bytes())?;
+                            self.write_bytes(&id.seq.to_le_bytes())?;
+                        }
+                    }
+                    self.write_length(group.pending.len() as u64)?;
+                    for (id, pending) in &group.pending {
+                        self.write_bytes(&id.ms.to_le_bytes())?;
+                        self.write_bytes(&id.seq.to_le_bytes())?;
+                        self.write_string(&pending.consumer)?;
+                        self.write_bytes(&pending.deliveries.to_le_bytes())?;
+                        self.write_bytes(&pending.last_delivered_ms.to_le_bytes())?;
                     }
                 }
             }

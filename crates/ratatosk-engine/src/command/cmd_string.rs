@@ -23,10 +23,10 @@ pub(super) fn cmd_append(
     purge_expired_key(&mut db, key, now);
 
     let (value, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        let Some(s) = existing.as_string_bytes() else {
             return wrong_type_response();
         };
-        (s.clone(), existing.expire_at_ms())
+        (s, existing.expire_at_ms())
     } else {
         (Bytes::new(), None)
     };
@@ -61,7 +61,7 @@ pub(super) fn cmd_strlen(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(s) = entry.as_string() else {
+    let Some(s) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
@@ -91,7 +91,7 @@ pub(super) fn cmd_getrange(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::bulk_str(""));
     };
-    let Some(s) = entry.as_string() else {
+    let Some(s) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
@@ -132,14 +132,14 @@ pub(super) fn cmd_setrange(
         let Some(entry) = db.get(key) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
         };
-        let Some(s) = entry.as_string() else {
+        let Some(s) = entry.as_string_bytes() else {
             return wrong_type_response();
         };
         return CommandOutcome::reply(RespFrame::Integer(s.len() as i64));
     }
 
     let (mut base, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        let Some(s) = existing.as_string_bytes() else {
             return wrong_type_response();
         };
         (s.to_vec(), existing.expire_at_ms())
@@ -284,4 +284,130 @@ pub(super) fn cmd_msetnx(
     }
 
     CommandOutcome::reply(RespFrame::Integer(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use ratatosk_resp::frame::RespFrame;
+
+    use crate::keyspace::ServerState;
+
+    use super::super::ClientState;
+
+    use super::super::execute;
+
+    fn cmd(parts: &[&str]) -> RespFrame {
+        RespFrame::Array(parts.iter().map(|part| RespFrame::bulk_str(part)).collect())
+    }
+
+    fn run(parts: &[&str], server: &mut ServerState, client: &mut ClientState) -> RespFrame {
+        let mut access = super::super::ServerAccess::new_inline(server);
+        execute(cmd(parts), &mut access, client).response
+    }
+
+    fn bulk(reply: &RespFrame) -> &[u8] {
+        match reply {
+            RespFrame::BulkString(Some(value)) => value.as_ref(),
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    fn integer(reply: &RespFrame) -> i64 {
+        match reply {
+            RespFrame::Integer(value) => *value,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    fn assert_wrongtype(reply: &RespFrame) {
+        match reply {
+            RespFrame::Error(message) => {
+                assert!(std::str::from_utf8(message).unwrap().contains("WRONGTYPE"))
+            }
+            other => panic!("expected WRONGTYPE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_string_supports_string_mutations_ttl_and_type_rejection() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        assert_eq!(
+            run(&["SET", "value", "42"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["TYPE", "value"], &mut server, &mut client),
+            RespFrame::SimpleString(Bytes::from_static(b"string"))
+        );
+        assert_eq!(
+            integer(&run(&["APPEND", "value", "."], &mut server, &mut client)),
+            3
+        );
+        assert_eq!(
+            bulk(&run(&["GET", "value"], &mut server, &mut client)),
+            b"42."
+        );
+        assert_eq!(
+            integer(&run(&["STRLEN", "value"], &mut server, &mut client)),
+            3
+        );
+        assert_eq!(
+            bulk(&run(
+                &["GETRANGE", "value", "0", "-1"],
+                &mut server,
+                &mut client
+            )),
+            b"42."
+        );
+        assert_eq!(
+            integer(&run(
+                &["SETRANGE", "value", "3", "x"],
+                &mut server,
+                &mut client
+            )),
+            4
+        );
+        assert_eq!(
+            bulk(&run(&["GET", "value"], &mut server, &mut client)),
+            b"42.x"
+        );
+
+        assert_eq!(
+            run(
+                &["SET", "min", "-9223372036854775808", "PX", "5000"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            integer(&run(&["APPEND", "min", "!"], &mut server, &mut client)),
+            21
+        );
+        assert_eq!(
+            bulk(&run(&["GET", "min"], &mut server, &mut client)),
+            b"-9223372036854775808!"
+        );
+        let ttl = integer(&run(&["PTTL", "min"], &mut server, &mut client));
+        assert!((0..=5000).contains(&ttl));
+
+        assert_eq!(
+            run(&["RPUSH", "list", "a"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["HSET", "hash", "field", "a"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_wrongtype(&run(&["APPEND", "list", "b"], &mut server, &mut client));
+        assert_wrongtype(&run(
+            &["SETBIT", "hash", "0", "1"],
+            &mut server,
+            &mut client,
+        ));
+    }
 }

@@ -60,7 +60,7 @@ use cmd_key::{
     parse_scan_cursor, parse_scan_match_count_options, scan_collect_indexes, scan_reply,
 };
 
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use bytes::Bytes;
 use hashbrown::HashMap as HashBrownMap;
@@ -3403,6 +3403,53 @@ pub struct CommandOutcome {
     pub acl_dirty: bool,
 }
 
+/// A command that changed durable state and can be replayed without relying on
+/// client-time inputs such as a relative TTL or an auto-generated stream ID.
+///
+/// The server consumes these after command execution.  Keeping the capture at
+/// this boundary is important: callers only see the client request, whereas
+/// this layer knows which conditional command actually took effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCommand {
+    pub db_index: usize,
+    pub argv: Vec<Bytes>,
+}
+
+/// The durable effects emitted by one command invocation.
+///
+/// A transaction is represented as a group so the AOF writer can place its
+/// effects inside one `MULTI`/`EXEC` envelope rather than writing a bare
+/// `EXEC` or letting a torn tail apply a prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DurabilityEffects {
+    pub commands: Vec<DurableCommand>,
+    pub transaction: bool,
+    /// One frozen execution clock for the command or atomic EXEC envelope.
+    pub timestamp_ms: i64,
+}
+
+impl DurabilityEffects {
+    fn single(db_index: usize, argv: Vec<Bytes>) -> Self {
+        Self {
+            commands: vec![DurableCommand { db_index, argv }],
+            transaction: false,
+            timestamp_ms: now_ms(),
+        }
+    }
+
+    fn transaction(commands: Vec<DurableCommand>) -> Self {
+        Self {
+            commands,
+            transaction: true,
+            timestamp_ms: now_ms(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockingRetry {
     pub deadline_ms: Option<i64>,
@@ -3565,6 +3612,8 @@ pub struct ClientState {
     lib_name: Option<Bytes>,
     lib_ver: Option<Bytes>,
     monitor_mode: bool,
+    durability_capture_enabled: bool,
+    durability_effects: Option<DurabilityEffects>,
 }
 
 impl ClientState {
@@ -3627,6 +3676,39 @@ impl ClientState {
 
     pub fn in_multi(&self) -> bool {
         self.tx_state.in_multi()
+    }
+
+    pub fn has_queued_writes(&self) -> bool {
+        match &self.tx_state {
+            TransactionState::InTransaction { queue, .. } => {
+                queue.iter().any(|argv| is_write_command(argv))
+            }
+            TransactionState::Normal => false,
+        }
+    }
+
+    /// Take effects captured for the most recently executed command.
+    ///
+    /// This is deliberately per-client transient state rather than a response
+    /// field so the protocol layer remains independent of persistence.
+    pub fn take_durability_effects(&mut self) -> Option<DurabilityEffects> {
+        self.durability_effects.take()
+    }
+
+    /// Enable durable-effect capture for the current server execution path.
+    ///
+    /// The server toggles this with its live AOF writer state. Keeping it off
+    /// by default avoids cloning argv or inspecting post-mutation values on
+    /// the ordinary disabled-AOF cache path.
+    pub fn set_durability_capture_enabled(&mut self, enabled: bool) {
+        self.durability_capture_enabled = enabled;
+        if !enabled {
+            self.durability_effects = None;
+        }
+    }
+
+    fn set_durability_effects(&mut self, effects: Option<DurabilityEffects>) {
+        self.durability_effects = effects;
     }
 
     pub fn set_protocol_version(&mut self, protocol_version: i64) {
@@ -3829,6 +3911,8 @@ impl ClientState {
             lib_name: None,
             lib_ver: None,
             monitor_mode: false,
+            durability_capture_enabled: false,
+            durability_effects: None,
         }
     }
 
@@ -3857,6 +3941,8 @@ impl ClientState {
         self.no_touch = false;
         self.reply_mode = Bytes::from_static(b"on");
         self.monitor_mode = false;
+        self.durability_capture_enabled = false;
+        self.durability_effects = None;
     }
 }
 
@@ -3908,9 +3994,32 @@ pub fn execute_argv(
     access: &mut ServerAccess<'_>,
     client: &mut ClientState,
 ) -> CommandOutcome {
+    if client.durability_capture_enabled {
+        // All relative expiries and lazy expiry decisions in this operation
+        // use the same clock that recovery will use, including nested EXEC.
+        ratatosk_core::time::with_command_time(now_ms(), || {
+            execute_argv_inner(argv, access, client)
+        })
+    } else {
+        execute_argv_inner(argv, access, client)
+    }
+}
+
+fn execute_argv_inner(
+    argv: &[Bytes],
+    access: &mut ServerAccess<'_>,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if argv.is_empty() {
+        client.set_durability_effects(None);
         return CommandOutcome::reply(err("ERR empty command"));
     }
+
+    // Each invocation owns its captured effects.  This also ensures queued,
+    // discarded, aborted, and validation-failed transaction commands cannot
+    // leak a previous command's effects into the AOF admission path.
+    client.set_durability_effects(None);
+    let selected_db_before = client.selected_db();
 
     let command_raw = &argv[0];
     let command = to_uppercase_stack(command_raw);
@@ -4349,7 +4458,176 @@ pub fn execute_argv(
         track_latency,
     );
 
+    // `cmd_exec` gathers the effects of its nested commands itself.  Replacing
+    // them here with a bare EXEC would make recovery both incomplete and
+    // vulnerable to a torn transaction tail.
+    if client.durability_capture_enabled && command.as_slice() != b"EXEC" {
+        client.set_durability_effects(capture_durability_effects(
+            command.as_slice(),
+            argv,
+            server,
+            selected_db_before,
+            &outcome.response,
+        ));
+    }
+
     outcome
+}
+
+fn capture_durability_effects(
+    command: &[u8],
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<DurabilityEffects> {
+    if argv.is_empty() || matches!(response, RespFrame::Error(_)) {
+        return None;
+    }
+
+    let canonical = match command {
+        // Relative expiry must never be replayed relative to the restart
+        // clock.  Reading the result from the keyspace also handles KEEPTTL,
+        // NX/XX and SET GET without trusting the shape of their reply.
+        b"SET" if set_command_was_applied(argv, server, db_index, response) => {
+            canonical_string_state(server, db_index, argv.get(1)?)
+        }
+        b"SETEX" | b"PSETEX" => canonical_string_state(server, db_index, argv.get(1)?),
+        b"GETEX" if argv.len() > 2 && matches!(response, RespFrame::BulkString(Some(_))) => {
+            canonical_string_state(server, db_index, argv.get(1)?)
+        }
+        b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
+            if matches!(response, RespFrame::Integer(1)) =>
+        {
+            canonical_expiry_state(server, db_index, argv.get(1)?)
+        }
+        // XADD resolves `*` (and the supported partial auto-ID form) while it
+        // mutates the stream.  Replay the returned concrete ID, never the
+        // caller's generator token.
+        b"XADD" => canonical_xadd(argv, response),
+        b"SPOP" => {
+            let members = match response {
+                RespFrame::BulkString(Some(member)) => vec![member.clone()],
+                RespFrame::Array(items) => items
+                    .iter()
+                    .filter_map(|item| match item {
+                        RespFrame::BulkString(Some(member)) => Some(member.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            if members.is_empty() {
+                return None;
+            }
+            let mut removal = vec![Bytes::from_static(b"SREM"), argv.get(1)?.clone()];
+            removal.extend(members);
+            Some(removal)
+        }
+        // These commands are administrative/session actions, not keyspace
+        // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
+        // a successful CONFIG reply as if it were data.
+        b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SELECT" | b"CONFIG"
+        | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF" | b"PUBLISH" | b"SPUBLISH" => None,
+        _ if is_write_command(argv) && raw_command_changed_state(command, response) => {
+            Some(argv.to_vec())
+        }
+        _ => None,
+    }?;
+
+    Some(DurabilityEffects::single(db_index, canonical))
+}
+
+fn set_command_was_applied(
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> bool {
+    let has_condition = argv
+        .iter()
+        .skip(3)
+        .any(|option| option.eq_ignore_ascii_case(b"NX") || option.eq_ignore_ascii_case(b"XX"));
+    if !has_condition {
+        return true;
+    }
+
+    if matches!(response, RespFrame::SimpleString(value) if value.eq_ignore_ascii_case(b"OK")) {
+        return true;
+    }
+
+    // SET ... GET returns the prior value rather than OK.  If a condition was
+    // met, the post-state contains the requested value.  A same-value no-op
+    // produces an identical canonical state, which is still safe to replay.
+    argv.get(2).is_some_and(|requested| {
+        server
+            .db(db_index)
+            .get(argv.get(1).expect("SET key checked by dispatcher"))
+            .and_then(|entry| entry.as_string_bytes())
+            .is_some_and(|actual| actual == *requested)
+    })
+}
+
+fn canonical_string_state(
+    server: &ServerState,
+    db_index: usize,
+    key: &Bytes,
+) -> Option<Vec<Bytes>> {
+    let entry = server.db(db_index).get(key).cloned();
+    match entry {
+        Some(entry) => {
+            let value = entry.as_string_bytes()?;
+            let mut argv = vec![Bytes::from_static(b"SET"), key.clone(), value];
+            if let Some(expire_at_ms) = entry.expire_at_ms() {
+                argv.push(Bytes::from_static(b"PXAT"));
+                argv.push(Bytes::from(expire_at_ms.to_string()));
+            }
+            Some(argv)
+        }
+        // Commands such as SET PXAT in the past and GETEX with an elapsed
+        // absolute deadline are durable deletions, not a restarted TTL.
+        None => Some(vec![Bytes::from_static(b"DEL"), key.clone()]),
+    }
+}
+
+fn canonical_expiry_state(
+    server: &ServerState,
+    db_index: usize,
+    key: &Bytes,
+) -> Option<Vec<Bytes>> {
+    let entry = server.db(db_index).get(key).cloned();
+    match entry {
+        Some(entry) => entry.expire_at_ms().map(|expire_at_ms| {
+            vec![
+                Bytes::from_static(b"PEXPIREAT"),
+                key.clone(),
+                Bytes::from(expire_at_ms.to_string()),
+            ]
+        }),
+        None => Some(vec![Bytes::from_static(b"DEL"), key.clone()]),
+    }
+}
+
+fn canonical_xadd(argv: &[Bytes], response: &RespFrame) -> Option<Vec<Bytes>> {
+    let RespFrame::BulkString(Some(id)) = response else {
+        return None;
+    };
+    let mut canonical = argv.to_vec();
+    let id_slot = canonical.get_mut(2)?;
+    *id_slot = id.clone();
+    Some(canonical)
+}
+
+fn raw_command_changed_state(command: &[u8], response: &RespFrame) -> bool {
+    // A small set of common conditional/no-op responses must not be admitted
+    // as replay input.  Other data commands retain their original argv; their
+    // ordering is now against one authoritative AOF lineage.
+    match command {
+        b"DEL" | b"UNLINK" | b"SETNX" | b"MSETNX" | b"HSETNX" | b"PERSIST" => {
+            !matches!(response, RespFrame::Integer(0))
+        }
+        _ => true,
+    }
 }
 
 pub fn execute(
@@ -4359,7 +4637,10 @@ pub fn execute(
 ) -> CommandOutcome {
     let argv = match frame_to_argv(frame) {
         Ok(argv) => argv,
-        Err(response) => return CommandOutcome::reply(response),
+        Err(response) => {
+            client.set_durability_effects(None);
+            return CommandOutcome::reply(response);
+        }
     };
 
     execute_argv(&argv, access, client)
@@ -4985,10 +5266,7 @@ fn expire_condition_matches(condition: ExpireCondition, current: Option<i64>, ta
 }
 
 fn now_ms() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
+    ratatosk_core::time::now_ms()
 }
 
 pub(super) fn now_client_clock_ms() -> i64 {
@@ -5079,6 +5357,15 @@ mod tests {
         execute(cmd(parts), &mut access, client).response
     }
 
+    fn run_outcome(
+        parts: &[&str],
+        server: &mut ServerState,
+        client: &mut ClientState,
+    ) -> CommandOutcome {
+        let mut access = ServerAccess::new_inline(server);
+        execute(cmd(parts), &mut access, client)
+    }
+
     fn run_with_atomic(
         parts: &[&str],
         server: &mut ServerState,
@@ -5096,6 +5383,14 @@ mod tests {
     ) -> CommandOutcome {
         let mut access = ServerAccess::new_inline(server);
         execute(cmd(parts), &mut access, client)
+    }
+
+    fn pubsub_ack(kind: &str, target: Option<&str>, count: i64) -> RespFrame {
+        RespFrame::Sequence(vec![RespFrame::Push(vec![
+            RespFrame::bulk_str(kind),
+            target.map_or(RespFrame::BulkString(None), RespFrame::bulk_str),
+            RespFrame::Integer(count),
+        ])])
     }
 
     fn unique_test_path(prefix: &str) -> std::path::PathBuf {
@@ -5123,19 +5418,18 @@ mod tests {
         assert_eq!(actual_set, expected_set);
     }
 
-    fn assert_array_pairs_eq(actual: &RespFrame, expected_pairs: &[(&str, &str)]) {
-        let RespFrame::Array(items) = actual else {
-            panic!("expected Array, got {actual:?}");
+    fn assert_map_pairs_eq(actual: &RespFrame, expected_pairs: &[(&str, &str)]) {
+        let RespFrame::Map(entries) = actual else {
+            panic!("expected Map, got {actual:?}");
         };
-        assert_eq!(items.len() % 2, 0);
-        let mut actual_pairs: Vec<(&[u8], &[u8])> = items
-            .chunks(2)
-            .map(|pair| {
-                let k = match &pair[0] {
+        let mut actual_pairs: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(key, value)| {
+                let k = match key {
                     RespFrame::BulkString(Some(b)) => b.as_ref(),
                     _ => panic!("expected BulkString key"),
                 };
-                let v = match &pair[1] {
+                let v = match value {
                     RespFrame::BulkString(Some(b)) => b.as_ref(),
                     _ => panic!("expected BulkString value"),
                 };
@@ -7368,29 +7662,17 @@ mod tests {
 
         assert_eq!(
             run(&["SUBSCRIBE", "chan:1"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("subscribe"),
-                RespFrame::bulk_str("chan:1"),
-                RespFrame::Integer(1),
-            ])
+            pubsub_ack("subscribe", Some("chan:1"), 1)
         );
 
         assert_eq!(
             run(&["PSUBSCRIBE", "chan:*"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("psubscribe"),
-                RespFrame::bulk_str("chan:*"),
-                RespFrame::Integer(2),
-            ])
+            pubsub_ack("psubscribe", Some("chan:*"), 2)
         );
 
         assert_eq!(
             run(&["SSUBSCRIBE", "s:1"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("ssubscribe"),
-                RespFrame::bulk_str("s:1"),
-                RespFrame::Integer(3),
-            ])
+            pubsub_ack("ssubscribe", Some("s:1"), 1)
         );
 
         assert_eq!(
@@ -7440,27 +7722,15 @@ mod tests {
 
         assert_eq!(
             run(&["UNSUBSCRIBE", "chan:1"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("unsubscribe"),
-                RespFrame::bulk_str("chan:1"),
-                RespFrame::Integer(2),
-            ])
+            pubsub_ack("unsubscribe", Some("chan:1"), 1)
         );
         assert_eq!(
             run(&["PUNSUBSCRIBE"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("punsubscribe"),
-                RespFrame::bulk_str("chan:*"),
-                RespFrame::Integer(1),
-            ])
+            pubsub_ack("punsubscribe", Some("chan:*"), 0)
         );
         assert_eq!(
             run(&["UNSUBSCRIBE"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("unsubscribe"),
-                RespFrame::BulkString(None),
-                RespFrame::Integer(0),
-            ])
+            pubsub_ack("unsubscribe", None, 0)
         );
 
         assert_eq!(
@@ -7483,16 +7753,30 @@ mod tests {
 
         assert_eq!(
             run(&["SUNSUBSCRIBE"], &mut server, &mut client),
-            RespFrame::Array(vec![
-                RespFrame::bulk_str("sunsubscribe"),
-                RespFrame::bulk_str("s:1"),
-                RespFrame::Integer(0),
-            ])
+            pubsub_ack("sunsubscribe", Some("s:1"), 0)
         );
 
         assert_eq!(
             run(&["PUBSUB", "NUMPAT"], &mut server, &mut client),
             RespFrame::Integer(0)
+        );
+
+        assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
+        assert_eq!(
+            run(
+                &["SUBSCRIBE", "transaction:channel"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::Array(vec![pubsub_ack(
+                "subscribe",
+                Some("transaction:channel"),
+                1
+            )])
         );
     }
 
@@ -8149,7 +8433,10 @@ mod tests {
             run(&["GET", "k"], &mut server, &mut client),
             RespFrame::queued()
         );
-        assert_eq!(run(&["EXEC"], &mut server, &mut client), RespFrame::Null);
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::NullArray
+        );
 
         assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
         assert_eq!(
@@ -8171,6 +8458,86 @@ mod tests {
             RespFrame::ok()
         );
         assert_eq!(run(&["UNWATCH"], &mut server, &mut client), RespFrame::ok());
+    }
+
+    #[test]
+    fn durability_capture_groups_only_successful_exec_effects() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        assert_eq!(
+            run(&["RPUSH", "not-a-number", "x"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        let _ = client.take_durability_effects();
+        assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
+        assert_eq!(
+            run(&["SET", "committed", "yes"], &mut server, &mut client),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["INCR", "not-a-number"], &mut server, &mut client),
+            RespFrame::queued()
+        );
+
+        let outcome = run_outcome(&["EXEC"], &mut server, &mut client);
+        let RespFrame::Array(replies) = outcome.response else {
+            panic!("EXEC should return replies");
+        };
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], RespFrame::ok());
+        assert!(matches!(replies[1], RespFrame::Error(_)));
+
+        let effects = client.take_durability_effects().expect("committed effects");
+        assert!(effects.transaction);
+        assert_eq!(effects.commands.len(), 1);
+        assert_eq!(effects.commands[0].db_index, 0);
+        assert_eq!(
+            effects.commands[0].argv,
+            vec![
+                Bytes::from("SET"),
+                Bytes::from("committed"),
+                Bytes::from("yes")
+            ]
+        );
+
+        assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
+        assert_eq!(
+            run(&["SET", "discarded", "no"], &mut server, &mut client),
+            RespFrame::queued()
+        );
+        assert_eq!(run(&["DISCARD"], &mut server, &mut client), RespFrame::ok());
+        assert!(client.take_durability_effects().is_none());
+    }
+
+    #[test]
+    fn durability_capture_resolves_expiry_and_stream_auto_ids() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        assert_eq!(
+            run_outcome(&["SET", "ttl", "v", "PX", "5000"], &mut server, &mut client).response,
+            RespFrame::ok()
+        );
+        let ttl_effect = client.take_durability_effects().expect("ttl effect");
+        assert_eq!(ttl_effect.commands[0].argv[0], Bytes::from("SET"));
+        assert_eq!(ttl_effect.commands[0].argv[3], Bytes::from("PXAT"));
+        let deadline = std::str::from_utf8(&ttl_effect.commands[0].argv[4])
+            .expect("deadline text")
+            .parse::<i64>()
+            .expect("deadline integer");
+        assert!(deadline > now_ms());
+
+        let xadd = run_outcome(
+            &["XADD", "events", "1-*", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(xadd.response, RespFrame::bulk_str("1-0"));
+        let stream_effect = client.take_durability_effects().expect("stream effect");
+        assert_eq!(stream_effect.commands[0].argv[2], Bytes::from("1-0"));
     }
 
     #[test]
@@ -8794,7 +9161,7 @@ mod tests {
                 RespFrame::BulkString(None),
             ])
         );
-        assert_array_pairs_eq(
+        assert_map_pairs_eq(
             &run(&["HGETALL", "h"], &mut server, &mut client),
             &[("f1", "v1"), ("f2", "v2b")],
         );
@@ -8847,7 +9214,7 @@ mod tests {
             ),
             RespFrame::ok()
         );
-        assert_array_pairs_eq(
+        assert_map_pairs_eq(
             &run(&["HGETALL", "h2"], &mut server, &mut client),
             &[("f1", "v1"), ("f2", "v2")],
         );

@@ -1,7 +1,7 @@
 /// RDB file magic bytes: "REDIS"
 pub const RDB_MAGIC: &[u8; 5] = b"REDIS";
 
-/// RDB version we produce (compatible with Redis 7+)
+/// Container version. Ratatosk value extensions are not Redis RDB encodings.
 pub const RDB_VERSION: u32 = 12;
 
 /// RDB version string as 4 ASCII digits
@@ -17,6 +17,10 @@ pub const RDB_TYPE_SET: u8 = 2;
 pub const RDB_TYPE_ZSET: u8 = 5;
 pub const RDB_TYPE_HASH: u8 = 4;
 pub const RDB_TYPE_STREAM: u8 = 19;
+// Private types distinguish lossless snapshots from the older encodings.
+// Older Ratatosk readers reject these rather than silently dropping metadata.
+pub const RDB_TYPE_RATATOSK_HASH_TTL: u8 = 128;
+pub const RDB_TYPE_RATATOSK_STREAM_GROUPS: u8 = 129;
 
 // ---------------------------------------------------------------------------
 // RDB opcodes

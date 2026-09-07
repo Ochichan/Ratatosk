@@ -6,7 +6,11 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use ratatosk_resp::{RespFrame, parse};
 
-use super::{AofWriter, FsyncPolicy, writer::AOF_VERSION_HEADER};
+use super::{
+    AofWriter, FsyncPolicy,
+    recovery::decode_timed_command,
+    writer::{AOF_V1_HEADER, AOF_VERSION_HEADER},
+};
 
 pub const DEFAULT_SINGLE_FILE_AOF_FILENAME: &str = "appendonly.aof";
 
@@ -21,7 +25,7 @@ pub fn rewrite_single_file_in_place(aof_path: &Path) -> io::Result<()> {
         )
     })?;
 
-    let payload: &[u8] = if raw.starts_with(AOF_VERSION_HEADER) {
+    let payload: &[u8] = if raw.starts_with(AOF_VERSION_HEADER) || raw.starts_with(AOF_V1_HEADER) {
         &raw[AOF_VERSION_HEADER.len()..]
     } else if raw.starts_with(b"*") || raw.is_empty() {
         &raw
@@ -54,6 +58,7 @@ pub fn rewrite_single_file_in_place(aof_path: &Path) -> io::Result<()> {
         let parse_start = payload.len().saturating_sub(parser_buf.len());
         match parse(&mut parser_buf) {
             Ok(Some(frame)) => {
+                let (timestamp, frame) = decode_timed_command(frame).map_err(io::Error::other)?;
                 let argv = frame_to_argv(frame)?;
                 if let Some(db_index) = parse_select_db(&argv) {
                     current_db = db_index;
@@ -61,7 +66,11 @@ pub fn rewrite_single_file_in_place(aof_path: &Path) -> io::Result<()> {
                 }
 
                 tmp_writer
-                    .append_command(current_db, &argv)
+                    .append_command_at(
+                        current_db,
+                        &argv,
+                        timestamp.unwrap_or_else(ratatosk_core::time::now_ms),
+                    )
                     .map_err(|error| {
                         io::Error::other(format!("rewriting command into AOF: {error}"))
                     })?;

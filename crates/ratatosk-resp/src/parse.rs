@@ -43,6 +43,7 @@ enum FrameDesc {
     NullBulk,
     Array(Vec<FrameDesc>),
     Map(Vec<(FrameDesc, FrameDesc)>),
+    NullArray,
     Null,
     InlineCommand(Vec<InlineToken>),
 }
@@ -204,7 +205,7 @@ fn describe_array(data: &[u8], idx: usize) -> Result<Option<(FrameDesc, usize)>,
 
     let mut cur = idx + 1 + line_consumed;
     if len == -1 {
-        return Ok(Some((FrameDesc::Null, cur - idx)));
+        return Ok(Some((FrameDesc::NullArray, cur - idx)));
     }
     if len < -1 {
         return Err(RespParseError::InvalidArrayLength(text.to_string()));
@@ -377,6 +378,8 @@ fn materialize(frozen: &Bytes, desc: FrameDesc) -> RespFrame {
                 .collect();
             RespFrame::Map(pairs)
         }
+
+        FrameDesc::NullArray => RespFrame::NullArray,
 
         FrameDesc::Null => RespFrame::Null,
 

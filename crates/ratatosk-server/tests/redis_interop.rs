@@ -95,6 +95,9 @@ fn spawn_ratatosk_server(port: u16, dir: &Path) -> io::Result<ChildGuard> {
         .env("RATATOSK_BIND", "127.0.0.1")
         .env("RATATOSK_PORT", port.to_string())
         .env("RATATOSK_DIR", dir)
+        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
+        .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
+        .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
         .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
         .env("RATATOSK_ALLOW_NO_METRICS", "true")
         .stdout(Stdio::null())
@@ -118,6 +121,9 @@ fn spawn_ratatosk_server_on_dynamic_port(dir: &Path) -> io::Result<(ChildGuard, 
         .env("RATATOSK_BIND", "127.0.0.1")
         .env("RATATOSK_PORT", "0")
         .env("RATATOSK_DIR", dir)
+        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
+        .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
+        .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
         .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
         .env("RATATOSK_ALLOW_NO_METRICS", "true")
         .env("RATATOSK_BOUND_ADDR_FILE", &bound_addr_file)
@@ -412,6 +418,12 @@ fn redis_interop_supported_subset_matches_redis_when_available() -> io::Result<(
 
     let _ratatosk = spawn_ratatosk_server(ratatosk_port, ratatosk_dir.path())?;
     let Some(_redis) = spawn_redis_server(redis_port, redis_dir.path())? else {
+        if std::env::var_os("RATATOSK_REQUIRE_REDIS_INTEROP").is_some_and(|value| value == "1") {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "Redis interop is required but redis-server is not installed",
+            ));
+        }
         eprintln!("skipping redis interop smoke test because redis-server is not installed");
         return Ok(());
     };

@@ -73,6 +73,16 @@ impl AofManifest {
         self.dir.join(name)
     }
 
+    /// Allocate a new materialized BASE snapshot filename.
+    ///
+    /// BASE files use the existing RDB codec, which preserves absolute
+    /// expiries and complex values without replaying a historical command log.
+    pub fn new_base_file(&mut self) -> PathBuf {
+        let name = format!("appendonly.aof.{}.base.rdb", self.next_seq);
+        self.next_seq += 1;
+        self.dir.join(name)
+    }
+
     /// Set the BASE file after an AOF rewrite completes.
     /// Clears all previous INCR files.
     pub fn set_base_after_rewrite(&mut self, base_name: String) {

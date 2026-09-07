@@ -3,11 +3,11 @@ use std::{io, sync::Arc, time::Duration};
 use bytes::{Bytes, BytesMut};
 use ratatosk_engine::{
     command::{
-        ClientState, CommandOutcome, ExecuteArgvPrecheck, ServerAccess,
+        ClientState, CommandOutcome, DurabilityEffects, ExecuteArgvPrecheck, ServerAccess,
         apply_post_execute_side_effects, execute, execute_argv, is_write_command,
         post_execute_tracking_flags, precheck_execute_argv_with_default_acl,
     },
-    keyspace::{PubSubMessage, SharedState},
+    keyspace::{PubSubMessage, ServerState, SharedState},
     object::normalize_range,
 };
 use ratatosk_resp::{RespFrame, encode, parse};
@@ -17,6 +17,7 @@ use tokio::{
     sync::Notify,
     time::timeout,
 };
+use tracing::Instrument;
 
 use self::execution::run_with_blocking_retry;
 use self::io_support::{
@@ -37,7 +38,8 @@ use crate::breadcrumbs;
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
 use crate::metrics;
 use crate::persistence::{
-    PersistenceRuntime, append_aof_command, run_save, start_bgrewriteaof, start_bgsave,
+    PersistenceRuntime, append_aof_effects, disable_aof, enable_aof_from_snapshot, run_save,
+    set_aof_fsync_policy, start_bgrewriteaof, start_bgsave,
 };
 
 mod execution;
@@ -109,38 +111,40 @@ pub async fn handle_client_with_limits(
         remote_addr = %remote_addr,
     );
 
-    let _span_enter = client_span.enter();
+    async move {
+        tracing::debug!(
+            target = "ratatosk::client",
+            client_id = client_id,
+            remote_addr = %remote_addr,
+            "client connected"
+        );
 
-    tracing::debug!(
-        target = "ratatosk::client",
-        client_id = client_id,
-        remote_addr = %remote_addr,
-        "client connected"
-    );
+        let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits)
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "handling client I/O (client_id={}, remote_addr={}): {}",
+                        client_id, remote_addr, error
+                    ),
+                )
+            });
 
-    let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits)
-        .await
-        .map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "handling client I/O (client_id={}, remote_addr={}): {}",
-                    client_id, remote_addr, error
-                ),
-            )
-        });
+        let disconnect_reason = disconnect_reason_for_result(&result);
+        finish_client_connection(&server_state, client_id, disconnect_reason).await;
 
-    let disconnect_reason = disconnect_reason_for_result(&result);
-    finish_client_connection(&server_state, client_id, disconnect_reason).await;
+        tracing::debug!(
+            target = "ratatosk::client",
+            client_id = client_id,
+            reason = disconnect_reason,
+            "client disconnected"
+        );
 
-    tracing::debug!(
-        target = "ratatosk::client",
-        client_id = client_id,
-        reason = disconnect_reason,
-        "client disconnected"
-    );
-
-    result
+        result
+    }
+    .instrument(client_span)
+    .await
 }
 
 async fn handle_client_inner(
@@ -174,7 +178,13 @@ mod tests {
         keyspace::{HashFieldEntry, ServerState, SharedState, SortedSet, StoredValue},
     };
     use ratatosk_resp::RespFrame;
-    use std::{collections::VecDeque, sync::Arc, time::Duration};
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        sync::Arc,
+        task::{Context, Poll, Waker},
+        time::Duration,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -190,6 +200,41 @@ mod tests {
 
     async fn setup_client_server() -> (TcpStream, tokio::task::JoinHandle<()>) {
         setup_client_server_with_limits(ClientIoLimits::default()).await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn client_tracing_span_does_not_leak_after_pending_poll() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let client = TcpStream::connect(addr).await.expect("connect client");
+        let (server, _) = listener.accept().await.expect("accept client");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let persistence = Arc::new(
+            PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
+                .expect("persistence runtime"),
+        );
+
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            assert!(tracing::Span::current().id().is_none());
+
+            let mut session = Box::pin(handle_client_with_limits(
+                server,
+                shared,
+                persistence,
+                ClientIoLimits::default(),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(matches!(session.as_mut().poll(&mut context), Poll::Pending));
+            assert!(
+                tracing::Span::current().id().is_none(),
+                "client session span leaked into its caller after returning Pending"
+            );
+
+            drop(session);
+            drop(client);
+        });
     }
 
     async fn setup_client_server_with_shared(
@@ -232,7 +277,14 @@ mod tests {
             .await
             .expect("bind listener");
         let addr = listener.local_addr().expect("local addr");
-        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let mut state = ServerState::with_default_dbs();
+        let enabled = persistence.aof_sender().is_some();
+        state.set_aof_enabled(enabled);
+        state.config.set_appendonly(enabled);
+        state
+            .config
+            .set_appendfsync(Bytes::from(persistence.aof_policy().as_str()));
+        let shared = Arc::new(SharedState::new(state));
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
@@ -615,10 +667,10 @@ mod tests {
         .expect("lock-free HGETALL should be handled");
         assert_eq!(
             hgetall.response,
-            RespFrame::Array(vec![
+            RespFrame::Map(vec![(
                 RespFrame::BulkString(Some(Bytes::from_static(b"live"))),
                 RespFrame::BulkString(Some(Bytes::from_static(b"payload"))),
-            ])
+            )])
         );
 
         let hkeys = try_execute_lock_free_fast_command(

@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -8,8 +8,10 @@ use bytes::Bytes;
 use crate::error::PersistError;
 
 /// AOF file format version header.
-/// Format: "REDIS-AOF-001\n" followed by RESP commands.
-pub(crate) const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-001\n";
+/// V2 adds timestamped RESP envelopes. V1 remains readable during upgrade.
+pub(crate) const AOF_VERSION_HEADER: &[u8] = b"REDIS-AOF-002\n";
+pub(crate) const AOF_V1_HEADER: &[u8] = b"REDIS-AOF-001\n";
+pub(crate) const TIMED_COMMAND_MARKER: &[u8] = b"RATATOSK.AOF.AT";
 
 // ---------------------------------------------------------------------------
 // FsyncPolicy
@@ -54,7 +56,10 @@ pub struct AofWriter {
     writer: BufWriter<File>,
     policy: FsyncPolicy,
     last_fsync: Instant,
-    current_db: usize,
+    // An existing AOF can end after any SELECT.  Keep this unknown until the
+    // first append so that reopening a writer always establishes its replay
+    // database explicitly instead of inheriting an old file tail's DB.
+    current_db: Option<usize>,
 }
 
 impl AofWriter {
@@ -62,7 +67,35 @@ impl AofWriter {
     ///
     /// If the file is newly created, writes the version header.
     pub fn open(path: &Path, policy: FsyncPolicy) -> Result<Self, PersistError> {
-        let is_new = !path.exists();
+        let needs_header = !path.exists()
+            || std::fs::metadata(path)
+                .map(|metadata| metadata.len() == 0)
+                .unwrap_or(false);
+
+        if !needs_header {
+            // Upgrade only the container marker, preserving every legacy byte.
+            // Atomic replacement leaves either complete version on failure.
+            let mut input = File::open(path)?;
+            let mut header = [0; 14];
+            let count = input.read(&mut header)?;
+            if !header[..count].starts_with(AOF_VERSION_HEADER) {
+                let skip = if header[..count].starts_with(AOF_V1_HEADER) {
+                    AOF_V1_HEADER.len()
+                } else if header.first() == Some(&b'*') {
+                    0
+                } else {
+                    return Err(PersistError::corrupt(
+                        "refusing to append to unknown AOF version",
+                    ));
+                };
+                crate::atomic::atomic_write(path, |output| {
+                    output.write_all(AOF_VERSION_HEADER)?;
+                    output.write_all(&header[skip..count])?;
+                    io::copy(&mut input, output)?;
+                    Ok(())
+                })?;
+            }
+        }
 
         let file = OpenOptions::new()
             .create(true)
@@ -78,7 +111,7 @@ impl AofWriter {
         let mut writer = BufWriter::new(file);
 
         // Write version header for new files
-        if is_new {
+        if needs_header {
             writer.write_all(AOF_VERSION_HEADER).map_err(|e| {
                 PersistError::Io(io::Error::new(
                     e.kind(),
@@ -91,7 +124,7 @@ impl AofWriter {
             writer,
             policy,
             last_fsync: Instant::now(),
-            current_db: 0,
+            current_db: None,
         })
     }
 
@@ -99,24 +132,100 @@ impl AofWriter {
     ///
     /// Automatically prepends a SELECT command if the database index changed.
     pub fn append_command(&mut self, db_index: usize, args: &[Bytes]) -> Result<(), PersistError> {
+        self.append_command_at(db_index, args, ratatosk_core::time::now_ms())
+    }
+
+    pub fn append_command_at(
+        &mut self,
+        db_index: usize,
+        args: &[Bytes],
+        timestamp_ms: i64,
+    ) -> Result<(), PersistError> {
         if args.is_empty() {
             return Ok(());
         }
 
         // Emit SELECT if DB changed
-        if db_index != self.current_db {
+        if self.current_db != Some(db_index) {
             self.write_select_command(db_index).map_err(|e| {
                 io::Error::new(e.kind(), format!("appending AOF SELECT db {db_index}: {e}"))
             })?;
-            self.current_db = db_index;
+            self.current_db = Some(db_index);
         }
 
-        self.write_resp_array_bytes(args)
+        self.write_timed_command(args, timestamp_ms)
             .map_err(|e| io::Error::new(e.kind(), format!("appending AOF command: {e}")))?;
 
         self.maybe_fsync()?;
 
         Ok(())
+    }
+
+    /// Append a committed transaction as one recoverable AOF unit.
+    ///
+    /// The DB switches live inside the transaction envelope.  If a process is
+    /// killed before the final EXEC reaches disk, recovery queues the prefix
+    /// but never applies it, which is the failure mode required for a torn
+    /// transaction tail.
+    pub fn append_transaction(
+        &mut self,
+        commands: &[(usize, Vec<Bytes>)],
+    ) -> Result<(), PersistError> {
+        self.append_transaction_at(commands, ratatosk_core::time::now_ms())
+    }
+
+    pub fn append_transaction_at(
+        &mut self,
+        commands: &[(usize, Vec<Bytes>)],
+        timestamp_ms: i64,
+    ) -> Result<(), PersistError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+
+        self.write_resp_array_bytes(&[Bytes::from_static(b"MULTI")])
+            .map_err(|e| io::Error::new(e.kind(), format!("appending AOF MULTI: {e}")))?;
+
+        for (db_index, args) in commands {
+            if args.is_empty() {
+                continue;
+            }
+
+            if self.current_db != Some(*db_index) {
+                self.write_select_command(*db_index).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("appending AOF transaction SELECT db {db_index}: {e}"),
+                    )
+                })?;
+                self.current_db = Some(*db_index);
+            }
+
+            self.write_resp_array_bytes(args).map_err(|e| {
+                io::Error::new(e.kind(), format!("appending AOF transaction command: {e}"))
+            })?;
+        }
+
+        self.write_timed_command(&[Bytes::from_static(b"EXEC")], timestamp_ms)
+            .map_err(|e| io::Error::new(e.kind(), format!("appending AOF EXEC: {e}")))?;
+        self.maybe_fsync()?;
+
+        Ok(())
+    }
+
+    fn write_timed_command(&mut self, args: &[Bytes], timestamp_ms: i64) -> io::Result<()> {
+        // Array(marker, integer timestamp, ordinary command array). The nested
+        // command remains byte-for-byte RESP and has no client-visible opcode.
+        self.writer.write_all(b"*3\r\n")?;
+        write!(self.writer, "${}\r\n", TIMED_COMMAND_MARKER.len())?;
+        self.writer.write_all(TIMED_COMMAND_MARKER)?;
+        write!(self.writer, "\r\n:{timestamp_ms}\r\n")?;
+        self.write_resp_array_bytes(args)
+    }
+
+    /// Apply a runtime `appendfsync` update without reopening the AOF file.
+    pub fn set_policy(&mut self, policy: FsyncPolicy) {
+        self.policy = policy;
     }
 
     /// Perform fsync if required by the policy.
@@ -252,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_does_not_emit_select_for_same_db() {
+    fn writer_emits_one_initial_select_then_reuses_same_db() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("test.aof");
 
@@ -267,7 +376,38 @@ mod tests {
         }
 
         let content = fs::read_to_string(&path).expect("read");
-        assert!(!content.contains("SELECT"));
+        assert_eq!(content.matches("SELECT").count(), 1);
+    }
+
+    #[test]
+    fn reopened_writer_reestablishes_db_before_appending() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("test.aof");
+
+        {
+            let mut writer = AofWriter::open(&path, FsyncPolicy::No).expect("open");
+            writer
+                .append_command(
+                    1,
+                    &[Bytes::from("SET"), Bytes::from("db1"), Bytes::from("v")],
+                )
+                .expect("append db1");
+        }
+        {
+            let mut writer = AofWriter::open(&path, FsyncPolicy::No).expect("reopen");
+            writer
+                .append_command(
+                    0,
+                    &[Bytes::from("SET"), Bytes::from("db0"), Bytes::from("v")],
+                )
+                .expect("append db0");
+        }
+
+        let mut loaded = ratatosk_engine::keyspace::ServerState::with_default_dbs();
+        crate::aof::AofRecovery::replay_file(&path, &mut loaded).expect("replay reopened file");
+        assert!(loaded.db(0).contains_key(b"db0".as_slice()));
+        assert!(!loaded.db(1).contains_key(b"db0".as_slice()));
+        assert!(loaded.db(1).contains_key(b"db1".as_slice()));
     }
 
     #[test]

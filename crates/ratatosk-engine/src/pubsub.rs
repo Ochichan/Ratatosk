@@ -478,20 +478,26 @@ impl PubSubState {
         self.subscriber_tx.remove(&client_id);
     }
 
-    fn client_total_subscriptions(&self, client_id: i64) -> usize {
+    pub(crate) fn client_total_subscriptions(&self, client_id: i64) -> usize {
+        self.client_standard_subscriptions(client_id)
+            .saturating_add(self.client_shard_subscriptions(client_id))
+    }
+
+    pub(crate) fn client_standard_subscriptions(&self, client_id: i64) -> usize {
         self.client_channel_subs
             .get(&client_id)
-            .map_or(0usize, HashSet::len)
-            .saturating_add(
-                self.client_shard_channel_subs
-                    .get(&client_id)
-                    .map_or(0usize, HashSet::len),
-            )
+            .map_or(0, HashSet::len)
             .saturating_add(
                 self.client_pattern_subs
                     .get(&client_id)
-                    .map_or(0usize, HashSet::len),
+                    .map_or(0, HashSet::len),
             )
+    }
+
+    pub(crate) fn client_shard_subscriptions(&self, client_id: i64) -> usize {
+        self.client_shard_channel_subs
+            .get(&client_id)
+            .map_or(0, HashSet::len)
     }
 
     #[cfg(test)]

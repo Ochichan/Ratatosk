@@ -5,8 +5,8 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{AtomicStatsState, ServerState, purge_expired_key};
 
 use super::{
-    ClientState, CommandOutcome, ServerAccess, TransactionState, WatchedKey, err, execute, now_ms,
-    wrong_arity,
+    ClientState, CommandOutcome, DurabilityEffects, DurableCommand, ServerAccess, TransactionState,
+    WatchedKey, err, execute, now_ms, wrong_arity,
 };
 
 pub(super) fn cmd_multi(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
@@ -60,11 +60,16 @@ pub(super) fn cmd_exec(
     client.watched.clear();
 
     if watched_dirty {
-        return CommandOutcome::reply(RespFrame::Null);
+        return CommandOutcome::reply(RespFrame::NullArray);
     }
 
     let overcounted = queued.len() as u64;
     let mut replies = Vec::with_capacity(queued.len());
+    let mut reply_protocol = client.protocol_version();
+    let mut segment_start = 0;
+    let mut durable_commands = Vec::<DurableCommand>::new();
+    let mut config_dirty = false;
+    let mut acl_dirty = false;
     for argv in queued {
         let frame = RespFrame::Array(
             argv.into_iter()
@@ -73,6 +78,24 @@ pub(super) fn cmd_exec(
         );
         let mut access = ServerAccess::new_with_optional_atomic_stats(server, atomic_stats);
         let outcome = execute(frame, &mut access, client);
+        config_dirty |= outcome.config_dirty;
+        acl_dirty |= outcome.acl_dirty;
+        if let Some(effects) = client.take_durability_effects() {
+            durable_commands.extend(effects.commands);
+        }
+        if client.protocol_version() != reply_protocol {
+            // Only the completed segment belongs to the previous version.
+            // Each reply is wrapped at most once, even with repeated HELLOs.
+            for reply in &mut replies[segment_start..] {
+                let previous = std::mem::replace(reply, RespFrame::Null);
+                *reply = RespFrame::Versioned {
+                    version: reply_protocol,
+                    frame: Box::new(previous),
+                };
+            }
+            segment_start = replies.len();
+            reply_protocol = client.protocol_version();
+        }
         replies.push(outcome.response);
     }
 
@@ -83,7 +106,13 @@ pub(super) fn cmd_exec(
         stats.adjust_commands_processed_by(overcounted);
     }
 
-    CommandOutcome::reply(RespFrame::Array(replies))
+    if !durable_commands.is_empty() {
+        client.set_durability_effects(Some(DurabilityEffects::transaction(durable_commands)));
+    }
+    let mut outcome = CommandOutcome::reply(RespFrame::Array(replies));
+    outcome.config_dirty = config_dirty;
+    outcome.acl_dirty = acl_dirty;
+    outcome
 }
 
 pub(super) fn cmd_discard(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
@@ -139,4 +168,36 @@ pub(super) fn cmd_unwatch(args: &[Bytes], client: &mut ClientState) -> CommandOu
 
     client.watched.clear();
     CommandOutcome::reply(RespFrame::ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(parts: &[&str]) -> Vec<Bytes> {
+        parts
+            .iter()
+            .map(|part| Bytes::copy_from_slice(part.as_bytes()))
+            .collect()
+    }
+
+    #[test]
+    fn exec_aggregates_inner_config_and_acl_dirty_flags() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState {
+            tx_state: TransactionState::InTransaction {
+                queue: vec![
+                    argv(&["CONFIG", "SET", "hz", "20"]),
+                    argv(&["ACL", "SETUSER", "lifecycle", "on", "nopass", "+@all"]),
+                ],
+                has_error: false,
+            },
+            ..ClientState::default()
+        };
+
+        let outcome = cmd_exec(&[], &mut server, &mut client, None);
+
+        assert!(outcome.config_dirty);
+        assert!(outcome.acl_dirty);
+    }
 }

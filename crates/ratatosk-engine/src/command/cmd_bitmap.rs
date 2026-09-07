@@ -82,7 +82,7 @@ pub(super) fn cmd_setbit(
     purge_expired_key(&mut db, key, now);
 
     let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        let Some(s) = existing.as_string_bytes() else {
             return wrong_type_response();
         };
         (s.to_vec(), existing.expire_at_ms())
@@ -127,11 +127,11 @@ pub(super) fn cmd_getbit(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(data) = entry.as_string() else {
+    let Some(data) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
-    CommandOutcome::reply(RespFrame::Integer(get_bit(data, offset) as i64))
+    CommandOutcome::reply(RespFrame::Integer(get_bit(&data, offset) as i64))
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +156,7 @@ pub(super) fn cmd_bitcount(
     let Some(entry) = db.get(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(data) = entry.as_string() else {
+    let Some(data) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
@@ -198,7 +198,7 @@ pub(super) fn cmd_bitcount(
         let end = end.min(total_bits - 1);
         let mut count: i64 = 0;
         for bit_pos in start..=end {
-            count += get_bit(data, bit_pos) as i64;
+            count += get_bit(&data, bit_pos) as i64;
         }
         CommandOutcome::reply(RespFrame::Integer(count))
     } else {
@@ -265,7 +265,7 @@ pub(super) fn cmd_bitpos(
         }
         return CommandOutcome::reply(RespFrame::Integer(-1));
     };
-    let Some(data) = entry.as_string() else {
+    let Some(data) = entry.as_string_bytes() else {
         return wrong_type_response();
     };
 
@@ -317,7 +317,7 @@ pub(super) fn cmd_bitpos(
         }
         let end = end.min(total_bits - 1);
         for pos in start..=end {
-            if get_bit(data, pos) == target_bit {
+            if get_bit(&data, pos) == target_bit {
                 return CommandOutcome::reply(RespFrame::Integer(pos as i64));
             }
         }
@@ -333,7 +333,7 @@ pub(super) fn cmd_bitpos(
         let end_bit = (end_byte + 1) * 8 - 1;
 
         for pos in start_bit..=end_bit {
-            if get_bit(data, pos) == target_bit {
+            if get_bit(&data, pos) == target_bit {
                 return CommandOutcome::reply(RespFrame::Integer(pos as i64));
             }
         }
@@ -380,7 +380,7 @@ pub(super) fn cmd_bitop(
     for src_key in src_keys {
         purge_expired_key(&mut db, src_key, now);
         if let Some(entry) = db.get(src_key) {
-            let Some(data) = entry.as_string() else {
+            let Some(data) = entry.as_string_bytes() else {
                 return wrong_type_response();
             };
             let v = data.to_vec();
@@ -461,4 +461,89 @@ pub(super) fn cmd_bitop(
     );
 
     CommandOutcome::reply(RespFrame::Integer(result_len))
+}
+
+#[cfg(test)]
+mod numeric_string_tests {
+    use ratatosk_resp::frame::RespFrame;
+
+    use crate::keyspace::ServerState;
+
+    use super::super::ClientState;
+
+    use super::super::{ServerAccess, execute};
+
+    fn cmd(parts: &[&str]) -> RespFrame {
+        RespFrame::Array(parts.iter().map(|part| RespFrame::bulk_str(part)).collect())
+    }
+
+    fn run(parts: &[&str], server: &mut ServerState, client: &mut ClientState) -> RespFrame {
+        let mut access = ServerAccess::new_inline(server);
+        execute(cmd(parts), &mut access, client).response
+    }
+
+    fn integer(reply: &RespFrame) -> i64 {
+        match reply {
+            RespFrame::Integer(value) => *value,
+            other => panic!("expected integer, got {other:?}"),
+        }
+    }
+
+    fn bulk(reply: &RespFrame) -> &[u8] {
+        match reply {
+            RespFrame::BulkString(Some(value)) => value.as_ref(),
+            other => panic!("expected bulk string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_string_uses_decimal_bytes_for_bitmap_operations() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        assert_eq!(
+            run(&["SET", "bits", "255"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            integer(&run(&["GETBIT", "bits", "23"], &mut server, &mut client)),
+            1
+        );
+        assert_eq!(
+            integer(&run(&["BITCOUNT", "bits"], &mut server, &mut client)),
+            11
+        );
+        assert_eq!(
+            integer(&run(&["BITPOS", "bits", "1"], &mut server, &mut client)),
+            2
+        );
+        assert_eq!(
+            run(
+                &["BITFIELD", "bits", "GET", "u8", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::Integer(50)])
+        );
+        assert_eq!(
+            integer(&run(
+                &["SETBIT", "bits", "8", "1"],
+                &mut server,
+                &mut client
+            )),
+            0
+        );
+        assert_eq!(
+            bulk(&run(&["GET", "bits"], &mut server, &mut client)),
+            &[b'2', 0xb5, b'5']
+        );
+        assert_eq!(
+            run(
+                &["BITFIELD_RO", "bits", "GET", "u8", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::Integer(50)])
+        );
+    }
 }

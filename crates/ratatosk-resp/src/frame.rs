@@ -11,7 +11,21 @@ pub enum RespFrame {
     Array(Vec<RespFrame>),
     Push(Vec<RespFrame>),
     Map(Vec<(RespFrame, RespFrame)>),
+    /// A RESP2 null array. RESP3 projects this to its untyped null value.
+    NullArray,
     Null,
+    /// Reply frames emitted in place without an aggregate header.
+    ///
+    /// Only outbound command handlers construct this logical container. It also
+    /// preserves the independent Pub/Sub acknowledgements emitted inside EXEC;
+    /// ordinary Array values retain their own headers and nesting.
+    Sequence(Vec<RespFrame>),
+    /// A logical reply whose wire version was fixed before a later command
+    /// changed the connection protocol (for example HELLO inside EXEC).
+    Versioned {
+        version: i64,
+        frame: Box<RespFrame>,
+    },
 }
 
 const SHARED_INTEGER_COUNT: usize = 10000;

@@ -6,7 +6,8 @@ use std::path::Path;
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use ratatosk_engine::keyspace::{
-    DbSnapshot, HashFieldEntry, ServerState, SortedSet, StoredValue, StreamEntry, StreamId,
+    DbSnapshot, HashFieldEntry, ServerState, SortedSet, StoredValue, StreamConsumer, StreamEntry,
+    StreamGroup, StreamId, StreamPendingEntry,
 };
 
 use crate::error::PersistError;
@@ -195,13 +196,32 @@ impl<R: Read> RdbLoader<R> {
                 }
                 StoredValue::set(set, expire_ms)
             }
-            RDB_TYPE_HASH => {
+            RDB_TYPE_HASH | RDB_TYPE_RATATOSK_HASH_TTL => {
                 let len = self.read_length()? as usize;
                 let mut hash = HashMap::with_capacity(len);
                 for _ in 0..len {
                     let field = self.read_string()?;
                     let value = self.read_string()?;
-                    hash.insert(field, HashFieldEntry::new(value));
+                    let expire_at_ms = if type_byte == RDB_TYPE_RATATOSK_HASH_TTL {
+                        match self.read_byte()? {
+                            0 => None,
+                            1 => Some(self.read_i64()?),
+                            _ => {
+                                return Err(PersistError::corrupt(
+                                    "invalid hash field expiry marker",
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    hash.insert(
+                        field,
+                        HashFieldEntry {
+                            value,
+                            expire_at_ms,
+                        },
+                    );
                 }
                 StoredValue::hash(hash, expire_ms)
             }
@@ -217,7 +237,7 @@ impl<R: Read> RdbLoader<R> {
                 }
                 StoredValue::sorted_set(zset, expire_ms)
             }
-            RDB_TYPE_STREAM => {
+            RDB_TYPE_STREAM | RDB_TYPE_RATATOSK_STREAM_GROUPS => {
                 let entry_count = self.read_length()? as usize;
                 let mut entries = Vec::with_capacity(entry_count);
                 for _ in 0..entry_count {
@@ -239,7 +259,55 @@ impl<R: Read> RdbLoader<R> {
                     }
                     entries.push(StreamEntry { id, fields });
                 }
-                StoredValue::stream(entries, expire_ms)
+                let mut value = StoredValue::stream(entries, expire_ms);
+                if type_byte == RDB_TYPE_RATATOSK_STREAM_GROUPS {
+                    let groups = value.as_stream_groups_mut().expect("stream value");
+                    let group_count = self.read_length()?;
+                    for _ in 0..group_count {
+                        let name = self.read_string()?;
+                        let last_delivered_id = self.read_stream_id()?;
+                        let mut consumers = HashMap::new();
+                        let consumer_count = self.read_length()?;
+                        for _ in 0..consumer_count {
+                            let name = self.read_string()?;
+                            let seen_time_ms = self.read_i64()?;
+                            let mut pending = HashSet::new();
+                            let pending_count = self.read_length()?;
+                            for _ in 0..pending_count {
+                                pending.insert(self.read_stream_id()?);
+                            }
+                            consumers.insert(
+                                name,
+                                StreamConsumer {
+                                    seen_time_ms,
+                                    pending,
+                                },
+                            );
+                        }
+                        let mut pending = HashMap::new();
+                        let pending_count = self.read_length()?;
+                        for _ in 0..pending_count {
+                            let id = self.read_stream_id()?;
+                            pending.insert(
+                                id,
+                                StreamPendingEntry {
+                                    consumer: self.read_string()?,
+                                    deliveries: self.read_i64()?,
+                                    last_delivered_ms: self.read_i64()?,
+                                },
+                            );
+                        }
+                        groups.insert(
+                            name,
+                            StreamGroup {
+                                last_delivered_id,
+                                consumers,
+                                pending,
+                            },
+                        );
+                    }
+                }
+                value
             }
             other => {
                 return Err(PersistError::UnknownType { type_byte: other });
@@ -248,6 +316,19 @@ impl<R: Read> RdbLoader<R> {
 
         state.db_mut(db_idx).insert(key, value);
         Ok(())
+    }
+
+    fn read_i64(&mut self) -> Result<i64, PersistError> {
+        let mut bytes = [0; 8];
+        self.read_bytes(&mut bytes)?;
+        Ok(i64::from_le_bytes(bytes))
+    }
+
+    fn read_stream_id(&mut self) -> Result<StreamId, PersistError> {
+        Ok(StreamId {
+            ms: self.read_i64()?,
+            seq: self.read_i64()?,
+        })
     }
 
     fn read_length(&mut self) -> Result<u64, PersistError> {
@@ -476,6 +557,106 @@ mod tests {
             loaded_hash.get(&Bytes::from("f2")).map(|e| &e.value),
             Some(&Bytes::from("v2"))
         );
+    }
+
+    #[test]
+    fn snapshot_preserves_field_expiry_and_all_stream_group_metadata() {
+        let state = ServerState::with_default_dbs();
+        let mut hash = HashMap::new();
+        hash.insert(
+            Bytes::from("expires"),
+            HashFieldEntry::with_ttl(Bytes::from("value"), 123456),
+        );
+        hash.insert(
+            Bytes::from("stays"),
+            HashFieldEntry::new(Bytes::from("value")),
+        );
+        state
+            .db_mut(3)
+            .insert(Bytes::from("hash"), StoredValue::hash(hash, Some(234567)));
+        let id = StreamId { ms: 123, seq: 4 };
+        let mut stream = StoredValue::stream(
+            vec![StreamEntry {
+                id,
+                fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+            }],
+            None,
+        );
+        stream.as_stream_groups_mut().expect("groups").insert(
+            Bytes::from("group"),
+            StreamGroup {
+                last_delivered_id: id,
+                consumers: HashMap::from_iter([
+                    (
+                        Bytes::from("consumer"),
+                        StreamConsumer {
+                            seen_time_ms: 333,
+                            pending: HashSet::from_iter([id]),
+                        },
+                    ),
+                    (
+                        Bytes::from("empty"),
+                        StreamConsumer {
+                            seen_time_ms: 444,
+                            pending: HashSet::new(),
+                        },
+                    ),
+                ]),
+                pending: HashMap::from_iter([(
+                    id,
+                    StreamPendingEntry {
+                        consumer: Bytes::from("consumer"),
+                        deliveries: 7,
+                        last_delivered_ms: 555,
+                    },
+                )]),
+            },
+        );
+        state.db_mut(3).insert(Bytes::from("stream"), stream);
+        let loaded = roundtrip_state(&state);
+        let db = loaded.db(3);
+        let hash = db.get(b"hash".as_slice()).expect("hash");
+        assert_eq!(hash.expire_at_ms(), Some(234567));
+        let fields = hash.as_hash().expect("fields");
+        assert_eq!(
+            fields
+                .get(b"expires".as_slice())
+                .expect("field")
+                .expire_at_ms,
+            Some(123456)
+        );
+        assert_eq!(
+            fields.get(b"stays".as_slice()).expect("field").expire_at_ms,
+            None
+        );
+        let groups = db
+            .get(b"stream".as_slice())
+            .expect("stream")
+            .as_stream_groups()
+            .expect("groups");
+        let group = groups.get(b"group".as_slice()).expect("group");
+        assert_eq!(group.last_delivered_id, id);
+        assert_eq!(group.consumers.len(), 2);
+        assert_eq!(
+            group
+                .consumers
+                .get(b"empty".as_slice())
+                .expect("empty consumer")
+                .seen_time_ms,
+            444
+        );
+        assert!(
+            group
+                .consumers
+                .get(b"consumer".as_slice())
+                .expect("consumer")
+                .pending
+                .contains(&id)
+        );
+        let pending = group.pending.get(&id).expect("PEL");
+        assert_eq!(pending.consumer, Bytes::from("consumer"));
+        assert_eq!(pending.deliveries, 7);
+        assert_eq!(pending.last_delivered_ms, 555);
     }
 
     #[test]

@@ -737,7 +737,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                 None => RespFrame::Integer(0),
                 Some(entry) if !entry.is_string() => RespFrame::wrongtype(),
                 Some(entry) => {
-                    let data = entry.as_string().map_or(&[][..], Bytes::as_ref);
+                    let data = entry.as_string_bytes().unwrap_or_default();
                     if data.is_empty() {
                         RespFrame::Integer(0)
                     } else if args.len() == 1 {
@@ -796,7 +796,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                                 let end = end.min(total_bits.saturating_sub(1));
                                 let mut count = 0i64;
                                 for bit_pos in start..=end {
-                                    count += i64::from(get_bit(data, bit_pos));
+                                    count += i64::from(get_bit(&data, bit_pos));
                                 }
                                 RespFrame::Integer(count)
                             }
@@ -861,7 +861,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                     None => RespFrame::Integer(0),
                     Some(entry) if !entry.is_string() => RespFrame::wrongtype(),
                     Some(entry) => RespFrame::Integer(i64::from(get_bit(
-                        entry.as_string().map_or(&[][..], Bytes::as_ref),
+                        &entry.as_string_bytes().unwrap_or_default(),
                         offset as usize,
                     ))),
                 }
@@ -910,7 +910,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                     None => RespFrame::BulkString(Some(Bytes::new())),
                     Some(entry) if !entry.is_string() => RespFrame::wrongtype(),
                     Some(entry) => {
-                        let bytes = entry.as_string().map_or(&[][..], Bytes::as_ref);
+                        let bytes = entry.as_string_bytes().unwrap_or_default();
                         if let Some((range_start, range_end)) =
                             normalize_range(bytes.len(), start, end)
                         {
@@ -1005,19 +1005,21 @@ pub(super) fn try_execute_lock_free_fast_command(
                 );
 
                 match db.data.get(key.as_ref()) {
-                    None => RespFrame::Array(vec![]),
+                    None => RespFrame::Map(vec![]),
                     Some(entry) => match entry.as_hash() {
                         None => RespFrame::wrongtype(),
                         Some(hash) => {
-                            let mut out = Vec::with_capacity(hash.len().saturating_mul(2));
+                            let mut out = Vec::with_capacity(hash.len());
                             for (field, field_entry) in hash.iter() {
                                 if field_entry.is_expired(now_ms) {
                                     continue;
                                 }
-                                out.push(RespFrame::BulkString(Some(field.clone())));
-                                out.push(RespFrame::BulkString(Some(field_entry.value.clone())));
+                                out.push((
+                                    RespFrame::BulkString(Some(field.clone())),
+                                    RespFrame::BulkString(Some(field_entry.value.clone())),
+                                ));
                             }
-                            RespFrame::Array(out)
+                            RespFrame::Map(out)
                         }
                     },
                 }

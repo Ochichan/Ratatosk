@@ -50,10 +50,12 @@ else
 fi
 
 BUILD_ARGS=()
-SERVER_BIN="$ROOT_DIR/target/debug/ratatosk"
+BUILD_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
+[[ "$BUILD_TARGET_DIR" = /* ]] || BUILD_TARGET_DIR="$ROOT_DIR/$BUILD_TARGET_DIR"
+SERVER_BIN="$BUILD_TARGET_DIR/debug/ratatosk"
 if [[ "$PROFILE" == "release" ]]; then
   BUILD_ARGS=(--release)
-  SERVER_BIN="$ROOT_DIR/target/release/ratatosk"
+  SERVER_BIN="$BUILD_TARGET_DIR/release/ratatosk"
 fi
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ratatosk-backup-restore-drill.XXXXXX")"
@@ -185,6 +187,9 @@ start_server() {
   RATATOSK_PORT="$PORT" \
   RATATOSK_METRICS_BIND="127.0.0.1:${METRICS_PORT}" \
   RATATOSK_DIR="$dir" \
+  RATATOSK_DISABLE_CONFIG_AUTOLOAD=true \
+  RATATOSK_AUDIT_LOG="$dir/audit.log" \
+  RATATOSK_AUDIT_CHAIN_STATE="$dir/audit.state" \
   RATATOSK_APPENDONLY=true \
   RATATOSK_MAX_CLIENTS="$MAX_CLIENTS" \
   RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS="$CONN_RATE_LIMIT_MAX_ATTEMPTS" \

@@ -64,6 +64,26 @@ pub(super) fn next_stream_id(entries: &[StreamEntry]) -> StreamId {
     }
 }
 
+fn next_stream_id_for_ms(entries: &[StreamEntry], ms: i64) -> StreamId {
+    let Some(last) = entries.last() else {
+        return StreamId { ms, seq: 0 };
+    };
+
+    if ms > last.id.ms {
+        StreamId { ms, seq: 0 }
+    } else if ms == last.id.ms {
+        StreamId {
+            ms,
+            seq: last.id.seq.saturating_add(1),
+        }
+    } else {
+        // The ordinary monotonicity check below reports the compatibility
+        // error.  Keeping the candidate at the requested millisecond avoids
+        // manufacturing a new, unrelated ID for an invalid request.
+        StreamId { ms, seq: 0 }
+    }
+}
+
 pub(super) fn stream_entry_frame(entry: &StreamEntry) -> RespFrame {
     let mut fields = Vec::with_capacity(entry.fields.len().saturating_mul(2));
     for (field, value) in &entry.fields {
@@ -137,6 +157,18 @@ pub(super) fn cmd_xadd(
 
     let id = if id_raw.as_ref() == b"*" {
         next_stream_id(stream)
+    } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
+        let Some(ms_text) = std::str::from_utf8(ms_raw).ok() else {
+            return CommandOutcome::reply(err(
+                "ERR Invalid stream ID specified as stream command argument",
+            ));
+        };
+        let Some(ms) = ms_text.parse::<i64>().ok().filter(|ms| *ms >= 0) else {
+            return CommandOutcome::reply(err(
+                "ERR Invalid stream ID specified as stream command argument",
+            ));
+        };
+        next_stream_id_for_ms(stream, ms)
     } else {
         let Some(parsed) = parse_stream_id(id_raw) else {
             return CommandOutcome::reply(err(

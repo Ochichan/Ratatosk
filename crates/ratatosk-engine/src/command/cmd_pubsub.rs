@@ -6,6 +6,34 @@ use crate::keyspace::ServerState;
 
 use super::{ClientState, CommandOutcome, err, to_uppercase_bytes, wrong_arity};
 
+fn acknowledgement(kind: &str, target: Option<Bytes>, count: i64) -> RespFrame {
+    RespFrame::Push(vec![
+        RespFrame::bulk_str(kind),
+        RespFrame::BulkString(target),
+        RespFrame::Integer(count),
+    ])
+}
+
+fn client_acknowledgement(
+    server: &ServerState,
+    client: &mut ClientState,
+    kind: &str,
+    target: Option<Bytes>,
+) -> RespFrame {
+    client
+        .set_pubsub_subscription_count(server.pubsub.client_total_subscriptions(client.id) as i64);
+    let count = if matches!(kind, "ssubscribe" | "sunsubscribe") {
+        server.pubsub.client_shard_subscriptions(client.id)
+    } else {
+        server.pubsub.client_standard_subscriptions(client.id)
+    };
+    acknowledgement(kind, target, count as i64)
+}
+
+fn acknowledgement_outcome(replies: Vec<RespFrame>) -> CommandOutcome {
+    CommandOutcome::reply(RespFrame::Sequence(replies))
+}
+
 pub(super) fn cmd_subscribe(
     args: &[Bytes],
     server: &mut ServerState,
@@ -17,20 +45,16 @@ pub(super) fn cmd_subscribe(
 
     let mut replies = Vec::with_capacity(args.len());
     for channel in args {
-        let count = server.pubsub.subscribe_channel(client.id, channel.clone());
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("subscribe"),
-            RespFrame::BulkString(Some(channel.clone())),
-            RespFrame::Integer(count),
-        ]));
+        server.pubsub.subscribe_channel(client.id, channel.clone());
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "subscribe",
+            Some(channel.clone()),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_ssubscribe(
@@ -44,22 +68,18 @@ pub(super) fn cmd_ssubscribe(
 
     let mut replies = Vec::with_capacity(args.len());
     for channel in args {
-        let count = server
+        server
             .pubsub
             .subscribe_shard_channel(client.id, channel.clone());
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("ssubscribe"),
-            RespFrame::BulkString(Some(channel.clone())),
-            RespFrame::Integer(count),
-        ]));
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "ssubscribe",
+            Some(channel.clone()),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_psubscribe(
@@ -73,20 +93,16 @@ pub(super) fn cmd_psubscribe(
 
     let mut replies = Vec::with_capacity(args.len());
     for pattern in args {
-        let count = server.pubsub.subscribe_pattern(client.id, pattern.clone());
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("psubscribe"),
-            RespFrame::BulkString(Some(pattern.clone())),
-            RespFrame::Integer(count),
-        ]));
+        server.pubsub.subscribe_pattern(client.id, pattern.clone());
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "psubscribe",
+            Some(pattern.clone()),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_publish(args: &[Bytes], server: &mut ServerState) -> CommandOutcome {
@@ -119,30 +135,26 @@ pub(super) fn cmd_unsubscribe(
     };
 
     if channels.is_empty() {
-        client.set_pubsub_subscription_count(0);
-        return CommandOutcome::reply(RespFrame::Array(vec![
-            RespFrame::bulk_str("unsubscribe"),
-            RespFrame::BulkString(None),
-            RespFrame::Integer(0),
-        ]));
+        return acknowledgement_outcome(vec![client_acknowledgement(
+            server,
+            client,
+            "unsubscribe",
+            None,
+        )]);
     }
 
     let mut replies = Vec::with_capacity(channels.len());
     for channel in channels {
-        let count = server.pubsub.unsubscribe_channel(client.id, &channel);
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("unsubscribe"),
-            RespFrame::BulkString(Some(channel)),
-            RespFrame::Integer(count),
-        ]));
+        server.pubsub.unsubscribe_channel(client.id, &channel);
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "unsubscribe",
+            Some(channel),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_punsubscribe(
@@ -157,30 +169,26 @@ pub(super) fn cmd_punsubscribe(
     };
 
     if patterns.is_empty() {
-        client.set_pubsub_subscription_count(0);
-        return CommandOutcome::reply(RespFrame::Array(vec![
-            RespFrame::bulk_str("punsubscribe"),
-            RespFrame::BulkString(None),
-            RespFrame::Integer(0),
-        ]));
+        return acknowledgement_outcome(vec![client_acknowledgement(
+            server,
+            client,
+            "punsubscribe",
+            None,
+        )]);
     }
 
     let mut replies = Vec::with_capacity(patterns.len());
     for pattern in patterns {
-        let count = server.pubsub.unsubscribe_pattern(client.id, &pattern);
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("punsubscribe"),
-            RespFrame::BulkString(Some(pattern)),
-            RespFrame::Integer(count),
-        ]));
+        server.pubsub.unsubscribe_pattern(client.id, &pattern);
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "punsubscribe",
+            Some(pattern),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_sunsubscribe(
@@ -195,30 +203,26 @@ pub(super) fn cmd_sunsubscribe(
     };
 
     if channels.is_empty() {
-        client.set_pubsub_subscription_count(0);
-        return CommandOutcome::reply(RespFrame::Array(vec![
-            RespFrame::bulk_str("sunsubscribe"),
-            RespFrame::BulkString(None),
-            RespFrame::Integer(0),
-        ]));
+        return acknowledgement_outcome(vec![client_acknowledgement(
+            server,
+            client,
+            "sunsubscribe",
+            None,
+        )]);
     }
 
     let mut replies = Vec::with_capacity(channels.len());
     for channel in channels {
-        let count = server.pubsub.unsubscribe_shard_channel(client.id, &channel);
-        client.set_pubsub_subscription_count(count);
-        replies.push(RespFrame::Array(vec![
-            RespFrame::bulk_str("sunsubscribe"),
-            RespFrame::BulkString(Some(channel)),
-            RespFrame::Integer(count),
-        ]));
+        server.pubsub.unsubscribe_shard_channel(client.id, &channel);
+        replies.push(client_acknowledgement(
+            server,
+            client,
+            "sunsubscribe",
+            Some(channel),
+        ));
     }
 
-    if replies.len() == 1 {
-        CommandOutcome::reply(replies.pop().unwrap_or(RespFrame::Array(vec![])))
-    } else {
-        CommandOutcome::reply(RespFrame::Array(replies))
-    }
+    acknowledgement_outcome(replies)
 }
 
 pub(super) fn cmd_pubsub(args: &[Bytes], server: &ServerState) -> CommandOutcome {

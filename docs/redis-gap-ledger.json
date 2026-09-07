@@ -208,7 +208,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "ASKING",
@@ -247,7 +247,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-persistence",
       "owner": "",
-      "notes": "Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain)."
+      "notes": "Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). Materializes the current dataset including hash-field TTLs and complete stream group state before switching BASE/INCR manifest."
     },
     {
       "name": "BGSAVE",
@@ -273,7 +273,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "BITFIELD",
@@ -286,7 +286,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "BITFIELD_RO",
@@ -299,7 +299,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "BITOP",
@@ -312,7 +312,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "BITPOS",
@@ -325,7 +325,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "BLMOVE",
@@ -1274,7 +1274,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 operational baseline implemented (timeout/appendonly/save/slowlog params)."
+      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch."
     },
     {
       "name": "COPY",
@@ -1482,7 +1482,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 transaction baseline implemented with WATCH conflict abort (null reply) and EXECABORT on queue-time errors."
+      "notes": "Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping."
     },
     {
       "name": "EXISTS",
@@ -1508,7 +1508,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 generic baseline implemented (EXPIRE [NX|XX|GT|LT])."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "EXPIREAT",
@@ -1521,7 +1521,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 generic baseline implemented."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "EXPIRETIME",
@@ -1885,7 +1885,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "GETDEL",
@@ -1911,7 +1911,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Expiry mutation records the resulting value and absolute expiry for restart-safe local persistence."
     },
     {
       "name": "GETRANGE",
@@ -1924,7 +1924,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "GETSET",
@@ -1963,7 +1963,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 parity baseline implemented (proto negotiation + AUTH/SETNAME syntax + NOPROTO handling)."
+      "notes": "RESP2 negotiation returns a flat array; RESP3 returns a map. Pipelined and transactional protocol changes preserve previously completed replies."
     },
     {
       "name": "HEXISTS",
@@ -1989,7 +1989,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": " Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots."
     },
     {
       "name": "HEXPIREAT",
@@ -2002,7 +2002,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": " Absolute field deadlines survive RDB/BASE snapshots and AOF replay."
     },
     {
       "name": "HEXPIRETIME",
@@ -2041,7 +2041,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 hash core baseline implemented."
+      "notes": "RESP2 flat field/value array and RESP3 map in both engine and readonly paths, including EXEC."
     },
     {
       "name": "HGETDEL",
@@ -2223,7 +2223,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": " Field persistence changes survive timestamped AOF replay, including extension before an earlier deadline."
     },
     {
       "name": "HPEXPIRE",
@@ -2236,7 +2236,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": " Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots."
     },
     {
       "name": "HPEXPIREAT",
@@ -2249,7 +2249,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": ""
+      "notes": " Absolute field deadlines survive RDB/BASE snapshots and AOF replay."
     },
     {
       "name": "HPEXPIRETIME",
@@ -2392,7 +2392,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "M1 string baseline implemented. Timestamped AOF replay preserves expiry decisions before and after a key deadline."
     },
     {
       "name": "INCRBY",
@@ -3003,7 +3003,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 baseline implemented: numkeys KV block + NX/XX + EX/PX shared expiration, atomic all-or-nothing."
+      "notes": "M1 baseline implemented: numkeys KV block + NX/XX + EX/PX shared expiration, atomic all-or-nothing. AOF v2 records execution time so relative expiration survives restart without TTL extension."
     },
     {
       "name": "MSETNX",
@@ -3133,7 +3133,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 generic baseline implemented."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "PEXPIREAT",
@@ -3146,7 +3146,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 generic baseline implemented."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "PEXPIRETIME",
@@ -3250,7 +3250,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "PSUBSCRIBE",
@@ -3263,7 +3263,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 events baseline implemented with pattern fanout and async push delivery."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "PSYNC",
@@ -3406,7 +3406,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 pubsub baseline implemented: pattern unsubscribe and no-arg unsubscribe-all behavior."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "QUIT",
@@ -3536,7 +3536,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling."
+      "notes": "M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. AOF v2 preserves the execution clock for relative key TTL during replay; native payload compatibility limits remain."
     },
     {
       "name": "RESTORE-ASKING",
@@ -4095,7 +4095,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented (SET [NX|XX])."
+      "notes": "NX/XX, GET and expiry options in local baseline; AOF captures successful values with absolute expiry, including KEEPTTL."
     },
     {
       "name": "SETBIT",
@@ -4108,7 +4108,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m4-extended-types",
       "owner": "",
-      "notes": ""
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "SETEX",
@@ -4121,7 +4121,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay."
     },
     {
       "name": "SETNX",
@@ -4147,7 +4147,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "SFLUSH",
@@ -4381,7 +4381,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m2-collections",
       "owner": "",
-      "notes": "M2 set/list extension baseline implemented."
+      "notes": "Random removal; AOF propagates the actual removed members as SREM for deterministic recovery."
     },
     {
       "name": "SPUBLISH",
@@ -4446,7 +4446,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 sharded pubsub baseline implemented with per-client shard subscriptions and RESP subscribe ack."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "STRLEN",
@@ -4459,7 +4459,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "M1 string baseline implemented."
+      "notes": "Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types."
     },
     {
       "name": "SUBSCRIBE",
@@ -4472,7 +4472,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 events baseline implemented with cross-client fanout and async push delivery."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "SUBSTR",
@@ -4524,7 +4524,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 sharded pubsub baseline implemented with explicit/all unsubscribe behavior and RESP unsubscribe ack."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "SWAPDB",
@@ -4641,7 +4641,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 pubsub baseline implemented: unsubscribe channel/all with remaining-subscription counts."
+      "notes": "Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate."
     },
     {
       "name": "UNWATCH",
@@ -4732,7 +4732,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (auto-ID and explicit ID checks, field/value append)."
+      "notes": "Auto-ID, explicit ID and millisecond-* ID forms; AOF records the resolved ID. Other Redis XADD option variants remain outside this baseline."
     },
     {
       "name": "XAUTOCLAIM",
@@ -4810,7 +4810,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch)."
+      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. Group cursors accept omitted sequence zero, including the common cursor 0."
     },
     {
       "name": "XGROUP CREATE",
@@ -5018,7 +5018,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback)."
+      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). RDB/BASE snapshots retain group delivery cursor and PEL owner, delivery count and timestamp."
     },
     {
       "name": "XREVRANGE",

@@ -76,7 +76,20 @@ pub(crate) fn validate_working_directory(dir: &Path) -> io::Result<()> {
 
 pub(crate) fn validate_aof_file(path: &Path) -> io::Result<()> {
     match std::fs::File::open(path) {
-        Ok(_) => {
+        Ok(mut file) => {
+            // The writer upgrades legacy headers before startup replay. Keep
+            // the existing opt-in gate ahead of that mutation so an upgrade
+            // cannot disguise an unapproved headerless file as version 2.
+            let mut first = [0; 1];
+            if std::io::Read::read(&mut file, &mut first)? != 0 && first[0] == b'*' {
+                if !env_truthy("RATATOSK_ALLOW_LEGACY_AOF") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AOF file is in legacy headerless format; refusing startup by default (set RATATOSK_ALLOW_LEGACY_AOF=true to bypass)",
+                    ));
+                }
+                tracing::warn!(path = %path.display(), "upgrading explicitly allowed legacy headerless AOF");
+            }
             tracing::info!(
                 target = "ratatosk::startup",
                 path = %path.display(),

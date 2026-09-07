@@ -1,0 +1,119 @@
+# Ratatosk baseline (20260907-143023)
+# profile: default allocator
+pipeline_set_parse_execute_encode/1
+                        time:   [590.77 ns 598.56 ns 607.82 ns]
+                        thrpt:  [1.6452 Melem/s 1.6707 Melem/s 1.6927 Melem/s]
+pipeline_set_parse_execute_encode/32
+                        time:   [11.354 µs 11.478 µs 11.627 µs]
+                        thrpt:  [2.7523 Melem/s 2.7881 Melem/s 2.8183 Melem/s]
+pipeline_set_parse_execute_encode/256
+                        time:   [87.920 µs 89.483 µs 90.785 µs]
+                        thrpt:  [2.8199 Melem/s 2.8609 Melem/s 2.9117 Melem/s]
+pipeline_set_parse_execute_encode/1024
+                        time:   [358.20 µs 362.21 µs 365.65 µs]
+                        thrpt:  [2.8005 Melem/s 2.8271 Melem/s 2.8587 Melem/s]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high severe
+
+pipeline_ping_parse_execute_encode/1
+                        time:   [343.60 ns 348.12 ns 352.90 ns]
+                        thrpt:  [2.8336 Melem/s 2.8726 Melem/s 2.9104 Melem/s]
+pipeline_ping_parse_execute_encode/32
+                        time:   [3.2751 µs 3.3371 µs 3.4047 µs]
+                        thrpt:  [9.3987 Melem/s 9.5891 Melem/s 9.7708 Melem/s]
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) low mild
+pipeline_ping_parse_execute_encode/256
+                        time:   [25.029 µs 25.393 µs 25.837 µs]
+                        thrpt:  [9.9084 Melem/s 10.081 Melem/s 10.228 Melem/s]
+Found 2 outliers among 20 measurements (10.00%)
+  2 (10.00%) high mild
+pipeline_ping_parse_execute_encode/1024
+                        time:   [99.841 µs 101.35 µs 102.52 µs]
+                        thrpt:  [9.9884 Melem/s 10.103 Melem/s 10.256 Melem/s]
+
+pipeline_set_parse_only/1
+                        time:   [93.167 ns 93.662 ns 94.390 ns]
+                        thrpt:  [10.594 Melem/s 10.677 Melem/s 10.733 Melem/s]
+pipeline_set_parse_only/32
+                        time:   [2.5290 µs 2.5603 µs 2.6056 µs]
+                        thrpt:  [12.281 Melem/s 12.499 Melem/s 12.653 Melem/s]
+pipeline_set_parse_only/256
+                        time:   [20.687 µs 20.811 µs 20.962 µs]
+                        thrpt:  [12.213 Melem/s 12.301 Melem/s 12.375 Melem/s]
+pipeline_set_parse_only/1024
+                        time:   [80.803 µs 81.462 µs 82.268 µs]
+                        thrpt:  [12.447 Melem/s 12.570 Melem/s 12.673 Melem/s]
+
+pipeline_ping_parse_only/1
+                        time:   [69.079 ns 71.092 ns 73.911 ns]
+                        thrpt:  [13.530 Melem/s 14.066 Melem/s 14.476 Melem/s]
+pipeline_ping_parse_only/32
+                        time:   [1.4962 µs 1.5220 µs 1.5423 µs]
+                        thrpt:  [20.749 Melem/s 21.025 Melem/s 21.387 Melem/s]
+pipeline_ping_parse_only/256
+                        time:   [11.538 µs 11.640 µs 11.784 µs]
+                        thrpt:  [21.725 Melem/s 21.993 Melem/s 22.188 Melem/s]
+pipeline_ping_parse_only/1024
+                        time:   [46.242 µs 46.927 µs 47.486 µs]
+                        thrpt:  [21.564 Melem/s 21.821 Melem/s 22.144 Melem/s]
+
+pipeline_set_execute_only/1
+                        time:   [457.90 ns 480.08 ns 496.30 ns]
+                        thrpt:  [2.0149 Melem/s 2.0830 Melem/s 2.1839 Melem/s]
+pipeline_set_execute_only/32
+                        time:   [8.8126 µs 8.9189 µs 9.0381 µs]
+                        thrpt:  [3.5406 Melem/s 3.5879 Melem/s 3.6312 Melem/s]
+pipeline_set_execute_only/256
+                        time:   [75.317 µs 77.138 µs 78.127 µs]
+                        thrpt:  [3.2767 Melem/s 3.3187 Melem/s 3.3990 Melem/s]
+pipeline_set_execute_only/1024
+                        time:   [296.76 µs 304.51 µs 313.35 µs]
+                        thrpt:  [3.2679 Melem/s 3.3628 Melem/s 3.4506 Melem/s]
+Found 7 outliers among 20 measurements (35.00%)
+  3 (15.00%) low severe
+  3 (15.00%) high mild
+  1 (5.00%) high severe
+
+pipeline_ping_execute_only/1
+                        time:   [301.47 ns 310.44 ns 317.61 ns]
+                        thrpt:  [3.1485 Melem/s 3.2213 Melem/s 3.3171 Melem/s]
+pipeline_ping_execute_only/32
+                        time:   [2.1207 µs 2.1486 µs 2.1820 µs]
+                        thrpt:  [14.665 Melem/s 14.893 Melem/s 15.089 Melem/s]
+pipeline_ping_execute_only/256
+                        time:   [15.357 µs 15.512 µs 15.734 µs]
+                        thrpt:  [16.271 Melem/s 16.504 Melem/s 16.670 Melem/s]
+pipeline_ping_execute_only/1024
+                        time:   [60.259 µs 61.259 µs 62.478 µs]
+                        thrpt:  [16.390 Melem/s 16.716 Melem/s 16.993 Melem/s]
+
+pipeline_set_encode_only/1
+                        time:   [11.565 ns 11.855 ns 12.081 ns]
+                        thrpt:  [82.773 Melem/s 84.352 Melem/s 86.471 Melem/s]
+pipeline_set_encode_only/32
+                        time:   [121.83 ns 124.24 ns 126.95 ns]
+                        thrpt:  [252.07 Melem/s 257.56 Melem/s 262.66 Melem/s]
+pipeline_set_encode_only/256
+                        time:   [874.77 ns 908.21 ns 940.37 ns]
+                        thrpt:  [272.23 Melem/s 281.87 Melem/s 292.65 Melem/s]
+pipeline_set_encode_only/1024
+                        time:   [3.4450 µs 3.5810 µs 3.6821 µs]
+                        thrpt:  [278.10 Melem/s 285.96 Melem/s 297.24 Melem/s]
+
+pipeline_ping_encode_only/1
+                        time:   [11.800 ns 12.108 ns 12.438 ns]
+                        thrpt:  [80.399 Melem/s 82.589 Melem/s 84.744 Melem/s]
+pipeline_ping_encode_only/32
+                        time:   [150.87 ns 153.36 ns 156.27 ns]
+                        thrpt:  [204.78 Melem/s 208.67 Melem/s 212.11 Melem/s]
+pipeline_ping_encode_only/256
+                        time:   [1.0649 µs 1.0940 µs 1.1234 µs]
+                        thrpt:  [227.89 Melem/s 234.01 Melem/s 240.39 Melem/s]
+Found 4 outliers among 20 measurements (20.00%)
+  1 (5.00%) low mild
+  3 (15.00%) high severe
+pipeline_ping_encode_only/1024
+                        time:   [4.1220 µs 4.2179 µs 4.2880 µs]
+                        thrpt:  [238.81 Melem/s 242.77 Melem/s 248.42 Melem/s]
+

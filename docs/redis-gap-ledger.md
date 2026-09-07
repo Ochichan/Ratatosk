@@ -91,16 +91,16 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `ACL SETUSER` | server | 6.0.0 | done | behavioral_subset | m0-foundation | M0 ACL baseline implemented (on/off/nopass/resetpass/password and rule-token parsing). |
 | `ACL USERS` | server | 6.0.0 | done | behavioral_subset | m0-foundation | M0 ACL baseline implemented (sorted user list). |
 | `ACL WHOAMI` | server | 6.0.0 | done | behavioral_subset | m0-foundation | M0 ACL baseline implemented (current authenticated ACL user). |
-| `APPEND` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
+| `APPEND` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `ASKING` | cluster | 3.0.0 | done | syntax_only | m5-advanced |  |
 | `AUTH` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented (accepts AUTH <username> <password>). |
-| `BGREWRITEAOF` | server | 1.0.0 | done | behavioral_subset | m3-persistence | Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). |
+| `BGREWRITEAOF` | server | 1.0.0 | done | behavioral_subset | m3-persistence | Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). Materializes the current dataset including hash-field TTLs and complete stream group state before switching BASE/INCR manifest. |
 | `BGSAVE` | server | 1.0.0 | done | behavioral_subset | m3-persistence | M3 baseline implemented (non-blocking acknowledgement path with timestamp update). |
-| `BITCOUNT` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types |  |
-| `BITFIELD` | bitmap | 3.2.0 | done | behavioral_subset | m4-extended-types |  |
-| `BITFIELD_RO` | bitmap | 6.0.0 | done | behavioral_subset | m4-extended-types |  |
-| `BITOP` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types |  |
-| `BITPOS` | bitmap | 2.8.7 | done | behavioral_subset | m4-extended-types |  |
+| `BITCOUNT` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `BITFIELD` | bitmap | 3.2.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `BITFIELD_RO` | bitmap | 6.0.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `BITOP` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `BITPOS` | bitmap | 2.8.7 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `BLMOVE` | list | 6.2.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
 | `BLMPOP` | list | 7.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
 | `BLPOP` | list | 2.0.0 | done | behavioral_subset | m2-collections | M2 blocking semantics implemented (blocked wait registry + producer wakeup with timeout fallback; nil on timeout). |
@@ -173,7 +173,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `CONFIG HELP` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG RESETSTAT` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG REWRITE` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (in-memory acknowledge path). |
-| `CONFIG SET` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (timeout/appendonly/save/slowlog params). |
+| `CONFIG SET` | server | 2.0.0 | done | baseline_local | m0-foundation | Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. |
 | `COPY` | generic | 6.2.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (DB/REPLACE options). |
 | `DBSIZE` | server | 1.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `DEBUG` | server | 1.0.0 | done | unsupported | m0-foundation | M0 admin baseline implemented (HELP + unsupported subcommand response). |
@@ -189,10 +189,10 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `EVALSHA` | scripting | 2.6.0 | done | unsupported | m5-advanced |  |
 | `EVALSHA_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
 | `EVAL_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
-| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented with WATCH conflict abort (null reply) and EXECABORT on queue-time errors. |
+| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. |
 | `EXISTS` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
-| `EXPIRE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (EXPIRE [NX\|XX\|GT\|LT]). |
-| `EXPIREAT` | generic | 1.2.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
+| `EXPIRE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
+| `EXPIREAT` | generic | 1.2.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `EXPIRETIME` | generic | 7.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `FAILOVER` | server | 6.2.0 | done | unsupported | m0-foundation | M0 standalone baseline implemented (returns unsupported-in-standalone error). |
 | `FCALL` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
@@ -220,19 +220,19 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `GEOSEARCH` | geo | 6.2.0 | done | behavioral_subset | m4-extended-types |  |
 | `GEOSEARCHSTORE` | geo | 6.2.0 | done | behavioral_subset | m4-extended-types |  |
 | `GET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `GETBIT` | bitmap | 2.2.0 | done | behavioral_subset | m4-extended-types |  |
+| `GETBIT` | bitmap | 2.2.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `GETDEL` | string | 6.2.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `GETEX` | string | 6.2.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `GETRANGE` | string | 2.4.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
+| `GETEX` | string | 6.2.0 | done | behavioral_subset | m1-kv-core | Expiry mutation records the resulting value and absolute expiry for restart-safe local persistence. |
+| `GETRANGE` | string | 2.4.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `GETSET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `HDEL` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
-| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | M0 parity baseline implemented (proto negotiation + AUTH/SETNAME syntax + NOPROTO handling). |
+| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | RESP2 negotiation returns a flat array; RESP3 returns a map. Pipelined and transactional protocol changes preserve previously completed replies. |
 | `HEXISTS` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
-| `HEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
-| `HEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
+| `HEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots. |
+| `HEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Absolute field deadlines survive RDB/BASE snapshots and AOF replay. |
 | `HEXPIRETIME` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
 | `HGET` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
-| `HGETALL` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
+| `HGETALL` | hash | 2.0.0 | done | behavioral_subset | m2-collections | RESP2 flat field/value array and RESP3 map in both engine and readonly paths, including EXEC. |
 | `HGETDEL` | hash | 8.0.0 | done | behavioral_subset | m2-collections |  |
 | `HGETEX` | hash | 8.0.0 | done | behavioral_subset | m2-collections |  |
 | `HINCRBY` | hash | 2.0.0 | done | behavioral_subset | m2-collections | Batch-7 hash extended baseline implemented. |
@@ -246,9 +246,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `HOTKEYS RESET` | server | 8.6.0 | done | baseline_local | m0-foundation | M0 admin baseline implemented (no-op OK). |
 | `HOTKEYS START` | server | 8.6.0 | done | baseline_local | m0-foundation | M0 admin baseline implemented (no-op OK). |
 | `HOTKEYS STOP` | server | 8.6.0 | done | baseline_local | m0-foundation | M0 admin baseline implemented (no-op OK). |
-| `HPERSIST` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
-| `HPEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
-| `HPEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
+| `HPERSIST` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Field persistence changes survive timestamped AOF replay, including extension before an earlier deadline. |
+| `HPEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots. |
+| `HPEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Absolute field deadlines survive RDB/BASE snapshots and AOF replay. |
 | `HPEXPIRETIME` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
 | `HPTTL` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
 | `HRANDFIELD` | hash | 6.2.0 | done | behavioral_subset | m2-collections | Batch-7 hash extended baseline implemented. |
@@ -259,7 +259,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `HSTRLEN` | hash | 3.2.0 | done | behavioral_subset | m2-collections | Batch-7 hash extended baseline implemented. |
 | `HTTL` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  |
 | `HVALS` | hash | 2.0.0 | done | behavioral_subset | m2-collections | Batch-5 baseline implemented (ordered 1->2 execution). |
-| `INCR` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
+| `INCR` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. Timestamped AOF replay preserves expiry decisions before and after a key deadline. |
 | `INCRBY` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `INCRBYFLOAT` | string | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `INFO` | server | 1.0.0 | done | baseline_local | m0-foundation | M0 compatibility baseline implemented for SERVER/CLIENTS/STATS/KEYSPACE sections. |
@@ -306,7 +306,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `MONITOR` | server | 1.0.0 | done | baseline_local | m0-foundation | M0 baseline implemented: MONITOR command accepted with standalone OK response. |
 | `MOVE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `MSET` | string | 1.0.1 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `MSETEX` | string | 8.4.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: numkeys KV block + NX/XX + EX/PX shared expiration, atomic all-or-nothing. |
+| `MSETEX` | string | 8.4.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: numkeys KV block + NX/XX + EX/PX shared expiration, atomic all-or-nothing. AOF v2 records execution time so relative expiration survives restart without TTL extension. |
 | `MSETNX` | string | 1.0.1 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `MULTI` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented. |
 | `OBJECT` | generic | 2.2.3 | done | behavioral_subset | m1-kv-core | M1 generic/object baseline implemented (HELP and key introspection subcommands). |
@@ -316,8 +316,8 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `OBJECT IDLETIME` | generic | 2.2.3 | done | behavioral_subset | m1-kv-core | M1 generic/object baseline implemented. |
 | `OBJECT REFCOUNT` | generic | 2.2.3 | done | behavioral_subset | m1-kv-core | M1 generic/object baseline implemented. |
 | `PERSIST` | generic | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
-| `PEXPIRE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
-| `PEXPIREAT` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
+| `PEXPIRE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
+| `PEXPIREAT` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `PEXPIRETIME` | generic | 7.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `PFADD` | hyperloglog | 2.8.9 | done | behavioral_subset | m4-extended-types |  |
 | `PFCOUNT` | hyperloglog | 2.8.9 | done | behavioral_subset | m4-extended-types |  |
@@ -325,8 +325,8 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `PFMERGE` | hyperloglog | 2.8.9 | done | behavioral_subset | m4-extended-types |  |
 | `PFSELFTEST` | hyperloglog | 2.8.9 | done | behavioral_subset | m4-extended-types |  |
 | `PING` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
-| `PSETEX` | string | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `PSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with pattern fanout and async push delivery. |
+| `PSETEX` | string | 2.6.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
+| `PSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
 | `PSYNC` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with stateful FULLRESYNC handshake over the current replid/offset. |
 | `PTTL` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `PUBLISH` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with receiver counting and server-side fanout queue. |
@@ -337,7 +337,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `PUBSUB NUMSUB` | pubsub | 2.8.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented (channel subscriber count pairs). |
 | `PUBSUB SHARDCHANNELS` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | M3 sharded pubsub baseline implemented (active shard channel listing with optional pattern). |
 | `PUBSUB SHARDNUMSUB` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | M3 sharded pubsub baseline implemented (per-channel shard subscriber counts). |
-| `PUNSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented: pattern unsubscribe and no-arg unsubscribe-all behavior. |
+| `PUNSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
 | `QUIT` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
 | `RANDOMKEY` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `READONLY` | cluster | 3.0.0 | done | syntax_only | m5-advanced |  |
@@ -347,7 +347,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `REPLCONF` | server | 3.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with LISTENING-PORT/CAPA/ACK/GETACK/IP-ADDRESS subset backed by per-client replica metadata. |
 | `REPLICAOF` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with standalone role transition between master and configured upstream replica. |
 | `RESET` | connection | 6.2.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
-| `RESTORE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. |
+| `RESTORE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. AOF v2 preserves the execution clock for relative key TTL during replay; native payload compatibility limits remain. |
 | `RESTORE-ASKING` | server | 3.0.0 | done | behavioral_subset | m0-foundation | M0 replication-control baseline implemented as RESTORE alias behavior. |
 | `ROLE` | server | 2.8.12 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with master/replica role reporting, replica list, and logical replication offsets. |
 | `RPOP` | list | 1.0.0 | done | behavioral_subset | m2-collections | M2 list core baseline implemented. |
@@ -390,11 +390,11 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `SENTINEL SET` | sentinel | 2.8.4 | done | unsupported | m5-advanced |  |
 | `SENTINEL SIMULATE-FAILURE` | sentinel | 3.2.0 | done | unsupported | m5-advanced |  |
 | `SENTINEL SLAVES` | sentinel | 2.8.0 | done | unsupported | m5-advanced |  |
-| `SET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented (SET [NX\|XX]). |
-| `SETBIT` | bitmap | 2.2.0 | done | behavioral_subset | m4-extended-types |  |
-| `SETEX` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
+| `SET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | NX/XX, GET and expiry options in local baseline; AOF captures successful values with absolute expiry, including KEEPTTL. |
+| `SETBIT` | bitmap | 2.2.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `SETEX` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `SETNX` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `SETRANGE` | string | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
+| `SETRANGE` | string | 2.2.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `SFLUSH` | server | 8.0.0 | done | syntax_only | m0-foundation | M0 admin baseline implemented (SYNC/ASYNC option parse + OK no-op). |
 | `SHUTDOWN` | server | 1.0.0 | done | unsupported | m0-foundation | M0 standalone baseline implemented (returns unsupported-in-build error). |
 | `SINTER` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
@@ -412,18 +412,18 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `SMOVE` | set | 1.0.0 | done | behavioral_subset | m2-collections | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `SORT` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (list/set sorting with ASC/DESC, ALPHA, LIMIT, STORE). |
 | `SORT_RO` | generic | 7.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (list/set sorting with ASC/DESC, ALPHA, LIMIT). |
-| `SPOP` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set/list extension baseline implemented. |
+| `SPOP` | set | 1.0.0 | done | behavioral_subset | m2-collections | Random removal; AOF propagates the actual removed members as SREM for deterministic recovery. |
 | `SPUBLISH` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | M3 sharded pubsub baseline implemented with shard-channel fanout and receiver counting. |
 | `SRANDMEMBER` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set/list extension baseline implemented. |
 | `SREM` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set core baseline implemented. |
 | `SSCAN` | set | 2.8.0 | done | behavioral_subset | m2-collections | M2 scan family baseline + cursor progression semantics refined. |
-| `SSUBSCRIBE` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | M3 sharded pubsub baseline implemented with per-client shard subscriptions and RESP subscribe ack. |
-| `STRLEN` | string | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
-| `SUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with cross-client fanout and async push delivery. |
+| `SSUBSCRIBE` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
+| `STRLEN` | string | 2.2.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
+| `SUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
 | `SUBSTR` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented as GETRANGE alias. |
 | `SUNION` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
 | `SUNIONSTORE` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
-| `SUNSUBSCRIBE` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | M3 sharded pubsub baseline implemented with explicit/all unsubscribe behavior and RESP unsubscribe ack. |
+| `SUNSUBSCRIBE` | pubsub | 7.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
 | `SWAPDB` | server | 4.0.0 | done | behavioral_subset | m0-foundation | M0 admin baseline implemented (DB payload swap with range checks). |
 | `SYNC` | server | 1.0.0 | done | unsupported | m0-foundation | M0 replication-control baseline implemented (standalone unsupported error baseline). |
 | `TIME` | server | 2.6.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
@@ -432,20 +432,20 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `TTL` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `TYPE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `UNLINK` | generic | 4.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (synchronous fallback). |
-| `UNSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented: unsubscribe channel/all with remaining-subscription counts. |
+| `UNSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
 | `UNWATCH` | transactions | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented. |
 | `WAIT` | generic | 3.0.0 | done | baseline_local | m1-kv-core | M1 baseline implemented: immediate standalone WAIT result from tracked replica ACK offsets without blocking timeout semantics. |
 | `WAITAOF` | generic | 7.2.0 | done | baseline_local | m1-kv-core | M1 baseline implemented: immediate standalone WAITAOF vector from local AOF health and tracked replica ACK offsets. |
 | `WATCH` | transactions | 2.2.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented with key-version tracking. |
 | `XACK` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented. |
 | `XACKDEL` | stream | 8.2.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
-| `XADD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (auto-ID and explicit ID checks, field/value append). |
+| `XADD` | stream | 5.0.0 | done | behavioral_subset | m3-events | Auto-ID, explicit ID and millisecond-* ID forms; AOF records the resolved ID. Other Redis XADD option variants remain outside this baseline. |
 | `XAUTOCLAIM` | stream | 6.2.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XCFGSET` | stream | 8.6.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
 | `XCLAIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XDEL` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XDELEX` | stream | 8.2.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
-| `XGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). |
+| `XGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. Group cursors accept omitted sequence zero, including the common cursor 0. |
 | `XGROUP CREATE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (MKSTREAM + BUSYGROUP + id/$ support). |
 | `XGROUP CREATECONSUMER` | stream | 6.2.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented. |
 | `XGROUP DELCONSUMER` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (consumer pending removal count). |
@@ -461,7 +461,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XPENDING` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (summary + range forms). |
 | `XRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (inclusive range + COUNT option). |
 | `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). |
-| `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). |
+| `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). RDB/BASE snapshots retain group delivery cursor and PEL owner, delivery count and timestamp. |
 | `XREVRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (reverse inclusive range + COUNT option). |
 | `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XTRIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |

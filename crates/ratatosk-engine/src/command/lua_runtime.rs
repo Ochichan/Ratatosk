@@ -403,12 +403,15 @@ fn table_to_resp(tbl: &mlua::Table) -> RespFrame {
 /// - SimpleString(s)        -> { ok = s }  table
 /// - Error(e)               -> { err = e } table
 /// - Array(items)           -> sequential Lua table
-/// - Null                   -> false
+/// - Null / NullArray       -> false
 fn resp_to_lua(lua: &Lua, frame: &RespFrame) -> LuaResult<Value> {
     match frame {
+        RespFrame::Versioned { frame, .. } => resp_to_lua(lua, frame),
         RespFrame::Integer(n) => Ok(Value::Integer(*n)),
         RespFrame::BulkString(Some(b)) => Ok(Value::String(lua.create_string(b.as_ref())?)),
-        RespFrame::BulkString(None) | RespFrame::Null => Ok(Value::Boolean(false)),
+        RespFrame::BulkString(None) | RespFrame::Null | RespFrame::NullArray => {
+            Ok(Value::Boolean(false))
+        }
         RespFrame::SimpleString(s) => {
             let tbl = lua.create_table()?;
             tbl.set("ok", lua.create_string(s.as_ref())?)?;
@@ -419,7 +422,7 @@ fn resp_to_lua(lua: &Lua, frame: &RespFrame) -> LuaResult<Value> {
             tbl.set("err", lua.create_string(e.as_ref())?)?;
             Ok(Value::Table(tbl))
         }
-        RespFrame::Array(items) => {
+        RespFrame::Array(items) | RespFrame::Push(items) | RespFrame::Sequence(items) => {
             let tbl = lua.create_table()?;
             for (i, item) in items.iter().enumerate() {
                 tbl.set((i + 1) as i64, resp_to_lua(lua, item)?)?;
@@ -435,13 +438,6 @@ fn resp_to_lua(lua: &Lua, frame: &RespFrame) -> LuaResult<Value> {
                 idx += 1;
                 tbl.set(idx, resp_to_lua(lua, v)?)?;
                 idx += 1;
-            }
-            Ok(Value::Table(tbl))
-        }
-        RespFrame::Push(items) => {
-            let tbl = lua.create_table()?;
-            for (i, item) in items.iter().enumerate() {
-                tbl.set((i + 1) as i64, resp_to_lua(lua, item)?)?;
             }
             Ok(Value::Table(tbl))
         }

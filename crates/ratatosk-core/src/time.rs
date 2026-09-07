@@ -17,13 +17,35 @@
 //! - Instant is guaranteed monotonic but not comparable across restarts
 //! - Mixing them causes bugs: negative durations, missed deadlines, panics
 
+use std::cell::Cell;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+thread_local! {
+    static COMMAND_TIME: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// Run synchronous command execution against its recorded wall clock.
+/// This scope must never span an await. Nested scopes and unwinding restore
+/// the caller's clock; other runtime threads retain their own real clock.
+pub fn with_command_time<T>(timestamp_ms: i64, execute: impl FnOnce() -> T) -> T {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COMMAND_TIME.set(self.0);
+        }
+    }
+    let _restore = Restore(COMMAND_TIME.replace(Some(timestamp_ms)));
+    execute()
+}
 
 /// Current wall-clock time in milliseconds since UNIX epoch.
 ///
 /// Use for display, persistence, and absolute deadlines.
 /// Do NOT use for duration measurement (use `monotonic_ms()` instead).
 pub fn now_ms() -> i64 {
+    if let Some(timestamp) = COMMAND_TIME.get() {
+        return timestamp;
+    }
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
@@ -35,10 +57,7 @@ pub fn now_ms() -> i64 {
 /// Use for display, persistence, and absolute deadlines.
 /// Do NOT use for duration measurement (use `monotonic_ms()` instead).
 pub fn now_sec() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
+    now_ms() / 1000
 }
 
 /// Monotonic clock in milliseconds since an arbitrary epoch.
@@ -56,6 +75,20 @@ pub fn monotonic_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_clock_is_nested_thread_local_and_unwind_safe() {
+        with_command_time(12345, || {
+            assert_eq!(now_ms(), 12345);
+            assert_eq!(now_sec(), 12);
+            with_command_time(67890, || assert_eq!(now_ms(), 67890));
+            assert_eq!(now_ms(), 12345);
+            assert!(std::thread::spawn(now_ms).join().expect("clock thread") > 12345);
+            let _ = std::panic::catch_unwind(|| with_command_time(1, || panic!("test unwind")));
+            assert_eq!(now_ms(), 12345);
+        });
+        assert!(now_ms() > 12345);
+    }
 
     #[test]
     fn now_ms_returns_positive() {

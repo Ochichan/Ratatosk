@@ -17,6 +17,9 @@ pub mod frame;
 pub mod fuzz_support;
 pub mod parse;
 
-pub use encode::{encode, encode_to_vec, encoded_len};
+pub use encode::{
+    RespVersion, encode, encode_for_version, encode_to_vec, encode_to_vec_for_version, encoded_len,
+    encoded_len_for_version,
+};
 pub use frame::RespFrame;
 pub use parse::{RespParseError, parse};

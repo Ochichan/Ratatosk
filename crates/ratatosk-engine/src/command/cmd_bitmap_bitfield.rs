@@ -304,7 +304,7 @@ pub(super) fn cmd_bitfield(
     purge_expired_key(&mut db, key, now);
 
     let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        let Some(s) = existing.as_string_bytes() else {
             return wrong_type_response();
         };
         (s.to_vec(), existing.expire_at_ms())
@@ -413,18 +413,18 @@ pub(super) fn cmd_bitfield_ro(
     purge_expired_key(&mut db, key, now);
 
     let data = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string() else {
+        let Some(s) = existing.as_string_bytes() else {
             return wrong_type_response();
         };
-        s.as_ref()
+        s
     } else {
-        &[] as &[u8]
+        Bytes::new()
     };
 
     let mut results: Vec<RespFrame> = Vec::with_capacity(ops.len());
     for op in &ops {
         if let BitfieldOp::Get { encoding, offset } = op {
-            let val = read_bits(data, *offset, encoding.bits, encoding.signed);
+            let val = read_bits(&data, *offset, encoding.bits, encoding.signed);
             results.push(RespFrame::Integer(val));
         }
     }

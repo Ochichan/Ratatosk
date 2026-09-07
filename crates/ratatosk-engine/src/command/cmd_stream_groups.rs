@@ -8,10 +8,24 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame, parse_stream_id,
-    parse_stream_range_bound, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
-    xreadgroup_nogroup_error,
+    blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame,
+    parse_stream_id as parse_full_stream_id, parse_stream_range_bound, stream_entry_frame,
+    stream_id_to_bytes, stream_nogroup_error, xreadgroup_nogroup_error,
 };
+
+// Group cursors accept a millisecond-only ID (notably the common `0`),
+// with an omitted sequence interpreted as zero.
+fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
+    parse_full_stream_id(raw).or_else(|| {
+        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(StreamId {
+            ms: parse_i64(raw)?,
+            seq: 0,
+        })
+    })
+}
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
     wrong_arity, wrong_type_response,

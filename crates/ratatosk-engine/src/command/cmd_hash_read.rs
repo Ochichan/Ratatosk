@@ -98,22 +98,24 @@ pub(super) fn cmd_hgetall(
     purge_expired_key(&mut db, key, now);
 
     let Some(entry) = db.get(key) else {
-        return CommandOutcome::reply(RespFrame::Array(vec![]));
+        return CommandOutcome::reply(RespFrame::Map(vec![]));
     };
     let Some(hash) = entry.as_hash() else {
         return wrong_type_response();
     };
 
-    let mut out = Vec::with_capacity(hash.len() * 2);
+    let mut out = Vec::with_capacity(hash.len());
     for (field, fe) in hash.iter() {
         if !field_alive(fe, now) {
             continue;
         }
-        out.push(RespFrame::BulkString(Some(field.clone())));
-        out.push(RespFrame::BulkString(Some(fe.value.clone())));
+        out.push((
+            RespFrame::BulkString(Some(field.clone())),
+            RespFrame::BulkString(Some(fe.value.clone())),
+        ));
     }
 
-    CommandOutcome::reply(RespFrame::Array(out))
+    CommandOutcome::reply(RespFrame::Map(out))
 }
 
 pub(super) fn cmd_hkeys(
