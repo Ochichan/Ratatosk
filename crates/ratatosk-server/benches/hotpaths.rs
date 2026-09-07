@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;
 use criterion::{
@@ -8,8 +8,8 @@ use hashbrown::{HashMap, HashSet};
 use ratatosk_engine::{
     command::{ClientState, ServerAccess, execute},
     keyspace::{
-        ServerState, StoredValue, StreamConsumer, StreamEntry, StreamGroup, StreamId,
-        StreamPendingEntry,
+        HashFieldEntry, ServerState, StoredValue, StreamConsumer, StreamEntry, StreamGroup,
+        StreamId, StreamPendingEntry,
     },
 };
 use ratatosk_resp::RespFrame;
@@ -25,6 +25,20 @@ fn cmd_frame(parts: Vec<Bytes>) -> RespFrame {
             .map(|part| RespFrame::BulkString(Some(part)))
             .collect(),
     )
+}
+
+/// Executes one command against owned state and hands the state back so its
+/// drop lands outside criterion's timed section.
+fn run_timed(
+    frame: &RespFrame,
+    (mut server, mut client): (ServerState, ClientState),
+) -> (ServerState, ClientState) {
+    let outcome = {
+        let mut access = ServerAccess::new_inline(&mut server);
+        execute(frame.clone(), &mut access, &mut client)
+    };
+    black_box(outcome.response);
+    (server, client)
 }
 
 fn setup_set_state(size: usize) -> (ServerState, ClientState) {
@@ -47,6 +61,38 @@ fn setup_set_state(size: usize) -> (ServerState, ClientState) {
         db.insert(bs(b"s2"), StoredValue::set(s2, None));
         db.insert(bs(b"s3"), StoredValue::set(s3, None));
     }
+
+    (server, client)
+}
+
+fn setup_list_state(size: usize) -> (ServerState, ClientState) {
+    let server = ServerState::with_default_dbs();
+    let client = ClientState::default();
+
+    let list = (0..size)
+        .map(|i| Bytes::from(format!("v{i}")))
+        .collect::<VecDeque<_>>();
+    server
+        .db_mut(0)
+        .insert(bs(b"l"), StoredValue::list(list, None));
+
+    (server, client)
+}
+
+fn setup_hash_state(size: usize) -> (ServerState, ClientState) {
+    let server = ServerState::with_default_dbs();
+    let client = ClientState::default();
+
+    let mut fields = HashMap::with_capacity(size);
+    for i in 0..size {
+        fields.insert(
+            Bytes::from(format!("f{i}")),
+            HashFieldEntry::new(Bytes::from(format!("v{i}"))),
+        );
+    }
+    server
+        .db_mut(0)
+        .insert(bs(b"h"), StoredValue::hash(fields, None));
 
     (server, client)
 }
@@ -144,11 +190,7 @@ fn bench_set_hotpaths(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sinter", size), &size, |b, &size| {
             b.iter_batched(
                 || setup_set_state(size),
-                |(mut server, mut client)| {
-                    let mut access = ServerAccess::new_inline(&mut server);
-                    let outcome = execute(sinter_frame.clone(), &mut access, &mut client);
-                    black_box(outcome.response);
-                },
+                |state| run_timed(&sinter_frame, state),
                 BatchSize::SmallInput,
             );
         });
@@ -163,11 +205,7 @@ fn bench_set_hotpaths(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("sinterstore", size), &size, |b, &size| {
             b.iter_batched(
                 || setup_set_state(size),
-                |(mut server, mut client)| {
-                    let mut access = ServerAccess::new_inline(&mut server);
-                    let outcome = execute(sinterstore_frame.clone(), &mut access, &mut client);
-                    black_box(outcome.response);
-                },
+                |state| run_timed(&sinterstore_frame, state),
                 BatchSize::SmallInput,
             );
         });
@@ -184,12 +222,7 @@ fn bench_set_hotpaths(c: &mut Criterion) {
             |b, &size| {
                 b.iter_batched(
                     || setup_set_state(size),
-                    |(mut server, mut client)| {
-                        let mut access = ServerAccess::new_inline(&mut server);
-                        let outcome =
-                            execute(srandmember_neg_frame.clone(), &mut access, &mut client);
-                        black_box(outcome.response);
-                    },
+                    |state| run_timed(&srandmember_neg_frame, state),
                     BatchSize::SmallInput,
                 );
             },
@@ -222,11 +255,7 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
             |b, &entry_count| {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 0),
-                    |(mut server, mut client)| {
-                        let mut access = ServerAccess::new_inline(&mut server);
-                        let outcome = execute(xreadgroup_frame.clone(), &mut access, &mut client);
-                        black_box(outcome.response);
-                    },
+                    |state| run_timed(&xreadgroup_frame, state),
                     BatchSize::SmallInput,
                 );
             },
@@ -243,11 +272,7 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
             |b, &entry_count| {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 512),
-                    |(mut server, mut client)| {
-                        let mut access = ServerAccess::new_inline(&mut server);
-                        let outcome = execute(xclaim_frame.clone(), &mut access, &mut client);
-                        black_box(outcome.response);
-                    },
+                    |state| run_timed(&xclaim_frame, state),
                     BatchSize::SmallInput,
                 );
             },
@@ -269,15 +294,52 @@ fn bench_stream_hotpaths(c: &mut Criterion) {
             |b, &entry_count| {
                 b.iter_batched(
                     || setup_stream_state(entry_count, 1024),
-                    |(mut server, mut client)| {
-                        let mut access = ServerAccess::new_inline(&mut server);
-                        let outcome = execute(xautoclaim_frame.clone(), &mut access, &mut client);
-                        black_box(outcome.response);
-                    },
+                    |state| run_timed(&xautoclaim_frame, state),
                     BatchSize::SmallInput,
                 );
             },
         );
+    }
+
+    group.finish();
+}
+
+/// Single-element writes against large collections.
+///
+/// `lpush_1` / `hset_1` mutate in place; `rename` relocates the value through
+/// `DbWriteGuard::remove` + `insert`, which re-estimates object memory.  Time
+/// should stay flat across sizes; growth proportional to size means an O(n)
+/// walk sneaked into a per-command path.
+fn bench_collection_write_hotpaths(c: &mut Criterion) {
+    let mut group = c.benchmark_group("engine_collection_write_hotpaths_execute");
+
+    for &size in &[1024usize, 16384] {
+        let lpush_frame = cmd_frame(vec![bs(b"LPUSH"), bs(b"l"), bs(b"x")]);
+        group.bench_with_input(BenchmarkId::new("lpush_1", size), &size, |b, &size| {
+            b.iter_batched(
+                || setup_list_state(size),
+                |state| run_timed(&lpush_frame, state),
+                BatchSize::LargeInput,
+            );
+        });
+
+        let hset_frame = cmd_frame(vec![bs(b"HSET"), bs(b"h"), bs(b"fnew"), bs(b"x")]);
+        group.bench_with_input(BenchmarkId::new("hset_1", size), &size, |b, &size| {
+            b.iter_batched(
+                || setup_hash_state(size),
+                |state| run_timed(&hset_frame, state),
+                BatchSize::LargeInput,
+            );
+        });
+
+        let rename_frame = cmd_frame(vec![bs(b"RENAME"), bs(b"l"), bs(b"l2")]);
+        group.bench_with_input(BenchmarkId::new("rename_list", size), &size, |b, &size| {
+            b.iter_batched(
+                || setup_list_state(size),
+                |state| run_timed(&rename_frame, state),
+                BatchSize::LargeInput,
+            );
+        });
     }
 
     group.finish();
@@ -293,6 +355,6 @@ fn criterion_config() -> Criterion {
 criterion_group! {
     name = hotpath_benches;
     config = criterion_config();
-    targets = bench_set_hotpaths, bench_stream_hotpaths
+    targets = bench_set_hotpaths, bench_stream_hotpaths, bench_collection_write_hotpaths
 }
 criterion_main!(hotpath_benches);

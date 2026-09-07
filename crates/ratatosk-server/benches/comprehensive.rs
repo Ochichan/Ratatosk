@@ -184,7 +184,7 @@ fn bench_connection_server(c: &mut Criterion) {
 fn bench_string_hash(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_comprehensive_string_hash");
 
-    group.throughput(Throughput::Elements(8192));
+    group.throughput(Throughput::Elements(1));
     group.bench_function(BenchmarkId::new("string_get", 8192), |bench| {
         let (mut server, mut client) = setup_string_state(8192);
         let get = frame(vec![b(b"GET"), Bytes::from("k4096")]);
@@ -195,6 +195,7 @@ fn bench_string_hash(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(1));
     group.bench_function("string_set_overwrite", |bench| {
         let (mut server, mut client) = setup_string_state(1);
         let set = frame(vec![b(b"SET"), b(b"k0"), b(b"updated")]);
@@ -205,6 +206,7 @@ fn bench_string_hash(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(16));
     group.bench_function("string_mget_16", |bench| {
         let (mut server, mut client) = setup_string_state(8192);
         let mut args = vec![b(b"MGET")];
@@ -219,7 +221,7 @@ fn bench_string_hash(c: &mut Criterion) {
         });
     });
 
-    group.throughput(Throughput::Elements(4096));
+    group.throughput(Throughput::Elements(1));
     group.bench_function(BenchmarkId::new("hash_hget", 4096), |bench| {
         let (mut server, mut client) = setup_hash_state(4096);
         let hget = frame(vec![b(b"HGET"), b(b"h"), Bytes::from("f2048")]);
@@ -230,6 +232,7 @@ fn bench_string_hash(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(16));
     group.bench_function("hash_hmget_16", |bench| {
         let (mut server, mut client) = setup_hash_state(4096);
         let mut args = vec![b(b"HMGET"), b(b"h")];
@@ -244,6 +247,7 @@ fn bench_string_hash(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(512));
     group.bench_function("hash_hgetall_512", |bench| {
         let (mut server, mut client) = setup_hash_state(512);
         let hgetall = frame(vec![b(b"HGETALL"), b(b"h")]);
@@ -260,7 +264,7 @@ fn bench_string_hash(c: &mut Criterion) {
 fn bench_list_zset(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_comprehensive_list_zset");
 
-    group.throughput(Throughput::Elements(8192));
+    group.throughput(Throughput::Elements(100));
     group.bench_function(BenchmarkId::new("list_lrange_100", 8192), |bench| {
         let (mut server, mut client) = setup_list_state(8192);
         let cmd = frame(vec![b(b"LRANGE"), b(b"l"), b(b"0"), b(b"99")]);
@@ -271,6 +275,7 @@ fn bench_list_zset(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(1));
     group.bench_function("list_lindex_middle", |bench| {
         let (mut server, mut client) = setup_list_state(8192);
         let cmd = frame(vec![b(b"LINDEX"), b(b"l"), b(b"4096")]);
@@ -281,6 +286,7 @@ fn bench_list_zset(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(100));
     group.bench_function(BenchmarkId::new("zset_zrange_100", 8192), |bench| {
         let (mut server, mut client) = setup_zset_state(8192);
         let cmd = frame(vec![b(b"ZRANGE"), b(b"z"), b(b"0"), b(b"99")]);
@@ -291,6 +297,7 @@ fn bench_list_zset(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(1));
     group.bench_function("zset_zscore_middle", |bench| {
         let (mut server, mut client) = setup_zset_state(8192);
         let cmd = frame(vec![b(b"ZSCORE"), b(b"z"), Bytes::from("m4096")]);
@@ -307,7 +314,7 @@ fn bench_list_zset(c: &mut Criterion) {
 fn bench_key_scan_pubsub(c: &mut Criterion) {
     let mut group = c.benchmark_group("engine_comprehensive_key_scan_pubsub");
 
-    group.throughput(Throughput::Elements(20000));
+    group.throughput(Throughput::Elements(100));
     group.bench_function(BenchmarkId::new("scan_match_count100", 20000), |bench| {
         let (mut server, mut client) = setup_scan_state(20000);
         let scan = frame(vec![
@@ -325,6 +332,7 @@ fn bench_key_scan_pubsub(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(32));
     group.bench_function("exists_32", |bench| {
         let (mut server, mut client) = setup_string_state(8192);
         let mut args = vec![b(b"EXISTS")];
@@ -342,6 +350,7 @@ fn bench_key_scan_pubsub(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(1));
     group.bench_function("publish_1sub", |bench| {
         let (mut server, _sub_client, mut pub_client, mut rx) = setup_pubsub_state(1);
         let publish = frame(vec![b(b"PUBLISH"), b(b"ch0"), b(b"payload")]);
@@ -354,6 +363,7 @@ fn bench_key_scan_pubsub(c: &mut Criterion) {
         });
     });
 
+    group.throughput(Throughput::Elements(16));
     group.bench_function("pubsub_numsub_16", |bench| {
         let (mut server, _sub_client, mut pubsub_client, _rx) = setup_pubsub_state(16);
         let mut args = vec![b(b"PUBSUB"), b(b"NUMSUB")];
