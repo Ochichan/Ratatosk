@@ -7,7 +7,7 @@
 > (backups + restart), quantified by the durability contract in
 > `docs/operations.md`.
 
-Established by Phase 2 of `docs/RELEASE_ROADMAP.md`. Last synced: **2026-06-02**.
+Established by Phase 2 of `docs/RELEASE_ROADMAP.md`. Last synced: **2026-09-08**.
 
 ---
 
@@ -19,7 +19,7 @@ Every SLI maps to a metric already exported by the Prometheus endpoint
 
 | SLI | Definition | Source signal |
 |---|---|---|
-| Availability | fraction of scrape windows where `PING HEALTH` = `ok` and the process is up | `up`, `ratatosk_aof_write_latched`, health payload |
+| Availability | fraction of scrape windows where `PING HEALTH` reports `status:healthy` and the process is up | `up`, `ratatosk_aof_write_latched`, health payload |
 | Command latency | per-command server-side duration | `ratatosk_command_duration_seconds` (histogram) |
 | Read latency (p99) | p99 of duration for read commands | `histogram_quantile(0.99, rate(ratatosk_command_duration_seconds_bucket[5m]))` |
 | Durability freshness | staleness of the last successful AOF/RDB persistence | `ratatosk_aof_queue_depth`, `ratatosk_aof_write_errors_total`, `ratatosk_rdb_save_errors_total` |
@@ -32,14 +32,15 @@ Every SLI maps to a metric already exported by the Prometheus endpoint
 ## 2. SLOs (targets)
 
 Targets are **single-instance, default config, within the published capacity
-envelope** (`docs/operations.md` capacity section). They are deliberately
+envelope** (measured with `scripts/capacity_envelope.sh`; the published envelope
+is a release deliverable, not yet part of `docs/operations.md`). They are deliberately
 modest and honest — "safe within this workload", not "fastest in the world".
 
 | Objective | Target (28-day window) | Measured by |
 |---|---|---|
 | Process availability | **99.9%** of 1m windows healthy | `avg_over_time((ratatosk_aof_write_latched == bool 0)[28d])` + `up` |
-| Read p99 latency | **≤ 1 ms** at ≤ 50k ops/s pipelined | command-duration histogram, `command` label = read |
-| Write p99 latency | **≤ 2 ms** (`appendfsync everysec`) | command-duration histogram, `command` label = write |
+| Read p99 latency | **≤ 1 ms** at ≤ 50k ops/s pipelined | `ratatosk_command_duration_seconds` histogram, aggregated over read commands (`GET`, `MGET`, `HGET`, `LRANGE`, ...) via the per-command `command` label |
+| Write p99 latency | **≤ 2 ms** (`appendfsync everysec`) | `ratatosk_command_duration_seconds` histogram, aggregated over write commands (`SET`, `HSET`, `LPUSH`, `XADD`, ...) via the per-command `command` label |
 | Durable-write loss window | **≤ 1 s** of acknowledged writes (`everysec`); **0** (`always`) | durability contract, `docs/operations.md` |
 | AOF write error budget | **0** sustained write errors | `increase(ratatosk_aof_write_errors_total[5m]) == 0` |
 | Memory estimate freshness | **< 100 ticks** stale | `ratatosk_memory_estimate_age_ticks` |
@@ -48,24 +49,29 @@ modest and honest — "safe within this workload", not "fastest in the world".
 
 - Availability budget over 28 days at 99.9% = **~40m 19s** of unhealthy time.
 - When >50% of the budget is consumed in a rolling 7-day window, freeze
-  non-essential config changes and prioritize the persistence/lock runbooks.
+  non-essential config changes and prioritize persistence recovery (durability
+  contract and recovery matrix in `docs/operations.md`, `scripts/recovery_matrix.sh`).
 
 ---
 
-## 3. SLO → alert → runbook wiring
+## 3. SLO → alert wiring
 
-Each objective has a Prometheus alert (`monitoring/prometheus/ratatosk-alerts.yml`)
-and a runbook entry (`docs/operations.md` runbook section). The Alertmanager
-routing tree lives in `monitoring/alertmanager/alertmanager.yml`.
+The availability and durability objectives are backed by Prometheus alerts in
+`monitoring/prometheus/ratatosk-alerts.yml`; the Alertmanager routing tree lives
+in `monitoring/alertmanager/alertmanager.yml`. The latency objectives have no
+alert yet and are verified by the benchmark guardrail instead. Every page-level
+alert must satisfy the runbook policy in `docs/operations.md` (Part 6 §5);
+per-alert runbook pages are not published yet, so the last column names the
+first response only.
 
-| SLO breached | Alert | Severity | Runbook |
+| SLO breached | Alert | Severity | First response |
 |---|---|---|---|
-| Availability (AOF latched) | `RatatoskAofWritesLatched` | page | AOF latch recovery |
-| Write durability | `RatatoskAofWriteErrors` | page | AOF write-error recovery |
-| Snapshot durability | `RatatoskRdbSaveErrors` | ticket | RDB save recovery |
-| Memory accuracy | `RatatoskMemoryEstimateStale` | ticket | memory-estimate refresh |
-| Connection health | `RatatoskAcceptErrorBurst`, `RatatoskFdUtilizationHigh` | ticket | fd / accept saturation |
-| Blocking liveness | `RatatoskBlockingRetryDeadlinesExhausted` | ticket | blocking-waiter saturation |
+| Availability (AOF latched) | `RatatoskAofWritesLatched` | page | check disk health and recent AOF errors; restart after the cause is fixed (`docs/operations.md` durability contract) |
+| Write durability | `RatatoskAofWriteErrors` | page | inspect disk writability and persistence logs |
+| Snapshot durability | `RatatoskRdbSaveErrors` | ticket | verify persistence directory access and free space |
+| Memory accuracy | `RatatoskMemoryEstimateStale` | ticket | compare `INFO memory` `mem_estimate_age_ticks`; check `server_cron` is running |
+| Connection health | `RatatoskAcceptErrorBurst`, `RatatoskFdUtilizationHigh` | ticket | raise the fd limit or `maxclients`; look for connection storms |
+| Blocking liveness | `RatatoskBlockingRetryDeadlinesExhausted` | ticket | inspect blocking-command producers and timeouts |
 
 ---
 

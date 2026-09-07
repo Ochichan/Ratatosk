@@ -84,7 +84,7 @@
 
               meta = {
                 description = "Standalone Redis-compatible in-memory data server";
-                license = lib.licenses.mit;
+                license = lib.licenses.gpl3Plus;
                 mainProgram = "ratatosk";
                 platforms = lib.platforms.unix;
               }

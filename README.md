@@ -1,55 +1,89 @@
 # Ratatosk
 
 Ratatosk is a single-node, Redis-compatible, RESP2/RESP3 in-memory server for
-cache, Pub/Sub, and local durability. It is **not** a Redis Cluster, Sentinel, or
-replication-compatible drop-in replacement. Every command exposes a capability
-tier (`COMMAND DOCS`); the supported subset is tested against Redis/Valkey.
+cache, Pub/Sub, and local durability. It is **not** a Redis Cluster, Sentinel,
+or replication-compatible drop-in replacement. Every command exposes a
+capability tier; the supported subset is tested against Redis. Written in Rust.
 
-The command surface is broad (420 entries) but **semantics vary by tier** —
-"command name exists" is not "identical to Redis". Run with
-`compatibility-mode strict` to make unsupported and syntax-only commands fail
-loudly instead of returning a misleading success. See
-[`docs/PRODUCT_CONTRACT.md`](docs/PRODUCT_CONTRACT.md) for the full boundary and
-tier policy.
+Licensed under the GNU GPL v3.0 or later. See [`LICENSE`](LICENSE).
 
-Current project boundary:
+## The problem
 
-- Single-node only
-- RESP2/RESP3 TCP server
-- Cache + Pub/Sub + local persistence
-- RDB snapshot + AOF durability
-- Broad Redis command surface, but not full Redis distributed parity
+Most software that "needs Redis" needs about a dozen commands on one host: a
+cache with TTLs, a lock with `SET NX`, a Pub/Sub channel, a stream, a counter.
+Getting that today means one of two things:
 
-For the detailed implementation boundary, see:
+- Run the real thing. Redis and its forks are excellent, but they carry the
+  weight of a distributed system you are not using, and their licensing has
+  changed more than once.
+- Run a "Redis-compatible" server. These accept your client's commands, but the
+  compatibility boundary is usually undocumented. A command can be accepted,
+  return `OK`, and do something different from Redis. You find out in
+  production.
 
-- `docs/PRODUCT_CONTRACT.md` (product boundary, capability-tier policy, strict/compat mode — the single source of the contract)
-- `docs/architecture.md` (architecture, internals, capability declarations, Redis gap analysis, command ledger)
-- `docs/operations.md` (configuration, ecosystem, health, observability, product contract, ship readiness)
-- `docs/optimization.md` (performance baseline, RAM/CPU optimization plan and checklist)
-- `docs/RELEASE_ROADMAP.md` (live v1.0.0 GA execution tracker: phases, exit gates, ship gate, verification commands)
+Ratatosk targets the single-host case and makes the compatibility boundary
+explicit and machine-checkable instead of implied.
 
-## Workspace Layout
+## How Ratatosk answers it
 
-- `crates/ratatosk-core`: shared types, flags, errors, time utilities
-- `crates/ratatosk-resp`: RESP parser and encoder
-- `crates/ratatosk-engine`: keyspace, command execution, eviction, expiry, tracking
-- `crates/ratatosk-persist`: RDB/AOF codecs and recovery
-- `crates/ratatosk-server`: TCP server, event loop, runtime orchestration
+**Every command declares what it actually does.** All 420 catalogued commands
+carry a capability tier, visible through `COMMAND DOCS` and recorded in the
+[gap ledger](docs/redis-gap-ledger.md):
 
-## What Ratatosk Is Good For
+| Tier | Meaning | Count |
+|---|---|---|
+| `behavioral_subset` | implemented and tested for real Redis semantics on a single node | 275 |
+| `baseline_local` | works locally with standalone semantics (for example `WAIT` answers immediately, `CLUSTER` reports one node) | 76 |
+| `syntax_only` | parsed and acknowledged, no real effect | 6 |
+| `unsupported` | rejected | 63 |
+| `distributed_parity` | reserved; nothing claims it | 0 |
 
-- Local or single-host cache
-- Pub/Sub event fanout
-- Session and rate-limit storage
-- Durable local data service with Redis-compatible clients
+A test locks the runtime tier of every command spec to the ledger, so the docs
+cannot drift from the binary.
 
-## What Ratatosk Does Not Provide
+**Strict mode turns silent mismatches into errors.** With
+`compatibility-mode strict`, `syntax_only` and `unsupported` commands fail with
+a structured error instead of a misleading success. The default `compat` mode
+keeps Redis-style leniency for existing clients.
 
-- Redis Cluster
-- Sentinel failover
-- Real network replication stream
-- Replica-backed `WAIT`/`WAITAOF` semantics
-- Redis Functions parity
+**The supported subset is diff-tested against Redis.** The interop suite
+starts a real `redis-server`, runs the same command sequences against both, and
+compares replies. CI runs it on every push.
+
+**Durability is a contract, not a checkbox.** RDB snapshots plus a
+manifest-backed AOF with BASE and INCR files, timestamped entries, and a
+per-fsync-policy durability table in [`docs/operations.md`](docs/operations.md).
+A recovery matrix script exercises crash, `kill -9`, truncated-AOF,
+missing-manifest, and repeated-rewrite paths.
+
+**It runs comfortably next to something else.** Ratatosk is built to be a
+sidecar: `RATATOSK_PORT=0` picks a free port and writes it to
+`RATATOSK_BOUND_ADDR_FILE`, `PING HEALTH` reports readiness with named reasons,
+SIGTERM drains gracefully within a configurable grace window, and a Prometheus
+endpoint plus a Grafana dashboard ship in [`monitoring/`](monitoring/).
+
+**Memory safety by construction.** Four of the five crates are
+`#![forbid(unsafe_code)]`. The server crate's only `unsafe` blocks set
+environment variables inside its own tests.
+
+## What it is good for
+
+- Local or single-host cache, session, and rate-limit storage
+- Pub/Sub fanout and Streams with consumer groups on one machine
+- A durable local data service for an app that speaks a Redis client
+- Development and CI environments that need Redis semantics without a daemon
+  from another package manager
+
+## What it does not provide
+
+- Redis Cluster, Sentinel, or failover
+- A real replication stream or replica-backed `WAIT`/`WAITAOF`
+- Redis Functions parity, or Search / JSON / Vector modules
+- Lua scripting in the default build (`EVAL` family is behind the
+  `lua-scripting` feature and rejected otherwise)
+
+The full boundary and tier policy live in
+[`docs/PRODUCT_CONTRACT.md`](docs/PRODUCT_CONTRACT.md).
 
 ## Run
 
@@ -57,80 +91,69 @@ For the detailed implementation boundary, see:
 cargo run -p ratatosk-server --bin ratatosk --release
 ```
 
-Ratatosk resolves configuration in this order:
+The server listens on `127.0.0.1:6379` and exports Prometheus metrics on
+`127.0.0.1:9090`. Set `RATATOSK_PORT=6380` to coexist with a local Redis.
 
-- built-in defaults
-- `--config /path/to/ratatosk.conf`
-- `RATATOSK_CONFIG=/path/to/ratatosk.conf`
-- auto-loaded `./ratatosk.conf` when present
-- environment variable overrides
-
-Disable implicit local config discovery when you want explicit startup only:
-
-- `--no-config-autoload`
-- `RATATOSK_DISABLE_CONFIG_AUTOLOAD=true`
-
-Useful operator commands:
+Configuration is resolved in this order: built-in defaults, `--config PATH`,
+`RATATOSK_CONFIG`, an auto-loaded `./ratatosk.conf` when present, then
+`RATATOSK_*` environment overrides. Pass `--no-config-autoload` (or set
+`RATATOSK_DISABLE_CONFIG_AUTOLOAD=true`) to skip the implicit file.
 
 ```bash
 # Validate the resolved configuration and startup preflight checks
-cargo run -p ratatosk-server --bin ratatosk -- --check-config
+ratatosk --check-config
 
-# Inspect the effective config in Redis-style text form
-cargo run -p ratatosk-server --bin ratatosk -- --print-config text
-
-# Inspect the same config in JSON
-cargo run -p ratatosk-server --bin ratatosk -- --print-config json
+# Print the effective config as Redis-style text or JSON
+ratatosk --print-config text
+ratatosk --print-config json
 
 # Start with an explicit config file
-cargo run -p ratatosk-server --bin ratatosk -- --config ./ratatosk.conf
+ratatosk --config ./ratatosk.conf
 ```
 
-Default listener:
+The shipped [`ratatosk.conf`](ratatosk.conf) is a real startup config, and
+`CONFIG REWRITE` writes the running config back to it.
 
-- `127.0.0.1:6379`
+### Binding beyond loopback
 
-Recommended coexistence port when Redis may also be running:
+Ratatosk refuses to expose an unauthenticated server by accident:
 
-- `RATATOSK_PORT=6380`
+- A non-loopback bind requires `RATATOSK_ALLOW_INSECURE_BIND=true`.
+- With `protected-mode yes` (the default) a non-loopback bind also refuses to
+  start while the `default` ACL user has no password. Set
+  `RATATOSK_DEFAULT_USER_PASSWORD` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH` to
+  bootstrap one.
+- `protected-mode no` is the explicit, insecure opt-out.
 
-Remote bind hardening:
+There is no built-in TLS. `docs/operations.md` has termination recipes for
+stunnel, nginx, and Envoy.
 
-- non-loopback bind still requires `RATATOSK_ALLOW_INSECURE_BIND=true`
-- `protected-mode yes` (the default) makes a non-loopback bind refuse to start while the `default` ACL user is still `nopass`
-- for non-loopback bind, set `RATATOSK_DEFAULT_USER_PASSWORD=...` or `RATATOSK_DEFAULT_USER_PASSWORD_HASH=...` to bootstrap a password
-- `protected-mode no` (or `RATATOSK_ALLOW_DEFAULT_USER_NOPASS=true`) is the explicitly insecure operator opt-out
-
-Config workflow:
-
-- the shipped [`ratatosk.conf`](ratatosk.conf) is a real startup config, not a placeholder
-- `CONFIG REWRITE` persists the current runtime config back to `ratatosk.conf` under the active `dir`
-- file values with spaces are emitted with quoting so generated configs round-trip cleanly
-
-## Nix
-
-Ratatosk can also be built and run directly with Nix flakes.
+### Nix
 
 ```bash
-nix build .#ratatosk
-nix run .#ratatosk
-nix develop
+nix build .#ratatosk     # release binary
+nix run .#ratatosk       # run it
+nix develop              # Rust toolchain shell
 ```
 
-Available flake outputs:
+The package installs an example config under `share/examples/ratatosk/` and
+the docs under `share/doc/ratatosk`.
 
-- `packages.<system>.ratatosk`: default release build of the `ratatosk` server binary
-- `apps.<system>.ratatosk`: run the packaged server with `nix run`
-- `devShells.<system>.default`: Rust + Nix development shell
+## Workspace layout
 
-The package also installs:
+| Crate | Role |
+|---|---|
+| `ratatosk-core` | shared types, flags, errors, time utilities |
+| `ratatosk-resp` | RESP2/RESP3 zero-copy parser and encoder, with a libFuzzer target |
+| `ratatosk-engine` | keyspace, command handlers, eviction, expiry, Pub/Sub, ACL, client tracking |
+| `ratatosk-persist` | RDB and AOF codecs, manifest, recovery |
+| `ratatosk-server` | TCP accept loop, per-client I/O, config, metrics, persistence runtime |
 
-- example config: `$out/share/examples/ratatosk/ratatosk.conf`
-- docs bundle: `$out/share/doc/ratatosk`
+Dependencies point one way: `server → {engine, persist} → resp → core`.
 
-## Quality Gate
+## Quality gate
 
-The repository is kept warning-free under the local quality gate below:
+The repository is kept warning-free:
 
 ```bash
 cargo fmt --all --check
@@ -139,11 +162,27 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --quiet
 ```
 
-CI mirrors the same baseline in `.github/workflows/rust-ci.yml`.
+CI runs the same gate plus the Redis interop suite, a latency guardrail on the
+pipeline benchmarks, `cargo-deny`, and an SBOM build.
+To make the interop comparison mandatory locally:
 
-## Key Docs
+```bash
+RATATOSK_REQUIRE_REDIS_INTEROP=1 cargo test -p ratatosk-server --test redis_interop
+```
 
-- `docs/architecture.md`: architecture, eviction/expiry, persistence, capability declarations, Redis gap analysis, command ledger
-- `docs/operations.md`: configuration, ecosystem integration, ports, health protocol, observability, product contract, versioning policy, ship readiness
-- `docs/optimization.md`: performance baseline, RAM/CPU optimization master plan, execution checklist
-- `AUTOSTART_RUNBOOK_KO.md`: systemd user autostart guide
+## Documentation
+
+- [`docs/PRODUCT_CONTRACT.md`](docs/PRODUCT_CONTRACT.md): the product boundary and capability-tier policy, and the source every other surface repeats
+- [`docs/architecture.md`](docs/architecture.md): internals, state model, persistence design, Redis gap analysis
+- [`docs/operations.md`](docs/operations.md): configuration reference, durability contract, health protocol, observability, versioning policy
+- [`docs/SLO.md`](docs/SLO.md): single-node SLO and SLI definitions wired to exported metrics
+- [`docs/optimization.md`](docs/optimization.md): performance baselines and the memory/CPU optimization record
+- [`docs/redis-gap-ledger.md`](docs/redis-gap-ledger.md): per-command tier and notes, generated from `docs/redis-gap-ledger.json`
+- [`CHANGELOG.md`](CHANGELOG.md)
+
+## Status
+
+Ratatosk is pre-1.0 (`0.1.0`). It follows Semantic Versioning, but in the
+`0.y.z` range a minor release may still contain breaking changes; the stable
+contract in `docs/operations.md` applies from `1.0.0`. Ratatosk is an
+independent project and is not affiliated with Redis Ltd.

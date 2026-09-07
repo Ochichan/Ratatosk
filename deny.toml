@@ -4,6 +4,8 @@ yanked = "warn"
 
 [licenses]
 allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "BSD-2-Clause", "Unicode-3.0", "Zlib"]
+# Workspace crates are GPL-3.0-or-later; dependencies must stay permissive.
+private = { ignore = true }
 
 [bans]
 allow-wildcard-paths = true

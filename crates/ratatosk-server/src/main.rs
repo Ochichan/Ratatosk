@@ -42,7 +42,7 @@ enum PrintConfigFormat {
     name = "ratatosk",
     version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"),
     about = "Single-node, Redis-compatible RESP2/RESP3 server for cache, Pub/Sub, and local durability",
-    long_about = "Ratatosk is a single-node, Redis-compatible, RESP2/RESP3 in-memory server for cache, Pub/Sub, and local durability. It is NOT a Redis Cluster, Sentinel, or replication-compatible drop-in replacement. Every command exposes a capability tier (COMMAND DOCS); the supported subset is tested against Redis/Valkey. Run `compatibility-mode strict` to make unsupported and syntax-only commands fail loudly instead of silently succeeding.\n\nConfiguration is resolved in this order: defaults, then a Redis-style config file from `--config`, then `RATATOSK_CONFIG`, then auto-loaded `./ratatosk.conf` when present, and finally environment variable overrides."
+    long_about = "Ratatosk is a single-node, Redis-compatible, RESP2/RESP3 in-memory server for cache, Pub/Sub, and local durability. It is NOT a Redis Cluster, Sentinel, or replication-compatible drop-in replacement. Every command exposes a capability tier (COMMAND DOCS); the supported subset is tested against Redis. Run `compatibility-mode strict` to make unsupported and syntax-only commands fail loudly instead of silently succeeding.\n\nConfiguration is resolved in this order: defaults, then a Redis-style config file from `--config`, then `RATATOSK_CONFIG`, then auto-loaded `./ratatosk.conf` when present, and finally environment variable overrides."
 )]
 struct Args {
     #[arg(

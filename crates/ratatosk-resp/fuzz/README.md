@@ -22,7 +22,7 @@ libFuzzer campaign harness.
 ## One-time setup
 
 ```bash
-rustup toolchain install nightly        # already present on this host
+rustup toolchain install nightly
 cargo install cargo-fuzz                 # not installed by default
 ```
 
@@ -46,4 +46,4 @@ cargo +nightly fuzz run resp_parse crates/ratatosk-resp/fuzz/artifacts/resp_pars
 This is not wired into the stable CI gates by design (libFuzzer needs nightly and
 a campaign needs wall-clock time). To add a periodic short campaign, run the
 bounded form above on a nightly-toolchain runner on a schedule. See
-`docs/RELEASE_ROADMAP.md` Phase 5 and `docs/GA_MANUAL_RUNBOOK.md`.
+`docs/RELEASE_ROADMAP.md` Phase 5.

@@ -20,7 +20,7 @@
    Compiling typenum v1.19.0
    Compiling hashbrown v0.16.1
    Compiling memchr v2.8.0
-   Compiling ratatosk-engine v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-engine)
+   Compiling ratatosk-engine v0.1.0 (<repo>/crates/ratatosk-engine)
    Compiling regex-syntax v0.8.9
    Compiling futures-sink v0.3.31
    Compiling utf8parse v0.2.2
@@ -54,7 +54,7 @@
    Compiling rayon-core v1.13.0
    Compiling allocator-api2 v0.2.21
    Compiling anstream v0.6.21
-   Compiling ratatosk-server v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-server)
+   Compiling ratatosk-server v0.1.0 (<repo>/crates/ratatosk-server)
    Compiling futures-util v0.3.31
    Compiling crc-catalog v2.4.0
    Compiling plotters-backend v0.3.7
@@ -134,8 +134,8 @@
    Compiling thiserror v1.0.69
    Compiling tracing v0.1.44
    Compiling thiserror v2.0.18
-   Compiling ratatosk-core v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-core)
-   Compiling ratatosk-resp v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-resp)
+   Compiling ratatosk-core v0.1.0 (<repo>/crates/ratatosk-core)
+   Compiling ratatosk-resp v0.1.0 (<repo>/crates/ratatosk-resp)
    Compiling clap v4.5.57
    Compiling serde_spanned v0.6.9
    Compiling toml_datetime v0.6.11
@@ -157,7 +157,7 @@
    Compiling metrics-util v0.17.0
    Compiling criterion v0.5.1
    Compiling h2 v0.4.13
-   Compiling ratatosk-persist v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-persist)
+   Compiling ratatosk-persist v0.1.0 (<repo>/crates/ratatosk-persist)
    Compiling hyper v1.8.1
    Compiling hyper-util v0.1.20
    Compiling metrics-exporter-prometheus v0.15.3

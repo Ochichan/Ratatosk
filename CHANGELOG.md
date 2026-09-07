@@ -9,6 +9,20 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Added
 
+- **Timestamped AOF (`REDIS-AOF-002`)**: new writes carry a per-command wall-clock
+  timestamp so replay re-executes each command at its recorded time, preserving
+  relative expiries and pre-deadline mutations. Version 1 and legacy RESP files
+  remain readable and are upgraded in place on first append. See
+  `docs/operations.md` "Persistence format upgrade" for the migration and
+  rollback procedure; a binary-only downgrade after new writes is unsupported.
+- **Hash-field TTL and stream group state in RDB**: snapshots retain hash-field
+  absolute deadlines (`HEXPIRE` family) and stream group / consumer / PEL state
+  using private type bytes 128 and 129. Older Ratatosk encodings stay loadable.
+- **Sidecar handoff**: `RATATOSK_PORT=0` binds an ephemeral loopback port and,
+  when `RATATOSK_BOUND_ADDR_FILE` is set, writes the bound address to that file
+  once the listener is ready (the path is preflight-checked at startup). The
+  release archive includes `ratatosk-sidecar-evidence.json` with the binary
+  hash and the health / port / shutdown contract.
 - **Strict compatibility mode** (`compatibility-mode strict|compat`, default `compat`):
   rejects `unsupported`/`syntax_only` commands plus `WAIT`/`WAITAOF` with a
   structured error instead of a misleading success. Config file directive,
@@ -49,7 +63,7 @@ The format is based on Keep a Changelog and the versioning policy in
   were corrected to `unsupported`/`syntax_only`). A new test
   (`capability_tier_matches_gap_ledger_for_every_spec`) locks runtime tier =
   ledger for every command spec.
-- `docs/SLO.md` — single-node SLO/SLI targets wired to real metrics, alerts, and runbooks.
+- `docs/SLO.md` — single-node SLO/SLI targets wired to real metrics and alerts.
 - Persistence recovery matrix (`scripts/recovery_matrix.sh`): crash / kill-9 /
   truncated-AOF / missing-manifest / repeated-rewrite invariants.
 - Backup / restore / rollback drill (`scripts/backup_restore_drill.sh`).
@@ -70,8 +84,15 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
-- README, CLI `--help`, and `ratatosk.conf` now state the single-node /
-  capability-tier product contract verbatim.
+- **License changed from MIT to GPL-3.0-or-later.** The workspace `license`
+  field, `flake.nix` metadata, and `LICENSE` file were updated together.
+- The product contract sentence now says the supported subset is tested against
+  Redis; the interop suite and CI never exercised Valkey.
+- README rewritten around the problem Ratatosk solves and the capability-tier
+  contract; maintainer-only planning and harness files are no longer tracked.
+- README and CLI `--help` now state the single-node / capability-tier product
+  contract verbatim; `ratatosk.conf` documents `compatibility-mode` and
+  `protected-mode` with a pointer to it.
 - `cargo-deny` configuration updated to match the current tool schema
 
 ### Migration notes

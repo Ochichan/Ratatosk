@@ -1,5 +1,11 @@
 # Ratatosk Architecture & Compatibility Reference
 
+2026-09-06 persistence update: Part 3 below describes the current materialized
+BASE/INCR and timestamped AOF implementation. The older design review in Part 5
+predates those changes; its statements that BASE materialization and runtime AOF
+lifecycle are absent are superseded. Command notes in `docs/redis-gap-ledger.json`
+are authoritative over the historical embedded ledger.
+
 이 문서는 6개의 개별 문서를 통합한 단일 참조 문서다.
 
 - Part 1: Architecture (원본: `architecture-ratatosk.md`)
@@ -13,7 +19,7 @@
 
 # Part 1: Architecture
 
-이 문서는 **현재 저장소 코드 기준**(2026-06-02) 아키텍처를 설명한다.
+이 문서는 **현재 저장소 코드 기준** 아키텍처를 설명한다 (2026-09-08 대조).
 과거 계획 문서가 아니라 실제 구현 상태를 기준으로 작성했다.
 
 ## Snapshot
@@ -32,6 +38,7 @@
 ratatosk-server
   ├── ratatosk-engine
   ├── ratatosk-persist
+  ├── ratatosk-resp (frame 타입, 인코딩 길이 계산)
   └── ratatosk-core
 
 ratatosk-persist
@@ -101,9 +108,9 @@ ratatosk-core
 - `execute(frame, &mut access, &mut client_state)` 호출. `access`는 `ServerAccess` 래퍼로, `SharedState` 내부 `Mutex<ServerState>`를 잠근 뒤 생성된다.
   DB 값 자체는 per-DB `parking_lot::RwLock` 기반 `DataState`에 놓여 있고, `SharedState.data`와 inner `ServerState.data`는 같은 backing shard를 공유한다.
   다만 현재 런타임의 대부분의 명령은 여전히 `meta` mutex를 잡은 상태에서 실행되므로, cross-DB 병렬성은 저장소 레이어의 잠재력이고 일반 command path의 기본 성질은 아니다.
-  예외적으로 `PING` / `ECHO` / `TIME` / `DBSIZE` / `TYPE` / `EXISTS` / `GET` / `MGET` / `STRLEN` / `BITCOUNT` / `GETBIT` / `GETRANGE` / `SUBSTR` / `HGET` / `HMGET` / `HGETALL` / `HKEYS` / `HVALS` / `HEXISTS` / `HLEN` / `HSTRLEN` / `SISMEMBER` / `SMISMEMBER` / `SCARD` / `ZSCORE` / `ZCARD` / `ZMSCORE` / `ZCOUNT` / `ZLEXCOUNT` / `ZRANGE` / `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` / `ZRANGEBYLEX` / `ZREVRANGEBYLEX` / `ZREVRANGE` / `ZRANK` / `ZREVRANK` / `LLEN` / `LINDEX` / `LRANGE` / `TTL` / `PTTL` / `EXPIRETIME` / `PEXPIRETIME`는 default ACL policy cache가 `nopass + full access`인 연결에 한해 lock-free fast path를 탈 수 있다. readonly pipeline이 이 커맨드들로만 이루어진 경우에도 batch 전체가 lock-free로 처리된다. fast path를 탈 수 없는 readonly batch는 더 이상 배치 전체를 한 번에 잠그지 않고, 명령별로 `meta` lock을 다시 잡으며 순차 실행한다. 이 batch gate는 이제 fast path 집합 외에도 non-blocking readonly command spec을 받아들이며, `WAIT` / `WAITAOF` / connection / pubsub 계열은 제외한다. 일반 단건 경로도 lock 밖에서 만든 argv를 재사용하므로, locked path에서 같은 RESP frame을 다시 파싱하지 않는다. 여기에 더해 default-user `nopass` 승격과 즉시 `NOAUTH`로 끝나는 요청은 공용 precheck helper로 먼저 걸러서, 불필요하게 `meta` lock을 잡지 않도록 했다. `PING HEALTH`처럼 서버 메타 상태가 필요한 변형은 여전히 locked path를 사용한다. 다만 fast path도 실행 후에는 공용 post-execute helper를 통해 slowlog/latency, client tracking reset, MONITOR broadcast를 맞추고, `MULTI` 안에서는 큐잉 의미론을 우회하지 않도록 비활성화된다. `EXISTS`와 `GET`은 atomic keyspace hit/miss counter까지 함께 갱신한다.
+  예외적으로 `PING` / `ECHO` / `TIME` / `DBSIZE` / `TYPE` / `EXISTS` / `GET` / `MGET` / `STRLEN` / `BITCOUNT` / `GETBIT` / `GETRANGE` / `SUBSTR` / `HGET` / `HMGET` / `HGETALL` / `HKEYS` / `HVALS` / `HEXISTS` / `HLEN` / `HSTRLEN` / `SISMEMBER` / `SMISMEMBER` / `SCARD` / `ZSCORE` / `ZCARD` / `ZMSCORE` / `ZCOUNT` / `ZLEXCOUNT` / `ZRANGE` / `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` / `ZRANGEBYLEX` / `ZREVRANGEBYLEX` / `ZREVRANGE` / `ZRANK` / `ZREVRANK` / `LLEN` / `LINDEX` / `LRANGE` / `TTL` / `PTTL` / `EXPIRETIME` / `PEXPIRETIME`는 default user가 full access인 연결에 한해 lock-free fast path를 탈 수 있다 (미인증 연결은 default user가 `nopass`이기도 해야 하고, 인증된 default-user 연결은 full access만 필요하다). readonly pipeline이 이 커맨드들로만 이루어진 경우에도 batch 전체가 lock-free로 처리된다. fast path를 탈 수 없는 readonly batch는 더 이상 배치 전체를 한 번에 잠그지 않고, 명령별로 `meta` lock을 다시 잡으며 순차 실행한다. 이 batch gate는 이제 fast path 집합 외에도 non-blocking readonly command spec을 받아들이며, `WAIT` / `WAITAOF` / connection / pubsub 계열은 제외한다. 일반 단건 경로도 lock 밖에서 만든 argv를 재사용하므로, locked path에서 같은 RESP frame을 다시 파싱하지 않는다. 여기에 더해 default-user `nopass` 승격과 즉시 `NOAUTH`로 끝나는 요청은 공용 precheck helper로 먼저 걸러서, 불필요하게 `meta` lock을 잡지 않도록 했다. `PING HEALTH`처럼 서버 메타 상태가 필요한 변형은 여전히 locked path를 사용한다. 다만 fast path도 실행 후에는 공용 post-execute helper를 통해 slowlog/latency, client tracking reset, MONITOR broadcast를 맞추고, `MULTI` 안에서는 큐잉 의미론을 우회하지 않도록 비활성화된다. `EXISTS`와 `GET`은 atomic keyspace hit/miss counter까지 함께 갱신한다.
   stats/config 읽기/client id 할당/default ACL cache는 lock-free.
-- `CommandOutcome { response, close, retry_blocking, config_dirty, acl_dirty }`로 결과를 통일한다.
+- `CommandOutcome { response, close, delay_ms, retry_blocking, config_dirty, acl_dirty }`로 결과를 통일한다.
 
 ### 5) Blocking command retry
 
@@ -116,7 +123,7 @@ ratatosk-core
 `crates/ratatosk-resp/src/encode.rs`:
 
 - `+OK`, `+PONG`, `:0`, `:1`, `$-1`는 shared static 인코딩 사용.
-- `encoded_len()`으로 flush 전 output limit 예측.
+- `encoded_len_for_version()`으로 flush 전 output limit 예측.
 - `OUTPUT_BUFFER_FLUSH_THRESHOLD` (16 KiB)마다 배치 flush.
 
 ## Core State Model
@@ -127,7 +134,7 @@ ratatosk-core
 
 | Component | Type | 역할 |
 |-----------|------|------|
-| `atomic_stats` | `AtomicStatsState` | 11개 lock-free atomic counter (total_commands_processed, connected_clients, total_connections_received, net_input/output_bytes, evicted/expired_keys, keyspace_hits/misses, instantaneous_ops_per_sec, cached_memory_estimate) |
+| `stats` | `AtomicStatsState` | 11개 lock-free atomic counter (total_commands_processed, connected_clients, total_connections_received, net_input/output_bytes, evicted/expired_keys, keyspace_hits/misses, instantaneous_ops_per_sec, cached_memory_estimate) |
 | `default_acl_policy` | `DefaultAclPolicyState` | default user의 `nopass` / full-access 여부를 lock-free로 캐시 |
 | `config_cache` | `arc_swap::ArcSwap<ConfigState>` | lock-free config 읽기 (`config_cache.load()`) |
 | `next_client_id` | `AtomicI64` | lock 없이 새 client ID 할당 |
@@ -171,8 +178,8 @@ pub struct DbShard {
 ```
 
 - `db(idx)` → `MappedRwLockReadGuard<HashMap>` (auto-deref로 `&HashMap`처럼 사용)
-- `db_mut(idx)` → `MappedRwLockWriteGuard<HashMap>` (auto-deref로 `&mut HashMap`처럼 사용)
-- `write_two_dbs(a, b)` — ascending index 순서로 2개 DB 동시 write lock (MOVE, SWAPDB용)
+- `db_mut(idx)` → `DbWriteGuard<'_>` (`insert`/`remove`/`set_key_expiry`가 메모리 추정치와 expires index를 함께 갱신)
+- `write_two_dbs(a, b)` — ascending index 순서로 2개 DB 동시 write lock (SWAPDB용; MOVE는 `db_mut()`를 순차로 잡는다)
 - `write_all_dbs()` — 전체 DB ascending lock (FLUSHALL, load_from_rdb용)
 - `snapshot_all()` — DB별 순차 read-lock + clone (BGSAVE용)
 
@@ -229,7 +236,7 @@ eviction/cron/notification 관련 설정이 `ConfigState`에 포함된다:
 | `hz` | `10` | server_cron 주파수 |
 | `notify_keyspace_events` | `""` (비활성) | keyspace notification 설정 |
 | `lazyfree_lazy_*` | `false` | lazy free 정책 |
-| `tcp_keepalive` | `300` | TCP keepalive 초 |
+| `tcp_keepalive` | `300` | `CONFIG GET` 보고용 값. 소켓 keepalive에는 아직 적용되지 않는다 |
 
 ## Nervous System: server_cron
 
@@ -247,11 +254,11 @@ eviction/cron/notification 관련 설정이 `ConfigState`에 포함된다:
 
 - channel/shard/pattern subscription map을 분리 유지.
 - RESP3 Push wrapping: 모든 메시지 타입(Message, SMessage, PMessage, Invalidate, TrackingRedirectBroken)이 RESP3 push frame으로 래핑된다.
-- **mpsc push delivery**: per-subscriber `tokio::sync::mpsc::channel` 기반. `register_client()`가 `mpsc::Receiver<PubSubMessage>`를 반환하며, channel capacity는 `hard_limit`으로 설정된다.
+- **mpsc push delivery**: per-subscriber `tokio::sync::mpsc::channel` 기반. `register_client()`가 `mpsc::Receiver<PubSubMessage>`를 반환하며, channel capacity는 `max(hard_limit, 1)`로 설정된다 (이미 만들어진 채널의 capacity는 런타임 변경으로 바뀌지 않는다).
 - `publish()`는 `try_send()`로 메시지를 전달한다. channel이 가득 차면 overflow로 간주하고, receiver가 `None`을 수신하여 disconnect된다.
 - **초기화**: `PubSubState::new(&ConfigState)`로 생성되어 `ConfigState`가 유일한 기본값 출처 (single source of truth). `pending_queue_limit()`도 `self.hard_limit`을 반환하여 런타임 변경이 즉시 반영됨.
 - `CONFIG GET/SET pubsub-queue-hard-limit`으로 런타임 조정 가능.
-- Client tracking invalidation도 동일한 per-client mpsc 채널을 통해 자동 전달된다 (`mark_write_command → invalidate_tracked_keys → tracking_invalidate_keys → pubsub.enqueue_invalidation`).
+- Client tracking invalidation도 동일한 per-client mpsc 채널을 통해 자동 전달된다 (`maybe_track_write_version → invalidate_tracked_keys → tracking_invalidate_keys → pubsub.enqueue_invalidation`).
 - Monitor notifications는 별도 `Arc<Notify>` 경로를 사용한다 (`register_monitor_notifier()`).
 
 ### Client Loop (WaitResult)
@@ -263,7 +270,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 - `MonitorWake` — monitor notifier 깨어남
 - `NetworkRead` — 네트워크 입력
 
-제거된 API: `drain_messages()`, `take_overflowed_client()`, `client_notifiers` HashMap, `soft_limit_exceeded_at`.
+제거된 API: `drain_messages()`, `take_overflowed_client()`, pubsub 쪽 `client_notifiers` HashMap, `soft_limit_exceeded_at`. (`BlockingState`의 `client_notifiers`는 blocking command wake-up용으로 남아 있다.)
 
 ## Concurrency Model
 
@@ -378,7 +385,6 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 - `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 
 (`maxmemory*`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET` 전용이며 `CONFIG SET`은 'ERR Unknown option'을 반환한다.)
-- `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 
 ## Build / Run / Test
 
@@ -716,7 +722,7 @@ crates/ratatosk-server/src/persistence/
 | RDB | `dump.rdb` | Point-in-time binary snapshot. 빠른 로딩, 데이터 손실 가능 (마지막 save 이후) |
 | AOF | `appendonly.aof.*` | 명령 단위 append. 더 강한 durability, 파일 크기 큼 |
 
-Recovery 순서: RDB 로드 → AOF replay.
+AOF가 활성화되어 있으면 manifest의 BASE + INCR만 복구한다. 독립 `dump.rdb`를 먼저 합치지 않는다. AOF 이력이 없는 최초 활성화 때만 RDB를 읽고 authoritative BASE로 변환한다.
 
 ---
 
@@ -851,7 +857,10 @@ writer.append_command(0, &[
 
 기능:
 - RESP array 형식으로 인코딩 (`*<count>\r\n$<len>\r\n<data>\r\n...`)
-- DB index가 변경되면 자동으로 `SELECT` 명령 삽입
+- writer를 열고 처음 쓸 때와 DB index가 변경될 때 `SELECT` 명령 삽입
+- engine이 수집한 실제 변경을 기록하고, `EXEC`의 변경은 하나의 `MULTI`/`EXEC` AOF envelope로 기록
+- SET/expiry의 절대 만료 시각, XADD의 확정 ID, SPOP의 실제 제거 대상을 기록
+- state lock 안에서 변경 실행과 AOF append 완료를 순서대로 처리하며, `always`는 fsync 후 응답
 - 빈 명령은 무시
 
 ### Fsync Policy
@@ -859,7 +868,7 @@ writer.append_command(0, &[
 | Policy | 동작 | 특성 |
 |--------|------|------|
 | `Always` | 매 write 후 `flush + sync_all` | 가장 강한 durability, 가장 느림 |
-| `EverySec` | 마지막 fsync에서 1초 이상 경과 시 | 기본값, 좋은 균형 |
+| `EverySec` | 쓰기 경로와 독립 1초 timer에서 fsync | 유휴 상태의 마지막 쓰기도 동기화 |
 | `No` | `flush`만 (OS에 맡김) | 가장 빠름, 데이터 손실 가능 |
 
 `CONFIG SET appendfsync always|everysec|no`로 런타임 변경 가능.
@@ -875,7 +884,7 @@ Redis 7+ 호환 manifest 기반 AOF 관리. AOF를 BASE + INCR 파일로 분리�
   appendonly.aof.manifest     (manifest: BASE/INCR 목록)
   appendonly.aof.1.incr.aof   (INCR: 증분 append)
   appendonly.aof.2.incr.aof   (INCR: 증분 append)
-  appendonly.aof.base.aof     (BASE: rewrite 결과)
+  appendonly.aof.1.base.rdb   (BASE: 현재 상태를 materialize한 snapshot)
 ```
 
 주요 API:
@@ -893,6 +902,13 @@ Redis 7+ 호환 manifest 기반 AOF 관리. AOF를 BASE + INCR 파일로 분리�
 
 AOF 파일을 재생하여 서버 상태를 복구한다.
 
+새 파일은 `REDIS-AOF-002`를 사용한다. timestamp envelope 안의 명령과
+`EXEC`는 당시 시각으로 실행되어, 상대 TTL과 만료 전 후속 변경의 순서가
+보존된다. 시간 override는 동기 실행 범위와 현재 thread에만 적용된다.
+version 1/legacy RESP는 읽을 수 있으며 writer가 header를 원자적으로
+upgrade한다. 이전 기록에는 timestamp가 없으므로 과거의 잘못된 만료 이력을
+복원할 수는 없다. 업그레이드·롤백 절차는 `docs/operations.md`를 따른다.
+
 ```rust
 let mut state = ServerState::with_default_dbs();
 let replayed = AofRecovery::replay_file(&path, &mut state)?;
@@ -902,9 +918,10 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 1. 파일 전체를 메모리에 읽기
 2. `ratatosk_resp::parse()`로 RESP 프레임 파싱
 3. `ratatosk_engine::command::execute()`로 각 명령 실행
-4. 파싱 에러 발생 시 남은 데이터 건너뜀 (graceful 절단 처리)
+4. 최초 손상 또는 미완료 transaction 이전의 검증된 prefix에서 중단
+5. startup이 파일을 해당 경계로 truncate하고 fsync한 뒤 새 쓰기를 허용
 
-절단된 AOF 파일은 마지막 완전한 명령까지만 복구하고 경고 로그를 남긴다.
+완료되지 않은 `MULTI`는 부분 적용하지 않는다. 잘못된 데이터 안의 RESP 모양 바이트를 새 명령으로 간주하지 않는다. 실행 오류나 알 수 없는 format은 startup을 실패시킨다.
 
 ---
 
@@ -913,12 +930,27 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 서버 시작 시 데이터 복구:
 
 ```
-1. RDB 파일 존재? → RdbLoader::load_into()
-2. AOF 파일 존재? → AofRecovery::replay_file() (manifest의 recovery_files() 순서)
-3. 둘 다 없으면 빈 상태로 시작
+1. AOF 활성 + 유효한 이력: manifest BASE → INCR 순서로 복구 (독립 dump.rdb 제외)
+2. 새 AOF + 기존 RDB: RDB를 로드하고 첫 BASE를 만든 뒤 쓰기 허용
+3. AOF 비활성: 독립 RDB만 로드
+4. 이력이 없으면 빈 상태로 시작; 누락된 manifest/segment는 기본적으로 실패
 ```
 
-AOF가 RDB 이후에 재생되므로, RDB 스냅샷 이후의 변경 사항이 AOF에서 복구된다.
+`BGREWRITEAOF`는 mutation lock 안에서 snapshot과 rewrite enqueue 순서를 확정한다. BASE와 새 INCR을 준비한 뒤 manifest를 전환한다. 이전 파일은 자동 삭제하지 않으므로, 장기 운영 시 보존 파일의 용량 관리가 필요하다.
+
+RDB BASE는 해시 필드의 절대 만료 시각, stream group의 마지막 전달 ID,
+consumer별 pending ID와 seen time, PEL의 소유자·전달 횟수·전달 시각을
+보존한다. 이 metadata는 Ratatosk 전용 type 128/129로 저장하며 기존
+hash/stream 인코딩은 읽기 호환을 유지한다.
+
+`CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다.
+
+`EXEC` 내부의 설정 변경은 최종 committed state를 기준으로 반영한다.
+활성화는 최종 snapshot 한 번으로 transaction을 포함하고, 비활성화는
+transaction의 변경을 기존 writer에 기록·flush한 뒤 종료한다. worker가
+접수한 policy/shutdown 요청은 확정 결과까지 기다리며, 오래된 rewrite의
+완료 통지는 writer generation이 바뀌면 폐기한다. 저장 오류 latch는 새
+BASE와 writer의 활성화가 성공한 뒤에만 초기화한다.
 
 참고: Pub/Sub delivery는 per-subscriber `mpsc::channel` 기반 push 방식이므로 AOF에 기록되지 않는다. AOF는 state-mutating 명령만 기록하며, Pub/Sub 메시지와 client tracking invalidation은 휘발성 delivery 경로로 처리된다.
 
@@ -1027,7 +1059,7 @@ Legacy single-file AOF 모드에서는 `aof_current_size`만 의미가 있으며
 
 Deployment model, distribution boundaries, and honest limitations for Ratatosk.
 
-Last updated: 2026-06-02
+Last verified against code: 2026-09-08
 
 ---
 
@@ -1041,7 +1073,7 @@ Last updated: 2026-06-02
 | Replication | Metadata skeleton only; no network replication stream |
 | Failover | Not supported |
 
-Ratatosk is a standalone, single-process, in-memory data server. It listens on a single TCP endpoint and serves all clients from one process. There is no built-in mechanism to distribute data across multiple Ratatosk instances.
+Ratatosk is a standalone, single-process, in-memory data server. It serves all clients from one process on a single RESP TCP endpoint, plus a separate Prometheus HTTP endpoint (`RATATOSK_METRICS_BIND`, default `127.0.0.1:9090`). There is no built-in mechanism to distribute data across multiple Ratatosk instances.
 
 ---
 
@@ -1051,7 +1083,7 @@ Ratatosk accepts cluster-related commands at the protocol level for client compa
 
 | Command | Behavior |
 |---------|----------|
-| `CLUSTER INFO` | Returns `cluster_enabled:0` with zeroed counters |
+| `CLUSTER INFO` | Returns `cluster_enabled:0`, `cluster_known_nodes:1`, and zeroed slot counters |
 | `CLUSTER MYID` | Returns a local node ID (not part of any cluster) |
 | `CLUSTER KEYSLOT` | Computes CRC16 hash slot (local calculation only) |
 | `CLUSTER COUNTKEYSINSLOT` / `GETKEYSINSLOT` | Operates on local keyspace |
@@ -1078,8 +1110,8 @@ Ratatosk maintains a replication metadata skeleton for protocol compatibility. A
 | `REPLCONF` | Accepts LISTENING-PORT/CAPA/IP-ADDRESS/ACK/GETACK for metadata tracking |
 | `ROLE` | Returns master/replica mode and logical replication offset |
 | `INFO replication` | Returns local replication metadata |
-| `WAIT` | Returns immediately with currently tracked replica ACK count (no blocking) |
-| `WAITAOF` | Returns immediately with local AOF health (no blocking) |
+| `WAIT` | Returns immediately with `min(tracked replica ACKs, requested)` (no blocking) |
+| `WAITAOF` | Returns immediately with `[local_ack, replica_ack]`; `local_ack` is `1` when AOF is enabled and not latched (no blocking) |
 
 Key limitations:
 
@@ -1087,7 +1119,7 @@ Key limitations:
 - **No network stream**: No data is transmitted to any replica.
 - **No partial resync**: `PSYNC` is rejected entirely.
 - **`WAIT` is non-blocking**: It returns the current replica ACK count instantly rather than waiting for acknowledgement during the timeout window.
-- **0 replicas in practice**: `WAIT` and `WAITAOF` will typically return 0 because no actual replication connections exist.
+- **0 replicas in practice**: `WAIT` returns `0` and `WAITAOF` returns `[1, 0]` (or `[0, 0]` without AOF) because no actual replication connections exist.
 
 ---
 
@@ -1102,7 +1134,7 @@ Ratatosk provides **durability** (surviving restarts) but not **distribution** (
 | Background save (`BGSAVE`) | Non-blocking snapshot creation | Offsite backup or failover |
 | AOF manifest (BASE + INCR) | Structured recovery ordering | Distribution or sharding |
 
-Recovery order on startup: RDB load, then AOF replay. Both operate on the local filesystem only.
+Recovery order on startup: if the AOF manifest chain has authoritative data, its BASE snapshot and INCR files are loaded and the standalone RDB is not consulted; otherwise the RDB is loaded and any AOF replayed. Both operate on the local filesystem only.
 
 **Ratatosk is a single point of failure.** If the node goes down, the service is unavailable until the process restarts and replays persisted data.
 
@@ -1118,7 +1150,7 @@ Recovery order on startup: RDB load, then AOF replay. Both operate on the local 
 | Lock-free config reads | `arc_swap::ArcSwap<ConfigState>` via `config_cache.load()` |
 | Lock-free client ID | `AtomicI64` for new connection ID allocation |
 | Pub/Sub delivery | Per-subscriber `tokio::sync::mpsc::channel` (push, no polling) |
-| Background threads | Lazy-free, RDB save, AOF rewrite |
+| Background work | Lazy-free thread; Tokio tasks for `BGSAVE` and `BGREWRITEAOF` |
 | I/O thread pool | Placeholder only (not active) |
 
 Command execution is effectively serial for state mutation. The mutex is held for the duration of each mutating command. However, `SharedState` eliminates ~9 lock acquisitions per client request by moving stats, config reads, and client ID allocation to lock-free paths. Pub/Sub delivery operates outside the mutex via mpsc channels.
@@ -1132,7 +1164,7 @@ Command execution is effectively serial for state mutation. The mutex is held fo
 | Feature gate | `lua-scripting` |
 | Lua version | 5.1 (vendored via `mlua`) |
 | Sandbox | TABLE+STRING+MATH+OS+BASE libs only |
-| Memory limit | 1 MB per script |
+| Memory limit | 1 MiB per thread-local Lua VM |
 | Instruction limit | 100K per script |
 | Nested EVAL | Rejected |
 
@@ -1140,14 +1172,14 @@ Supported commands when `lua-scripting` is enabled:
 
 | Command | Status |
 |---------|--------|
-| `EVAL` / `EVAL_RO` | Functional |
-| `EVALSHA` / `EVALSHA_RO` | Functional |
+| `EVAL` / `EVAL_RO` | Functional (`EVAL_RO` is an alias; read-only is not enforced) |
+| `EVALSHA` / `EVALSHA_RO` | Functional (`EVALSHA_RO` is an alias; read-only is not enforced) |
 | `SCRIPT LOAD` | Functional |
 | `SCRIPT EXISTS` | Functional |
 | `SCRIPT FLUSH` | Functional |
-| `FCALL` / `FUNCTION *` | **Not implemented** (Redis Functions are not supported) |
+| `FCALL` / `FUNCTION LOAD/DELETE/RESTORE` | **Not implemented** (Redis Functions are not supported); `FUNCTION HELP/LIST/DUMP/STATS/FLUSH` answer with empty local results |
 
-When `lua-scripting` is disabled, `EVAL` and `EVALSHA` return unsupported errors.
+When `lua-scripting` is disabled, `EVAL` returns `ERR Scripting not supported in this build` and `EVALSHA` returns `NOSCRIPT`.
 
 ---
 

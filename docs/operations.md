@@ -99,7 +99,7 @@ applies behind the proxy (TLS is transport, not authentication).
 - RDB는 point-in-time snapshot이다
 - AOF는 local durability mechanism이다
 - durability는 distribution을 의미하지 않는다
-- startup replay 순서는 RDB -> AOF다
+- AOF 활성 시 manifest의 BASE + INCR만 복구한다. 독립 RDB와 전체 AOF를 중복 적용하지 않는다. 새 AOF를 기존 RDB 위에서 시작할 때는 첫 BASE를 만든다.
 - persistence format migration이나 rollback safety에 예외 플래그가 필요하면, 그 환경은 ship-ready로 간주하지 않는다
 
 ### Durability contract by fsync policy
@@ -109,20 +109,32 @@ the contract — it is exercised by `scripts/recovery_matrix.sh` (Phase 4).
 
 | Config | Acknowledged-write loss window on `kill -9` | Loss on graceful shutdown | Notes |
 |---|---|---|---|
-| `appendonly no` (RDB only) | everything since the last `SAVE`/`BGSAVE` | nothing if shutdown flush succeeds | snapshot durability; cron `save` rules bound the window |
+| `appendonly no` (RDB only) | everything since the last `SAVE`/`BGSAVE` | everything since the last completed snapshot | explicitly complete and verify a snapshot before shutdown |
 | `appendonly yes`, `appendfsync always` | **0** — every acknowledged write is fsynced | 0 | strongest; highest per-write cost |
-| `appendonly yes`, `appendfsync everysec` | **≤ 1 second** of acknowledged writes | 0 | default-recommended balance |
+| `appendonly yes`, `appendfsync everysec` | approximately 1 second of acknowledged writes | 0 | default-recommended balance |
 | `appendonly yes`, `appendfsync no` | up to the OS page-cache flush interval | 0 | OS decides; weakest AOF durability |
 
 Recovery invariants (asserted by `scripts/recovery_matrix.sh`):
 
-- **Truncated AOF tail** → server starts and recovers a consistent *prefix*; it never crashes and never invents writes beyond what was acknowledged.
+- **Truncated AOF tail** → server starts and recovers a consistent *prefix*; the incomplete transaction is omitted and the invalid tail is removed before new writes. A fully recorded write can be replayed even if the client did not receive its reply.
 - **`kill -9` during `BGREWRITEAOF`** → restart recovers the full pre-rewrite dataset; no corruption.
 - **Missing manifest with segments on disk** → server either rebuilds or fails startup cleanly; it never reports an empty keyspace as a successful start (no silent data loss).
 - **Repeated `BGREWRITEAOF`** → keyspace size is stable across rewrites.
-- **Disk full** is surfaced via `ratatosk_aof_write_errors_total` + the `RatatoskAofWriteErrors` alert (constrained-FS injection is CI-only).
+- **Disk full** is surfaced via `ratatosk_aof_write_errors_total` + the `RatatoskAofWriteErrors` alert. The recovery matrix does not simulate a full disk.
 
 Backup / restore / rollback is reproducible via `scripts/backup_restore_drill.sh`.
+
+### Persistence format upgrade
+
+- New writes use `REDIS-AOF-002` with a timestamped RESP envelope. Replay executes each command/transaction at its recorded wall clock, then normal reads and expiry resume at the real clock. This preserves relative expiries and mutations made before an earlier deadline.
+- Readers accept version 1 and version 2 AOF files. Opening a version 1 or legacy RESP file for append atomically upgrades its header while preserving its existing command bytes; it needs temporary free space approximately equal to that file's size. Old commands have no execution timestamps, so upgrading cannot reconstruct already-lost history or correct every historical TTL decision; materialize a verified current dataset with `BGREWRITEAOF` before relying on the new guarantee.
+- RDB snapshots retain hash-field absolute deadlines and stream group/consumer/PEL state using private type bytes 128 and 129. Older Ratatosk encodings remain readable. Ratatosk RDB and DUMP formats are not a promise of Redis binary-file interchange.
+- Before upgrading a populated instance, stop writes, take an offline copy of the complete data directory (manifest, BASE, all INCRs and independent RDB), and verify the copy with the old binary. Start the new binary against a copy first; compare database contents, expiry deadlines, stream groups and pending messages, then restart it and repeat the comparison before switching clients.
+- A binary-only downgrade after new writes is unsupported. Roll back by stopping the new instance and restoring the complete pre-upgrade directory with the old binary; writes made after cutover require a separately planned export. Keep the backup and orphaned old AOF files until the verification period ends. No cleanup of old lineage files is automatic.
+
+The local tests exercise interrupted transactions, legacy-header upgrade,
+metadata round trips and crash/restart against private data directories. Production-sized migration, power-loss and application soak
+testing remain separate release conditions.
 
 ## 5. 운영 계약
 
@@ -327,9 +339,9 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 | RDB snapshot | 완료 | save/load + CRC64 + atomic write |
 | AOF writer | 완료 | RESP append + fsync 정책 |
 | AOF recovery | 완료 | RESP 파싱 -> execute 재생 |
-| AOF manifest | 부분 구현 | save/load, bootstrap/recovery, manifest switch helper, rewrite 후 새 INCR rotation 연결. BASE materialization과 full atomic switch는 아직 없음 |
+| AOF manifest | 구현 | materialized RDB BASE + 새 INCR 준비 후 manifest 전환, 단일 authoritative recovery chain |
 | Background save | 완료 | `BGSAVE` background snapshot worker + shutdown drain |
-| AOF rewrite | 완료 | `BGREWRITEAOF` background rewrite worker. Redis식 current-state compaction은 아님 |
+| AOF rewrite | 완료 | 현재 상태를 BASE로 저장하고 새 INCR로 전환. 이전 파일은 보존하므로 용량 관리 필요 |
 | AOF 서버 통합 | 완료 | write 명령 후 자동 append 경로 존재 |
 | Blocking commands | 완료 | blocked wait registry + producer-side wakeup (list/sorted-set/stream) |
 | Client tracking | 부분 구현 | direct/BCAST/PREFIX/NOLOOP/OPTIN/OPTOUT + redirect wakeup. Redis full contract는 아직 |
@@ -359,7 +371,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - RDB snapshot으로 주기적 데이터 백업.
 - AOF로 명령 단위 durability 확보.
-- 서버 재시작 시 RDB -> AOF 순서로 데이터 복구.
+- AOF 활성 시 BASE + INCR, 비활성 시 독립 RDB를 복구.
 
 ### 4) Redis-compatible endpoint
 
@@ -1432,7 +1444,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 #### 부족한 점
 
 - perf gate가 CI required가 아니다.
-- sustained load, p95/p99, max client envelope, memory growth envelope가 문서화되어 있지 않다.
+- p99 목표는 `docs/SLO.md`에 있고 `scripts/capacity_envelope.sh`로 측정할 수 있지만, sustained load · max client envelope · memory growth envelope의 측정 결과는 아직 문서화되어 있지 않다.
 - 현재 whole-command meta lock은 성능 ceiling을 낮출 수 있다.
 
 #### 10점 조건
@@ -1466,7 +1478,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 
 - [README Nix section](../README.md#L57-L76)
 - [ecosystem deployment baseline](./operations.md)
-- [autostart runbook](../AUTOSTART_RUNBOOK_KO.md#L1-L176)
+- autostart installers: `scripts/install-ratatosk-autostart.sh` (systemd --user) and `scripts/install-ratatosk-autostart-macos.sh` (launchd)
 
 #### 부족한 점
 
@@ -1498,7 +1510,7 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 #### 현재 상태
 
 - version은 아직 `0.1.0`
-- release tag 없음
+- `vX.Y.Z` release tag 없음 (`sidecar-v0.1.0` 태그만 존재)
 - changelog 존재
 - semver/support policy 존재
 - release workflow 존재

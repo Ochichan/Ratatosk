@@ -1,11 +1,11 @@
 # Ratatosk Product Contract
 
-> **Single source of the product boundary.** README, CLI `--help`, Docker image
-> description, `COMMAND DOCS`, the gap ledger, and release notes all repeat the
-> sentences in §1. If any surface drifts from this document, this document wins
+> **Single source of the product boundary.** README and CLI `--help` repeat the
+> sentence in §1 verbatim; `COMMAND DOCS` and the gap ledger carry the per-command
+> tier it promises. If any surface drifts from this document, this document wins
 > and the surface is the bug. Established by Phase 0 of `docs/RELEASE_ROADMAP.md`.
 
-Last synced with code + ledger: **2026-06-02**.
+Last synced with code + ledger: **2026-09-08**.
 
 ---
 
@@ -14,12 +14,12 @@ Last synced with code + ledger: **2026-06-02**.
 > **EN:** Ratatosk is a single-node, Redis-compatible, RESP2/RESP3 in-memory
 > server for cache, Pub/Sub, and local durability. It is **not** a Redis Cluster,
 > Sentinel, or replication-compatible drop-in replacement. Every command exposes
-> a capability tier; the supported subset is tested against Redis/Valkey.
+> a capability tier; the supported subset is tested against Redis.
 
 > **KO:** Ratatosk는 캐시 · Pub/Sub · 로컬 지속성을 위한 단일 노드 Redis 호환
 > RESP2/RESP3 인메모리 서버다. Redis Cluster · Sentinel · replication 호환 drop-in
 > 대체재가 **아니다**. 모든 명령은 capability tier를 노출하며, 지원 subset은
-> Redis/Valkey와 대조 검증된다.
+> Redis와 대조 검증된다.
 
 ---
 
@@ -32,7 +32,7 @@ Last synced with code + ledger: **2026-06-02**.
 | Local RDB snapshot + AOF durability | Real network replication stream (PSYNC) |
 | Broad Redis command surface (420 entries) | Replica-backed `WAIT` / `WAITAOF` semantics |
 | Per-command capability tier metadata | Redis Functions parity |
-| Tested supported subset vs Redis/Valkey | Search / JSON / Vector modules |
+| Tested supported subset vs Redis | Search / JSON / Vector modules |
 
 The out-of-scope column is **published, not hidden** — see `docs/RELEASE_ROADMAP.md`
 Phase 9. Naming the gaps is part of the honesty contract.
@@ -148,11 +148,11 @@ operators get a cause, not just a status word. `reasons:none` when healthy.
 
 | Item | Risk if unmanaged | Mitigation (status) |
 |---|---|---|
-| `done=420` phrasing | read as "identical to Redis" | "surface 420, semantics vary by tier" everywhere (✅ this doc, README, CLI) |
+| `done=420` phrasing | read as "identical to Redis" | "surface 420, semantics vary by tier" (✅ this doc, README; CLI `--help` states the tier rule without the count) |
 | `syntax_only` (6) | client/tool reads false success | `strict` mode → ERR; `compat` mode documented (✅ implemented) |
 | Cluster/Sentinel helpers | looks cluster-capable | tiered `unsupported`; strict ERR (✅) |
 | `WAIT` / `WAITAOF` | metadata read as durability | strict ERR; not replica-backed (✅) |
-| Lua / Functions | feature-gated vs ledger drift | `FUNCTION *`/`FCALL` unsupported; Lua experimental (see roadmap Phase 8) |
+| Lua / Functions | feature-gated vs ledger drift | `FUNCTION LOAD/DELETE/RESTORE` and `FCALL`/`FCALL_RO` unsupported; other `FUNCTION` subcommands `baseline_local`; `EVAL` family behind the `lua-scripting` feature and `unsupported` in the default build |
 | no-op admin | ops automation reads false success | tiered + strict ERR + documented (✅) |
 | Unauthenticated remote bind | data store exposed without a password | `protected-mode yes` default → non-loopback + `nopass` default user fails startup (✅) |
 

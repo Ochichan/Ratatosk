@@ -1,6 +1,6 @@
-   Compiling ratatosk-engine v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-engine)
-   Compiling ratatosk-persist v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-persist)
-   Compiling ratatosk-server v0.1.0 (/home/ochi/Documents/Project/Ratatosk/crates/ratatosk-server)
+   Compiling ratatosk-engine v0.1.0 (<repo>/crates/ratatosk-engine)
+   Compiling ratatosk-persist v0.1.0 (<repo>/crates/ratatosk-persist)
+   Compiling ratatosk-server v0.1.0 (<repo>/crates/ratatosk-server)
     Finished `bench` profile [optimized] target(s) in 26.08s
      Running benches/pipeline.rs (target/release/deps/pipeline-38ec57b04c826300)
 Gnuplot not found, using plotters backend

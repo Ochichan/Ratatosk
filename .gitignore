@@ -39,3 +39,15 @@ __pycache__/
 .cargo-home/
 .cargo-install/
 .cargo/config.local.toml
+
+# ---------------------------------------------------------------------------
+# Maintainer-private material — never published.
+# Agent harness, personal notes, and integration plans for private projects.
+# ---------------------------------------------------------------------------
+/AGENTS.md
+/docs/ai/
+/.command-center/
+/settings.local.json
+/.DS_Store
+
+

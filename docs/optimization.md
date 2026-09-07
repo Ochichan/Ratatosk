@@ -71,7 +71,7 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 `ServerState` 내부 `DataState`가 DB별 `parking_lot::RwLock<DbShard>`를 관리한다:
 
 - `db(idx)` → `MappedRwLockReadGuard<HashMap>`: 읽기 명령은 read lock 공유
-- `db_mut(idx)` → `MappedRwLockWriteGuard<HashMap>`: 쓰기 명령은 해당 DB만 exclusive lock
+- `db_mut(idx)` → `DbWriteGuard<'_>`: 쓰기 명령은 해당 DB만 exclusive lock. guard의 `insert`/`remove`/`set_key_expiry`가 메모리 추정치와 expires index를 함께 갱신한다
 - 서로 다른 DB에 대한 명령은 lock contention 없이 병렬 실행 가능
 - `snapshot_all()`: BGSAVE 시 DB별 순차 read-lock + clone. 전체 global lock 점유 대신 DB 하나씩 짧게 잠금
 - Lock ordering: 항상 ascending DB index 순서로 획득 → deadlock 방지
@@ -79,13 +79,13 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 
 #### AtomicStatsState
 
-10개 `AtomicU64` counter로 매 요청마다 lock 없이 stats를 갱신:
+11개 atomic counter로 매 요청마다 lock 없이 stats를 갱신 (`crates/ratatosk-engine/src/stats.rs`의 `AtomicStatsState`):
 
-- `total_commands_processed`, `connected_clients`
-- `net_input_bytes`, `net_output_bytes`
+- `total_commands_processed`, `connected_clients`, `total_connections_received`
+- `total_net_input_bytes`, `total_net_output_bytes`
 - `evicted_keys`, `expired_keys`
 - `keyspace_hits`, `keyspace_misses`
-- `ops_per_sec`, `cached_memory_estimate`
+- `instantaneous_ops_per_sec`, `cached_memory_estimate`
 
 `INFO` 명령의 stats 섹션이 이 atomic counter를 직접 읽으므로, stats 조회도 lock-free.
 
@@ -98,7 +98,7 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 
 #### Atomic Client ID
 
-`AtomicU64::fetch_add`로 새 연결의 client ID를 할당. accept 경로에서 lock이 불필요.
+`AtomicI64::fetch_add`로 새 연결의 client ID를 할당. accept 경로에서 lock이 불필요.
 
 ### Pub/Sub: mpsc Push Delivery
 
@@ -106,106 +106,20 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 
 성능 이점:
 - **Zero polling overhead**: 이전의 20ms polling interval이 제거됨. 메시지가 즉시 push 전달.
-- **Backpressure**: `try_send()` 기반. channel capacity (= hard_limit) 초과 시 즉시 overflow → disconnect.
+- **Backpressure**: `try_send()` 기반. channel capacity (= `max(hard_limit, 1)`) 초과 시 즉시 overflow → disconnect.
 - **Client loop 통합**: `WaitResult` enum으로 pub/sub, monitor, network read를 단일 `select!`에서 처리.
 - **Client tracking invalidation**: 동일 mpsc 채널을 통해 자동 전달. 별도 delivery 경로 불필요.
 
 ---
 
-### Optimization Plan: cmd_string.rs
+### Optimization Plan: cmd_string.rs (completed)
 
-#### Priority 1: Hot Path - High Impact
+이 절에 있던 string hot-path 계획은 모두 반영되었다. 현재 상태:
 
-##### 1.1 `cmd_get` - Double Lookup 제거
-
-**현재 문제**:
-```rust
-let found = db.contains_key(key);  // 1st lookup
-if !found { ... }
-let entry = &server.db(client.selected_db)[key];  // 2nd lookup
-```
-
-**개선안**:
-```rust
-let Some(entry) = db.get(key) else {
-    server.stats.mark_keyspace_miss();
-    return CommandOutcome::reply(RespFrame::BulkString(None));
-};
-
-server.stats.mark_keyspace_hit();
-if !entry.is_string() {
-    return wrong_type_response();
-}
-CommandOutcome::reply(RespFrame::BulkString(entry.as_string().cloned()))
-```
-
-**예상 효과**: GET 명령어 15-25% latency 감소
-
-##### 1.2 `cmd_incr_decr_with_delta` - Allocation Churn 제거
-
-**현재 문제**:
-```rust
-Bytes::from(next.to_string())  // heap allocation on every INCR/DECR
-```
-
-**개선안**: `itoa` crate 사용
-```rust
-let mut buffer = itoa::Buffer::new();
-let formatted = buffer.format(next);
-Bytes::from(formatted.to_owned())
-```
-
-**예상 효과**: INCR/DECR ~30-50% allocation overhead 감소
-
-##### 1.3 `cmd_incrbyfloat` - 불필요한 Clone 제거
-
-**개선안**: encoded를 한 번만 clone
-```rust
-let encoded = format_f64_for_redis(next);
-let encoded_for_reply = encoded.clone();
-db.insert(key.clone(), StoredValue::string(encoded, expire_at_ms));
-CommandOutcome::reply(RespFrame::BulkString(Some(encoded_for_reply)))
-```
-
-**예상 효과**: INCRBYFLOAT 1 allocation 감소
-
-#### Priority 2: Medium Impact
-
-##### 2.1 `cmd_set` - Option Parsing Allocation 제거
-
-**개선안**: Case-insensitive direct slice 비교로 `to_uppercase_bytes()` 호출 제거
-```rust
-fn option_matches(bytes: &[u8], expected: &[u8]) -> bool {
-    bytes.len() == expected.len() &&
-    bytes.iter().zip(expected).all(|(b, e)| b.to_ascii_uppercase() == *e)
-}
-```
-
-**예상 효과**: SET with options ~20% allocation 감소
-
-##### 2.2 `cmd_msetnx` - 단일 패스 최적화 (보류)
-
-원자성 보장을 위해 두 패스가 필요할 수 있음. Semantic 변경 위험 > 성능 이익.
-
-#### Priority 3: Architecture Review
-
-##### 3.1 `cmd_mget` - Clone 필수 여부
-
-`Bytes`는 Arc-based로 clone이 cheap (O(1)). **현재 구현이 이미 최적화됨. 변경 불필요.**
-
-#### Implementation Order
-
-1. **`cmd_get` double lookup** - 즉시 적용, 낮은 위험
-2. **`cmd_incrbyfloat` clone 제거** - 즉시 적용, 낮은 위험
-3. **`cmd_incr_decr_with_delta` allocation** - itoa 의존성 추가 후 적용
-4. **`cmd_set` option parsing** - 리팩토링 필요, 중간 위험
-
-#### Testing Strategy
-
-1. 기존 unit test 통과 확인
-2. Integration test with redis-benchmark
-3. Criterion microbenchmark for affected functions
-4. Memory allocation counting before/after
+- `cmd_get` (`crates/ratatosk-engine/src/command/cmd_string_access.rs`): 단일 `db.get(key)` 조회. double lookup 없음.
+- `INCR`/`DECR` (`cmd_string_numeric.rs`): 결과를 `StoredValue::string_int(next, expire_at_ms)`로 저장하므로 요청마다 문자열 heap allocation이 발생하지 않는다.
+- `SET` 옵션 파싱 (`cmd_string_access.rs`): `eq_ignore_ascii_case` 기반 slice 비교. 대문자 변환 allocation 없음.
+- 정수 문자열은 `ValueData::StringInt(i64)`로 보관되며 `OBJECT ENCODING`은 `int`를 반환한다.
 
 ---
 
@@ -395,7 +309,7 @@ pub fn estimate_used_memory(state: &ServerState) -> usize {
     }
 }
 
-// perform_eviction에서 이 함수를 최대 130회 호출:
+// perform_eviction에서 이 함수를 최대 128회 호출:
 // 1회 (memory_before) + 최대 128회 (loop) + 1회 (memory_after)
 ```
 
@@ -1426,7 +1340,7 @@ Phase 8 (Hot Path)         ── 독립 실행 가능 (일부 Phase 1 이후)
 
 ## Part 3: Optimization Execution Checklist
 
-> 작성일: 2026-04-05
+> 작성일: 2026-04-05 · 체크 상태는 2026-09-08에 현재 코드와 대조해 갱신했다. 수치는 각 Phase 실행 시점의 기록이다.
 > 기반: Part 2 (RAM/CPU Optimization Master Plan) + 실측 검토 결과
 > 불변 규칙: **모든 Phase 완료 시 zero-warning 상태 유지**
 
@@ -1472,16 +1386,16 @@ hashbrown HashMap shell = 40 bytes
   - `load_from_rdb()` 제거
 - [x] `save_state()` 공개 API는 유지 (테스트에서 사용 중) — `write_preamble()+write_db()` 재사용
 - [x] `crates/ratatosk-server/src/persistence/aof.rs`의 `save()` 호출도 동일하게 확인
-  - line 667, 721: `rdb::saver::save(&state.snapshot_dbs(), &runtime.rdb_path)` — 이미 올바름
+  - 현재는 `rdb::saver::save_atomic(snapshot, &base_path)`로 AOF BASE 스냅샷을 쓴다
 
 #### 검증
-- [x] `cargo test -p ratatosk-persist` — RDB saver 테스트 전체 통과 (48 passed)
-- [x] `cargo test -p ratatosk-server` — persistence 통합 테스트 통과 (79 passed)
+- [x] `cargo test -p ratatosk-persist` — RDB saver 테스트 전체 통과
+- [x] `cargo test -p ratatosk-server` — persistence 통합 테스트 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
 - [x] RDB 파일 무결성: 기존 save_state 테스트 4개 + save→load 왕복 모두 통과
 
 #### 검토 노트
-- `save_state()`는 테스트 코드 4곳에서 직접 사용하므로 삭제하지 않는다.
+- `save_state()`는 테스트 코드에서 직접 사용하므로 삭제하지 않는다.
 - `save_snapshot()`과 `save_state()` 간 직렬화 로직 중복을 
   private helper로 통합할 수 있지만, 이 Phase에서는 범위를 제한한다.
 
@@ -1506,14 +1420,11 @@ hashbrown HashMap shell = 40 bytes
   pub fn set_encoding(&mut self, enc: Encoding) { self.encoding_and_lru = ((enc as u32) << LRU_BITS) | (self.encoding_and_lru & LRU_MASK); }
   pub fn lru_clock(&self) -> u32 { self.encoding_and_lru & LRU_MASK }
   pub fn set_lru_clock(&mut self, clock: u32) { self.encoding_and_lru = (self.encoding_and_lru & !LRU_MASK) | (clock & LRU_MASK); }
-  pub fn set_lru_clock_value(&mut self, c: u32) { self.lru_clock = c; }
-  pub fn encoding_value(&self) -> Encoding { self.encoding }
-  pub fn set_encoding_value(&mut self, e: Encoding) { self.encoding = e; }
   ```
 - [x] 전체 소스 `.expire_at_ms` 직접 접근 → `.expire_at_ms()` / `.set_expire_at_ms()` 전환 (86건)
 - [x] `.lru_clock` → `.lru_clock()` / `.set_lru_clock()` 전환 (3건)
 - [x] `.data` → `.data()` / `.data_mut()` 전환 (6건)
-- [x] `embedded.rs` `StoredValueExt::from_data()` → `StoredValue::new()` 사용
+- [x] `embedded.rs`는 encoding별 생성을 위해 `StoredValueExt::from_data()`를 유지
 - [x] `cargo test --workspace` 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
 
@@ -1535,7 +1446,7 @@ hashbrown HashMap shell = 40 bytes
 - [x] Box clone 비용 수용 확인 (cache friendliness net positive)
 
 #### 검증
-- [x] `cargo test --workspace` 전체 통과 (362 tests)
+- [x] `cargo test --workspace` 전체 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
 - [x] `cargo fmt --all --check` 통과
 - [x] `size_of::<StoredValue>()` == 24 확인 테스트 추가
@@ -1559,7 +1470,7 @@ hashbrown HashMap shell = 40 bytes
 
 > **위험도 중, eviction CPU 99% 절감**
 > `estimate_used_memory()` O(N) 전체 순회를 O(1) atomic read로 교체.
-> `perform_eviction()` 내부에서 최대 130회 O(N) → 130회 O(1).
+> `perform_eviction()` 내부에서 최대 128회 O(N) → 128회 O(1).
 
 #### 사전 조건
 - [x] Phase 1 완료 (StoredValue 96B→24B, estimate에 자동 반영)
@@ -1577,21 +1488,14 @@ hashbrown HashMap shell = 40 bytes
 > 새 코드에서는 tracked helper를 사용하고, 기존 코드는 점진적으로 전환.
 > 전환 완료 전까지는 주기적 full-scan 보정이 정확성을 보장.
 
-- [ ] `DbShard`에 추적 메서드 추가:
-  ```rust
-  impl DbShard {
-      pub fn tracked_insert(&mut self, key: Bytes, value: StoredValue, mem: &AtomicUsize) -> Option<StoredValue>;
-      pub fn tracked_remove(&mut self, key: &Bytes, mem: &AtomicUsize) -> Option<StoredValue>;
-  }
-  ```
-- [ ] `eviction.rs`의 `estimate_object_memory()` 재활용 (이미 존재)
-- [ ] `perform_eviction()` 내 `db_mut().remove()` → `tracked_remove()` 전환
-- [ ] lazy_free_del, lazy_free_flush_db → tracked 버전 추가
+- [x] 추적은 `DbWriteGuard::insert` / `DbWriteGuard::remove` (`keyspace.rs`)가 담당한다. 별도의 `tracked_*` 메서드는 두지 않았다.
+- [x] `eviction.rs`의 `estimate_object_memory()` 재활용
+- [x] `perform_eviction()`은 `state.db_mut(db_idx).remove(&key)`로 제거하며 accounting은 guard 안에서 일어난다
 
 #### Step 2-C: perform_eviction 수정
 
 - [x] `memory_before`/loop `used`/`memory_after` → `state.data.estimated_memory()` O(1)
-- [x] eviction remove 시 `data.sub_memory(db_idx, freed)` 호출
+- [x] eviction remove는 `DbWriteGuard::remove()`를 거치므로 accounting이 자동으로 반영된다
 - [x] `estimate_used_memory()` 유지 (주기적 full-scan 보정용)
 
 #### Step 2-D: 주기적 보정
@@ -1602,9 +1506,9 @@ hashbrown HashMap shell = 40 bytes
 - [x] `clear_db()` / `clear_all_dbs()`: `reset_memory(idx, 0)` + `expires.clear()`
 
 #### 검증
-- [x] `cargo test --workspace` 통과 (362 passed, 0 failed)
+- [x] `cargo test --workspace` 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
-- [x] eviction 테스트 11개 통과 (tracked_insert helper 사용)
+- [x] eviction 테스트 통과
 - [x] `cargo fmt --all --check` 통과
 
 #### 검토 노트
@@ -1642,24 +1546,16 @@ hashbrown HashMap shell = 40 bytes
       }
   }
   ```
-- [ ] 기존 `purge_expired_key()` — 삭제 시 `expires.remove()` 추가
-- [ ] 기존 `purge_expired_keys()` — retain 후 `expires` 동기화
-- [ ] `clear_db()` — `expires.clear()` 추가
-- [ ] `swap_dbs()` — `expires`도 swap 확인 (DbShard 전체 swap이므로 자동)
+- [x] 만료 키 purge 경로에서 `expires` 동기화
+- [x] DB clear 경로에서 `expires` 정리
+- [x] `swap_dbs()` — DbShard 전체 swap이므로 `expires`도 함께 이동
 
 #### Step 3-C: 커맨드 핸들러 동기화 지점
 
-> 키 레벨 TTL을 변경하는 모든 지점에서 `sync_expire_index()` 호출.
+> 키 레벨 TTL 변경은 `DbWriteGuard::insert()`(삽입 시 동기화)와 `DbWriteGuard::set_key_expiry()`를 통해서만 이루어진다.
 
-- [ ] `cmd_key.rs` PERSIST (line 30): `entry.expire_at_ms.take()` → `sync_expire_index()`
-- [ ] `cmd_key.rs` EXPIRE/PEXPIRE (line 489): `entry.expire_at_ms = Some(target)` → `sync_expire_index()`
-- [ ] `cmd_string_access.rs` SET with EX/PX (line 259, 266)
-- [ ] `cmd_generic_string.rs` SET EX/PX 옵션 파싱 후 insert
-- [ ] `cmd_generic_dump.rs` RESTORE (line 109)
-- [ ] `direct.rs` expire/persist (line 1014, 1051)
-- [ ] **insert() 경로**: `StoredValue` 생성 시 expire 포함 여부에 따라 자동 동기화
-  - 53건의 `StoredValue::*()` 호출 → insert 직후 `sync_expire_index()` 필요
-  - **대안**: `tracked_insert()` (Phase 2)에 통합
+- [x] PERSIST / EXPIRE / PEXPIRE / RESTORE / `direct.rs`의 TTL 변경은 `DbWriteGuard::set_key_expiry()`를 사용한다
+- [x] **insert() 경로**: `DbWriteGuard::insert()`가 `StoredValue`의 expire 포함 여부에 따라 `expires`를 자동 동기화
 
 #### Step 3-D: Active Expiry 수정
 
@@ -1670,9 +1566,9 @@ hashbrown HashMap shell = 40 bytes
 
 #### Step 3-E: Eviction 수정
 
-- [ ] `eviction.rs`의 `select_eviction_candidate()`:
-  - `volatile-*` 정책: `shard.expires.iter()` 에서 직접 샘플링
-  - `allkeys-*` 정책: 기존대로 `shard.data.iter()`
+- [x] `eviction.rs`:
+  - `volatile-*` 정책: `shard.expires`에서 직접 샘플링
+  - `allkeys-*` 정책: 기존대로 `shard.data`에서 샘플링
 
 #### Step 3-F: RDB/Startup 시 Expires 구축
 
@@ -1680,15 +1576,15 @@ hashbrown HashMap shell = 40 bytes
 - [x] AOF recovery는 명령 재실행이므로 핸들러 레벨에서 동기화 — 후속 점진 적용
 
 #### 검증
-- [x] `cargo test --workspace` 통과 (362 passed, 0 failed)
+- [x] `cargo test --workspace` 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
-- [x] expiry 테스트 5개 통과 (insert_tracked helper로 expires 자동 동기화)
+- [x] expiry 관련 검증 통과 (guard insert가 expires를 자동 동기화)
   - SET key val EX 60 → `shard.expires.contains_key(key)` == true
   - PERSIST key → `shard.expires.contains_key(key)` == false
   - DEL key → `shard.expires.contains_key(key)` == false
   - EXPIRE → `shard.expires[key]` == expected_ms
-- [ ] 신규 테스트: active_expire_cycle이 expires index에서 올바르게 샘플링
-- [ ] 기존 expiry 테스트 3개 통과
+- [x] `active_expire_cycle_removes_expired_keys` — expires index 기반 샘플링 검증
+- [x] `expiry.rs` 테스트 3개 통과
 - [ ] `#[cfg(test)] fn assert_expires_invariant(shard: &DbShard)` — 
   data 내 expire와 expires index가 일치하는지 검증하는 불변식 체크 함수 추가
 - [ ] RDB save → load 후 expires index 재구축 검증
@@ -1756,11 +1652,11 @@ hashbrown HashMap shell = 40 bytes
 - [x] `should_lazy_free` / `estimate_object_memory` / `cmd_server_memory` 모두 업데이트
 - [x] RDB save/load 왕복 48개 테스트 통과
 - [x] AOF replay 테스트 통과
-- [x] `cargo test --workspace` 362 테스트 전체 통과
+- [x] `cargo test --workspace` 전체 통과
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
 
 #### 검토 노트
-- **ValueData enum 크기**: `StringInt(i64)` = 8B < 현재 최대 64B → enum 크기 불변
+- **ValueData enum 크기**: `StringInt(i64)` = 8B < 현재 최대 72B → enum 크기 불변 (`keyspace.rs`의 size 테스트가 72B를 고정)
 - **OBJECT ENCODING 응답**: Redis는 정수 문자열에 "int" 반환 → `Encoding::Int` 사용
 - **edge case**: 빈 문자열 "", "+0", "-0", leading zeros "007" → String으로 유지
   (Redis 동작과 일치)
@@ -1777,7 +1673,7 @@ hashbrown HashMap shell = 40 bytes
 - [ ] Phase 1 완료
 
 #### 구현
-- [ ] `keyspace.rs`에 `ValueData::SetInt(Vec<i64>)` variant 추가
+- [x] `keyspace.rs`에 `ValueData::SetInt(Vec<i64>)` variant 추가
 - [ ] CONFIG 파라미터: `set-max-intset-entries` (기본 512) → `config.rs`에 추가
 - [ ] IntSet helper 메서드:
   ```rust
@@ -1976,7 +1872,7 @@ hashbrown HashMap shell = 40 bytes
 - [x] mimalloc + jemalloc 동시 활성화 방지: `compile_error!` 가드 추가
 
 #### 검증
-- [x] `cargo test --workspace` 통과 (362 tests)
+- [x] `cargo test --workspace` 통과
 - [ ] `cargo test --workspace --features jemalloc` 통과 — CI에서 확인
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` 통과
 - [x] `cargo clippy -p ratatosk-server --features jemalloc -- -D warnings` 통과
@@ -2077,10 +1973,12 @@ hashbrown HashMap shell = 40 bytes
   ```rust
   pub fn format_f64_for_redis(value: f64) -> Bytes {
       let mut buf = ryu::Buffer::new();
-      Bytes::copy_from_slice(buf.format(value).as_bytes())
+      let s = buf.format(value);
+      let trimmed = s.strip_suffix(".0").unwrap_or(s);
+      Bytes::copy_from_slice(trimmed.as_bytes())
   }
   ```
-- [x] 테스트: 전체 362 tests 통과 (f64 formatting 역호환 확인)
+- [x] 테스트: workspace 전체 통과 (f64 formatting 역호환 확인)
 
 #### 8-B: cmd_append entry API 최적화
 
@@ -2097,7 +1995,6 @@ hashbrown HashMap shell = 40 bytes
   - `RespFrame::Integer(-1)` → `b":-1\r\n"` (MISSING 등)
   - `RespFrame::Integer(-2)` → `b":-2\r\n"` (NO KEY 등)
   - `RespFrame::SimpleString("QUEUED")` → `b"+QUEUED\r\n"`
-  - `RespFrame::Error("...")` 중 빈번한 것 (WRONGTYPE 등)
 - [x] QUEUED, -1, -2 shared static 추가
 - [x] 테스트: encoded_len 일치 확인 (encode tests 통과)
 
