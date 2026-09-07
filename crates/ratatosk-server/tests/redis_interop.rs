@@ -262,7 +262,7 @@ fn bulk_text(frame: RespFrame) -> io::Result<String> {
 }
 
 #[test]
-fn scholar_v1_sidecar_wire_contract_smoke() -> io::Result<()> {
+fn sidecar_v1_wire_contract_smoke() -> io::Result<()> {
     let ratatosk_dir = tempfile::tempdir()?;
     let ratatosk_port = reserve_port()?;
 
@@ -298,46 +298,46 @@ fn scholar_v1_sidecar_wire_contract_smoke() -> io::Result<()> {
     assert_eq!(
         send_frame(
             &mut client,
-            array(&["SET", "nexus:cache:search:1", "payload", "EX", "60"])
+            array(&["SET", "app:cache:search:1", "payload", "EX", "60"])
         )?,
         RespFrame::ok()
     );
     assert_eq!(
-        send_frame(&mut client, array(&["GET", "nexus:cache:search:1"]))?,
+        send_frame(&mut client, array(&["GET", "app:cache:search:1"]))?,
         bulk("payload")
     );
-    match send_frame(&mut client, array(&["TTL", "nexus:cache:search:1"]))? {
+    match send_frame(&mut client, array(&["TTL", "app:cache:search:1"]))? {
         RespFrame::Integer(ttl) if (0..=60).contains(&ttl) => {}
         other => panic!("expected TTL for short-lived cache key to be 0..=60, got {other:?}"),
     }
     assert_eq!(
-        send_frame(&mut client, array(&["DEL", "nexus:cache:search:1"]))?,
+        send_frame(&mut client, array(&["DEL", "app:cache:search:1"]))?,
         RespFrame::Integer(1)
     );
     assert_eq!(
-        send_frame(&mut client, array(&["GET", "nexus:cache:search:1"]))?,
+        send_frame(&mut client, array(&["GET", "app:cache:search:1"]))?,
         RespFrame::BulkString(None)
     );
 
     assert_eq!(
-        send_frame(&mut client, array(&["INCR", "nexus:quota:provider:window"]))?,
+        send_frame(&mut client, array(&["INCR", "app:quota:provider:window"]))?,
         RespFrame::Integer(1)
     );
     assert_eq!(
         send_frame(
             &mut client,
-            array(&["EXPIRE", "nexus:quota:provider:window", "30"])
+            array(&["EXPIRE", "app:quota:provider:window", "30"])
         )?,
         RespFrame::Integer(1)
     );
-    match send_frame(&mut client, array(&["TTL", "nexus:quota:provider:window"]))? {
+    match send_frame(&mut client, array(&["TTL", "app:quota:provider:window"]))? {
         RespFrame::Integer(ttl) if (0..=30).contains(&ttl) => {}
         other => panic!("expected TTL for provider quota key to be 0..=30, got {other:?}"),
     }
 
     let xadd_id = bulk_text(send_frame(
         &mut client,
-        array(&["XADD", "nexus:telemetry", "*", "event", "search.completed"]),
+        array(&["XADD", "app:telemetry", "*", "event", "search.completed"]),
     )?)?;
     assert!(
         xadd_id.contains('-'),
@@ -346,20 +346,20 @@ fn scholar_v1_sidecar_wire_contract_smoke() -> io::Result<()> {
 
     let mut subscriber = connect_client(ratatosk_port)?;
     assert_eq!(
-        send_frame(&mut subscriber, array(&["SUBSCRIBE", "nexus:events"]))?,
+        send_frame(&mut subscriber, array(&["SUBSCRIBE", "app:events"]))?,
         RespFrame::Array(vec![
             bulk("subscribe"),
-            bulk("nexus:events"),
+            bulk("app:events"),
             RespFrame::Integer(1),
         ])
     );
     assert_eq!(
-        send_frame(&mut client, array(&["PUBLISH", "nexus:events", "changed"]))?,
+        send_frame(&mut client, array(&["PUBLISH", "app:events", "changed"]))?,
         RespFrame::Integer(1)
     );
     assert_eq!(
         read_frame(&mut subscriber)?,
-        RespFrame::Array(vec![bulk("message"), bulk("nexus:events"), bulk("changed"),])
+        RespFrame::Array(vec![bulk("message"), bulk("app:events"), bulk("changed"),])
     );
 
     Ok(())
