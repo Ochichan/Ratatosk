@@ -5,8 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
+
 use ratatosk_engine::eviction::EvictionPolicy;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 pub const DEFAULT_CONFIG_FILENAME: &str = "ratatosk.conf";
@@ -42,6 +45,9 @@ pub const DEFAULT_CLIENT_WRITE_TIMEOUT_SEC: u64 = 5;
 pub const DEFAULT_SLOWLOG_LOG_SLOWER_THAN_US: i64 = -1;
 pub const DEFAULT_SLOWLOG_MAX_LEN: usize = 128;
 pub const DEFAULT_LATENCY_TRACKING: bool = false;
+pub const DEFAULT_UNIXSOCKETPERM: u32 = 0o700;
+const DEFAULT_SHM_RING_BYTES: u32 = 1024 * 1024;
+const DEFAULT_SHM_SPIN_ITERS: u32 = 2000;
 
 const APPENDFSYNC_VALUES: &[&str] = &["always", "everysec", "no"];
 const COMPATIBILITY_MODE_VALUES: &[&str] = &["compat", "strict"];
@@ -82,6 +88,8 @@ impl LoadedConfig {
 
         apply_env_overrides(&mut config)?;
         validate_bind_security(&config)?;
+        validate_unixsocket(&config)?;
+        validate_shm_socket(&config)?;
 
         Ok(Self {
             config,
@@ -114,6 +122,22 @@ impl LoadedConfig {
 pub struct ServerConfig {
     pub bind: String,
     pub port: u16,
+    /// Optional Unix-domain socket listener path. `None` leaves Unix socket support disabled.
+    #[serde(serialize_with = "serialize_unixsocket")]
+    pub unixsocket: Option<PathBuf>,
+    /// Unix-domain socket permissions, parsed and rendered as octal digits.
+    ///
+    /// The default is `0o700`, deliberately stricter than Redis's `0` (which defers to umask).
+    #[serde(serialize_with = "serialize_unixsocketperm")]
+    pub unixsocketperm: u32,
+    /// Control socket for the experimental shared-memory transport. Requires the
+    /// `shm-transport` build feature; the socket file gets `unixsocketperm`.
+    #[serde(serialize_with = "serialize_unixsocket")]
+    pub shm_socket: Option<PathBuf>,
+    /// Per-direction ring size for shared-memory sessions (power of two).
+    pub shm_ring_bytes: u32,
+    /// Server-side spin iterations before a shared-memory session parks.
+    pub shm_spin_iters: u32,
     pub max_clients: usize,
     pub output_buffer_limit_bytes: usize,
     pub shutdown_grace_period_ms: u64,
@@ -163,6 +187,11 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1".to_string(),
             port: 6379,
+            unixsocket: None,
+            unixsocketperm: DEFAULT_UNIXSOCKETPERM,
+            shm_socket: None,
+            shm_ring_bytes: DEFAULT_SHM_RING_BYTES,
+            shm_spin_iters: DEFAULT_SHM_SPIN_ITERS,
             max_clients: DEFAULT_MAX_CLIENTS,
             output_buffer_limit_bytes: DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES,
             shutdown_grace_period_ms: DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
@@ -244,6 +273,31 @@ impl ServerConfig {
         writeln!(&mut out, "# Network").expect("write config");
         write_scalar(&mut out, "bind", &self.bind);
         write_number(&mut out, "port", self.port);
+        write_scalar(
+            &mut out,
+            "unixsocket",
+            &self
+                .unixsocket
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+        write_number(
+            &mut out,
+            "unixsocketperm",
+            format!("{:o}", self.unixsocketperm),
+        );
+        write_scalar(
+            &mut out,
+            "shm-socket",
+            &self
+                .shm_socket
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        );
+        write_number(&mut out, "shm-ring-bytes", self.shm_ring_bytes);
+        write_number(&mut out, "shm-spin-iters", self.shm_spin_iters);
         write_number(&mut out, "maxclients", self.max_clients);
         write_number(&mut out, "timeout", self.timeout);
         write_number(&mut out, "client-timeout-sec", self.client_timeout_sec);
@@ -363,6 +417,32 @@ pub enum ConfigError {
         "non-loopback RATATOSK_BIND '{value}' requires RATATOSK_ALLOW_INSECURE_BIND=true (or enable a TLS proxy)"
     )]
     InsecureBindRequiresOptIn { value: String },
+
+    #[error("Unix sockets are only supported on Unix targets: {path}")]
+    UnixSocketUnsupported { path: PathBuf },
+
+    #[error("resolving relative Unix socket path {path}: {source}")]
+    ResolveUnixSocketPath { path: PathBuf, source: io::Error },
+
+    #[error("Unix socket parent directory does not exist: {path}")]
+    UnixSocketParentMissing { path: PathBuf },
+
+    #[error("Unix socket parent is not a directory: {path}")]
+    UnixSocketParentNotDirectory { path: PathBuf },
+
+    #[error("Unix socket path exists and is not a socket: {path}")]
+    SocketPathNotASocket { path: PathBuf },
+
+    #[error("Unix socket path must be shorter than {max} bytes: {path}")]
+    SocketPathTooLong { path: PathBuf, max: usize },
+
+    #[error(
+        "shm-socket {path} requires a server built with the `shm-transport` feature (cargo build --features shm-transport)"
+    )]
+    ShmTransportNotBuilt { path: PathBuf },
+
+    #[error("shm-socket must differ from unixsocket: {path}")]
+    ShmSocketCollidesWithUnixSocket { path: PathBuf },
 }
 
 fn resolve_config_path(
@@ -421,6 +501,11 @@ fn apply_env_overrides(config: &mut ServerConfig) -> Result<(), ConfigError> {
     for (env_name, directive) in [
         ("RATATOSK_BIND", "bind"),
         ("RATATOSK_PORT", "port"),
+        ("RATATOSK_UNIXSOCKET", "unixsocket"),
+        ("RATATOSK_UNIXSOCKETPERM", "unixsocketperm"),
+        ("RATATOSK_SHM_SOCKET", "shm-socket"),
+        ("RATATOSK_SHM_RING_BYTES", "shm-ring-bytes"),
+        ("RATATOSK_SHM_SPIN_ITERS", "shm-spin-iters"),
         ("RATATOSK_MAX_CLIENTS", "maxclients"),
         (
             "RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES",
@@ -511,6 +596,79 @@ fn validate_bind_security(config: &ServerConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_shm_socket(config: &ServerConfig) -> Result<(), ConfigError> {
+    let Some(path) = config.shm_socket.as_deref() else {
+        return Ok(());
+    };
+    if !cfg!(feature = "shm-transport") {
+        return Err(ConfigError::ShmTransportNotBuilt {
+            path: path.to_path_buf(),
+        });
+    }
+    if config.unixsocket.as_deref() == Some(path) {
+        return Err(ConfigError::ShmSocketCollidesWithUnixSocket {
+            path: path.to_path_buf(),
+        });
+    }
+    validate_local_socket_path(path)
+}
+
+fn validate_unixsocket(config: &ServerConfig) -> Result<(), ConfigError> {
+    let Some(path) = config.unixsocket.as_deref() else {
+        return Ok(());
+    };
+    validate_local_socket_path(path)
+}
+
+fn validate_local_socket_path(path: &Path) -> Result<(), ConfigError> {
+    #[cfg(not(unix))]
+    {
+        return Err(ConfigError::UnixSocketUnsupported {
+            path: path.to_path_buf(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()
+                .map_err(|source| ConfigError::ResolveUnixSocketPath {
+                    path: path.to_path_buf(),
+                    source,
+                })?
+                .join(path)
+        };
+        if resolved.as_os_str().as_bytes().len() >= 104 {
+            return Err(ConfigError::SocketPathTooLong {
+                path: resolved,
+                max: 104,
+            });
+        }
+        let parent = resolved.parent().unwrap_or(Path::new("."));
+
+        if !parent.exists() {
+            return Err(ConfigError::UnixSocketParentMissing {
+                path: parent.to_path_buf(),
+            });
+        }
+        if !parent.is_dir() {
+            return Err(ConfigError::UnixSocketParentNotDirectory {
+                path: parent.to_path_buf(),
+            });
+        }
+
+        if let Ok(metadata) = fs::symlink_metadata(&resolved) {
+            if !metadata.file_type().is_socket() {
+                return Err(ConfigError::SocketPathNotASocket { path: resolved });
+            }
+        }
+
+        Ok(())
+    }
+}
+
 fn apply_directive(
     config: &mut ServerConfig,
     directive: &str,
@@ -519,6 +677,46 @@ fn apply_directive(
     match directive {
         "bind" => config.bind = expect_single_value(directive, values)?.to_string(),
         "port" => config.port = parse_u16(directive, expect_single_value(directive, values)?)?,
+        "unixsocket" => {
+            let value = expect_single_value(directive, values)?;
+            config.unixsocket = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        "unixsocketperm" => {
+            let value = parse_octal_u32(directive, expect_single_value(directive, values)?)?;
+            if value == 0 {
+                return Err(
+                    "directive 'unixsocketperm' must be 1..=777 (Redis's 0 = umask is not supported; Ratatosk always applies an explicit mode)".to_string(),
+                );
+            }
+            config.unixsocketperm = value;
+        }
+        "shm-socket" => {
+            let value = expect_single_value(directive, values)?;
+            config.shm_socket = (!value.is_empty()).then(|| PathBuf::from(value));
+        }
+        "shm-ring-bytes" => {
+            let value = expect_single_value(directive, values)?;
+            let parsed: u32 = value
+                .parse()
+                .map_err(|_| format!("directive '{directive}' requires a u32 value"))?;
+            if !parsed.is_power_of_two() || !(4096..=64 * 1024 * 1024).contains(&parsed) {
+                return Err(format!(
+                    "directive '{directive}' requires a power of two in 4096..=67108864"
+                ));
+            }
+            config.shm_ring_bytes = parsed;
+        }
+        "shm-spin-iters" => {
+            let parsed: u32 = expect_single_value(directive, values)?
+                .parse()
+                .map_err(|_| format!("directive '{directive}' requires a u32 value"))?;
+            if parsed > 1_000_000 {
+                return Err(format!(
+                    "directive '{directive}' must be at most 1000000 (spinning occupies a runtime worker)"
+                ));
+            }
+            config.shm_spin_iters = parsed;
+        }
         "maxclients" | "max-clients" => {
             config.max_clients =
                 parse_nonzero_usize(directive, expect_single_value(directive, values)?)?
@@ -806,6 +1004,17 @@ fn parse_u16(directive: &str, raw: &str) -> Result<u16, String> {
         .map_err(|_| format!("directive '{directive}' requires a valid u16 integer"))
 }
 
+fn parse_octal_u32(directive: &str, raw: &str) -> Result<u32, String> {
+    let value = u32::from_str_radix(raw, 8)
+        .map_err(|_| format!("directive '{directive}' requires an octal value in 0..=777"))?;
+    if value > 0o777 {
+        return Err(format!(
+            "directive '{directive}' requires an octal value in 0..=777"
+        ));
+    }
+    Ok(value)
+}
+
 fn parse_u32(directive: &str, raw: &str) -> Result<u32, String> {
     raw.parse::<u32>()
         .map_err(|_| format!("directive '{directive}' requires a valid unsigned integer"))
@@ -866,6 +1075,25 @@ fn write_number<T: std::fmt::Display>(out: &mut String, key: &str, value: T) {
     writeln!(out, "{key} {value}").expect("write config");
 }
 
+fn serialize_unixsocket<S>(value: &Option<PathBuf>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(
+        &value
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn serialize_unixsocketperm<S>(value: &u32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(&format!("{value:o}"))
+}
+
 fn format_scalar_value(value: &str) -> String {
     if value.is_empty()
         || value
@@ -909,6 +1137,8 @@ fn env_truthy(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
     use std::{
         path::PathBuf,
         sync::{Mutex, OnceLock},
@@ -916,6 +1146,8 @@ mod tests {
 
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    use super::{ConfigError, validate_local_socket_path};
     use super::{
         DEFAULT_ACTIVE_EXPIRE_CYCLE_LOOKUPS, DEFAULT_ACTIVE_EXPIRE_CYCLE_THRESHOLD_PCT,
         DEFAULT_APPENDFSYNC, DEFAULT_APPENDONLY, DEFAULT_CLIENT_TIMEOUT_SEC,
@@ -925,8 +1157,8 @@ mod tests {
         DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES, DEFAULT_PUBSUB_QUEUE_HARD_LIMIT,
         DEFAULT_PUBSUB_QUEUE_SOFT_LIMIT, DEFAULT_PUBSUB_QUEUE_SOFT_SECONDS,
         DEFAULT_QUERY_BUFFER_LIMIT, DEFAULT_SHUTDOWN_GRACE_PERIOD_MS,
-        DEFAULT_SLOWLOG_LOG_SLOWER_THAN_US, DEFAULT_SLOWLOG_MAX_LEN, DEFAULT_TIMEOUT, LoadedConfig,
-        ServerConfig, is_loopback_bind,
+        DEFAULT_SLOWLOG_LOG_SLOWER_THAN_US, DEFAULT_SLOWLOG_MAX_LEN, DEFAULT_TIMEOUT,
+        DEFAULT_UNIXSOCKETPERM, LoadedConfig, ServerConfig, is_loopback_bind,
     };
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1002,6 +1234,8 @@ mod tests {
         );
         assert_eq!(config.slowlog_max_len, DEFAULT_SLOWLOG_MAX_LEN);
         assert_eq!(config.latency_tracking, DEFAULT_LATENCY_TRACKING);
+        assert_eq!(config.unixsocket, None);
+        assert_eq!(config.unixsocketperm, DEFAULT_UNIXSOCKETPERM);
         assert_eq!(
             config.pubsub_queue_hard_limit,
             DEFAULT_PUBSUB_QUEUE_HARD_LIMIT
@@ -1112,8 +1346,8 @@ mod tests {
         let config_path = dir.path().join("ratatosk.conf");
         std::fs::write(&config_path, "port 6381\n").expect("write config");
 
-        let previous_dir = std::env::current_dir().expect("current dir");
         let _guard = env_lock().lock().expect("env lock");
+        let previous_dir = std::env::current_dir().expect("current dir");
         std::env::set_current_dir(dir.path()).expect("enter temp dir");
         unsafe { std::env::remove_var("RATATOSK_CONFIG") };
 
@@ -1134,8 +1368,8 @@ mod tests {
         let config_path = dir.path().join("ratatosk.conf");
         std::fs::write(&config_path, "port 6381\n").expect("write config");
 
-        let previous_dir = std::env::current_dir().expect("current dir");
         let _guard = env_lock().lock().expect("env lock");
+        let previous_dir = std::env::current_dir().expect("current dir");
         std::env::set_current_dir(dir.path()).expect("enter temp dir");
         unsafe { std::env::remove_var("RATATOSK_CONFIG") };
         unsafe { std::env::set_var("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true") };
@@ -1158,6 +1392,256 @@ mod tests {
         let rendered = config.render_redis_config();
         assert!(rendered.contains("dir \"/tmp/ratatosk data\""));
         assert!(rendered.contains("dbfilename \"dump data.rdb\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixsocket_directives_parse_and_render() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+        let socket_path = dir.path().join("ratatosk.sock");
+        std::fs::write(
+            &config_path,
+            format!(
+                "unixsocket \"{}\"\nunixsocketperm 750\n",
+                socket_path.display()
+            ),
+        )
+        .expect("write config");
+
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                ("RATATOSK_UNIXSOCKET", None),
+                ("RATATOSK_UNIXSOCKETPERM", None),
+            ],
+            || {
+                let loaded = LoadedConfig::load(Some(&config_path)).expect("load config");
+                assert_eq!(loaded.config.unixsocket, Some(socket_path.clone()));
+                assert_eq!(loaded.config.unixsocketperm, 0o750);
+
+                let rendered = loaded.config.render_redis_config();
+                assert!(rendered.contains(&format!("unixsocket {}", socket_path.display())));
+                assert!(rendered.contains("unixsocketperm 750"));
+            },
+        );
+
+        std::fs::write(&config_path, "unixsocket \"\"\n").expect("write empty socket config");
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                ("RATATOSK_UNIXSOCKET", None),
+                ("RATATOSK_UNIXSOCKETPERM", None),
+            ],
+            || {
+                let loaded = LoadedConfig::load(Some(&config_path)).expect("load config");
+                assert_eq!(loaded.config.unixsocket, None);
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixsocket_environment_overrides_config_file_values() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+        let configured_socket = dir.path().join("configured.sock");
+        let overridden_socket = dir.path().join("overridden.sock");
+        std::fs::write(
+            &config_path,
+            format!(
+                "unixsocket \"{}\"\nunixsocketperm 700\n",
+                configured_socket.display()
+            ),
+        )
+        .expect("write config");
+
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                (
+                    "RATATOSK_UNIXSOCKET",
+                    Some(overridden_socket.to_str().expect("UTF-8 temp path")),
+                ),
+                ("RATATOSK_UNIXSOCKETPERM", Some("750")),
+            ],
+            || {
+                let loaded = LoadedConfig::load(Some(&config_path)).expect("load config");
+                assert_eq!(loaded.config.unixsocket, Some(overridden_socket.clone()));
+                assert_eq!(loaded.config.unixsocketperm, 0o750);
+            },
+        );
+    }
+
+    #[test]
+    fn unixsocketperm_rejects_invalid_octal_values() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+
+        for (raw, expected_message) in [
+            (
+                "0",
+                "directive 'unixsocketperm' must be 1..=777 (Redis's 0 = umask is not supported; Ratatosk always applies an explicit mode)",
+            ),
+            (
+                "1000",
+                "directive 'unixsocketperm' requires an octal value in 0..=777",
+            ),
+            (
+                "888",
+                "directive 'unixsocketperm' requires an octal value in 0..=777",
+            ),
+        ] {
+            std::fs::write(&config_path, format!("unixsocketperm {raw}\n")).expect("write config");
+            with_env_vars(
+                &[
+                    ("RATATOSK_CONFIG", None),
+                    ("RATATOSK_UNIXSOCKET", None),
+                    ("RATATOSK_UNIXSOCKETPERM", None),
+                ],
+                || {
+                    let error = LoadedConfig::load(Some(&config_path))
+                        .expect_err("invalid octal permission should fail");
+                    assert!(error.to_string().contains(expected_message));
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn unixsocket_values_render_for_text_and_json_config_output() {
+        let dir = tempdir().expect("tempdir");
+        let socket_path = dir.path().join("ratatosk.sock");
+        let config = ServerConfig {
+            unixsocket: Some(socket_path.clone()),
+            unixsocketperm: 0o750,
+            ..ServerConfig::default()
+        };
+
+        let rendered = config.render_redis_config();
+        assert!(rendered.contains(&format!("unixsocket {}", socket_path.display())));
+        assert!(rendered.contains("unixsocketperm 750"));
+
+        let json = serde_json::to_value(&config).expect("serialize config");
+        assert_eq!(json["unixsocket"], socket_path.display().to_string());
+        assert_eq!(json["unixsocketperm"], "750");
+
+        let default_json =
+            serde_json::to_value(ServerConfig::default()).expect("serialize default");
+        assert_eq!(default_json["unixsocket"], "");
+        assert_eq!(default_json["unixsocketperm"], "700");
+
+        let default_text = ServerConfig::default().render_redis_config();
+        assert!(default_text.contains("unixsocket \"\""));
+        assert!(default_text.contains("unixsocketperm 700"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixsocket_requires_an_existing_parent_directory() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+        let missing_parent = dir.path().join("missing");
+        std::fs::write(
+            &config_path,
+            format!(
+                "unixsocket \"{}\"\n",
+                missing_parent.join("ratatosk.sock").display()
+            ),
+        )
+        .expect("write config");
+
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                ("RATATOSK_UNIXSOCKET", None),
+                ("RATATOSK_UNIXSOCKETPERM", None),
+            ],
+            || {
+                let error = LoadedConfig::load(Some(&config_path))
+                    .expect_err("missing Unix socket parent should fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Unix socket parent directory does not exist")
+                );
+            },
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixsocket_rejects_an_existing_regular_file() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+        let socket_path = dir.path().join("ratatosk.sock");
+        std::fs::write(&socket_path, "do not remove").expect("write regular file");
+        std::fs::write(
+            &config_path,
+            format!("unixsocket \"{}\"\n", socket_path.display()),
+        )
+        .expect("write config");
+
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                ("RATATOSK_UNIXSOCKET", None),
+                ("RATATOSK_UNIXSOCKETPERM", None),
+            ],
+            || {
+                let error = LoadedConfig::load(Some(&config_path))
+                    .expect_err("regular file socket path should fail");
+                assert!(matches!(
+                    error,
+                    ConfigError::SocketPathNotASocket { path } if path == socket_path
+                ));
+            },
+        );
+        assert!(socket_path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unixsocket_rejects_paths_at_the_portable_sun_path_limit() {
+        let socket_path = PathBuf::from(format!("/{}", "s".repeat(103)));
+        assert_eq!(socket_path.as_os_str().as_bytes().len(), 104);
+
+        let error =
+            validate_local_socket_path(&socket_path).expect_err("104-byte socket path should fail");
+        assert!(matches!(
+            error,
+            ConfigError::SocketPathTooLong { path, max: 104 } if path == socket_path
+        ));
+
+        let accepted_path = PathBuf::from(format!("/{}", "s".repeat(102)));
+        assert_eq!(accepted_path.as_os_str().as_bytes().len(), 103);
+        validate_local_socket_path(&accepted_path)
+            .expect("103-byte socket path should be accepted");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unixsocket_is_rejected_on_non_unix_targets() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("ratatosk.conf");
+        std::fs::write(&config_path, "unixsocket ratatosk.sock\n").expect("write config");
+
+        with_env_vars(
+            &[
+                ("RATATOSK_CONFIG", None),
+                ("RATATOSK_UNIXSOCKET", None),
+                ("RATATOSK_UNIXSOCKETPERM", None),
+            ],
+            || {
+                let error = LoadedConfig::load(Some(&config_path))
+                    .expect_err("Unix socket config should fail on non-Unix targets");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Unix sockets are only supported on Unix targets")
+                );
+            },
+        );
     }
 
     #[test]

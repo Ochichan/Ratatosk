@@ -1209,7 +1209,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 operational baseline implemented (GET/SET/HELP/RESETSTAT subset)."
+      "notes": "M0 operational baseline implemented (GET/SET/HELP/RESETSTAT subset; startup-only Unix socket listener configuration is exposed through GET)."
     },
     {
       "name": "CONFIG GET",
@@ -1222,7 +1222,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 operational baseline implemented (glob pattern matching over core params)."
+      "notes": "M0 operational baseline implemented (glob pattern matching over core params and startup-only unixsocket/unixsocketperm values)."
     },
     {
       "name": "CONFIG HELP",

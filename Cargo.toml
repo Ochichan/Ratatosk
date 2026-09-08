@@ -5,6 +5,7 @@ members = [
     "crates/ratatosk-engine",
     "crates/ratatosk-persist",
     "crates/ratatosk-server",
+    "crates/ratatosk-shm",
 ]
 resolver = "3"
 
@@ -24,6 +25,7 @@ ratatosk-resp = { path = "crates/ratatosk-resp" }
 ratatosk-engine = { path = "crates/ratatosk-engine" }
 ratatosk-persist = { path = "crates/ratatosk-persist" }
 ratatosk-server = { path = "crates/ratatosk-server" }
+ratatosk-shm = { path = "crates/ratatosk-shm" }
 
 # Zero-Copy fundamentals
 bytes = "1"
@@ -55,6 +57,7 @@ metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
 
 # Concurrency
+libc = "0.2"
 parking_lot = "0.12"
 crossbeam-channel = "0.5"
 arc-swap = "1"

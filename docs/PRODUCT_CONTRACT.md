@@ -27,12 +27,13 @@ Last synced with code + ledger: **2026-09-08**.
 
 | Provides | Does not provide |
 |---|---|
-| Single-node RESP2/RESP3 TCP server | Redis Cluster (bus / MOVED / ASK routing) |
+| Single-node RESP2/RESP3 server over TCP and Unix domain sockets | Redis Cluster (bus / MOVED / ASK routing) |
 | Cache + Pub/Sub + keyspace notifications | Sentinel failover |
 | Local RDB snapshot + AOF durability | Real network replication stream (PSYNC) |
 | Broad Redis command surface (420 entries) | Replica-backed `WAIT` / `WAITAOF` semantics |
 | Per-command capability tier metadata | Redis Functions parity |
 | Tested supported subset vs Redis | Search / JSON / Vector modules |
+| Experimental shared-memory transport (`--features shm-transport`, Unix only; not part of the support contract — see `docs/shm-transport.md`) | Sub-microsecond latency guarantees of any kind; measured numbers live in `benchmarks/ipc/` and `docs/IPC_TRANSPORT_DECISION.md` |
 
 The out-of-scope column is **published, not hidden** — see `docs/RELEASE_ROADMAP.md`
 Phase 9. Naming the gaps is part of the honesty contract.

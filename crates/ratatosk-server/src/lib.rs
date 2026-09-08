@@ -19,6 +19,7 @@ pub mod io_thread;
 pub mod metrics;
 pub mod persistence;
 pub mod rate_limiter;
+pub mod transport;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,6 @@
 use super::shared_support::append_encoded_frame;
 use super::*;
+use crate::transport::SessionStream;
 
 /// Result of the select-based I/O wait: either a pubsub message arrived,
 /// a monitor notification arrived, or network data was read.
@@ -10,8 +11,8 @@ pub(super) enum WaitResult {
     NetworkRead(usize),
 }
 
-pub(super) async fn wait_for_async_push_or_input(
-    stream: &mut TcpStream,
+pub(super) async fn wait_for_async_push_or_input<S: SessionStream>(
+    stream: &mut S,
     input: &mut BytesMut,
     pubsub_rx: &mut tokio::sync::mpsc::Receiver<PubSubMessage>,
     monitor_notifier: &Notify,
@@ -26,8 +27,8 @@ pub(super) async fn wait_for_async_push_or_input(
     }
 }
 
-pub(super) async fn write_all_with_timeout(
-    stream: &mut TcpStream,
+pub(super) async fn write_all_with_timeout<S: SessionStream>(
+    stream: &mut S,
     payload: &[u8],
     write_timeout: Duration,
 ) -> io::Result<()> {

@@ -1,7 +1,11 @@
 use std::{io, sync::Arc, time::Duration};
 
-#[cfg(target_os = "linux")]
-use std::fs;
+#[cfg(unix)]
+use std::{
+    fs,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
+    path::{Path, PathBuf},
+};
 
 use bytes::Bytes;
 use ratatosk_core::time::now_ms;
@@ -21,6 +25,9 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
+
 use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
@@ -29,6 +36,7 @@ use crate::{
         load_startup_data, start_bgsave, sync_server_aof_file_info,
     },
     rate_limiter::ConnectionRateLimiter,
+    transport::ConnInfo,
 };
 
 const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
@@ -62,6 +70,178 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
     }
 
     matches!(error.raw_os_error(), Some(11 | 23 | 24))
+}
+
+#[cfg(unix)]
+fn bind_unix_listener(
+    path: &Path,
+    permissions: u32,
+) -> io::Result<(UnixListener, SocketFileGuard)> {
+    // Ownership first: if another live instance holds the lock we stop here and
+    // never touch its socket file, whatever the connect probe below would say.
+    let (lock_path, lock) = acquire_socket_lock(path)?;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!(
+                        "unix socket path {} exists and is not a socket; refusing to remove it",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("reading unix socket metadata {}: {error}", path.display()),
+            ));
+        }
+    }
+
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "unix socket {} is already in use by a running server",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            ) =>
+        {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("removing stale unix socket {}: {error}", path.display()),
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("probing unix socket {}: {error}", path.display()),
+            ));
+        }
+    }
+
+    let listener = UnixListener::bind(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("binding unix socket {}: {error}", path.display()),
+        )
+    })?;
+    // From here on the socket file is ours; the guard removes it on any exit path.
+    let guard = SocketFileGuard {
+        path: path.to_path_buf(),
+        lock_path,
+        _lock: lock,
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(permissions)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "setting permissions on unix socket {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+
+    Ok((listener, guard))
+}
+
+#[cfg(unix)]
+/// Owns a bound socket file for the life of the process: the `<path>.lock`
+/// advisory lock proves ownership (a second instance cannot mistake a live
+/// listener for a stale file), and both files are removed on drop — including
+/// early-return startup failures after bind.
+struct SocketFileGuard {
+    path: PathBuf,
+    lock_path: PathBuf,
+    _lock: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for SocketFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+/// Take an exclusive, non-blocking advisory lock on `<path>.lock`. Held for the
+/// process lifetime by the returned `File`; a held lock means a live server owns
+/// the socket path, regardless of what a connect probe says.
+#[cfg(unix)]
+fn acquire_socket_lock(path: &Path) -> io::Result<(PathBuf, fs::File)> {
+    use std::os::unix::io::AsRawFd;
+    let mut lock_name = path.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("opening socket lock {}: {error}", lock_path.display()),
+            )
+        })?;
+    // SAFETY: valid descriptor owned by `file`; flock has no memory-safety preconditions.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!(
+                "socket path {} is owned by another running server (lock {} held): {error}",
+                path.display(),
+                lock_path.display()
+            ),
+        ));
+    }
+    Ok((lock_path, file))
+}
+
+#[cfg(unix)]
+async fn unix_accept(listener: Option<&UnixListener>) -> io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn unix_accept(_listener: Option<&()>) -> io::Result<()> {
+    std::future::pending().await
+}
+
+#[cfg(all(unix, feature = "shm-transport"))]
+async fn shm_accept(listener: Option<&UnixListener>) -> io::Result<UnixStream> {
+    match listener {
+        Some(listener) => listener.accept().await.map(|(stream, _)| stream),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(all(unix, feature = "shm-transport")))]
+async fn shm_accept(_listener: Option<&()>) -> io::Result<()> {
+    std::future::pending().await
 }
 
 fn next_backoff(current: Duration) -> Duration {
@@ -100,6 +280,21 @@ fn env_truthy(name: &str) -> bool {
 fn apply_startup_config(initial_state: &mut ServerState, config: &ServerConfig) {
     initial_state.config.set_bind(config.bind.clone());
     initial_state.config.set_port(config.port);
+    initial_state
+        .config
+        .set_unixsocket(config.unixsocket.clone());
+    initial_state
+        .config
+        .set_unixsocketperm(config.unixsocketperm);
+    initial_state
+        .config
+        .set_shm_socket(config.shm_socket.clone());
+    initial_state
+        .config
+        .set_shm_ring_bytes(config.shm_ring_bytes);
+    initial_state
+        .config
+        .set_shm_spin_iters(config.shm_spin_iters);
     initial_state.config.set_max_clients(config.max_clients);
     initial_state
         .config
@@ -192,7 +387,11 @@ fn apply_startup_config(initial_state: &mut ServerState, config: &ServerConfig) 
     initial_state.set_aof_enabled(config.appendonly);
 }
 
-fn write_bound_addr_file_if_requested(bound_addr: std::net::SocketAddr) -> io::Result<()> {
+fn write_bound_addr_file_if_requested(
+    bound_addr: std::net::SocketAddr,
+    unixsocket: Option<&std::path::Path>,
+    shm_socket: Option<&std::path::Path>,
+) -> io::Result<()> {
     let Some(path) = std::env::var_os(BOUND_ADDR_FILE_ENV) else {
         return Ok(());
     };
@@ -215,10 +414,18 @@ fn write_bound_addr_file_if_requested(bound_addr: std::net::SocketAddr) -> io::R
         file_name.to_string_lossy(),
         std::process::id()
     ));
-    let payload = format!(
-        "{{\"bound_addr\":\"{bound_addr}\",\"bound_port\":{}}}\n",
-        bound_addr.port()
-    );
+    let mut payload = serde_json::json!({
+        "bound_addr": bound_addr.to_string(),
+        "bound_port": bound_addr.port(),
+    });
+    if let Some(unixsocket) = unixsocket {
+        payload["unixsocket"] = serde_json::Value::String(unixsocket.display().to_string());
+    }
+    if let Some(shm_socket) = shm_socket {
+        payload["shm_socket"] = serde_json::Value::String(shm_socket.display().to_string());
+    }
+    let mut payload = serde_json::to_vec(&payload).map_err(io::Error::other)?;
+    payload.push(b'\n');
 
     std::fs::write(&tmp_path, payload).and_then(|()| std::fs::rename(&tmp_path, &path))
 }
@@ -680,7 +887,60 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         bound_port = bound_addr.port(),
         "ratatosk listener bound"
     );
-    write_bound_addr_file_if_requested(bound_addr).map_err(|error| {
+
+    #[cfg(unix)]
+    let unixsocket_path = config.unixsocket.clone();
+    #[cfg(unix)]
+    let (unix_listener, _unix_socket_guard) = match unixsocket_path.as_deref() {
+        Some(path) => {
+            let (listener, socket_guard) = bind_unix_listener(path, config.unixsocketperm)?;
+            tracing::info!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                perm = %format!("{:o}", config.unixsocketperm),
+                "ratatosk unix listener bound"
+            );
+            (Some(listener), Some(socket_guard))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(unix))]
+    let unix_listener: Option<()> = None;
+
+    #[cfg(all(unix, feature = "shm-transport"))]
+    let shm_socket_path = config.shm_socket.clone();
+    #[cfg(all(unix, feature = "shm-transport"))]
+    let (shm_listener, _shm_socket_guard) = match shm_socket_path.as_deref() {
+        Some(path) => {
+            let (listener, socket_guard) = bind_unix_listener(path, config.unixsocketperm)?;
+            tracing::info!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                perm = %format!("{:o}", config.unixsocketperm),
+                ring_bytes = config.shm_ring_bytes,
+                spin_iters = config.shm_spin_iters,
+                "ratatosk shared-memory control listener bound (experimental)"
+            );
+            (Some(listener), Some(socket_guard))
+        }
+        None => (None, None),
+    };
+    #[cfg(not(all(unix, feature = "shm-transport")))]
+    let shm_listener: Option<()> = None;
+    #[cfg(all(unix, feature = "shm-transport"))]
+    let shm_config = Arc::new(ratatosk_shm::ServerConfig {
+        default_ring_bytes: config.shm_ring_bytes,
+        max_ring_bytes: config.shm_ring_bytes,
+        spin_iters: config.shm_spin_iters,
+        ..ratatosk_shm::ServerConfig::default()
+    });
+
+    write_bound_addr_file_if_requested(
+        bound_addr,
+        config.unixsocket.as_deref(),
+        config.shm_socket.as_deref(),
+    )
+    .map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("writing bound TCP listener address file: {error}"),
@@ -935,10 +1195,22 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
 
                 let state = Arc::clone(&server_state);
                 let persistence = Arc::clone(&persistence);
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(error = %error, "failed to enable TCP_NODELAY");
+                }
+                let info = ConnInfo::from_tcp(&stream);
                 let remote_addr = addr;
                 client_tasks.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_client_with_limits(stream, state, persistence, io_limits).await {
+                    if let Err(error) = handle_client_with_limits(
+                        stream,
+                        info,
+                        state,
+                        persistence,
+                        io_limits,
+                    )
+                    .await
+                    {
                         if is_expected_client_disconnect(&error) {
                             tracing::debug!(remote_addr = %remote_addr, error = %error, "client disconnected");
                         } else {
@@ -946,6 +1218,216 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                         }
                     }
                 });
+            }
+            accepted = unix_accept(unix_listener.as_ref()) => {
+                #[cfg(unix)]
+                {
+                    let stream = match accepted {
+                        Ok(stream) => {
+                            accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+                            stream
+                        }
+                        Err(error) if is_transient_accept_error(&error) => {
+                            let kind = io_error_kind_label(&error);
+                            crate::metrics::record_accept_error(&kind, true);
+                            crate::metrics::record_accept_backoff(accept_backoff.as_millis() as f64);
+                            tracing::debug!(
+                                error = %error,
+                                backoff_ms = accept_backoff.as_millis(),
+                                "transient Unix socket accept error; retrying"
+                            );
+                            tokio::time::sleep(accept_backoff).await;
+                            accept_backoff = next_backoff(accept_backoff);
+                            continue;
+                        }
+                        Err(error) => {
+                            let kind = io_error_kind_label(&error);
+                            crate::metrics::record_accept_error(&kind, false);
+                            let path = unixsocket_path
+                                .as_deref()
+                                .expect("Unix listener requires a configured socket path");
+                            let wrapped = io::Error::new(
+                                error.kind(),
+                                format!("accepting Unix socket connection on {}: {error}", path.display()),
+                            );
+                            tracing::error!(
+                                target = "ratatosk::network",
+                                error = %wrapped,
+                                kind = %kind,
+                                "fatal Unix socket accept error; initiating graceful shutdown"
+                            );
+                            fatal_error = Some(wrapped);
+                            break;
+                        }
+                    };
+
+                    // Unix sockets have no peer IP, and Redis does not apply its connection
+                    // rate limiter to Unix-domain socket clients.
+                    let permit: OwnedSemaphorePermit = match Arc::clone(&client_permits)
+                        .try_acquire_owned()
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            crate::metrics::record_connection_rejected("max_clients");
+                            crate::metrics::set_semaphore_available_permits(
+                                client_permits.available_permits(),
+                            );
+                            tracing::warn!(
+                                remote_addr = "unix",
+                                max_clients = config.max_clients,
+                                "rejecting Unix socket connection: max concurrent client limit reached"
+                            );
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    crate::metrics::set_semaphore_available_permits(
+                        client_permits.available_permits(),
+                    );
+
+                    let path = unixsocket_path
+                        .as_deref()
+                        .expect("Unix listener requires a configured socket path");
+                    let info = ConnInfo::from_unix(path);
+                    let remote_addr = info.remote_display.clone();
+                    let state = Arc::clone(&server_state);
+                    let persistence = Arc::clone(&persistence);
+                    client_tasks.spawn(async move {
+                        let _permit = permit;
+                        if let Err(error) = handle_client_with_limits(
+                            stream,
+                            info,
+                            state,
+                            persistence,
+                            io_limits,
+                        )
+                        .await
+                        {
+                            if is_expected_client_disconnect(&error) {
+                                tracing::debug!(remote_addr = %remote_addr, error = %error, "client disconnected");
+                            } else {
+                                tracing::warn!(remote_addr = %remote_addr, error = %error, "client handler error");
+                            }
+                        }
+                    });
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = accepted;
+                }
+            }
+            accepted = shm_accept(shm_listener.as_ref()) => {
+                #[cfg(all(unix, feature = "shm-transport"))]
+                {
+                    let control = match accepted {
+                        Ok(stream) => {
+                            accept_backoff = ACCEPT_ERROR_BACKOFF_INITIAL;
+                            stream
+                        }
+                        Err(error) if is_transient_accept_error(&error) => {
+                            let kind = io_error_kind_label(&error);
+                            crate::metrics::record_accept_error(&kind, true);
+                            crate::metrics::record_accept_backoff(accept_backoff.as_millis() as f64);
+                            tracing::debug!(
+                                error = %error,
+                                backoff_ms = accept_backoff.as_millis(),
+                                "transient shared-memory accept error; retrying"
+                            );
+                            tokio::time::sleep(accept_backoff).await;
+                            accept_backoff = next_backoff(accept_backoff);
+                            continue;
+                        }
+                        Err(error) => {
+                            let kind = io_error_kind_label(&error);
+                            crate::metrics::record_accept_error(&kind, false);
+                            let path = shm_socket_path
+                                .as_deref()
+                                .expect("shared-memory listener requires a configured socket path");
+                            let wrapped = io::Error::new(
+                                error.kind(),
+                                format!("accepting shared-memory control connection on {}: {error}", path.display()),
+                            );
+                            tracing::error!(
+                                target = "ratatosk::network",
+                                error = %wrapped,
+                                kind = %kind,
+                                "fatal shared-memory accept error; initiating graceful shutdown"
+                            );
+                            fatal_error = Some(wrapped);
+                            break;
+                        }
+                    };
+
+                    // Local transport: no peer IP, no connection rate limiter (as for Unix
+                    // sockets). The handshake itself enforces same-uid peers.
+                    let permit: OwnedSemaphorePermit = match Arc::clone(&client_permits)
+                        .try_acquire_owned()
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            crate::metrics::record_connection_rejected("max_clients");
+                            crate::metrics::set_semaphore_available_permits(
+                                client_permits.available_permits(),
+                            );
+                            tracing::warn!(
+                                remote_addr = "shm",
+                                max_clients = config.max_clients,
+                                "rejecting shared-memory connection: max concurrent client limit reached"
+                            );
+                            drop(control);
+                            continue;
+                        }
+                    };
+                    crate::metrics::set_semaphore_available_permits(
+                        client_permits.available_permits(),
+                    );
+
+                    let path = shm_socket_path
+                        .as_deref()
+                        .expect("shared-memory listener requires a configured socket path");
+                    let info = ConnInfo::from_shm(path);
+                    let remote_addr = info.remote_display.clone();
+                    let state = Arc::clone(&server_state);
+                    let persistence = Arc::clone(&persistence);
+                    let shm_config = Arc::clone(&shm_config);
+                    client_tasks.spawn(async move {
+                        let _permit = permit;
+                        // The handshake (peer-cred check, segment creation, fd passing) runs
+                        // inside the client task so a slow or hostile peer cannot stall accept.
+                        let stream = match ratatosk_shm::accept_shm_session(control, &shm_config).await {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                crate::metrics::record_connection_rejected("shm_handshake");
+                                tracing::warn!(
+                                    target = "ratatosk::security",
+                                    remote_addr = %remote_addr,
+                                    error = %error,
+                                    "rejecting shared-memory session: handshake failed"
+                                );
+                                return;
+                            }
+                        };
+                        if let Err(error) = handle_client_with_limits(
+                            stream,
+                            info,
+                            state,
+                            persistence,
+                            io_limits,
+                        )
+                        .await
+                        {
+                            if is_expected_client_disconnect(&error) {
+                                tracing::debug!(remote_addr = %remote_addr, error = %error, "client disconnected");
+                            } else {
+                                tracing::warn!(remote_addr = %remote_addr, error = %error, "client handler error");
+                            }
+                        }
+                    });
+                }
+                #[cfg(not(all(unix, feature = "shm-transport")))]
+                {
+                    let _ = accepted;
+                }
             }
             _ = cron_interval.tick() => {
                 crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
@@ -969,6 +1451,19 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
     let grace_period = Duration::from_millis(config.shutdown_grace_period_ms);
     drain_client_tasks(&mut client_tasks, grace_period).await;
+
+    #[cfg(unix)]
+    {
+        drop(unix_listener);
+        drop(_unix_socket_guard);
+    }
+
+    #[cfg(all(unix, feature = "shm-transport"))]
+    {
+        drop(shm_listener);
+        drop(_shm_socket_guard);
+    }
+
     let mut shutdown_flush_error = None;
 
     let (bgsave_completed, bgsave_aborted) = drain_bgsave_tasks(grace_period).await;
@@ -1046,6 +1541,9 @@ mod tests {
         finalize_shutdown_result, load_acl_state_from_disk, shutdown_best_effort_enabled,
     };
 
+    #[cfg(unix)]
+    use super::bind_unix_listener;
+
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK
@@ -1113,6 +1611,59 @@ mod tests {
                 || text.contains("shutdown_flush_error=flush timeout"),
             "{text}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_unix_listener_refuses_to_remove_a_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ratatosk.sock");
+        std::fs::write(&path, "do not remove").expect("write regular file");
+
+        let error = match bind_unix_listener(&path, 0o700) {
+            Ok(_) => panic!("binding over a regular file should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(path.exists());
+        assert_eq!(
+            std::fs::read(&path).expect("read regular file"),
+            b"do not remove"
+        );
+    }
+
+    /// A live owner holds `<path>.lock`; a second bind on the same path must be
+    /// refused *before* the connect probe can misjudge the socket as stale, and
+    /// the owner's socket file must survive. Dropping the owner's guard removes
+    /// both files.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bind_unix_listener_lock_protects_a_live_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("r.sock");
+        let (listener, guard) = bind_unix_listener(&path, 0o700).expect("first bind");
+        let lock_path = std::path::PathBuf::from({
+            let mut name = path.as_os_str().to_owned();
+            name.push(".lock");
+            name
+        });
+        assert!(lock_path.exists());
+
+        let error = match bind_unix_listener(&path, 0o700) {
+            Ok(_) => panic!("second bind must be refused while the lock is held"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(path.exists(), "owner's socket file must not be unlinked");
+
+        drop(listener);
+        drop(guard);
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+
+        // A fresh bind after the owner is gone succeeds (stale-file path).
+        let (_listener, _guard) = bind_unix_listener(&path, 0o700).expect("rebind after release");
     }
 
     #[test]

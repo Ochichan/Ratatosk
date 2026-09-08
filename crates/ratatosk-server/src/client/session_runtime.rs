@@ -3,9 +3,13 @@ use std::sync::Arc;
 use tokio::sync::Notify;
 
 use super::*;
+use crate::transport::{ConnInfo, SessionStream};
 
 pub(super) struct SessionRuntime {
     pub(super) input: BytesMut,
+    /// Bytes read into `input` while a blocking command was parked; the loop
+    /// treats them as a completed read on its next iteration.
+    pub(super) prefetched_input_bytes: usize,
     pub(super) output: Vec<u8>,
     pub(super) pending_input_bytes: u64,
     pub(super) pubsub_rx: tokio::sync::mpsc::Receiver<PubSubMessage>,
@@ -24,16 +28,13 @@ enum SessionLoopAction {
 }
 
 pub(super) async fn initialize_session_runtime(
-    stream: &TcpStream,
+    info: &ConnInfo,
     server_state: &SharedServerState,
     client_id: i64,
     client_state: &ClientState,
 ) -> SessionRuntime {
-    if let Err(error) = stream.set_nodelay(true) {
-        tracing::debug!(error = %error, "failed to enable TCP_NODELAY");
-    }
-
-    let (addr, laddr) = socket_addr_bytes(stream);
+    let addr = info.addr.clone();
+    let laddr = info.laddr.clone();
     let (
         pubsub_rx,
         monitor_notifier,
@@ -53,6 +54,7 @@ pub(super) async fn initialize_session_runtime(
 
     SessionRuntime {
         input: BytesMut::with_capacity(4096),
+        prefetched_input_bytes: 0,
         output: Vec::with_capacity(4096),
         pending_input_bytes: 0,
         pubsub_rx,
@@ -65,8 +67,8 @@ pub(super) async fn initialize_session_runtime(
     }
 }
 
-async fn wait_for_session_activity(
-    stream: &mut TcpStream,
+async fn wait_for_session_activity<S: SessionStream>(
+    stream: &mut S,
     client_state: &ClientState,
     runtime: &mut SessionRuntime,
     io_limits: ClientIoLimits,
@@ -139,8 +141,8 @@ async fn wait_for_session_activity(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_client_session_loop(
-    stream: &mut TcpStream,
+pub(super) async fn run_client_session_loop<S: SessionStream>(
+    stream: &mut S,
     server_state: &SharedServerState,
     persistence: &Arc<PersistenceRuntime>,
     client_state: &mut ClientState,
@@ -162,11 +164,14 @@ pub(super) async fn run_client_session_loop(
             return Ok(());
         }
 
-        let read = match wait_for_session_activity(stream, client_state, runtime, io_limits).await?
-        {
-            SessionLoopAction::Continue => continue,
-            SessionLoopAction::Close => return Ok(()),
-            SessionLoopAction::Read(read) => read,
+        let read = if runtime.prefetched_input_bytes > 0 {
+            std::mem::take(&mut runtime.prefetched_input_bytes)
+        } else {
+            match wait_for_session_activity(stream, client_state, runtime, io_limits).await? {
+                SessionLoopAction::Continue => continue,
+                SessionLoopAction::Close => return Ok(()),
+                SessionLoopAction::Read(read) => read,
+            }
         };
 
         server_state.stats.add_net_input_bytes(read as u64);
@@ -192,6 +197,9 @@ pub(super) async fn run_client_session_loop(
             persistence,
             client_state,
             stream,
+            &mut runtime.input,
+            runtime.query_buffer_limit,
+            &mut runtime.prefetched_input_bytes,
             &runtime.addr,
             &runtime.laddr,
         )

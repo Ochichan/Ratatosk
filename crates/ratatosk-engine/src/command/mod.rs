@@ -3611,6 +3611,7 @@ pub struct ClientState {
     auth_failure_count: u32,
     lib_name: Option<Bytes>,
     lib_ver: Option<Bytes>,
+    unix_socket: bool,
     monitor_mode: bool,
     durability_capture_enabled: bool,
     durability_effects: Option<DurabilityEffects>,
@@ -3644,6 +3645,10 @@ impl ClientState {
 
     pub fn set_monitor(&mut self, enabled: bool) {
         self.monitor_mode = enabled;
+    }
+
+    pub fn set_unix_socket(&mut self, value: bool) {
+        self.unix_socket = value;
     }
 
     pub fn selected_db(&self) -> usize {
@@ -3841,6 +3846,9 @@ impl ClientState {
         } else {
             flags.push(b'N');
         }
+        if self.unix_socket {
+            flags.push(b'U');
+        }
         if self.tx_state.in_multi() {
             flags.push(b'x');
         }
@@ -3910,6 +3918,7 @@ impl ClientState {
             auth_failure_count: 0,
             lib_name: None,
             lib_ver: None,
+            unix_socket: false,
             monitor_mode: false,
             durability_capture_enabled: false,
             durability_effects: None,
@@ -4750,21 +4759,20 @@ fn format_monitor_line(server: &ServerState, client: &ClientState, argv: &[Bytes
     let micros = total_us % 1_000_000;
     let db = client.selected_db();
 
-    // Look up the client address from the snapshot registry.
-    let addr = server
+    // Look up the client address and transport flag from the snapshot registry.
+    let (addr, unix_socket) = server
         .client_snapshot(client.id())
-        .map(|snap| snap.addr.clone())
-        .unwrap_or_else(|| Bytes::from_static(b"127.0.0.1:0"));
+        .map(|snap| (snap.addr.clone(), snap.flags.contains(&b'U')))
+        .unwrap_or_else(|| (Bytes::from_static(b"127.0.0.1:0"), false));
+    let addr = String::from_utf8_lossy(&addr);
+    let display_addr = if unix_socket {
+        format!("unix:{}", addr.strip_suffix(":0").unwrap_or(addr.as_ref()))
+    } else {
+        addr.into_owned()
+    };
 
     let mut buf = String::with_capacity(128);
-    let _ = write!(
-        buf,
-        "{}.{:06} [{} {}]",
-        secs,
-        micros,
-        db,
-        String::from_utf8_lossy(&addr)
-    );
+    let _ = write!(buf, "{}.{:06} [{} {}]", secs, micros, db, display_addr);
     for arg in argv {
         buf.push(' ');
         buf.push('"');
@@ -5785,6 +5793,76 @@ mod tests {
             RespFrame::Error(_) => {}
             other => panic!("expected error for invalid protected-mode, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn config_get_reports_startup_only_unix_socket_values() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        server
+            .config
+            .set_unixsocket(Some(std::path::PathBuf::from("/tmp/ratatosk.sock")));
+        server.config.set_unixsocketperm(0o750);
+
+        assert_eq!(
+            run(&["CONFIG", "GET", "unixsocket"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("unixsocket"),
+                RespFrame::bulk_str("/tmp/ratatosk.sock"),
+            ])
+        );
+        assert_eq!(
+            run(
+                &["CONFIG", "GET", "unixsocketperm"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("unixsocketperm"),
+                RespFrame::bulk_str("750"),
+            ])
+        );
+
+        let bind_error = run(
+            &["CONFIG", "SET", "bind", "127.0.0.1"],
+            &mut server,
+            &mut client,
+        );
+        let unixsocket_error = run(
+            &["CONFIG", "SET", "unixsocket", "/tmp/other.sock"],
+            &mut server,
+            &mut client,
+        );
+        let unixsocketperm_error = run(
+            &["CONFIG", "SET", "unixsocketperm", "700"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(unixsocket_error, bind_error);
+        assert_eq!(unixsocketperm_error, bind_error);
+    }
+
+    #[test]
+    fn unix_socket_client_flag_and_monitor_line_match_redis() {
+        let mut client = ClientState::new(42);
+        client.set_unix_socket(true);
+        let snapshot = client.snapshot(
+            Bytes::from_static(b"/tmp/ratatosk.sock:0"),
+            Bytes::from_static(b"/tmp/ratatosk.sock:0"),
+        );
+        assert_eq!(snapshot.flags, Bytes::from_static(b"NU"));
+
+        let mut server = ServerState::with_default_dbs();
+        server.upsert_client_snapshot(snapshot);
+        let line = super::format_monitor_line(&server, &client, &[Bytes::from_static(b"PING")]);
+        let line = String::from_utf8_lossy(&line);
+        assert!(line.contains("[0 unix:/tmp/ratatosk.sock] \"PING\""));
+
+        let tcp_snapshot = ClientState::new(43).snapshot(
+            Bytes::from_static(b"127.0.0.1:43"),
+            Bytes::from_static(b"127.0.0.1:6379"),
+        );
+        assert_eq!(tcp_snapshot.flags, Bytes::from_static(b"N"));
     }
 
     #[test]

@@ -1,21 +1,22 @@
 use super::shared_support::{append_encoded_frame, flush_pending_input_bytes};
 use super::*;
+use crate::transport::SessionStream;
 
 pub(super) struct ProtocolCommandOutcome {
     outcome: CommandOutcome,
     protocol_version: i64,
 }
 
-async fn write_output_limit_error(
-    stream: &mut TcpStream,
+async fn write_output_limit_error<S: SessionStream>(
+    stream: &mut S,
     write_timeout: Duration,
 ) -> io::Result<()> {
     let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
     write_all_with_timeout(stream, &response, write_timeout).await
 }
 
-async fn flush_output_buffer(
-    stream: &mut TcpStream,
+async fn flush_output_buffer<S: SessionStream>(
+    stream: &mut S,
     server_state: &SharedServerState,
     output: &mut Vec<u8>,
     write_timeout: Duration,
@@ -34,8 +35,8 @@ async fn flush_output_buffer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn drain_preloop_async_output(
-    stream: &mut TcpStream,
+pub(super) async fn drain_preloop_async_output<S: SessionStream>(
+    stream: &mut S,
     server_state: &SharedServerState,
     client_state: &ClientState,
     pubsub_rx: &mut tokio::sync::mpsc::Receiver<PubSubMessage>,
@@ -94,8 +95,8 @@ pub(super) async fn drain_preloop_async_output(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn collect_parsed_frames(
-    stream: &mut TcpStream,
+pub(super) async fn collect_parsed_frames<S: SessionStream>(
+    stream: &mut S,
     server_state: &SharedServerState,
     client_state: &ClientState,
     input: &mut BytesMut,
@@ -136,12 +137,15 @@ pub(super) async fn collect_parsed_frames(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn execute_client_pipeline(
+pub(super) async fn execute_client_pipeline<S: SessionStream>(
     parsed_frames: Vec<RespFrame>,
     server_state: &SharedServerState,
     persistence: &Arc<PersistenceRuntime>,
     client_state: &mut ClientState,
-    stream: &TcpStream,
+    stream: &mut S,
+    input: &mut BytesMut,
+    query_buffer_limit: usize,
+    prefetched: &mut usize,
     addr: &Bytes,
     laddr: &Bytes,
 ) -> io::Result<Vec<ProtocolCommandOutcome>> {
@@ -162,6 +166,9 @@ pub(super) async fn execute_client_pipeline(
                     persistence,
                     client_state,
                     stream,
+                    input,
+                    query_buffer_limit,
+                    prefetched,
                     addr,
                     laddr,
                 )
@@ -187,9 +194,9 @@ pub(super) async fn execute_client_pipeline(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn apply_command_outcomes(
+pub(super) async fn apply_command_outcomes<S: SessionStream>(
     outcomes: Vec<ProtocolCommandOutcome>,
-    stream: &mut TcpStream,
+    stream: &mut S,
     server_state: &SharedServerState,
     client_state: &mut ClientState,
     output: &mut Vec<u8>,
@@ -258,8 +265,8 @@ pub(super) async fn apply_command_outcomes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn drain_post_command_async_output(
-    stream: &mut TcpStream,
+pub(super) async fn drain_post_command_async_output<S: SessionStream>(
+    stream: &mut S,
     server_state: &SharedServerState,
     client_state: &ClientState,
     pubsub_rx: &mut tokio::sync::mpsc::Receiver<PubSubMessage>,
