@@ -168,8 +168,8 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `COMMAND HELP` | server | 5.0.0 | done | behavioral_subset | m0-foundation | M0 baseline implemented. |
 | `COMMAND INFO` | server | 2.8.13 | done | behavioral_subset | m0-foundation | M0 baseline implemented. |
 | `COMMAND LIST` | server | 7.0.0 | done | behavioral_subset | m0-foundation | M0 baseline implemented. |
-| `CONFIG` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (GET/SET/HELP/RESETSTAT subset). |
-| `CONFIG GET` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (glob pattern matching over core params). |
+| `CONFIG` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (GET/SET/HELP/RESETSTAT subset; startup-only Unix socket listener configuration is exposed through GET). |
+| `CONFIG GET` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (glob pattern matching over core params and startup-only unixsocket/unixsocketperm values). |
 | `CONFIG HELP` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG RESETSTAT` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG REWRITE` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (in-memory acknowledge path). |

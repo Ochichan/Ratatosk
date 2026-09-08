@@ -33,9 +33,11 @@ def equal(actual, expected):
 
 
 class Server:
-    def __init__(self, binary: Path, kind: str, output: Path, *, aof=False, extra=None):
+    def __init__(self, binary: Path, kind: str, output: Path, *, aof=False, extra=None,
+                 unixsocket: Path | None = None):
         self.binary, self.kind, self.aof = binary, kind, aof
         self.extra = extra or {}
+        self.unixsocket = unixsocket
         self.directory = Path(tempfile.mkdtemp(prefix=f"{kind}-", dir=output))
         self.process = None
         self.log = None
@@ -61,6 +63,8 @@ class Server:
                 RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS="100000",
                 RATATOSK_SHUTDOWN_GRACE_MS="1000",
             )
+            if self.unixsocket:
+                environment["RATATOSK_UNIXSOCKET"] = str(self.unixsocket)
             environment.update(self.extra)
             command = [str(self.binary), "--no-config-autoload"]
         else:
@@ -111,8 +115,19 @@ class Server:
         return self.start()
 
     def client(self, protocol=2, db=0):
+        if self.kind == "ratatosk" and self.unixsocket:
+            return redis.Redis(unix_socket_path=str(self.unixsocket), db=db, protocol=protocol,
+                               socket_connect_timeout=2, socket_timeout=3)
         return redis.Redis(host="127.0.0.1", port=self.port, db=db, protocol=protocol,
                            socket_connect_timeout=2, socket_timeout=3)
+
+    def raw_connection(self):
+        if self.kind == "ratatosk" and self.unixsocket:
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(3)
+            connection.connect(str(self.unixsocket))
+            return connection
+        return socket.create_connection(("127.0.0.1", self.port), timeout=3)
 
     def __enter__(self):
         return self.start()
@@ -536,7 +551,7 @@ def pubsub_transaction(s):
     expected = (b"+OK\r\n+QUEUED\r\n*1\r\n"
                 b"*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:1\r\n"
                 b"*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:2\r\n")
-    with socket.create_connection(("127.0.0.1", s.port), timeout=3) as connection:
+    with s.raw_connection() as connection:
         connection.sendall(b"MULTI\r\nSUBSCRIBE a b\r\nEXEC\r\n")
         with connection.makefile("rb") as reader:
             equal(reader.read(len(expected)), expected)
@@ -552,7 +567,7 @@ def pubsub_counts(s):
               (b"SUNSUBSCRIBE", b"sunsubscribe", b"s", 0)]
     def bulk(value):
         return b"$-1\r\n" if value is None else b"$%d\r\n%s\r\n" % (len(value), value)
-    with socket.create_connection(("127.0.0.1", s.port), timeout=3) as connection:
+    with s.raw_connection() as connection:
         with connection.makefile("rb") as reader:
             for command, kind, target, count in checks:
                 expected = b"*3\r\n" + bulk(kind) + bulk(target) + b":%d\r\n" % count
@@ -669,9 +684,15 @@ def main():
     parser.add_argument("--ratatosk", required=True, type=binary)
     parser.add_argument("--redis-server", required=True, type=binary)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--unixsocket",
+        type=Path,
+        help="Connect to Ratatosk over this Unix socket while Redis continues to use TCP.",
+    )
     parser.add_argument("--case", nargs="+", choices=[name for name, _, _ in CASES])
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    ratatosk_unixsocket = args.unixsocket.resolve() if args.unixsocket else None
     results = []
     for kind, executable in [("redis", args.redis_server), ("ratatosk", args.ratatosk)]:
         for name, aof, function in CASES:
@@ -679,7 +700,9 @@ def main():
                 continue
             row = {"server": kind, "case": name, "status": "PASS"}
             try:
-                with Server(executable, kind, args.output_dir, aof=aof) as server:
+                unixsocket = ratatosk_unixsocket if kind == "ratatosk" else None
+                with Server(executable, kind, args.output_dir, aof=aof,
+                            unixsocket=unixsocket) as server:
                     function(server)
                 row["artifacts"] = str(server.directory)
             except Exception as error:

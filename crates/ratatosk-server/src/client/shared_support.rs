@@ -3,9 +3,8 @@ use std::io;
 use bytes::Bytes;
 use ratatosk_engine::command::ClientState;
 use ratatosk_resp::{RespFrame, RespVersion, encode_to_vec_for_version, encoded_len_for_version};
-use tokio::net::TcpStream;
 
-use crate::metrics;
+use crate::{metrics, transport::ConnInfo};
 
 use super::SharedServerState;
 
@@ -29,7 +28,7 @@ pub(super) fn disconnect_reason_for_result(result: &io::Result<()>) -> &'static 
 }
 
 pub(super) fn register_client_connection(
-    stream: &TcpStream,
+    info: &ConnInfo,
     server_state: &SharedServerState,
 ) -> (i64, String) {
     let client_id = server_state.alloc_client_id();
@@ -37,12 +36,7 @@ pub(super) fn register_client_connection(
     metrics::set_active_connections(server_state.stats.connected_clients() as usize);
     metrics::record_connection_event("accepted");
 
-    let remote_addr = stream
-        .peer_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    (client_id, remote_addr)
+    (client_id, info.remote_display.clone())
 }
 
 pub(super) async fn finish_client_connection(
@@ -63,18 +57,6 @@ pub(super) async fn finish_client_connection(
     server_state.stats.mark_client_disconnected();
     metrics::set_active_connections(server_state.stats.connected_clients() as usize);
     metrics::record_connection_event(disconnect_reason);
-}
-
-pub(super) fn socket_addr_bytes(stream: &TcpStream) -> (Bytes, Bytes) {
-    let addr = stream
-        .peer_addr()
-        .map(|addr| Bytes::from(addr.to_string()))
-        .unwrap_or_else(|_| Bytes::from_static(b"127.0.0.1:0"));
-    let laddr = stream
-        .local_addr()
-        .map(|addr| Bytes::from(addr.to_string()))
-        .unwrap_or_else(|_| Bytes::from_static(b"127.0.0.1:0"));
-    (addr, laddr)
 }
 
 pub(super) async fn refresh_client_snapshot(

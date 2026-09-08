@@ -1,0 +1,24 @@
+[package]
+name = "ratatosk-shm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared-memory RESP byte-stream transport for Ratatosk (Unix only, experimental)"
+
+[lib]
+name = "ratatosk_shm"
+path = "src/lib.rs"
+
+[dependencies]
+libc = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

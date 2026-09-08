@@ -1,0 +1,4 @@
+{"harness":"scripts/ipc_rtt_lite.py (python stdlib, blocking socket, PING)","host":"Apple M5 Pro, Darwin 25.6.0","build":"release","commit":"26d8877b1","transport":"tcp loopback 127.0.0.1:6399","runs":[
+{"n":20000,"p50_us":15.958,"p95_us":21.209,"p99_us":25.75,"p999_us":33.291,"max_us":58.833},
+{"n":20000,"p50_us":15.916,"p95_us":20.917,"p99_us":25.542,"p999_us":33.958,"max_us":81.875},
+{"n":20000,"p50_us":15.75,"p95_us":20.916,"p99_us":25.5,"p999_us":32.625,"max_us":121.875}]}

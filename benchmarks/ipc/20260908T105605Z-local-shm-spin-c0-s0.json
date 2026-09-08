@@ -1,0 +1,103 @@
+{
+  "schema_version": "ratatosk-ipc-bench/v1",
+  "created_at_utc": "20260908T105605Z",
+  "environment": {
+    "cpu_model": "Apple M5 Pro",
+    "os": "macos",
+    "kernel_version": "25.6.0",
+    "arch": "aarch64",
+    "git_commit": "26d8877b1-dirty",
+    "client_build_profile": "release",
+    "client_rustc_version": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "host_label": "local",
+    "server_binary": {
+      "path": "ratatosk",
+      "size_bytes": 3714352,
+      "sha256": "aea7cda2280284504ea66ba87b867191e4c86bd10ae5c8527e767f72254bbaaa"
+    },
+    "ratatosk_server_env": {
+      "RATATOSK_ALLOW_NO_METRICS": "true",
+      "RATATOSK_AUDIT_CHAIN_STATE": "<tmp>/data/audit.state",
+      "RATATOSK_AUDIT_LOG": "<tmp>/data/audit.log",
+      "RATATOSK_BIND": "127.0.0.1",
+      "RATATOSK_BOUND_ADDR_FILE": "<tmp>/bound-addr.json",
+      "RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS": "100000",
+      "RATATOSK_CONN_RATE_LIMIT_WINDOW_SEC": "60",
+      "RATATOSK_DIR": "<tmp>/data",
+      "RATATOSK_DISABLE_CONFIG_AUTOLOAD": "true",
+      "RATATOSK_METRICS_BIND": "127.0.0.1:0",
+      "RATATOSK_PORT": "0",
+      "RATATOSK_SHM_SOCKET": "<tmp>/shm.sock",
+      "RATATOSK_SHUTDOWN_GRACE_MS": "1000"
+    }
+  },
+  "config": {
+    "server": "ratatosk",
+    "samples": 50000,
+    "warmup": 5000,
+    "connections": [
+      1,
+      4
+    ],
+    "payloads": [
+      "ping"
+    ],
+    "transports": [
+      "shm"
+    ],
+    "shm_client_spin": 0,
+    "tag": "shm-spin-c0-s0"
+  },
+  "redis": "not requested",
+  "resource_usage": {
+    "client": {
+      "user_seconds": 0.148535,
+      "system_seconds": 0.335742
+    },
+    "server": {
+      "user_seconds": 0.532678,
+      "system_seconds": 0.381994
+    },
+    "server_peak_rss_bytes": 13975552
+  },
+  "results": [
+    {
+      "server": "ratatosk",
+      "transport": "shm",
+      "payload": "ping",
+      "concurrency": 1,
+      "status": "ok",
+      "sample_count": 50000,
+      "warmup_count": 5000,
+      "duration_seconds": 0.163444834,
+      "p50_us": 2.625,
+      "p95_us": 6.875,
+      "p99_us": 8.625,
+      "p99_9_us": 12.292,
+      "max_us": 27.209,
+      "errors": 0,
+      "drops": 0,
+      "retries": 0,
+      "throughput_req_per_sec": 305913.61486530676
+    },
+    {
+      "server": "ratatosk",
+      "transport": "shm",
+      "payload": "ping",
+      "concurrency": 4,
+      "status": "ok",
+      "sample_count": 50000,
+      "warmup_count": 5000,
+      "duration_seconds": 0.244638792,
+      "p50_us": 18.959,
+      "p95_us": 25.834,
+      "p99_us": 31.166,
+      "p99_9_us": 43.542,
+      "max_us": 89.917,
+      "errors": 0,
+      "drops": 0,
+      "retries": 0,
+      "throughput_req_per_sec": 204382.9582023116
+    }
+  ]
+}

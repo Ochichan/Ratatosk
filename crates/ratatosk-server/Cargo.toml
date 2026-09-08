@@ -10,11 +10,15 @@ publish = false
 default = []
 mimalloc = ["dep:mimalloc", "ratatosk-engine/mimalloc"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Experimental shared-memory transport (Unix only). See docs/shm-transport.md.
+shm-transport = ["dep:ratatosk-shm"]
 
 [dependencies]
 ratatosk-core = { workspace = true }
 ratatosk-resp = { workspace = true }
 ratatosk-engine = { workspace = true }
+ratatosk-shm = { workspace = true, optional = true }
+libc = { workspace = true }
 ratatosk-persist = { workspace = true }
 bytes = { workspace = true }
 mimalloc = { workspace = true, optional = true }
@@ -37,6 +41,7 @@ parking_lot = { workspace = true }
 fs2 = { workspace = true }
 
 [dev-dependencies]
+ratatosk-shm = { workspace = true }
 criterion = { workspace = true }
 hashbrown = { workspace = true }
 ratatosk-resp = { workspace = true }

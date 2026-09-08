@@ -220,11 +220,32 @@ appendfsync everysec
 | --- | --- | --- |
 | `bind` | `RATATOSK_BIND` | `127.0.0.1` |
 | `port` | `RATATOSK_PORT` | `6379` |
+| `unixsocket` | `RATATOSK_UNIXSOCKET` | empty |
+| `unixsocketperm` | `RATATOSK_UNIXSOCKETPERM` | `700` |
+| `shm-socket` | `RATATOSK_SHM_SOCKET` | empty; experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
+| `shm-ring-bytes` | `RATATOSK_SHM_RING_BYTES` | 1048576; experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
+| `shm-spin-iters` | `RATATOSK_SHM_SPIN_ITERS` | 2000; experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
 | `maxclients` | `RATATOSK_MAX_CLIENTS` | `4096` |
 | `timeout` | `RATATOSK_TIMEOUT` | `0` |
 | `client-timeout-sec` | `RATATOSK_CLIENT_TIMEOUT` | `0` |
 | `output-buffer-limit-bytes` | `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` |
 | `shutdown-grace-ms` | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` |
+
+Unix-domain sockets are local-only. The socket file permission is the first access gate, and
+ACL/AUTH still apply after connection; Ratatosk defaults to `700` and accepts `unixsocketperm`
+only in `1..=777` (Redis's `0` = umask is not supported because Ratatosk always applies an
+explicit mode). The inode is created with the process umask's permissions and tightened to
+`unixsocketperm` immediately after bind; use a `0700` parent directory if that brief bind-to-chmod
+window matters. Ownership of a socket path is proven by an exclusive advisory lock on
+`<path>.lock` held for the life of the process: a second instance is refused with "owned by
+another running server" and never touches the live socket file. Only when no lock is held does
+Ratatosk probe an existing socket before unlinking a stale file (Redis unlinks unconditionally);
+it refuses to remove a non-socket path and refuses to start if that probe returns `EACCES`. Both
+the socket and the `.lock` file are removed when the process exits, including on startup failures
+after bind (a SIGKILL leaves them behind, and the next start reclaims them). A relative
+`unixsocket` resolves against the process current working directory. `port 0`
+retains Ratatosk's ephemeral-TCP-port meaning; it does not disable TCP. `CLIENT LIST` reports Unix
+clients as `addr=<path>:0` with flag `U`, and `MONITOR` reports `unix:<path>`.
 
 ### Compatibility
 
@@ -401,7 +422,8 @@ cargo run -p ratatosk-server --bin ratatosk --release
   Set `RATATOSK_PORT=6380` when running alongside Redis. A startup warning is emitted when using port 6379.
 - **Dynamic sidecar port**: `RATATOSK_PORT=0` asks the OS to choose an ephemeral loopback port.
   Sidecar supervisors should set `RATATOSK_BOUND_ADDR_FILE=/path/to/bound-addr.json`; Ratatosk
-  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` after the TCP listener binds.
+  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` after the TCP listener binds,
+  with optional `unixsocket` and `shm_socket` keys when those local listeners are configured.
   The structured startup log event `ratatosk listener bound` also includes `bound_port`.
 
 ### Autostart (systemd --user)
@@ -431,6 +453,11 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | --- | --- | --- |
 | `RATATOSK_BIND` | `127.0.0.1` | listen address |
 | `RATATOSK_PORT` | `6379` | listen port; `0` selects an OS-assigned ephemeral port |
+| `RATATOSK_UNIXSOCKET` | unset | optional local Unix-domain socket path |
+| `RATATOSK_UNIXSOCKETPERM` | `700` | Unix socket mode in octal `1..=777`; `0` is rejected |
+| `RATATOSK_SHM_SOCKET` | unset | experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
+| `RATATOSK_SHM_RING_BYTES` | `1048576` | experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
+| `RATATOSK_SHM_SPIN_ITERS` | `2000` | experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
 | `RATATOSK_BOUND_ADDR_FILE` | unset | optional sidecar handoff file for the actual bound address/port when using `RATATOSK_PORT=0` |
 | `RATATOSK_MAX_CLIENTS` | `4096` | concurrent connection cap |
 | `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client output limit |

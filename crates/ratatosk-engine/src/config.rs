@@ -6,6 +6,11 @@ use bytes::Bytes;
 pub struct ConfigState {
     bind: String,
     port: u16,
+    unixsocket: Option<PathBuf>,
+    unixsocketperm: u32,
+    shm_socket: Option<PathBuf>,
+    shm_ring_bytes: u32,
+    shm_spin_iters: u32,
     max_clients: usize,
     output_buffer_limit_bytes: usize,
     shutdown_grace_period_ms: u64,
@@ -42,6 +47,11 @@ impl Default for ConfigState {
         Self {
             bind: "127.0.0.1".to_string(),
             port: 6379,
+            unixsocket: None,
+            unixsocketperm: 0o700,
+            shm_socket: None,
+            shm_ring_bytes: 1024 * 1024,
+            shm_spin_iters: 2000,
             max_clients: 4096,
             output_buffer_limit_bytes: 8 * 1024 * 1024,
             shutdown_grace_period_ms: 10_000,
@@ -90,6 +100,46 @@ impl ConfigState {
 
     pub fn set_port(&mut self, value: u16) {
         self.port = value;
+    }
+
+    pub fn unixsocket(&self) -> Option<&PathBuf> {
+        self.unixsocket.as_ref()
+    }
+
+    pub fn set_unixsocket(&mut self, value: Option<PathBuf>) {
+        self.unixsocket = value;
+    }
+
+    pub fn unixsocketperm(&self) -> u32 {
+        self.unixsocketperm
+    }
+
+    pub fn set_unixsocketperm(&mut self, value: u32) {
+        self.unixsocketperm = value;
+    }
+
+    pub fn shm_socket(&self) -> Option<&PathBuf> {
+        self.shm_socket.as_ref()
+    }
+
+    pub fn set_shm_socket(&mut self, value: Option<PathBuf>) {
+        self.shm_socket = value;
+    }
+
+    pub fn shm_ring_bytes(&self) -> u32 {
+        self.shm_ring_bytes
+    }
+
+    pub fn set_shm_ring_bytes(&mut self, value: u32) {
+        self.shm_ring_bytes = value;
+    }
+
+    pub fn shm_spin_iters(&self) -> u32 {
+        self.shm_spin_iters
+    }
+
+    pub fn set_shm_spin_iters(&mut self, value: u32) {
+        self.shm_spin_iters = value;
     }
 
     pub fn max_clients(&self) -> usize {

@@ -1,5 +1,6 @@
 use super::shared_support::{frame_to_argv_for_persistence, refresh_client_snapshot};
 use super::*;
+use crate::transport::SessionStream;
 use ratatosk_persist::aof::FsyncPolicy;
 
 #[derive(Clone, Copy)]
@@ -252,8 +253,17 @@ async fn append_durability_effects_while_locked(
     }
 }
 
-async fn wait_for_blocking_ready(
-    stream: &TcpStream,
+/// Wait for the blocking command to become retryable: a key notification, the
+/// retry deadline, or the peer going away. Bytes the client pipelines behind
+/// the blocking command are read into `input` (and counted in `prefetched`) so
+/// socket readiness is consumed instead of spinning; they are parsed once the
+/// blocking command completes. Returns `Ok(true)` when the peer closed.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_blocking_ready<S: SessionStream>(
+    stream: &mut S,
+    input: &mut BytesMut,
+    query_buffer_limit: usize,
+    prefetched: &mut usize,
     wait_for: Duration,
     notifier: &Notify,
 ) -> io::Result<bool> {
@@ -266,22 +276,17 @@ async fn wait_for_blocking_ready(
     tokio::select! {
         _ = notifier.notified() => Ok(false),
         _ = &mut sleep => Ok(false),
-        result = stream.readable() => match result {
-            Ok(()) => {
-                let mut probe = [0u8; 1];
-                match stream.peek(&mut probe).await {
-                    Ok(0) => Ok(true),
-                    Ok(_) => Ok(false),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                        ) =>
-                    {
-                        Ok(false)
-                    }
-                    Err(error) => Err(error),
+        result = stream.read_buf(input) => match result {
+            Ok(0) => Ok(true),
+            Ok(read) => {
+                *prefetched = prefetched.saturating_add(read);
+                if input.len() > query_buffer_limit {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "query buffer limit exceeded while a blocking command was pending",
+                    ));
                 }
+                Ok(false)
             }
             Err(error)
                 if matches!(
@@ -297,12 +302,15 @@ async fn wait_for_blocking_ready(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_with_blocking_retry(
+pub(super) async fn run_with_blocking_retry<S: SessionStream>(
     frame: RespFrame,
     server_state: &SharedServerState,
     persistence: &Arc<PersistenceRuntime>,
     client_state: &mut ClientState,
-    stream: &TcpStream,
+    stream: &mut S,
+    input: &mut BytesMut,
+    query_buffer_limit: usize,
+    prefetched: &mut usize,
     addr: &Bytes,
     laddr: &Bytes,
 ) -> io::Result<CommandOutcome> {
@@ -559,18 +567,24 @@ pub(super) async fn run_with_blocking_retry(
         metrics::record_blocking_retry_iteration(&command_name);
         metrics::record_blocking_retry_wait_ms(&command_name, wait_for.as_millis() as f64);
 
-        if wait_for_blocking_ready(stream, wait_for, notifier.as_ref())
-            .await
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "waiting for blocking command retry readiness (command={}, attempt={}): {}",
-                        command_name, retry_attempts, error
-                    ),
-                )
-            })?
-        {
+        if wait_for_blocking_ready(
+            stream,
+            input,
+            query_buffer_limit,
+            prefetched,
+            wait_for,
+            notifier.as_ref(),
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "waiting for blocking command retry readiness (command={}, attempt={}): {}",
+                    command_name, retry_attempts, error
+                ),
+            )
+        })? {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
                 "client disconnected while waiting for blocking command",

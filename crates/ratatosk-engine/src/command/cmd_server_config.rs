@@ -435,6 +435,38 @@ fn known_config_values(server: &ServerState) -> Vec<(Bytes, Bytes)> {
             Bytes::from(server.config.port().to_string()),
         ),
         (
+            Bytes::from_static(b"unixsocket"),
+            Bytes::from(
+                server
+                    .config
+                    .unixsocket()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            Bytes::from_static(b"unixsocketperm"),
+            Bytes::from(format!("{:o}", server.config.unixsocketperm())),
+        ),
+        (
+            Bytes::from_static(b"shm-socket"),
+            Bytes::from(
+                server
+                    .config
+                    .shm_socket()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            Bytes::from_static(b"shm-ring-bytes"),
+            Bytes::from(server.config.shm_ring_bytes().to_string()),
+        ),
+        (
+            Bytes::from_static(b"shm-spin-iters"),
+            Bytes::from(server.config.shm_spin_iters().to_string()),
+        ),
+        (
             Bytes::from_static(b"maxclients"),
             Bytes::from(server.config.max_clients().to_string()),
         ),
@@ -655,6 +687,34 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     )
     .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "port {}", server.config.port()).map_err(|e| format!("writing config: {e}"))?;
+    let unixsocket = server
+        .config
+        .unixsocket()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    writeln!(
+        file,
+        "unixsocket {}",
+        format_config_scalar_value(&unixsocket)
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "unixsocketperm {:o}", server.config.unixsocketperm())
+        .map_err(|e| format!("writing config: {e}"))?;
+    let shm_socket = server
+        .config
+        .shm_socket()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    writeln!(
+        file,
+        "shm-socket {}",
+        format_config_scalar_value(&shm_socket)
+    )
+    .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "shm-ring-bytes {}", server.config.shm_ring_bytes())
+        .map_err(|e| format!("writing config: {e}"))?;
+    writeln!(file, "shm-spin-iters {}", server.config.shm_spin_iters())
+        .map_err(|e| format!("writing config: {e}"))?;
     writeln!(file, "maxclients {}", server.config.max_clients())
         .map_err(|e| format!("writing config: {e}"))?;
     writeln!(
@@ -906,5 +966,45 @@ mod tests {
         assert!(contents.contains("dbfilename \"snapshot data.rdb\""));
         assert!(contents.contains("appendonly yes"));
         assert!(contents.contains("appendfsync always"));
+    }
+
+    #[test]
+    fn rewrite_config_file_persists_unixsocket_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("data with spaces");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let unixsocket = config_dir.join("ratatosk socket.sock");
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_dir(config_dir.clone());
+        server.config.set_unixsocket(Some(unixsocket.clone()));
+        server.config.set_unixsocketperm(0o750);
+
+        rewrite_config_file(&server).expect("rewrite config file");
+
+        let contents = std::fs::read_to_string(config_dir.join("ratatosk.conf"))
+            .expect("read rewritten config");
+        assert!(contents.contains(&format!("unixsocket \"{}\"", unixsocket.display())));
+        assert!(contents.contains("unixsocketperm 750"));
+    }
+
+    #[test]
+    fn rewrite_config_file_persists_shm_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = dir.path().join("data");
+        std::fs::create_dir_all(&config_dir).expect("create config dir");
+        let shm_socket = config_dir.join("shm.sock");
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_dir(config_dir.clone());
+        server.config.set_shm_socket(Some(shm_socket.clone()));
+        server.config.set_shm_ring_bytes(65536);
+        server.config.set_shm_spin_iters(10);
+
+        rewrite_config_file(&server).expect("rewrite config file");
+
+        let contents = std::fs::read_to_string(config_dir.join("ratatosk.conf"))
+            .expect("read rewritten config");
+        assert!(contents.contains(&format!("shm-socket {}", shm_socket.display())));
+        assert!(contents.contains("shm-ring-bytes 65536"));
+        assert!(contents.contains("shm-spin-iters 10"));
     }
 }

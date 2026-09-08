@@ -266,8 +266,12 @@ fn bench_pipeline_set_encode_only(c: &mut Criterion) {
             BenchmarkId::from_parameter(pipeline_len),
             &responses,
             |b, responses| {
+                // The output buffer is allocated once outside the timed closure so the
+                // measurement is "frame -> designated buffer" only; `clear()` keeps the
+                // capacity and never reallocates.
+                let mut out = Vec::with_capacity(pipeline_len * 8);
                 b.iter(|| {
-                    let mut out = Vec::with_capacity(pipeline_len * 8);
+                    out.clear();
                     for response in responses {
                         encode_to_vec(response, &mut out);
                     }
@@ -291,8 +295,12 @@ fn bench_pipeline_ping_encode_only(c: &mut Criterion) {
             BenchmarkId::from_parameter(pipeline_len),
             &responses,
             |b, responses| {
+                // The output buffer is allocated once outside the timed closure so the
+                // measurement is "frame -> designated buffer" only; `clear()` keeps the
+                // capacity and never reallocates.
+                let mut out = Vec::with_capacity(pipeline_len * 8);
                 b.iter(|| {
-                    let mut out = Vec::with_capacity(pipeline_len * 8);
+                    out.clear();
                     for response in responses {
                         encode_to_vec(response, &mut out);
                     }
@@ -300,6 +308,36 @@ fn bench_pipeline_ping_encode_only(c: &mut Criterion) {
                 });
             },
         );
+    }
+
+    group.finish();
+}
+
+/// Single-reply encode cost into a pre-allocated buffer. This is the exact
+/// "function input -> designated buffer output" measurement referenced by the
+/// transport plan; it is a CPU cost per reply, not a command or IPC latency.
+fn bench_encode_reply_into_prealloc(c: &mut Criterion) {
+    let mut group = c.benchmark_group("encode_reply_into_prealloc");
+    let bulk_64 = RespFrame::bulk_str(&"x".repeat(64));
+    let bulk_1k = RespFrame::bulk_str(&"x".repeat(1024));
+    let cases: [(&str, RespFrame); 5] = [
+        ("simple_ok", RespFrame::simple_str("OK")),
+        ("integer_1", RespFrame::Integer(1)),
+        ("error_generic", RespFrame::error_str("ERR generic")),
+        ("bulk_64b", bulk_64),
+        ("bulk_1kib", bulk_1k),
+    ];
+
+    for (name, frame) in &cases {
+        group.throughput(Throughput::Elements(1));
+        group.bench_with_input(BenchmarkId::from_parameter(name), frame, |b, frame| {
+            let mut out = Vec::with_capacity(2048);
+            b.iter(|| {
+                out.clear();
+                encode_to_vec(black_box(frame), &mut out);
+                black_box(out.len());
+            });
+        });
     }
 
     group.finish();
@@ -314,6 +352,7 @@ criterion_group!(
     bench_pipeline_set_execute_only,
     bench_pipeline_ping_execute_only,
     bench_pipeline_set_encode_only,
-    bench_pipeline_ping_encode_only
+    bench_pipeline_ping_encode_only,
+    bench_encode_reply_into_prealloc
 );
 criterion_main!(pipeline_benches);

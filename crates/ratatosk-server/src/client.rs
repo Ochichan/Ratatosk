@@ -32,7 +32,7 @@ use self::session_loop::{
 use self::session_runtime::{initialize_session_runtime, run_client_session_loop};
 use self::shared_support::{
     disconnect_reason_for_result, finish_client_connection, refresh_client_snapshot,
-    register_client_connection, socket_addr_bytes,
+    register_client_connection,
 };
 use crate::breadcrumbs;
 use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
@@ -41,6 +41,7 @@ use crate::persistence::{
     PersistenceRuntime, append_aof_effects, disable_aof, enable_aof_from_snapshot, run_save,
     set_aof_fsync_policy, start_bgrewriteaof, start_bgsave,
 };
+use crate::transport::{ConnInfo, PeerKind, SessionStream};
 
 mod execution;
 mod io_support;
@@ -83,6 +84,13 @@ impl Default for ClientIoLimits {
 }
 
 pub async fn handle_client(stream: TcpStream, server_state: SharedServerState) -> io::Result<()> {
+    // The production accept loop sets TCP_NODELAY before handing the stream over;
+    // this convenience entry point must do the same so embedders and tests see
+    // identical latency behaviour.
+    if let Err(error) = stream.set_nodelay(true) {
+        tracing::debug!(error = %error, "failed to enable TCP_NODELAY");
+    }
+    let info = ConnInfo::from_tcp(&stream);
     let persistence = Arc::new(
         PersistenceRuntime::from_config(&crate::config::ServerConfig::default()).map_err(
             |error| {
@@ -93,22 +101,30 @@ pub async fn handle_client(stream: TcpStream, server_state: SharedServerState) -
             },
         )?,
     );
-    handle_client_with_limits(stream, server_state, persistence, ClientIoLimits::default()).await
+    handle_client_with_limits(
+        stream,
+        info,
+        server_state,
+        persistence,
+        ClientIoLimits::default(),
+    )
+    .await
 }
 
-pub async fn handle_client_with_limits(
-    stream: TcpStream,
+pub async fn handle_client_with_limits<S: SessionStream>(
+    stream: S,
+    info: ConnInfo,
     server_state: SharedServerState,
     persistence: Arc<PersistenceRuntime>,
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
-    let (client_id, remote_addr) = register_client_connection(&stream, &server_state);
+    let (client_id, remote_addr) = register_client_connection(&info, &server_state);
 
     // Create a tracing span for this client session
     let client_span = tracing::info_span!(
         "client_session",
         client_id = client_id,
-        remote_addr = %remote_addr,
+        remote_addr = %info.remote_display,
     );
 
     async move {
@@ -119,17 +135,24 @@ pub async fn handle_client_with_limits(
             "client connected"
         );
 
-        let result = handle_client_inner(stream, &server_state, &persistence, client_id, io_limits)
-            .await
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!(
-                        "handling client I/O (client_id={}, remote_addr={}): {}",
-                        client_id, remote_addr, error
-                    ),
-                )
-            });
+        let result = handle_client_inner(
+            stream,
+            &info,
+            &server_state,
+            &persistence,
+            client_id,
+            io_limits,
+        )
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "handling client I/O (client_id={}, remote_addr={}): {}",
+                    client_id, remote_addr, error
+                ),
+            )
+        });
 
         let disconnect_reason = disconnect_reason_for_result(&result);
         finish_client_connection(&server_state, client_id, disconnect_reason).await;
@@ -147,16 +170,19 @@ pub async fn handle_client_with_limits(
     .await
 }
 
-async fn handle_client_inner(
-    mut stream: TcpStream,
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_inner<S: SessionStream>(
+    mut stream: S,
+    info: &ConnInfo,
     server_state: &SharedServerState,
     persistence: &Arc<PersistenceRuntime>,
     client_id: i64,
     io_limits: ClientIoLimits,
 ) -> io::Result<()> {
     let mut client_state = ClientState::new(client_id);
+    client_state.set_unix_socket(matches!(&info.kind, PeerKind::Unix | PeerKind::Shm));
     let mut runtime =
-        initialize_session_runtime(&stream, server_state, client_id, &client_state).await;
+        initialize_session_runtime(info, server_state, client_id, &client_state).await;
 
     run_client_session_loop(
         &mut stream,
@@ -197,6 +223,7 @@ mod tests {
     };
     use crate::config::DEFAULT_OUTPUT_BUFFER_LIMIT_BYTES;
     use crate::persistence::PersistenceRuntime;
+    use crate::transport::ConnInfo;
 
     async fn setup_client_server() -> (TcpStream, tokio::task::JoinHandle<()>) {
         setup_client_server_with_limits(ClientIoLimits::default()).await
@@ -215,12 +242,14 @@ mod tests {
             PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
                 .expect("persistence runtime"),
         );
+        let info = ConnInfo::from_tcp(&server);
 
         tracing::subscriber::with_default(tracing_subscriber::registry(), || {
             assert!(tracing::Span::current().id().is_none());
 
             let mut session = Box::pin(handle_client_with_limits(
                 server,
+                info,
                 shared,
                 persistence,
                 ClientIoLimits::default(),
@@ -249,11 +278,12 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
+            let info = ConnInfo::from_tcp(&socket);
             let persistence = Arc::new(
                 PersistenceRuntime::from_config(&crate::config::ServerConfig::default())
                     .expect("persistence runtime"),
             );
-            handle_client_with_limits(socket, shared_for_server, persistence, io_limits)
+            handle_client_with_limits(socket, info, shared_for_server, persistence, io_limits)
                 .await
                 .expect("handle client");
         });
@@ -288,7 +318,8 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.expect("accept");
-            handle_client_with_limits(socket, shared, persistence, io_limits)
+            let info = ConnInfo::from_tcp(&socket);
+            handle_client_with_limits(socket, info, shared, persistence, io_limits)
                 .await
                 .expect("handle client");
         });
@@ -1563,8 +1594,10 @@ mod tests {
                 let shared = Arc::clone(&shared_for_accept);
                 let persistence = Arc::clone(&persistence);
                 tasks.push(tokio::spawn(async move {
+                    let info = ConnInfo::from_tcp(&socket);
                     handle_client_with_limits(
                         socket,
+                        info,
                         shared,
                         persistence,
                         ClientIoLimits::default(),
@@ -2262,8 +2295,10 @@ mod tests {
                 let shared = Arc::clone(&shared_for_accept);
                 let persistence = Arc::clone(&persistence);
                 tasks.push(tokio::spawn(async move {
+                    let info = ConnInfo::from_tcp(&socket);
                     handle_client_with_limits(
                         socket,
+                        info,
                         shared,
                         persistence,
                         ClientIoLimits::default(),
@@ -2989,6 +3024,218 @@ mod tests {
             .expect("quit observer");
         let _ = read_reply(&mut observer).await;
 
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn blocked_client_disconnect_finishes_session_and_cleans_up() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let shared_for_server = Arc::clone(&shared);
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept blocked client");
+            handle_client(socket, shared_for_server).await
+        });
+
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("connect blocked client");
+        client
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$1\r\nk\r\n$1\r\n0\r\n")
+            .await
+            .expect("start blocking pop");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if shared.meta.lock().await.blocked_clients() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked client was not registered");
+
+        drop(client);
+
+        let _session_result = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("blocked client session timeout")
+            .expect("blocked client session join");
+
+        assert_eq!(shared.stats.connected_clients(), 0);
+        let server = shared.meta.lock().await;
+        assert_eq!(server.blocked_clients(), 0, "blocked snapshot must be gone");
+        assert!(
+            !server.write_observers_active(),
+            "blocking registry must not keep waiters for a disconnected client"
+        );
+    }
+
+    /// A client that pipelines more bytes behind a blocking command and then
+    /// closes is torn down without executing the pipelined command. This is the
+    /// Redis behaviour (a blocked client that hits EOF is freed) and pins the
+    /// `peer_closed` semantics: read-closed with unread bytes still ends the session.
+    #[tokio::test]
+    async fn blocked_client_close_with_pipelined_bytes_ends_session() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let shared_for_server = Arc::clone(&shared);
+
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept blocked client");
+            handle_client(socket, shared_for_server).await
+        });
+
+        let mut client = TcpStream::connect(addr)
+            .await
+            .expect("connect blocked client");
+        client
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$1\r\nk\r\n$1\r\n0\r\n")
+            .await
+            .expect("start blocking pop");
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if shared.meta.lock().await.blocked_clients() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked client was not registered");
+
+        client
+            .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n")
+            .await
+            .expect("pipeline a write behind the block");
+        drop(client);
+
+        let _session_result = timeout(Duration::from_secs(2), server_task)
+            .await
+            .expect("blocked client session timeout")
+            .expect("blocked client session join");
+
+        assert_eq!(shared.stats.connected_clients(), 0);
+        let server = shared.meta.lock().await;
+        assert!(
+            server.db(0).get(&Bytes::from_static(b"a")).is_none(),
+            "pipelined command behind a closed blocking client must not execute"
+        );
+        assert_eq!(server.blocked_clients(), 0);
+        assert!(!server.write_observers_active());
+    }
+
+    /// Bytes pipelined behind a blocking command are buffered while the command
+    /// is parked (consuming socket readiness instead of spinning on it) and are
+    /// executed in order once the blocking reply has been sent — for both a
+    /// wake-up and a timeout completion.
+    #[tokio::test]
+    async fn pipelined_command_behind_blocking_pop_runs_after_it_completes() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+
+        let shared_for_accept = Arc::clone(&shared);
+        let accept_task = tokio::spawn(async move {
+            let (sock_blocked, _) = listener.accept().await.expect("accept blocked");
+            let (sock_writer, _) = listener.accept().await.expect("accept writer");
+            let shared_blocked = Arc::clone(&shared_for_accept);
+            let task_blocked = tokio::spawn(async move {
+                handle_client(sock_blocked, shared_blocked)
+                    .await
+                    .expect("handle blocked");
+            });
+            let shared_writer = Arc::clone(&shared_for_accept);
+            let task_writer = tokio::spawn(async move {
+                handle_client(sock_writer, shared_writer)
+                    .await
+                    .expect("handle writer");
+            });
+            task_blocked.await.expect("join blocked");
+            task_writer.await.expect("join writer");
+        });
+
+        let mut blocked = TcpStream::connect(addr).await.expect("connect blocked");
+        let mut writer = TcpStream::connect(addr).await.expect("connect writer");
+
+        // 1. Wake-up path: BLPOP parked, then PING pipelined behind it.
+        blocked
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$7\r\nwake-me\r\n$1\r\n5\r\n")
+            .await
+            .expect("start blocking pop");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if shared.meta.lock().await.blocked_clients() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked client was not registered");
+        blocked
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .await
+            .expect("pipeline ping behind the block");
+        // Give the parked session a moment: it must absorb the bytes, not answer yet.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        writer
+            .write_all(b"*3\r\n$5\r\nLPUSH\r\n$7\r\nwake-me\r\n$7\r\npayload\r\n")
+            .await
+            .expect("push payload");
+        assert_eq!(read_reply(&mut writer).await, b":1\r\n");
+
+        let mut reply = read_reply(&mut blocked).await;
+        if !reply.ends_with(b"+PONG\r\n") {
+            reply.extend(read_reply(&mut blocked).await);
+        }
+        let reply_text = String::from_utf8_lossy(&reply);
+        assert!(reply_text.contains("payload"), "{reply_text}");
+        assert!(reply_text.ends_with("+PONG\r\n"), "{reply_text}");
+
+        // 2. Timeout path: BLPOP with a 1s deadline, PING pipelined behind it.
+        blocked
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$5\r\nempty\r\n$1\r\n1\r\n")
+            .await
+            .expect("start timed blocking pop");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        blocked
+            .write_all(b"*1\r\n$4\r\nPING\r\n")
+            .await
+            .expect("pipeline ping behind the timed block");
+        let mut nil = timeout(Duration::from_secs(3), read_reply(&mut blocked))
+            .await
+            .expect("blocking pop must time out");
+        if !nil.ends_with(b"+PONG\r\n") {
+            nil.extend(read_reply(&mut blocked).await);
+        }
+        assert!(
+            nil.starts_with(b"*-1") || nil.starts_with(b"$-1") || nil.starts_with(b"_"),
+            "expected null reply, got {:?}",
+            String::from_utf8_lossy(&nil)
+        );
+        assert!(
+            nil.ends_with(b"+PONG\r\n"),
+            "pipelined PING must run after the timed-out block: {:?}",
+            String::from_utf8_lossy(&nil)
+        );
+
+        blocked.write_all(b"QUIT\r\n").await.expect("quit blocked");
+        let _ = read_reply(&mut blocked).await;
+        writer.write_all(b"QUIT\r\n").await.expect("quit writer");
+        let _ = read_reply(&mut writer).await;
         accept_task.await.expect("accept task join");
     }
 

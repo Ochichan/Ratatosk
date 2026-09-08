@@ -75,6 +75,25 @@ fn wait_for_tcp_listener(port: u16) -> io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
+fn wait_for_unix_listener(path: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(_) => thread::sleep(Duration::from_millis(50)),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("timed out waiting for Unix socket {}", path.display()),
+    ))
+}
+
 fn connect_client(port: u16) -> io::Result<TcpStream> {
     let stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -134,6 +153,34 @@ fn spawn_ratatosk_server_on_dynamic_port(dir: &Path) -> io::Result<(ChildGuard, 
     let port = wait_for_bound_port_file(&bound_addr_file, &mut child)?;
 
     Ok((ChildGuard { child }, port))
+}
+
+#[cfg(unix)]
+fn spawn_ratatosk_unixsocket_server(socket_path: &Path, dir: &Path) -> io::Result<ChildGuard> {
+    let metrics_port = reserve_port()?;
+    let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
+        )
+    })?;
+
+    let child = Command::new(bin)
+        .env("RATATOSK_BIND", "127.0.0.1")
+        .env("RATATOSK_PORT", "0")
+        .env("RATATOSK_UNIXSOCKET", socket_path)
+        .env("RATATOSK_UNIXSOCKETPERM", "700")
+        .env("RATATOSK_DIR", dir)
+        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
+        .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
+        .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
+        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env("RATATOSK_ALLOW_NO_METRICS", "true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    Ok(ChildGuard { child })
 }
 
 fn wait_for_bound_port_file(path: &Path, child: &mut Child) -> io::Result<u16> {
@@ -508,6 +555,45 @@ fn redis_interop_supported_subset_matches_redis_when_available() -> io::Result<(
             "interop mismatch at command #{index} ({label}): ratatosk={ratatosk_reply:?} redis={redis_reply:?}"
         );
     }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn redis_cli_can_ping_ratatosk_over_unix_socket_when_available() -> io::Result<()> {
+    let redis_cli = match Command::new("redis-cli").arg("--version").output() {
+        Ok(_) => "redis-cli",
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if std::env::var_os("RATATOSK_REQUIRE_REDIS_INTEROP").is_some_and(|value| value == "1")
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "Redis interop is required but redis-cli is not installed",
+                ));
+            }
+            eprintln!("skipping redis interop smoke test because redis-cli is not installed");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+
+    let dir = tempfile::tempdir()?;
+    let socket_path = dir.path().join("ratatosk.sock");
+    let _ratatosk = spawn_ratatosk_unixsocket_server(&socket_path, dir.path())?;
+    wait_for_unix_listener(&socket_path)?;
+
+    let output = Command::new(redis_cli)
+        .arg("-s")
+        .arg(&socket_path)
+        .arg("PING")
+        .output()?;
+    assert!(
+        output.status.success(),
+        "redis-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "PONG");
 
     Ok(())
 }
