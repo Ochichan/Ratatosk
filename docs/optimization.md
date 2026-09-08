@@ -23,6 +23,7 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 
 #### Bench Scope
 
+- Two-process transport latency: [IPC benchmark contract and usage](ipc-benchmark.md).
 - bench target: `cargo bench -p ratatosk-server --bench pipeline`
 - metrics:
   - `pipeline_set_parse_execute_encode`
@@ -46,6 +47,33 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 운영 규칙:
 - PASS 로그만 guardrail 업데이트 후보로 사용한다.
 - FAIL/고분산 로그는 회귀 원인 조사 참고용으로만 보관한다.
+
+#### RESP Reply Encode Cost (CPU, not latency)
+
+`encode_reply_into_prealloc` measures one `RespFrame` → pre-allocated `Vec<u8>`
+(`clear()` per iteration, no allocation inside the timed closure). This is a
+per-reply CPU cost of the encoder only. It is **not** a command latency, an IPC
+latency, or a kernel-crossing time, and must not be quoted as one.
+
+Measured 2026-09-08, Apple M5 Pro (arm64, macOS 25.6), release, criterion
+sample size 20 (`cargo bench -p ratatosk-server --bench pipeline -- encode`):
+
+| Case | Reply bytes | Time per reply |
+| --- | --- | ---: |
+| `simple_ok` | `+OK\r\n` | 3.1 ns |
+| `integer_1` | `:1\r\n` | 3.0 ns |
+| `error_generic` | `-ERR generic\r\n` | 3.1 ns |
+| `bulk_64b` | `$64\r\n…\r\n` | 4.7 ns |
+| `bulk_1kib` | `$1024\r\n…\r\n` | 13.8 ns |
+
+Batch-amortized figures agree: `pipeline_set_encode_only/1024` = 3.1 ns/reply,
+`pipeline_ping_encode_only/1024` = 3.9 ns/reply. Before 2026-09-08 the
+`*_encode_only/1` cases allocated the output `Vec` inside the timed closure and
+reported ~10.7 ns; that number was allocation overhead, not encoder cost.
+
+The "about 3.5 ns" figure quoted in internal planning documents is therefore
+this per-reply encoder CPU cost (`+OK` / `+PONG` on this host) and nothing more.
+Two-process transport latency is measured separately under `benchmarks/ipc/`.
 
 #### Allocator A/B Policy
 
