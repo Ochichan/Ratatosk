@@ -5,6 +5,7 @@ members = [
     "crates/ratatosk-engine",
     "crates/ratatosk-persist",
     "crates/ratatosk-server",
+    "crates/ratatosk-ipc-bench",
     "crates/ratatosk-shm",
 ]
 resolver = "3"

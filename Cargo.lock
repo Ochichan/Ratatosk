@@ -1234,6 +1234,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratatosk-ipc-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "ratatosk-shm",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "ratatosk-persist"
 version = "0.1.0"
 dependencies = [
