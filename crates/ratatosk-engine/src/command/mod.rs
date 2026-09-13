@@ -3610,6 +3610,8 @@ pub struct ClientState {
     no_touch: bool,
     reply_mode: Bytes,
     auth_failure_count: u32,
+    /// Trusted transport metadata, never derived from a client command.
+    peer_ip: Option<std::net::IpAddr>,
     lib_name: Option<Bytes>,
     lib_ver: Option<Bytes>,
     unix_socket: bool,
@@ -3799,6 +3801,15 @@ impl ClientState {
         self.snapshot_with_redirect(addr, laddr, self.tracking_redirect)
     }
 
+    /// Set once from transport facts when an embedded/server session is created.
+    pub fn set_peer_ip(&mut self, peer_ip: Option<std::net::IpAddr>) {
+        self.peer_ip = peer_ip;
+    }
+
+    pub fn peer_ip(&self) -> Option<std::net::IpAddr> {
+        self.peer_ip
+    }
+
     pub fn auth_failure_count(&self) -> u32 {
         self.auth_failure_count
     }
@@ -3931,6 +3942,7 @@ impl ClientState {
             no_touch: false,
             reply_mode: Bytes::from_static(b"on"),
             auth_failure_count: 0,
+            peer_ip: None,
             lib_name: None,
             lib_ver: None,
             unix_socket: false,
@@ -3969,6 +3981,7 @@ impl ClientState {
         self.monitor_mode = false;
         self.durability_capture_enabled = false;
         self.durability_effects = None;
+        // RESET preserves trusted peer identity and authentication failure history.
         // RESET can itself be queued; preserve an enclosing EXEC/EVAL unit.
         self.memory_admission_bypass_depth = memory_admission_bypass_depth;
     }
@@ -5905,8 +5918,8 @@ mod tests {
             &mut server,
             &mut client,
         ));
-        // RO names are currently writable aliases, so admission cannot assume
-        // that an arbitrary script passed through them is safe under OOM.
+        // RO execution still uses conservative admission: script caching can
+        // allocate even when the script only reads dataset values.
         assert_oom(run(
             &["EVAL_RO", "return redis.call('GET','call-key')", "0"],
             &mut server,
@@ -5920,8 +5933,8 @@ mod tests {
 
     #[cfg(feature = "lua-scripting")]
     #[test]
-    fn writable_lua_ro_aliases_share_top_level_admission_and_no_partial_oom() {
-        let script = "redis.call('SET','alias-call',string.rep('x',1024)); return redis.pcall('SET','alias-pcall',string.rep('y',1024))";
+    fn lua_ro_rejects_writes_and_retains_conservative_oom_admission() {
+        let script = "return redis.pcall('SET','alias-write','v')";
         for name in ["EVAL_RO", "EVALSHA_RO"] {
             let mut server = ServerState::with_default_dbs();
             server.config.set_maxmemory(1);
@@ -5934,17 +5947,17 @@ mod tests {
             } else {
                 script.to_owned()
             };
+            client.set_durability_capture_enabled(true);
+            let result = run(&[name, &body, "0"], &mut server, &mut client);
+            assert!(matches!(result, RespFrame::Error(_)), "{name}: {result:?}");
+            assert!(client.take_durability_effects().is_none());
             assert_eq!(
-                run(&[name, &body, "0"], &mut server, &mut client),
+                run(&["GET", "alias-write"], &mut server, &mut client),
+                RespFrame::BulkString(None)
+            );
+            assert_eq!(
+                run(&["SET", "seed", "over-cap"], &mut server, &mut client),
                 RespFrame::ok()
-            );
-            assert_eq!(
-                run(&["GET", "alias-call"], &mut server, &mut client),
-                RespFrame::bulk_str(&"x".repeat(1024))
-            );
-            assert_eq!(
-                run(&["GET", "alias-pcall"], &mut server, &mut client),
-                RespFrame::bulk_str(&"y".repeat(1024))
             );
             client.set_durability_capture_enabled(true);
             assert_oom(run(&[name, &body, "0"], &mut server, &mut client));

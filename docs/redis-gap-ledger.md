@@ -93,7 +93,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `ACL WHOAMI` | server | 6.0.0 | done | behavioral_subset | m0-foundation | M0 ACL baseline implemented (current authenticated ACL user). |
 | `APPEND` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `ASKING` | cluster | 3.0.0 | done | syntax_only | m5-advanced |  |
-| `AUTH` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented (accepts AUTH <username> <password>). |
+| `AUTH` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | AUTH and HELLO AUTH share per-connection delay/close and bounded process-local TCP peer-IP failure limits (20/60s, 4096 IPs). Success resets only connection history; RESET/reconnect cannot clear peer history. Local transports have connection limits only. |
 | `BGREWRITEAOF` | server | 1.0.0 | done | behavioral_subset | m3-persistence | Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). Materializes the current dataset including hash-field TTLs and complete stream group state before switching BASE/INCR manifest. |
 | `BGSAVE` | server | 1.0.0 | done | behavioral_subset | m3-persistence | M3 baseline implemented (non-blocking acknowledgement path with timestamp update). |
 | `BITCOUNT` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
@@ -185,11 +185,11 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `DISCARD` | transactions | 2.0.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented. |
 | `DUMP` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RATSK1 internal payload serialization for string/hash/list/set. |
 | `ECHO` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
-| `EVAL` | scripting | 2.6.0 | done | unsupported | m5-advanced |  |
-| `EVALSHA` | scripting | 2.6.0 | done | unsupported | m5-advanced |  |
-| `EVALSHA_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
-| `EVAL_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
-| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. |
+| `EVAL` | scripting | 2.6.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, Lua callbacks reject AUTH/HELLO and nested scripting; feature behavior does not establish full Redis parity. |
+| `EVALSHA` | scripting | 2.6.0 | done | unsupported | m5-advanced | Default build unsupported; lua-scripting enables cached execution with the same callback restrictions as EVAL. |
+| `EVALSHA_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, SHA execution uses the same read allowlist and conservative OOM admission as EVAL_RO. |
+| `EVAL_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, explicit data-read allowlist enforced before redis.call/pcall dispatch; other nested commands fail. Conservative OOM admission remains; not a host sandbox or full Redis parity. |
+| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. Inner terminal outcomes stop the remaining queue and propagate close plus accumulated delay; only the executed prefix persists (no rollback claim), with executed-command stats accounting. |
 | `EXISTS` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `EXPIRE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `EXPIREAT` | generic | 1.2.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
@@ -226,7 +226,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `GETRANGE` | string | 2.4.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `GETSET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `HDEL` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
-| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | RESP2 negotiation returns a flat array; RESP3 returns a map. Pipelined and transactional protocol changes preserve previously completed replies. |
+| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | RESP2 negotiation returns a flat array; RESP3 a map. Completed pipeline/EXEC replies keep their protocol. AUTH option shares credential failure delay/close and TCP peer-IP budget with AUTH; malformed options are not credential guesses. |
 | `HEXISTS` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
 | `HEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots. |
 | `HEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Absolute field deadlines survive RDB/BASE snapshots and AOF replay. |

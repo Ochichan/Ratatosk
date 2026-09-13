@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod acl;
+pub mod auth_rate_limiter;
 pub mod clients;
 pub mod command;
 pub mod config;

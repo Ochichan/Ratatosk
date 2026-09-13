@@ -312,11 +312,14 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 
 ### AUTH brute force prevention
 
-`crates/ratatosk-engine/src/command/cmd_auth_session.rs`, `crates/ratatosk-server/src/rate_limiter.rs`:
+`crates/ratatosk-engine/src/command/cmd_auth_session.rs`, `crates/ratatosk-engine/src/auth_rate_limiter.rs`:
 
 - **progressive delay**: 실패 횟수에 따라 응답 전 지수 지연을 적용한다. `delay_ms = min(100 × 2^(failures-1), 2000) × jitter(0.8..1.2)`. `tokio::time::sleep`으로 비동기 대기하므로 OS 스레드를 차단하지 않는다.
-- per-connection: 5회 연속 AUTH 실패 시 지연 후 연결을 종료한다 (`CommandOutcome::close_with_delay`).
-- per-IP: per-IP AUTH 실패 추적 한도(`AuthRateLimiter`, 60초 윈도우 / 20회)는 `crates/ratatosk-server/src/rate_limiter.rs`에 정의되어 있으나 현재 런타임 경로에 연결되어 있지 않다(데드 코드). 실제 accept 경로에 연결된 것은 IP별 *연결 시도* 횟수를 제한하는 `ConnectionRateLimiter`뿐이다.
+- per-connection: AUTH와 HELLO AUTH가 같은 실패 처리 경로를 사용한다. 5회 연속 실패 시 지연 후 연결 종료를 요청한다. 인증 성공은 연결별 횟수를 초기화하지만 RESET은 초기화하지 않는다.
+- per-IP: 서버가 전달한 실제 TCP peer IP를 기준으로 ServerState 소유 limiter가 60초 내 20회 실패를 추적한다. 재접속·AUTH/HELLO 혼용·RESET으로 우회할 수 없으며, 인증 성공도 공유 IP의 실패 기록을 지우지 않는다. IPv4-mapped IPv6는 같은 IPv4로 취급한다. 접속 횟수용 `ConnectionRateLimiter`와 별도다.
+- 자원 경계: 최대 4096 IP와 IP당 최대 20개 실패 시각을 보존한다. 활성 기록을 축출하지 않으며 용량이 찼을 때 새 IP의 인증 시도는 만료로 공간이 생길 때까지 거절한다. 성공한 세션의 일반 명령은 계속 처리한다. 시간 기준은 monotonic이며 프로세스 재시작 시 기록은 초기화된다.
+- UDS/SHM은 IP identity가 없으므로 연결별 제한만 적용한다. proxy/NAT 뒤의 사용자는 보이는 peer IP의 한도를 공유한다. 이 제한은 계정별 잠금·분산 방어·권한 회수 계약을 대신하지 않는다.
+- terminal outcome 뒤의 파이프라인 명령은 실행하지 않는다. EXEC도 terminal outcome에서 남은 큐 실행을 멈추고 누적 지연·종료를 전파한다. 이미 실행한 앞부분의 변경은 유지·영속화되며 전체 rollback을 보장하지 않는다. Lua callback에서는 AUTH/HELLO 자체를 거절한다.
 
 ### Sanitization helpers
 
@@ -333,7 +336,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 
 - Dependency: `mlua = { version = "0.11", features = ["lua51", "vendored"] }`
 - 구현: `crates/ratatosk-engine/src/command/lua_runtime.rs` (thread-local Lua VM)
-- Sandbox: TABLE+STRING+MATH+OS+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한
+- Sandbox: TABLE+STRING+MATH+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한
 - `redis.call()` / `redis.pcall()`: `mlua::Scope` + `RefCell`로 내부 `execute()`에 bridge
 - Type conversion: Redis 규약 (true->1, false->nil, table->Array, number->Integer)
 - Nested EVAL/EVALSHA는 거부됨
@@ -1163,7 +1166,7 @@ Command execution is effectively serial for state mutation. The mutex is held fo
 |----------|-------|
 | Feature gate | `lua-scripting` |
 | Lua version | 5.1 (vendored via `mlua`) |
-| Sandbox | TABLE+STRING+MATH+OS+BASE libs only |
+| Sandbox | TABLE+STRING+MATH+BASE libs only |
 | Memory limit | 1 MiB per thread-local Lua VM |
 | Instruction limit | 100K per script |
 | Nested EVAL | Rejected |
@@ -1172,8 +1175,8 @@ Supported commands when `lua-scripting` is enabled:
 
 | Command | Status |
 |---------|--------|
-| `EVAL` / `EVAL_RO` | Functional (`EVAL_RO` is an alias; read-only is not enforced) |
-| `EVALSHA` / `EVALSHA_RO` | Functional (`EVALSHA_RO` is an alias; read-only is not enforced) |
+| `EVAL` / `EVAL_RO` | Feature-gated; RO uses an explicit data-read allowlist and rejects other nested commands before dispatch |
+| `EVALSHA` / `EVALSHA_RO` | Feature-gated SHA execution; the RO callback boundary is identical to EVAL_RO |
 | `SCRIPT LOAD` | Functional |
 | `SCRIPT EXISTS` | Functional |
 | `SCRIPT FLUSH` | Functional |
@@ -1371,7 +1374,7 @@ Redis 공식 문서는 `EVAL`의 atomic execution과 Lua integration을, Functio
 
 - `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO` — Lua 5.1 VM에서 실행. `redis.call()` / `redis.pcall()`로 내부 `execute()`에 bridge.
 - `SCRIPT LOAD/EXISTS/FLUSH` — SHA1 캐시 관리.
-- Sandbox: TABLE+STRING+MATH+OS+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한.
+- Sandbox: TABLE+STRING+MATH+BASE 라이브러리만 허용, 1MB 메모리 제한, 100K instruction 제한.
 - Nested EVAL/EVALSHA 거부. Type conversion은 Redis 규약 준수 (true->1, false->nil, table->Array, number->Integer).
 - 구현: `crates/ratatosk-engine/src/command/lua_runtime.rs` (thread-local Lua VM, mlua 기반)
 
@@ -2324,3 +2327,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `ZSCORE` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
 | `ZUNION` | sorted_set | 6.2.0 | done | behavioral_subset | m2-collections |  |
 | `ZUNIONSTORE` | sorted_set | 2.0.0 | done | behavioral_subset | m2-collections |  |
+
+## Lua callback / OS library boundary (2026-09-13)
+
+`lua-scripting` builds restrict EVAL_RO/EVALSHA_RO nested Redis calls to the explicit read allowlist in `command/lua_runtime.rs`. Both redis.call and redis.pcall reject writes, publication and session/admin controls before dispatch. Disallowed readonly-looking commands may also be rejected; this is a conservative subset, not complete Redis parity. Read-path expiry and statistics still behave normally. The mode is fixed for each invocation.
+
+The VM no longer loads the OS library: `os.execute`, `os.remove`, `os.rename`, `os.exit`, `os.time` and `os.date` are unavailable. Existing scripts that used OS functions must change. Ordinary EVAL/EVALSHA may use redis.call('TIME') for timestamps. For RO scripts, obtain TIME outside the script and pass the value as ARGV; TIME does not replace date formatting. This removes known OS entry points but does not qualify the VM as a sandbox for hostile code.

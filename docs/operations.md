@@ -508,11 +508,16 @@ server is already over its limit when EXEC begins, a transaction containing
 memory-growing commands is rejected before its first operation. Once admitted,
 EXEC and a Lua invocation run as a unit for this admission check; they are not
 partially rejected solely because their own earlier writes crossed the limit.
-`EVAL_RO` and `EVALSHA_RO` currently remain functional aliases without read-only
-enforcement. They therefore receive the same potentially-growing admission as
-`EVAL`/`EVALSHA`, including OOM rejection even for a script that happens only to
-read. Ordinary read commands remain available. This change does not add a Lua
-read-only guarantee.
+With `lua-scripting`, `EVAL_RO` and `EVALSHA_RO` reject nested commands outside
+an explicit data-read allowlist before dispatch, for both `redis.call` and
+`redis.pcall`. This boundary restricts Redis command effects; it is not a general
+host sandbox. AUTH and HELLO are forbidden inside all Lua callbacks.
+
+All four EVAL variants retain conservative potentially-growing admission because
+script execution/caching can allocate. RO requests can therefore be rejected
+under OOM even when their dataset reads would be safe. Ordinary read commands
+remain available. This differs from full Redis EVAL_RO behavior; the scripting
+tier is not promoted by this change.
 
 ## Reliability report qualification
 
@@ -592,7 +597,7 @@ Ratatosk은 선택적 의존성으로 취급한다.
 ### Security defaults
 
 - loopback bind 기본 + insecure bind explicit opt-in.
-- AUTH brute force prevention: per-connection progressive delay (지수 백오프 + 지터, 최대 2초) + 5회 연속 실패 시 연결 종료, per-IP `AuthRateLimiter` (60초 윈도우 내 20회 실패 시 거부).
+- AUTH/HELLO AUTH: 연결별 지수 지연(기본 상한 2초에 jitter 적용)과 5회 연속 실패 시 종료. 공유 TCP peer IP는 60초 내 20회 실패 후 인증을 거절하며 성공·재접속·RESET으로 기록이 지워지지 않는다. IP 최대4096개에 도달하면 새 IP 인증도 공간 확보 전까지 거절한다. UDS/SHM은 연결별 제한만 적용한다. proxy/NAT 공유 IP와 프로세스 재시작 시 초기화에 유의한다.
 - audit trail은 append log를 `flush + sync_all` 한 뒤 checkpoint state를 atomic rename으로 저장한다. checkpoint가 뒤처져도 startup에서 durable audit log를 우선해 복구한다.
 - `MONITOR`는 `+OK`를 반환하고 해당 연결을 monitor 모드로 등록하며, 이후 실행된 명령을 `Arc<Notify>` 기반으로 등록된 클라이언트에게 broadcast한다 (baseline 수준, full Redis parity는 아님). 명령 인자가 그대로 노출되므로 신뢰된 운영 연결에서만 사용할 것.
 - TLS 종단은 프록시 계층(stunnel, nginx stream, envoy 등)에서 처리 권장.
@@ -1834,3 +1839,11 @@ cargo test -p ratatosk-server --test redis_interop -- --include-ignored --nocapt
 이 명령은 두 외부 시험과 같은 파일의 Ratatosk 자체 시험을 실행하며, 외부 바이너리가 없거나 실패하면 시험도 실패한다. 기존 `RATATOSK_REQUIRE_REDIS_INTEROP=1` 플래그만으로는 ignored 시험이 실행되지 않는다. Redis Interop CI도 위 명령을 사용한다. 비교 대상 Redis는 소유한 임시 디렉터리의 Unix socket으로만 열고 TCP는 비활성화한다.
 
 결과에는 사용한 Redis 버전·바이너리 identity를 별도로 남긴다. 이 suite는 버전을 pin하지 않으며, 일부 응답 비교와 redis-cli PING 성공을 전체 Redis 호환성·격리망 배포 적격성으로 확대하지 않는다.
+
+## 인증 실패로 종료되는 pipeline / EXEC
+
+AUTH와 HELLO AUTH는 같은 자격 증명 검사·실패 지연·종료 경로를 사용한다. 연결 종료가 요청되면 같은 pipeline의 뒤 명령은 실행하지 않는다. EXEC 안에서도 terminal outcome 뒤의 큐를 실행하지 않고, 이미 실행한 명령의 응답·변경·영속성 기록만 유지한다. 인증 실패로 중단된 EXEC는 전체 rollback이 아니므로, 자격 증명 협상은 업무 transaction 전에 끝낸다. 정상 EXEC의 기존 성공 동작은 유지한다.
+
+Lua compatibility change: the OS library is no longer exposed in `lua-scripting` builds, including `os.time` and `os.date`. Obtain timestamps with TIME outside an RO script and pass ARGV, or use redis.call('TIME') in ordinary EVAL/EVALSHA. Date formatting remains caller work. This removes process/file OS entry points without asserting a complete hostile-code sandbox.
+
+Lua 오류 traceback과 err/ok 응답 테이블의 CR/LF는 RESP line framing을 깨지 않도록 공백으로 변환한다. 일반 Lua 문자열의 bulk payload는 그대로 보존한다. 오류 후에도 같은 연결의 다음 응답을 정상적으로 읽을 수 있어야 한다.

@@ -74,13 +74,15 @@ pub(super) fn cmd_exec(
         return CommandOutcome::reply(maxmemory_oom_error());
     }
 
-    let overcounted = queued.len() as u64;
     let mut replies = Vec::with_capacity(queued.len());
     let mut reply_protocol = client.protocol_version();
     let mut segment_start = 0;
     let mut durable_commands = Vec::<DurableCommand>::new();
     let mut config_dirty = false;
     let mut acl_dirty = false;
+    let mut executed_count = 0u64;
+    let mut accumulated_delay_ms = None;
+    let mut should_close = false;
     client.begin_memory_admission_bypass();
     for argv in queued {
         let frame = RespFrame::Array(
@@ -90,8 +92,17 @@ pub(super) fn cmd_exec(
         );
         let mut access = ServerAccess::new_with_optional_atomic_stats(server, atomic_stats);
         let outcome = execute(frame, &mut access, client);
+        executed_count = executed_count.saturating_add(1);
         config_dirty |= outcome.config_dirty;
         acl_dirty |= outcome.acl_dirty;
+        if let Some(delay_ms) = outcome.delay_ms {
+            accumulated_delay_ms = Some(
+                accumulated_delay_ms
+                    .unwrap_or(0u64)
+                    .saturating_add(delay_ms),
+            );
+        }
+        should_close |= outcome.close;
         if let Some(effects) = client.take_durability_effects() {
             durable_commands.extend(effects.commands);
         }
@@ -109,20 +120,25 @@ pub(super) fn cmd_exec(
             reply_protocol = client.protocol_version();
         }
         replies.push(outcome.response);
+        if should_close {
+            break;
+        }
     }
     client.end_memory_admission_bypass();
 
     // Each queued command incremented total_commands_processed via execute(),
     // but Redis counts EXEC as a single command. Subtract the overcounted amount.
-    server.stats.adjust_commands_processed_by(overcounted);
+    server.stats.adjust_commands_processed_by(executed_count);
     if let Some(stats) = atomic_stats {
-        stats.adjust_commands_processed_by(overcounted);
+        stats.adjust_commands_processed_by(executed_count);
     }
 
     if !durable_commands.is_empty() {
         client.set_durability_effects(Some(DurabilityEffects::transaction(durable_commands)));
     }
     let mut outcome = CommandOutcome::reply(RespFrame::Array(replies));
+    outcome.close = should_close;
+    outcome.delay_ms = accumulated_delay_ms;
     outcome.config_dirty = config_dirty;
     outcome.acl_dirty = acl_dirty;
     outcome
@@ -186,6 +202,7 @@ pub(super) fn cmd_unwatch(args: &[Bytes], client: &mut ClientState) -> CommandOu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acl::AclState;
 
     fn argv(parts: &[&str]) -> Vec<Bytes> {
         parts
@@ -212,5 +229,68 @@ mod tests {
 
         assert!(outcome.config_dirty);
         assert!(outcome.acl_dirty);
+    }
+
+    #[test]
+    fn exec_stops_at_auth_close_and_keeps_executed_prefix_effects() {
+        let mut server = ServerState::with_default_dbs();
+        let default = server
+            .acl
+            .get_or_create_user_mut(&Bytes::from_static(b"default"));
+        default.nopass = false;
+        default
+            .passwords
+            .insert(AclState::hash_password(b"secret").expect("test password should hash"));
+        for _ in 0..100 {
+            server.stats.mark_command_processed();
+        }
+
+        let mut queue = vec![argv(&["SET", "before", "present"])];
+        queue.extend((0..5).map(|_| argv(&["AUTH", "wrong"])));
+        queue.push(argv(&["SET", "after", "absent"]));
+
+        let mut client = ClientState {
+            tx_state: TransactionState::InTransaction {
+                queue,
+                has_error: false,
+            },
+            ..ClientState::default()
+        };
+        client.authenticate_as(Bytes::from_static(b"default"));
+        client.set_durability_capture_enabled(true);
+
+        let outcome = cmd_exec(&[], &mut server, &mut client, None);
+
+        assert!(outcome.close);
+        assert!(outcome.delay_ms.is_some_and(|delay| delay > 0));
+        let RespFrame::Array(replies) = outcome.response else {
+            panic!("EXEC should return its executed prefix");
+        };
+        assert_eq!(replies.len(), 6);
+        assert_eq!(replies[0], RespFrame::ok());
+        assert!(
+            replies[1..]
+                .iter()
+                .all(|reply| matches!(reply, RespFrame::Error(_)))
+        );
+        assert_eq!(
+            server
+                .db(0)
+                .get(b"before" as &[u8])
+                .and_then(|value| value.as_string()),
+            Some(&Bytes::from_static(b"present"))
+        );
+        assert!(!server.db(0).contains_key(b"after" as &[u8]));
+        assert_eq!(server.stats.total_commands_processed(), 100);
+
+        let effects = client
+            .take_durability_effects()
+            .expect("executed write should remain durable");
+        assert!(effects.transaction);
+        assert_eq!(effects.commands.len(), 1);
+        assert_eq!(
+            effects.commands[0].argv,
+            argv(&["SET", "before", "present"])
+        );
     }
 }

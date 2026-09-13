@@ -181,6 +181,7 @@ async fn handle_client_inner<S: SessionStream>(
 ) -> io::Result<()> {
     let mut client_state = ClientState::new(client_id);
     client_state.set_unix_socket(matches!(&info.kind, PeerKind::Unix | PeerKind::Shm));
+    client_state.set_peer_ip(info.peer_ip);
     let mut runtime =
         initialize_session_runtime(info, server_state, client_id, &client_state).await;
 

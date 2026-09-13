@@ -59,6 +59,8 @@ pub(super) fn cmd_hello(
 ) -> CommandOutcome {
     let mut idx = 0usize;
     let mut proto = 3i64;
+    let mut auth_attempts = Vec::new();
+    let mut client_name = None;
 
     if let Some(first) = args.first() {
         if let Some(version) = parse_i64(first) {
@@ -82,17 +84,7 @@ pub(super) fn cmd_hello(
                 if idx + 2 >= args.len() {
                     return CommandOutcome::reply(err("ERR syntax error"));
                 }
-
-                if !super::cmd_auth_session::authenticate_client(
-                    server,
-                    &args[idx + 1],
-                    &args[idx + 2],
-                    client,
-                ) {
-                    return CommandOutcome::reply(err(
-                        "ERR invalid username-password pair or user is disabled.",
-                    ));
-                }
+                auth_attempts.push((&args[idx + 1], &args[idx + 2]));
                 idx += 3;
             }
             b"SETNAME" => {
@@ -102,10 +94,17 @@ pub(super) fn cmd_hello(
                 if let Err(response) = cmd_client::validate_client_name(&args[idx + 1]) {
                     return CommandOutcome::reply(response);
                 }
-                client.name = Some(args[idx + 1].clone());
+                client_name = Some(args[idx + 1].clone());
                 idx += 2;
             }
             _ => return CommandOutcome::reply(err("ERR syntax error")),
+        }
+    }
+
+    for (username, password) in auth_attempts {
+        match super::cmd_auth_session::authenticate_client(server, username, password, client) {
+            super::cmd_auth_session::AuthenticationResult::Authenticated => {}
+            super::cmd_auth_session::AuthenticationResult::Rejected(outcome) => return outcome,
         }
     }
 
@@ -113,6 +112,10 @@ pub(super) fn cmd_hello(
         return CommandOutcome::reply(err(
             "NOAUTH HELLO must be called with the client already authenticated",
         ));
+    }
+
+    if let Some(name) = client_name {
+        client.name = Some(name);
     }
 
     client.set_protocol_version(proto);
@@ -335,5 +338,29 @@ fn check_aof_health(dir: &Path, aof_enabled: bool) -> (bool, Option<String>) {
     match OpenOptions::new().create(true).append(true).open(&aof_path) {
         Ok(_) => (true, None),
         Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_hello_does_not_dispatch_an_embedded_auth_attempt() {
+        let server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        let args = [
+            Bytes::from_static(b"3"),
+            Bytes::from_static(b"AUTH"),
+            Bytes::from_static(b"missing"),
+            Bytes::from_static(b"wrong"),
+            Bytes::from_static(b"UNKNOWN"),
+        ];
+
+        let outcome = cmd_hello(&args, &server, &mut client);
+
+        assert_eq!(outcome.response, RespFrame::error_str("ERR syntax error"));
+        assert_eq!(client.auth_failure_count(), 0);
+        assert!(!client.is_authenticated());
     }
 }

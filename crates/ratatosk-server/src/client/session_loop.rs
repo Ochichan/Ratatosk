@@ -187,6 +187,12 @@ pub(super) async fn execute_client_pipeline<S: SessionStream>(
                     outcome,
                     protocol_version: client_state.protocol_version(),
                 });
+                if outcomes
+                    .last()
+                    .is_some_and(|executed| executed.outcome.close)
+                {
+                    break;
+                }
             }
             Ok(outcomes)
         }
