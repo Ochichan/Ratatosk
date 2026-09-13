@@ -16,6 +16,9 @@ use std::{
     time::SystemTime,
 };
 
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
+
 use anyhow::{Context, anyhow};
 use clap::{Parser, ValueEnum};
 use ratatosk_server::{
@@ -28,7 +31,7 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_CRASH_MAX_FILES: usize = 64;
 const DEFAULT_CRASH_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const BOUND_ADDR_FILE_ENV: &str = "RATATOSK_BOUND_ADDR_FILE";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DEFAULT_FD_HEADROOM: usize = 128;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -557,40 +560,67 @@ fn validate_fd_headroom(config: &ServerConfig, emit_logs: bool) -> anyhow::Resul
             return Ok(());
         };
 
-        let required = config.max_clients.saturating_add(DEFAULT_FD_HEADROOM);
-        if soft_limit < required as u64 {
-            return Err(anyhow!(
-                "insufficient open-file limit: soft_limit={} required_at_least={} (max_clients={} + headroom={})",
-                soft_limit,
-                required,
-                config.max_clients,
-                DEFAULT_FD_HEADROOM
-            ));
-        }
-
-        if emit_logs {
-            tracing::info!(
-                target = "ratatosk::startup",
-                fd_soft_limit = soft_limit,
-                fd_required = required,
-                "file descriptor headroom preflight passed"
-            );
-        }
-
-        Ok(())
+        validate_available_fd_headroom(config, soft_limit, emit_logs)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let soft_limit = macos_soft_nofile_limit()?;
+        validate_available_fd_headroom(config, soft_limit, emit_logs)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         if emit_logs {
             tracing::warn!(
                 target = "ratatosk::startup",
-                "fd headroom preflight is only implemented on Linux; skipping"
+                "fd headroom preflight is only implemented on Linux and macOS; skipping"
             );
         }
         let _ = config;
         Ok(())
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_available_fd_headroom(
+    config: &ServerConfig,
+    soft_limit: u64,
+    emit_logs: bool,
+) -> anyhow::Result<()> {
+    let required = config
+        .max_clients
+        .checked_add(DEFAULT_FD_HEADROOM)
+        .ok_or_else(|| {
+            anyhow!(
+                "open-file requirement overflow: max_clients={} headroom={}",
+                config.max_clients,
+                DEFAULT_FD_HEADROOM
+            )
+        })?;
+    let required_u64 = u64::try_from(required)
+        .context("converting required open-file limit to the platform limit representation")?;
+
+    if soft_limit < required_u64 {
+        return Err(anyhow!(
+            "insufficient open-file limit: soft_limit={} required_at_least={} (max_clients={} + headroom={})",
+            soft_limit,
+            required,
+            config.max_clients,
+            DEFAULT_FD_HEADROOM
+        ));
+    }
+
+    if emit_logs {
+        tracing::info!(
+            target = "ratatosk::startup",
+            fd_soft_limit = soft_limit,
+            fd_required = required,
+            "file descriptor headroom preflight passed"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -604,11 +634,83 @@ fn linux_soft_nofile_limit() -> Option<u64> {
         let rest = line.trim_start_matches("Max open files").trim();
         let mut parts = rest.split_whitespace();
         let soft = parts.next()?;
-        if soft.eq_ignore_ascii_case("unlimited") {
-            return Some(u64::MAX);
-        }
-        return soft.parse::<u64>().ok();
+        return parse_soft_nofile_limit(soft);
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_soft_nofile_limit() -> anyhow::Result<u64> {
+    let output = Command::new("/bin/sh")
+        .args(["-c", "ulimit -S -n"])
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .context("querying inherited macOS soft open-file limit with /bin/sh")?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "querying inherited macOS soft open-file limit with /bin/sh failed (status {}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let value = std::str::from_utf8(&output.stdout)
+        .context("macOS soft open-file limit query returned non-UTF-8 output")?;
+    parse_soft_nofile_limit(value).ok_or_else(|| {
+        anyhow!(
+            "could not parse macOS soft open-file limit from /bin/sh output: {:?}",
+            value.trim()
+        )
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn parse_soft_nofile_limit(value: &str) -> Option<u64> {
+    let mut parts = value.split_whitespace();
+    let value = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Some(u64::MAX);
+    }
+    value.parse::<u64>().ok()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod fd_limit_tests {
+    use super::{parse_soft_nofile_limit, validate_available_fd_headroom};
+    use ratatosk_server::config::ServerConfig;
+
+    #[test]
+    fn parses_numeric_and_unlimited_soft_limits() {
+        assert_eq!(parse_soft_nofile_limit("256\n"), Some(256));
+        assert_eq!(parse_soft_nofile_limit("unlimited\n"), Some(u64::MAX));
+    }
+
+    #[test]
+    fn rejects_invalid_and_overflowing_soft_limits() {
+        assert_eq!(parse_soft_nofile_limit("not-a-limit\n"), None);
+        assert_eq!(parse_soft_nofile_limit("18446744073709551616\n"), None);
+        assert_eq!(parse_soft_nofile_limit("256 trailing\n"), None);
+    }
+
+    #[test]
+    fn rejects_overflowing_fd_requirement() {
+        let mut config = ServerConfig {
+            max_clients: usize::MAX,
+            ..ServerConfig::default()
+        };
+
+        let error = validate_available_fd_headroom(&config, u64::MAX, false)
+            .expect_err("max_clients plus headroom should overflow");
+        assert!(error.to_string().contains("open-file requirement overflow"));
+
+        config.max_clients = 1;
+        validate_available_fd_headroom(&config, 129, false)
+            .expect("a representable requirement at the exact limit should pass");
+    }
 }

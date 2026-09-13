@@ -69,6 +69,31 @@ where
     command.output()
 }
 
+#[cfg(target_os = "macos")]
+fn run_ratatosk_with_soft_nofile_limit(
+    cwd: &Path,
+    soft_limit: usize,
+    max_clients: usize,
+) -> io::Result<Output> {
+    Command::new("/bin/sh")
+        .current_dir(cwd)
+        .env_clear()
+        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
+        .env("RATATOSK_DIR", cwd)
+        .env("RATATOSK_MAX_CLIENTS", max_clients.to_string())
+        .env("RATATOSK_AUDIT_LOG", cwd.join("audit.log"))
+        .env("RATATOSK_AUDIT_CHAIN_STATE", cwd.join("audit.state"))
+        .args([
+            "-c",
+            "ulimit -S -n \"$1\" && shift && exec \"$@\"",
+            "ratatosk-fd-preflight-test",
+        ])
+        .arg(soft_limit.to_string())
+        .arg(ratatosk_bin()?)
+        .arg("--check-config")
+        .output()
+}
+
 #[cfg(unix)]
 struct UnixServerGuard {
     child: Child,
@@ -323,6 +348,45 @@ fn check_config_fails_for_unwritable_bound_addr_file_parent() -> io::Result<()> 
     assert!(
         stderr.contains("bound address handoff parent is not a directory"),
         "stderr did not include bound address handoff failure:\n{stderr}"
+    );
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn check_config_honors_inherited_macos_soft_nofile_limit() -> io::Result<()> {
+    const SOFT_LIMIT: usize = 256;
+    const FD_HEADROOM: usize = 128;
+
+    let passing_temp = tempfile::tempdir()?;
+    let passing_max_clients = SOFT_LIMIT - FD_HEADROOM;
+    let passing =
+        run_ratatosk_with_soft_nofile_limit(passing_temp.path(), SOFT_LIMIT, passing_max_clients)?;
+    assert!(
+        passing.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&passing.stdout),
+        stderr_text(&passing)
+    );
+    assert!(
+        String::from_utf8_lossy(&passing.stdout).contains("ratatosk configuration OK"),
+        "stdout did not report successful validation:\n{}",
+        String::from_utf8_lossy(&passing.stdout)
+    );
+
+    let failing_temp = tempfile::tempdir()?;
+    let failing_max_clients = passing_max_clients + 1;
+    let failing =
+        run_ratatosk_with_soft_nofile_limit(failing_temp.path(), SOFT_LIMIT, failing_max_clients)?;
+    assert!(!failing.status.success(), "command unexpectedly succeeded");
+    let stderr = stderr_text(&failing);
+    assert!(
+        stderr.contains(
+            "insufficient open-file limit: soft_limit=256 required_at_least=257 \
+             (max_clients=129 + headroom=128)"
+        ),
+        "stderr did not include the macOS fd headroom failure:\n{stderr}"
     );
 
     Ok(())

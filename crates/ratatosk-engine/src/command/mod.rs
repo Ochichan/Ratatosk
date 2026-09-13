@@ -69,6 +69,7 @@ use smallvec::SmallVec;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::{
+    eviction::estimate_used_memory,
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
     keyspace::{AtomicStatsState, ClientSnapshot, DefaultAclPolicyState, ServerState},
     security::sanitize_error_message,
@@ -3615,6 +3616,8 @@ pub struct ClientState {
     monitor_mode: bool,
     durability_capture_enabled: bool,
     durability_effects: Option<DurabilityEffects>,
+    /// Nested EXEC/EVAL dispatches are admitted as one atomic command unit.
+    memory_admission_bypass_depth: usize,
 }
 
 impl ClientState {
@@ -3690,6 +3693,18 @@ impl ClientState {
             }
             TransactionState::Normal => false,
         }
+    }
+
+    fn begin_memory_admission_bypass(&mut self) {
+        self.memory_admission_bypass_depth = self.memory_admission_bypass_depth.saturating_add(1);
+    }
+
+    fn end_memory_admission_bypass(&mut self) {
+        self.memory_admission_bypass_depth = self.memory_admission_bypass_depth.saturating_sub(1);
+    }
+
+    fn memory_admission_is_bypassed(&self) -> bool {
+        self.memory_admission_bypass_depth > 0
     }
 
     /// Take effects captured for the most recently executed command.
@@ -3922,10 +3937,12 @@ impl ClientState {
             monitor_mode: false,
             durability_capture_enabled: false,
             durability_effects: None,
+            memory_admission_bypass_depth: 0,
         }
     }
 
     pub(crate) fn reset_for_connection(&mut self) {
+        let memory_admission_bypass_depth = self.memory_admission_bypass_depth;
         self.selected_db = 0;
         self.name = None;
         self.authenticated = false;
@@ -3952,6 +3969,8 @@ impl ClientState {
         self.monitor_mode = false;
         self.durability_capture_enabled = false;
         self.durability_effects = None;
+        // RESET can itself be queued; preserve an enclosing EXEC/EVAL unit.
+        self.memory_admission_bypass_depth = memory_admission_bypass_depth;
     }
 }
 
@@ -4088,6 +4107,13 @@ fn execute_argv_inner(
             return CommandOutcome::reply(response);
         }
 
+        if should_reject_for_maxmemory(argv, spec, server, client) {
+            if let TransactionState::InTransaction { has_error, .. } = &mut client.tx_state {
+                *has_error = true;
+            }
+            return CommandOutcome::reply(maxmemory_oom_error());
+        }
+
         if let TransactionState::InTransaction { queue, has_error } = &mut client.tx_state {
             if queue.len() >= MAX_TX_QUEUE_SIZE {
                 *has_error = true;
@@ -4106,6 +4132,15 @@ fn execute_argv_inner(
         if let Some(strict_err) = cmd_command_metadata::strict_mode_error(argv) {
             return CommandOutcome::reply(strict_err);
         }
+    }
+
+    if server.config.maxmemory() != 0
+        && spec.is_some_and(|candidate| {
+            cmd_command_metadata::command_arity_matches(candidate.arity, argv.len())
+        })
+        && should_reject_for_maxmemory(argv, spec, server, client)
+    {
+        return CommandOutcome::reply(maxmemory_oom_error());
     }
 
     let args = &argv[1..];
@@ -4341,13 +4376,35 @@ fn execute_argv_inner(
         b"ASKING" => cmd_cluster::cmd_asking(args),
         // Scripting
         #[cfg(feature = "lua-scripting")]
-        b"EVAL" => cmd_script::cmd_eval(args, server, client),
+        b"EVAL" => {
+            client.begin_memory_admission_bypass();
+            let outcome = cmd_script::cmd_eval(args, server, client);
+            client.end_memory_admission_bypass();
+            outcome
+        }
         #[cfg(feature = "lua-scripting")]
-        b"EVALSHA" => cmd_script::cmd_evalsha(args, server, client),
+        b"EVALSHA" => {
+            client.begin_memory_admission_bypass();
+            let outcome = cmd_script::cmd_evalsha(args, server, client);
+            client.end_memory_admission_bypass();
+            outcome
+        }
         #[cfg(feature = "lua-scripting")]
-        b"EVAL_RO" => cmd_script::cmd_eval_ro(args, server, client),
+        b"EVAL_RO" => {
+            // These currently documented aliases do not enforce read-only
+            // execution, so they need the same admission unit as EVAL.
+            client.begin_memory_admission_bypass();
+            let outcome = cmd_script::cmd_eval_ro(args, server, client);
+            client.end_memory_admission_bypass();
+            outcome
+        }
         #[cfg(feature = "lua-scripting")]
-        b"EVALSHA_RO" => cmd_script::cmd_evalsha_ro(args, server, client),
+        b"EVALSHA_RO" => {
+            client.begin_memory_admission_bypass();
+            let outcome = cmd_script::cmd_evalsha_ro(args, server, client);
+            client.end_memory_admission_bypass();
+            outcome
+        }
         #[cfg(not(feature = "lua-scripting"))]
         b"EVAL" => cmd_script::cmd_eval(args),
         #[cfg(not(feature = "lua-scripting"))]
@@ -4958,6 +5015,68 @@ pub fn is_write_command(argv: &[Bytes]) -> bool {
     is_write_command_name(name.as_ref())
 }
 
+/// Return whether a command can increase the keyspace memory estimate.
+///
+/// Redis' `denyoom` metadata covers most allocation-heavy commands, but not
+/// commands whose allocation depends on a subcommand or destination key. Keep
+/// those cases explicit so admission does not depend on incomplete metadata.
+fn command_may_grow_memory(argv: &[Bytes], spec: Option<CommandSpec>) -> bool {
+    if spec.is_some_and(|candidate| candidate.flags.contains(&"denyoom")) {
+        return true;
+    }
+
+    let Some(command) = argv.first().map(|raw| to_uppercase_stack(raw)) else {
+        return false;
+    };
+
+    match command.as_slice() {
+        #[cfg(feature = "lua-scripting")]
+        b"EVAL" | b"EVALSHA" | b"EVAL_RO" | b"EVALSHA_RO" => true,
+        b"XGROUP" => argv.get(1).is_some_and(|subcommand| {
+            subcommand.eq_ignore_ascii_case(b"CREATE")
+                || subcommand.eq_ignore_ascii_case(b"CREATECONSUMER")
+        }),
+        b"XREADGROUP" | b"XCLAIM" | b"XAUTOCLAIM" | b"XCFGSET" => true,
+        // Destination containers or keys can require fresh allocation even
+        // when a source entry is removed by the same command.
+        b"MIGRATE" | b"MOVE" | b"RENAME" | b"RENAMENX" | b"SMOVE" | b"LMOVE" | b"BLMOVE"
+        | b"RPOPLPUSH" | b"BRPOPLPUSH" => true,
+        _ => false,
+    }
+}
+
+fn maxmemory_limit_exceeded(server: &ServerState) -> bool {
+    let maxmemory = server.config.maxmemory();
+    if maxmemory == 0
+        || !server
+            .config
+            .maxmemory_policy()
+            .eq_ignore_ascii_case(b"noeviction")
+    {
+        return false;
+    }
+
+    // The incremental counter can drift when handlers mutate StoredValue in
+    // place. Limited mode therefore pays for a current full scan at admission.
+    estimate_used_memory(server) > maxmemory
+}
+
+fn should_reject_for_maxmemory(
+    argv: &[Bytes],
+    spec: Option<CommandSpec>,
+    server: &ServerState,
+    client: &ClientState,
+) -> bool {
+    server.config.maxmemory() != 0
+        && !client.memory_admission_is_bypassed()
+        && command_may_grow_memory(argv, spec)
+        && maxmemory_limit_exceeded(server)
+}
+
+fn maxmemory_oom_error() -> RespFrame {
+    err("OOM command not allowed when used memory > 'maxmemory'")
+}
+
 fn validate_queued_command(
     argv: &[Bytes],
     server: &ServerState,
@@ -5343,7 +5462,7 @@ fn to_uppercase_bytes(input: &Bytes) -> Vec<u8> {
 mod tests {
     use std::{
         fs,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use bytes::Bytes;
@@ -5382,6 +5501,455 @@ mod tests {
     ) -> RespFrame {
         let mut access = ServerAccess::new_with_atomic_stats(server, atomic_stats);
         execute(cmd(parts), &mut access, client).response
+    }
+
+    fn assert_oom(response: RespFrame) {
+        match response {
+            RespFrame::Error(message) => assert!(
+                message.starts_with(b"OOM command not allowed"),
+                "unexpected error: {}",
+                String::from_utf8_lossy(&message)
+            ),
+            other => panic!("expected OOM error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn noeviction_admits_one_overshoot_then_allows_reads_and_freeing() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["SET", "first", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_oom(run(&["SET", "second", "v"], &mut server, &mut client));
+        assert_eq!(
+            run(&["GET", "first"], &mut server, &mut client),
+            RespFrame::bulk_str(&large)
+        );
+        assert_eq!(
+            run(&["DEL", "first"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["SET", "second", "v"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+    }
+
+    #[test]
+    fn admission_does_not_change_other_eviction_policy_behavior() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        server
+            .config
+            .set_maxmemory_policy(Bytes::from_static(b"allkeys-lru"));
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["SET", "first", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "second", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+    }
+
+    #[test]
+    fn one_mib_limit_rejects_a_sixteen_by_128_kib_write_sequence() {
+        use crate::eviction::estimate_used_memory;
+
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1024 * 1024);
+        let mut client = ClientState::default();
+        let value = "x".repeat(128 * 1024);
+        let started = Instant::now();
+        let mut accepted = 0usize;
+        let mut rejection_seen = false;
+
+        for index in 0..16 {
+            let key = format!("chunk-{index}");
+            let response = run(&["SET", &key, &value], &mut server, &mut client);
+            if response == RespFrame::ok() {
+                assert!(!rejection_seen, "a growing write was admitted after OOM");
+                accepted += 1;
+            } else {
+                assert_oom(response);
+                rejection_seen = true;
+            }
+        }
+
+        assert!(accepted > 0 && accepted < 16, "accepted {accepted} writes");
+        let scan_rounds = 1_000u128;
+        let scan_started = Instant::now();
+        for _ in 0..scan_rounds {
+            std::hint::black_box(estimate_used_memory(&server));
+        }
+        let scan_elapsed_ns = scan_started.elapsed().as_nanos();
+        eprintln!(
+            "limited_nonempty_admission: accepted={accepted} attempted=16 elapsed_us={} full_scan_avg_ns={}",
+            started.elapsed().as_micros(),
+            scan_elapsed_ns / scan_rounds,
+        );
+    }
+
+    #[test]
+    fn limited_admission_full_scan_observes_in_place_growth_and_shrink_without_cron() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(256);
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["HSET", "hash", "a", &large], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_oom(run(&["HSET", "hash", "b", "v"], &mut server, &mut client));
+        assert_eq!(
+            run(&["HDEL", "hash", "a"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["HSET", "hash", "b", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["DEL", "hash"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+
+        assert_eq!(
+            run(&["LPUSH", "list", &large], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_oom(run(&["LPUSH", "list", "v"], &mut server, &mut client));
+        assert_eq!(
+            run(&["LPOP", "list"], &mut server, &mut client),
+            RespFrame::bulk_str(&large)
+        );
+        assert_eq!(
+            run(&["LPUSH", "list", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn limited_admission_counts_stream_consumer_and_pending_metadata() {
+        use crate::eviction::estimate_used_memory;
+
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        assert!(matches!(
+            run(
+                &["XADD", "stream", "*", "field", "value"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(Some(_))
+        ));
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "stream", "group", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        server
+            .config
+            .set_maxmemory(estimate_used_memory(&server).saturating_add(1));
+        let first = "a".repeat(1024);
+        let second = "b".repeat(1024);
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATECONSUMER", "stream", "group", &first],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(1)
+        );
+        assert_oom(run(
+            &["XGROUP", "CREATECONSUMER", "stream", "group", &second],
+            &mut server,
+            &mut client,
+        ));
+    }
+
+    #[test]
+    fn multi_queue_oom_dirties_transaction_and_exec_aborts() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["SET", "first", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
+        assert_oom(run(&["SET", "second", "v"], &mut server, &mut client));
+        match run(&["EXEC"], &mut server, &mut client) {
+            RespFrame::Error(message) => assert!(message.starts_with(b"EXECABORT")),
+            other => panic!("expected EXECABORT, got {other:?}"),
+        }
+        assert_eq!(
+            run(&["GET", "second"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+    }
+
+    #[test]
+    fn exec_rechecks_before_mutation_but_admitted_transaction_crosses_as_a_unit() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut transaction = ClientState::new(1);
+        let mut concurrent = ClientState::new(2);
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["MULTI"], &mut server, &mut transaction),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "queued", "v"], &mut server, &mut transaction),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["SET", "other", &large], &mut server, &mut concurrent),
+            RespFrame::ok()
+        );
+        assert_oom(run(&["EXEC"], &mut server, &mut transaction));
+        assert_eq!(
+            run(&["GET", "queued"], &mut server, &mut transaction),
+            RespFrame::BulkString(None)
+        );
+
+        assert_eq!(
+            run(&["DEL", "other"], &mut server, &mut concurrent),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["MULTI"], &mut server, &mut transaction),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "one", &large], &mut server, &mut transaction),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["SET", "two", &large], &mut server, &mut transaction),
+            RespFrame::queued()
+        );
+        assert!(
+            matches!(run(&["EXEC"], &mut server, &mut transaction), RespFrame::Array(ref replies) if replies == &[RespFrame::ok(), RespFrame::ok()])
+        );
+        assert_eq!(
+            run(&["GET", "two"], &mut server, &mut transaction),
+            RespFrame::bulk_str(&large)
+        );
+    }
+
+    #[test]
+    fn queued_reset_does_not_drop_exec_memory_admission() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(run(&["MULTI"], &mut server, &mut client), RespFrame::ok());
+        assert_eq!(
+            run(&["SET", "before-reset", &large], &mut server, &mut client),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["RESET"], &mut server, &mut client),
+            RespFrame::queued()
+        );
+        assert_eq!(
+            run(&["SET", "after-reset", &large], &mut server, &mut client),
+            RespFrame::queued()
+        );
+        assert!(matches!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::Array(ref replies) if replies.len() == 3 && replies[2] == RespFrame::ok()
+        ));
+        assert_eq!(
+            run(&["GET", "after-reset"], &mut server, &mut client),
+            RespFrame::bulk_str(&large)
+        );
+    }
+
+    #[test]
+    fn config_set_maxmemory_is_atomic_and_zero_recovers_writes() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "1"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(server.config.maxmemory(), 1);
+        assert_eq!(
+            run(&["SET", "first", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_oom(run(&["SET", "second", "v"], &mut server, &mut client));
+
+        assert!(matches!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "7", "timeout", "invalid"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(_)
+        ));
+        assert_eq!(server.config.maxmemory(), 1);
+        assert!(matches!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "-1"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(_)
+        ));
+        let overflow = format!("{}0", usize::MAX);
+        assert!(matches!(
+            run(
+                &["CONFIG", "SET", "maxmemory", &overflow],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(_)
+        ));
+
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "10485760"],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "second", "v"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "1"],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_oom(run(&["SET", "third", "v"], &mut server, &mut client));
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "third", "v"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+    }
+
+    #[test]
+    fn rejected_write_emits_no_durability_effects() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let large = "x".repeat(1024);
+
+        assert_eq!(
+            run(&["SET", "first", &large], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert!(client.take_durability_effects().is_some());
+        assert_oom(run(&["SET", "second", "v"], &mut server, &mut client));
+        assert!(client.take_durability_effects().is_none());
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn admitted_lua_call_and_pcall_cross_limit_as_one_script_unit() {
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(1);
+        let mut client = ClientState::default();
+        let script = "redis.call('SET','call-key',string.rep('x',1024)); local reply=redis.pcall('SET','pcall-key',string.rep('y',1024)); return reply";
+
+        assert_eq!(
+            run(&["EVAL", script, "0"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["STRLEN", "pcall-key"], &mut server, &mut client),
+            RespFrame::Integer(1024)
+        );
+        assert_oom(run(
+            &["EVAL", "return redis.call('SET','late','v')", "0"],
+            &mut server,
+            &mut client,
+        ));
+        // RO names are currently writable aliases, so admission cannot assume
+        // that an arbitrary script passed through them is safe under OOM.
+        assert_oom(run(
+            &["EVAL_RO", "return redis.call('GET','call-key')", "0"],
+            &mut server,
+            &mut client,
+        ));
+        assert_eq!(
+            run(&["GET", "call-key"], &mut server, &mut client),
+            RespFrame::bulk_str(&"x".repeat(1024))
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn writable_lua_ro_aliases_share_top_level_admission_and_no_partial_oom() {
+        let script = "redis.call('SET','alias-call',string.rep('x',1024)); return redis.pcall('SET','alias-pcall',string.rep('y',1024))";
+        for name in ["EVAL_RO", "EVALSHA_RO"] {
+            let mut server = ServerState::with_default_dbs();
+            server.config.set_maxmemory(1);
+            let mut client = ClientState::default();
+            let body = if name == "EVALSHA_RO" {
+                match run(&["SCRIPT", "LOAD", script], &mut server, &mut client) {
+                    RespFrame::BulkString(Some(sha)) => String::from_utf8(sha.to_vec()).unwrap(),
+                    other => panic!("expected script SHA, got {other:?}"),
+                }
+            } else {
+                script.to_owned()
+            };
+            assert_eq!(
+                run(&[name, &body, "0"], &mut server, &mut client),
+                RespFrame::ok()
+            );
+            assert_eq!(
+                run(&["GET", "alias-call"], &mut server, &mut client),
+                RespFrame::bulk_str(&"x".repeat(1024))
+            );
+            assert_eq!(
+                run(&["GET", "alias-pcall"], &mut server, &mut client),
+                RespFrame::bulk_str(&"y".repeat(1024))
+            );
+            client.set_durability_capture_enabled(true);
+            assert_oom(run(&[name, &body, "0"], &mut server, &mut client));
+            assert!(client.take_durability_effects().is_none());
+        }
     }
 
     fn run_full(

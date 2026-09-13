@@ -214,6 +214,7 @@ def _infer_capability_tier(status: str, name: str, notes: str) -> str:
 
     unsupported_commands = {
         "SYNC",
+        "PSYNC",
         "SENTINEL",
         "EVAL",
         "EVALSHA",
@@ -260,7 +261,6 @@ def _infer_capability_tier(status: str, name: str, notes: str) -> str:
     }
     baseline_local_commands = {
         "REPLCONF",
-        "PSYNC",
         "REPLICAOF",
         "SLAVEOF",
         "CLIENT",

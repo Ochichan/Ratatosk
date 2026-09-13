@@ -6,7 +6,8 @@ use crate::keyspace::{AtomicStatsState, ServerState, purge_expired_key};
 
 use super::{
     ClientState, CommandOutcome, DurabilityEffects, DurableCommand, ServerAccess, TransactionState,
-    WatchedKey, err, execute, now_ms, wrong_arity,
+    WatchedKey, command_may_grow_memory, err, execute, maxmemory_limit_exceeded,
+    maxmemory_oom_error, now_ms, registry::find_command_spec, wrong_arity,
 };
 
 pub(super) fn cmd_multi(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
@@ -63,6 +64,16 @@ pub(super) fn cmd_exec(
         return CommandOutcome::reply(RespFrame::NullArray);
     }
 
+    if server.config.maxmemory() != 0
+        && !client.memory_admission_is_bypassed()
+        && queued
+            .iter()
+            .any(|argv| command_may_grow_memory(argv, argv.first().and_then(find_command_spec)))
+        && maxmemory_limit_exceeded(server)
+    {
+        return CommandOutcome::reply(maxmemory_oom_error());
+    }
+
     let overcounted = queued.len() as u64;
     let mut replies = Vec::with_capacity(queued.len());
     let mut reply_protocol = client.protocol_version();
@@ -70,6 +81,7 @@ pub(super) fn cmd_exec(
     let mut durable_commands = Vec::<DurableCommand>::new();
     let mut config_dirty = false;
     let mut acl_dirty = false;
+    client.begin_memory_admission_bypass();
     for argv in queued {
         let frame = RespFrame::Array(
             argv.into_iter()
@@ -98,6 +110,7 @@ pub(super) fn cmd_exec(
         }
         replies.push(outcome.response);
     }
+    client.end_memory_admission_bypass();
 
     // Each queued command incremented total_commands_processed via execute(),
     // but Redis counts EXEC as a single command. Subtract the overcounted amount.

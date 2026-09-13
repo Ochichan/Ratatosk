@@ -1274,7 +1274,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch."
+      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. maxmemory accepts decimal byte limits at runtime (0 disables the cap); noeviction admission uses a current dataset estimate. Policies/samples remain startup-only."
     },
     {
       "name": "COPY",
@@ -3273,10 +3273,10 @@
       "path": "psync.json",
       "summary": "An internal command used in replication.",
       "status": "done",
-      "capability_tier": "baseline_local",
+      "capability_tier": "unsupported",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented with stateful FULLRESYNC handshake over the current replid/offset."
+      "notes": "Returns ERR in standalone mode; no FULLRESYNC handshake, partial resynchronization, or replication stream is implemented."
     },
     {
       "name": "PTTL",
@@ -3510,7 +3510,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented with standalone role transition between master and configured upstream replica."
+      "notes": "REPLICAOF NO ONE confirms standalone mode and returns OK; every upstream host/port request returns ERR. No replica connection or failover is implemented."
     },
     {
       "name": "RESET",
@@ -4238,7 +4238,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented as REPLICAOF alias."
+      "notes": "REPLICAOF alias: NO ONE returns OK as standalone confirmation; upstream host/port requests return ERR. No replica connection is created."
     },
     {
       "name": "SLOWLOG",

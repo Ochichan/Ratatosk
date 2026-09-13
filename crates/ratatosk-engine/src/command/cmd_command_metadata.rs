@@ -193,6 +193,7 @@ pub(super) fn command_capability_tier(spec: CommandSpec) -> &'static str {
     if matches!(
         name,
         "SYNC"
+            | "PSYNC"
             | "SENTINEL"
             | "EVAL"
             | "EVALSHA"
@@ -255,7 +256,6 @@ pub(super) fn command_capability_tier(spec: CommandSpec) -> &'static str {
         name,
         "ROLE"
             | "REPLCONF"
-            | "PSYNC"
             | "REPLICAOF"
             | "SLAVEOF"
             | "WAIT"
@@ -472,4 +472,55 @@ fn command_spec_frame(spec: CommandSpec) -> RespFrame {
         RespFrame::Integer(spec.last_key),
         RespFrame::Integer(spec.key_step),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::{ClientState, ServerAccess, execute_argv};
+    use crate::keyspace::ServerState;
+
+    #[test]
+    fn standalone_replication_capabilities_match_dispatch() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        for command in ["PSYNC", "REPLICAOF", "SLAVEOF"] {
+            let spec = find_command_spec(&Bytes::from(command)).expect("registered command");
+            assert_eq!(
+                command_capability_tier(spec),
+                if command == "PSYNC" {
+                    "unsupported"
+                } else {
+                    "baseline_local"
+                }
+            );
+            let argv = if command == "PSYNC" {
+                vec![Bytes::from(command), Bytes::from("?"), Bytes::from("-1")]
+            } else {
+                vec![
+                    Bytes::from(command),
+                    Bytes::from("127.0.0.1"),
+                    Bytes::from("6380"),
+                ]
+            };
+            let result = execute_argv(
+                &argv,
+                &mut ServerAccess::new_inline(&mut server),
+                &mut client,
+            );
+            assert!(matches!(result.response, RespFrame::Error(_)));
+            if command != "PSYNC" {
+                let confirm = [Bytes::from(command), Bytes::from("NO"), Bytes::from("ONE")];
+                assert_eq!(
+                    execute_argv(
+                        &confirm,
+                        &mut ServerAccess::new_inline(&mut server),
+                        &mut client
+                    )
+                    .response,
+                    RespFrame::ok()
+                );
+            }
+        }
+    }
 }

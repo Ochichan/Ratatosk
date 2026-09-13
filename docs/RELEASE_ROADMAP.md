@@ -329,7 +329,7 @@ P0 제품경계 ──▶ P1 상태모델 ──▶ ┬─▶ P2 관측성 ─�
   - Perf guardrail (set@256, ping@256): PASS
   ```
   - 소스: Phase 4 matrix + Phase 5 differential + Phase 6 perf.
-  - **구현:** `scripts/reliability_report.sh` 신규 — fmt/clippy/test/audit/deny/ledger/strict-mode/recovery-matrix/drill/perf 게이트를 PASS/FAIL/SKIP로 집계해 `benchmarks/reliability-report-*.md` 생성. SKIP은 외부 도구 부재 시 명시(silent 아님).
+  - **구현:** `scripts/reliability_report.sh` 신규 — fmt/clippy/test/audit/deny/ledger/strict-mode/recovery-matrix/drill/perf 게이트를 PASS/FAIL/SKIP로 집계해 `benchmarks/reliability-report-*.md` 생성. 필수 SKIP·누락은 INCOMPLETE/exit 1이며, 현재 local differential/fuzz 미배선 때문에 default release PASS는 나오지 않는다. 명시적 부분 검사 정책의 PASS (SCOPED)는 전체 릴리즈 적격성이 아니다.
 - [~] **benchmark report** + **recovery report** 산출물화 — recovery report는 `recovery_matrix.sh`, 통합 report는 `reliability_report.sh`가 생성. differential/fuzz는 외부 도구(redis/valkey, cargo-fuzz) 환경에서 채워짐.
 - [ ] **RC 발행 + soak** — `v1.0.0-rc1` 태그(서명), soak(24–72h) 시작.
 - [ ] **GA 체크리스트** — §7 전체 통과 확인 → `v1.0.0`.

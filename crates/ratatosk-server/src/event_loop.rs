@@ -1011,6 +1011,10 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     load_acl_state_from_disk(&mut initial_state, &config)?;
     bootstrap_default_user_for_bind(&mut initial_state, &config)?;
     initial_state.set_lazy_free_sender(lazy_free_tx);
+    // Recovery must replay every previously acknowledged command even when
+    // the configured cap is lower than the persisted dataset. Admission is
+    // enabled only after startup loading has completed.
+    initial_state.config.set_maxmemory(0);
     let server_state = Arc::new(SharedState::new(initial_state));
 
     let persistence = Arc::new(PersistenceRuntime::from_config(&config).map_err(|error| {
@@ -1040,6 +1044,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 format!("loading startup persistence data: {error}"),
             )
         })?;
+    {
+        let mut state = server_state.meta.lock().await;
+        state.config.set_maxmemory(config.maxmemory);
+        server_state.update_config_cache(&state.config);
+    }
 
     let client_permits = Arc::new(Semaphore::new(config.max_clients));
     crate::metrics::set_semaphore_available_permits(client_permits.available_permits());

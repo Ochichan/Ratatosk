@@ -142,7 +142,13 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
         ValueData::SortedSet(z) => {
             // BTreeMap + HashMap dual indexing
             let per_entry = 128;
-            z.len() * per_entry
+            let member_payload = z
+                .by_member
+                .keys()
+                .fold(0usize, |total, member| total.saturating_add(member.len()));
+            z.len()
+                .saturating_mul(per_entry)
+                .saturating_add(member_payload)
         }
         ValueData::Stream { entries, groups } => {
             let entries_size: usize = entries
@@ -155,7 +161,31 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
                         .sum::<usize>()
                 })
                 .sum();
-            let groups_size = groups.len() * 256;
+            let groups_size = groups.iter().fold(0usize, |total, (name, group)| {
+                let consumers_size =
+                    group.consumers.iter().fold(
+                        0usize,
+                        |consumer_total, (consumer_name, consumer)| {
+                            consumer_total
+                                .saturating_add(96)
+                                .saturating_add(consumer_name.len())
+                                .saturating_add(consumer.pending.len().saturating_mul(
+                                    std::mem::size_of::<crate::keyspace::StreamId>(),
+                                ))
+                        },
+                    );
+                let pending_size = group.pending.values().fold(0usize, |pending_total, entry| {
+                    pending_total
+                        .saturating_add(64)
+                        .saturating_add(std::mem::size_of::<crate::keyspace::StreamId>())
+                        .saturating_add(entry.consumer.len())
+                });
+                total
+                    .saturating_add(256)
+                    .saturating_add(name.len())
+                    .saturating_add(consumers_size)
+                    .saturating_add(pending_size)
+            });
             entries_size + groups_size
         }
     };
@@ -388,7 +418,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::keyspace::{HashFieldEntry, ServerState, StoredValue};
+    use crate::keyspace::{HashFieldEntry, ServerState, SortedSet, StoredValue};
 
     /// Insert a key into db 0 with memory tracking.
     fn tracked_insert(state: &ServerState, key: Bytes, val: StoredValue) {
@@ -544,6 +574,24 @@ mod tests {
         assert!(string_mem > 0);
         assert!(list_mem > string_mem);
         assert!(hash_mem > 0);
+    }
+
+    #[test]
+    fn sorted_set_estimate_includes_member_payload() {
+        let mut short = SortedSet::default();
+        short.insert(Bytes::from_static(b"a"), 1.0);
+        let mut long = SortedSet::default();
+        long.insert(Bytes::from(vec![b'x'; 4096]), 1.0);
+
+        let short_memory = estimate_object_memory(
+            &Bytes::from_static(b"z"),
+            &StoredValue::sorted_set(short, None),
+        );
+        let long_memory = estimate_object_memory(
+            &Bytes::from_static(b"z"),
+            &StoredValue::sorted_set(long, None),
+        );
+        assert!(long_memory >= short_memory + 4095);
     }
 
     #[test]

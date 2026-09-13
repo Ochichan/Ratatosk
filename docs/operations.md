@@ -470,14 +470,73 @@ cargo run -p ratatosk-server --bin ratatosk --release
 On Unix, SIGTERM enters the graceful shutdown path and should exit successfully
 after clients/background tasks drain within `RATATOSK_SHUTDOWN_GRACE_MS`.
 
+On Linux and macOS, startup and `--check-config` compare the process's soft
+open-file limit with `max_clients + 128`. Insufficient headroom refuses startup;
+the server does not change the host's limits. Linux reads `/proc/self/limits`.
+macOS queries the inherited limit through the fixed `/bin/sh` builtin
+`ulimit -S -n`, with an empty environment and no stdin. Query or parse failures
+on macOS are errors. The local builtin query is synchronous; it has no separate
+subprocess deadline. Other platforms still report the preflight as unsupported.
+
 런타임 `CONFIG SET` 지원:
-- `timeout`, `hz`, `appendonly`, `appendfsync` (always/everysec/no)
+- `timeout`, `hz`, `maxmemory` (바이트, `0`은 무제한), `appendonly`, `appendfsync` (always/everysec/no)
 - `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`, `save`
 - `slowlog-log-slower-than`, `slowlog-max-len`, `latency-tracking`
 - `pubsub-queue-hard-limit` (mpsc channel capacity), `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 - `active-expire-cycle-lookups`, `active-expire-cycle-threshold-pct`
 - `query-buffer-limit`, `output-buffer-flush-threshold`, `client-write-timeout-sec`
-- `maxmemory`/`maxmemory-policy`/`maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET`에서만 노출되며 런타임 `CONFIG SET`으로는 변경할 수 없다(catch-all에서 `ERR Unknown option` 반환).
+- `maxmemory-policy`/`maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET`에서만 노출되며 런타임 `CONFIG SET`으로는 변경할 수 없다(catch-all에서 `ERR Unknown option` 반환).
+
+## Memory admission under noeviction
+
+`maxmemory` is a byte limit on the estimated stored dataset, not a process RSS or
+allocator quota. With `noeviction` and a nonzero limit, commands that may grow the
+dataset are rejected with `OOM` when the current estimate already exceeds it.
+Reads, deletion and administrative recovery remain available. An accepted large
+command, transaction or Lua invocation can cross the limit; later growing work is
+refused. Raising the limit or setting it to `0` permits writes again.
+
+The limited path measures current values instead of relying on the periodically
+corrected counter, so repeated in-place hash/list growth and shrinking values are
+visible without waiting for cron. This requires a dataset scan and has a cost
+that increases with dataset size. The default unlimited path avoids that scan.
+Estimates include sorted-set member bytes, but are not exact allocator accounting.
+Other eviction policies continue to use the existing cron eviction behavior.
+
+OOM while queueing a growing command dirties MULTI, causing EXECABORT. If the
+server is already over its limit when EXEC begins, a transaction containing
+memory-growing commands is rejected before its first operation. Once admitted,
+EXEC and a Lua invocation run as a unit for this admission check; they are not
+partially rejected solely because their own earlier writes crossed the limit.
+`EVAL_RO` and `EVALSHA_RO` currently remain functional aliases without read-only
+enforcement. They therefore receive the same potentially-growing admission as
+`EVAL`/`EVALSHA`, including OOM rejection even for a script that happens only to
+read. Ordinary read commands remain available. This change does not add a Lua
+read-only guarantee.
+
+## Reliability report qualification
+
+`bash scripts/reliability_report.sh` writes a report and a separate log for each
+executed check under `RELIABILITY_OUT_DIR` (default: `benchmarks/`). The default
+release policy requires `format,build,lint,test,audit,deny,gap-ledger,strict-mode,
+recovery-matrix,backup-restore-drill,perf-guardrail,redis-differential,resp-fuzz`.
+Missing tools or disabled checks remain SKIP. Differential and fuzz are currently
+unwired in this local report, so the default report is INCOMPLETE, not a release
+PASS. Existing recovery/performance commands retain their own runtime requirements.
+
+Exit `0` requires every declared required check to pass; required FAIL, SKIP or
+missing evidence exits `1`. An invalid required-check policy or malformed report
+integrity exits `2`. An explicit `RELIABILITY_REQUIRED_CHECKS` override selects a
+nonempty, unique list of known IDs. Its success is `PASS (SCOPED)` for that list
+and is explicitly not full release qualification. Setting
+`RELIABILITY_RUN_RECOVERY=0` or `RELIABILITY_RUN_PERF=0` does not waive a required
+check: it makes the report incomplete. Per-check logs retain the actual command
+output and exit status; recognized warning diagnostics also fail the check.
+
+`python3 -W error scripts/test_reliability_report.py` exercises this decision
+logic in a temporary fixture with controlled commands. It does not execute or
+qualify actual Redis differential, fuzz, recovery, supply-chain or performance
+checks.
 
 ## Recommended Key Naming
 

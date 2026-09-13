@@ -377,14 +377,14 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 | `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | appendonly shutdown flush failure override |
 
 `CONFIG SET`을 통한 런타임 설정 변경:
-- `hz`, `timeout`, `appendonly`, `appendfsync`, `save`
+- `hz`, `timeout`, `maxmemory`, `appendonly`, `appendfsync`, `save`
 - `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`
 - `slowlog-log-slower-than`, `slowlog-max-len`, `latency-tracking`
 - `active-expire-cycle-lookups`, `active-expire-cycle-threshold-pct`
 - `query-buffer-limit`, `output-buffer-flush-threshold`, `client-write-timeout-sec`
 - `pubsub-queue-hard-limit`, `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 
-(`maxmemory*`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET` 전용이며 `CONFIG SET`은 'ERR Unknown option'을 반환한다.)
+(`maxmemory-policy`, `maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET` 전용이며 `CONFIG SET`은 'ERR Unknown option'을 반환한다.)
 
 ## Build / Run / Test
 
@@ -465,15 +465,14 @@ Redis 호환 8가지 maxmemory 정책:
 
 ### 설정
 
-```
-```
-# maxmemory 계열은 런타임 CONFIG SET 미지원 — ratatosk.conf로만 설정한다
-maxmemory 100mb
+```text
+# ratatosk.conf: 바이트 단위 용량과 시작 시 eviction 정책
+maxmemory 104857600
 maxmemory-policy allkeys-lru
 maxmemory-samples 5
-# 런타임에는 CONFIG GET maxmemory 등 조회만 가능
 ```
-```
+
+`CONFIG SET maxmemory 104857600`으로 실행 중 용량을 변경하고 `0`으로 제한을 해제할 수 있다. `maxmemory-policy`와 `maxmemory-samples`는 시작 설정이며 runtime에서는 조회만 지원한다.
 
 | 설정 | 기본값 | 설명 |
 |------|--------|------|
@@ -2172,7 +2171,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `RENAME` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `RENAMENX` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `REPLCONF` | server | 3.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with LISTENING-PORT/CAPA/ACK/GETACK/IP-ADDRESS subset backed by per-client replica metadata. |
-| `REPLICAOF` | server | 5.0.0 | done | unsupported | m0-foundation | Returns ERR for replication targets; REPLICAOF NO ONE still accepted for standalone confirmation. |
+| `REPLICAOF` | server | 5.0.0 | done | baseline_local | m0-foundation | Returns ERR for replication targets; REPLICAOF NO ONE still accepted for standalone confirmation. |
 | `RESET` | connection | 6.2.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `RESTORE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. |
 | `RESTORE-ASKING` | server | 3.0.0 | done | behavioral_subset | m0-foundation | M0 replication-control baseline implemented as RESTORE alias behavior. |
@@ -2228,7 +2227,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `SINTERCARD` | set | 7.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented (numkeys/LIMIT parser + cardinality-only path). |
 | `SINTERSTORE` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
 | `SISMEMBER` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set core baseline implemented. |
-| `SLAVEOF` | server | 1.0.0 | done | unsupported | m0-foundation | REPLICAOF alias; returns ERR for replication targets, NO ONE still accepted. |
+| `SLAVEOF` | server | 1.0.0 | done | baseline_local | m0-foundation | REPLICAOF alias; returns ERR for replication targets, NO ONE still accepted. |
 | `SLOWLOG` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented (GET/LEN/RESET/HELP subset). |
 | `SLOWLOG GET` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |
 | `SLOWLOG HELP` | server | 6.2.0 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |
