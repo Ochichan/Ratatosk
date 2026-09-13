@@ -685,7 +685,7 @@ async fn flush_persistence_before_shutdown(
     let started_at = std::time::Instant::now();
     let best_effort = shutdown_best_effort_enabled();
 
-    match flush_aof(persistence).await {
+    match persistence.shutdown_aof_for_exit().await {
         Ok(()) => {
             let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
             crate::metrics::record_shutdown_aof_flush_duration_ms(duration_ms, "success");
@@ -693,7 +693,7 @@ async fn flush_persistence_before_shutdown(
             tracing::info!(
                 target = "ratatosk::shutdown",
                 duration_ms = duration_ms,
-                "AOF flushed before shutdown"
+                "AOF flushed and worker stopped before shutdown"
             );
             Ok(true)
         }
@@ -1588,14 +1588,16 @@ mod tests {
 
     #[test]
     fn shutdown_best_effort_defaults_to_false() {
-        // SAFETY: test-only env isolation for this process.
+        let _guard = env_guard();
+        // SAFETY: serialized with other environment tests by env_guard().
         unsafe { std::env::remove_var(SHUTDOWN_BEST_EFFORT_ENV) };
         assert!(!shutdown_best_effort_enabled());
     }
 
     #[test]
     fn shutdown_best_effort_reads_truthy_env() {
-        // SAFETY: test-only env isolation for this process.
+        let _guard = env_guard();
+        // SAFETY: serialized with other environment tests by env_guard().
         unsafe { std::env::set_var(SHUTDOWN_BEST_EFFORT_ENV, "true") };
         assert!(shutdown_best_effort_enabled());
         // SAFETY: test-only env isolation for this process.
