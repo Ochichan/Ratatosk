@@ -36,4 +36,4 @@ jobs:
           redis-server --version
 
       - name: Run supported-subset differential test
-        run: cargo test -p ratatosk-server redis_interop_supported_subset_matches_redis_when_available -- --nocapture
+        run: cargo test -p ratatosk-server --test redis_interop -- --include-ignored --nocapture

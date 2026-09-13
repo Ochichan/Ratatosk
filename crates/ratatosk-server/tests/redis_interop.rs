@@ -1,8 +1,8 @@
 use std::{
-    fs,
+    env, fs,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::Path,
+    net::TcpStream,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -13,11 +13,51 @@ use ratatosk_resp::{RespFrame, encode_to_vec, parse};
 
 struct ChildGuard {
     child: Child,
+    name: String,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 impl ChildGuard {
+    fn new(
+        child: Child,
+        name: impl Into<String>,
+        stdout_path: PathBuf,
+        stderr_path: PathBuf,
+    ) -> Self {
+        Self {
+            child,
+            name: name.into(),
+            stdout_path,
+            stderr_path,
+        }
+    }
+
     fn id(&self) -> u32 {
         self.child.id()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn error_with_logs(&self, kind: io::ErrorKind, message: impl std::fmt::Display) -> io::Error {
+        let stdout = fs::read_to_string(&self.stdout_path).unwrap_or_default();
+        let stderr = fs::read_to_string(&self.stderr_path).unwrap_or_default();
+        io::Error::new(
+            kind,
+            format!(
+                "{} {message}; stdout={stdout:?}; stderr={stderr:?}",
+                self.name
+            ),
+        )
+    }
+
+    fn startup_exit_error(&self, status: ExitStatus) -> io::Error {
+        self.error_with_logs(
+            io::ErrorKind::Other,
+            format_args!("exited during startup: {status}"),
+        )
     }
 
     fn wait_for_exit(&mut self, timeout: Duration) -> io::Result<ExitStatus> {
@@ -29,7 +69,7 @@ impl ChildGuard {
             thread::sleep(Duration::from_millis(50));
         }
 
-        Err(io::Error::new(
+        Err(self.error_with_logs(
             io::ErrorKind::TimedOut,
             format!(
                 "child process {} did not exit within {timeout:?}",
@@ -55,30 +95,14 @@ impl Drop for ChildGuard {
     }
 }
 
-fn reserve_port() -> io::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
-}
-
-fn wait_for_tcp_listener(port: u16) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
-        match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(_) => return Ok(()),
-            Err(_) => thread::sleep(Duration::from_millis(50)),
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("timed out waiting for TCP listener on port {port}"),
-    ))
-}
-
 #[cfg(unix)]
-fn wait_for_unix_listener(path: &Path) -> io::Result<()> {
+fn wait_for_unix_listener(path: &Path, child: &mut ChildGuard) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Err(child.startup_exit_error(status));
+        }
+
         match std::os::unix::net::UnixStream::connect(path) {
             Ok(stream) => {
                 drop(stream);
@@ -88,7 +112,7 @@ fn wait_for_unix_listener(path: &Path) -> io::Result<()> {
         }
     }
 
-    Err(io::Error::new(
+    Err(child.error_with_logs(
         io::ErrorKind::TimedOut,
         format!("timed out waiting for Unix socket {}", path.display()),
     ))
@@ -101,71 +125,58 @@ fn connect_client(port: u16) -> io::Result<TcpStream> {
     Ok(stream)
 }
 
-fn spawn_ratatosk_server(port: u16, dir: &Path) -> io::Result<ChildGuard> {
-    let metrics_port = reserve_port()?;
-    let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
-        )
-    })?;
-
-    let child = Command::new(bin)
-        .env("RATATOSK_BIND", "127.0.0.1")
-        .env("RATATOSK_PORT", port.to_string())
-        .env("RATATOSK_DIR", dir)
-        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
-        .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
-        .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
-        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
-        .env("RATATOSK_ALLOW_NO_METRICS", "true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    Ok(ChildGuard { child })
+fn ratatosk_bin() -> io::Result<PathBuf> {
+    env::var_os("CARGO_BIN_EXE_ratatosk")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_ratatosk").map(PathBuf::from))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
+            )
+        })
 }
 
 fn spawn_ratatosk_server_on_dynamic_port(dir: &Path) -> io::Result<(ChildGuard, u16)> {
-    let metrics_port = reserve_port()?;
     let bound_addr_file = dir.join("ratatosk-bound-addr.json");
-    let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
-        )
-    })?;
+    let stdout_path = dir.join("ratatosk.stdout.log");
+    let stderr_path = dir.join("ratatosk.stderr.log");
+    let stdout = fs::File::create(&stdout_path)?;
+    let stderr = fs::File::create(&stderr_path)?;
 
-    let mut child = Command::new(bin)
+    let child = Command::new(ratatosk_bin()?)
+        .current_dir(dir)
+        .env_clear()
         .env("RATATOSK_BIND", "127.0.0.1")
         .env("RATATOSK_PORT", "0")
         .env("RATATOSK_DIR", dir)
         .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
         .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
         .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
-        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env("RATATOSK_METRICS_BIND", "127.0.0.1:0")
         .env("RATATOSK_ALLOW_NO_METRICS", "true")
         .env("RATATOSK_BOUND_ADDR_FILE", &bound_addr_file)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()?;
+    let mut child = ChildGuard::new(child, "ratatosk", stdout_path, stderr_path);
 
     let port = wait_for_bound_port_file(&bound_addr_file, &mut child)?;
 
-    Ok((ChildGuard { child }, port))
+    Ok((child, port))
 }
 
 #[cfg(unix)]
 fn spawn_ratatosk_unixsocket_server(socket_path: &Path, dir: &Path) -> io::Result<ChildGuard> {
-    let metrics_port = reserve_port()?;
-    let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "CARGO_BIN_EXE_ratatosk is not available for redis interop test",
-        )
-    })?;
+    let stdout_path = dir.join("ratatosk.stdout.log");
+    let stderr_path = dir.join("ratatosk.stderr.log");
+    let stdout = fs::File::create(&stdout_path)?;
+    let stderr = fs::File::create(&stderr_path)?;
 
-    let child = Command::new(bin)
+    let child = Command::new(ratatosk_bin()?)
+        .current_dir(dir)
+        .env_clear()
         .env("RATATOSK_BIND", "127.0.0.1")
         .env("RATATOSK_PORT", "0")
         .env("RATATOSK_UNIXSOCKET", socket_path)
@@ -174,16 +185,17 @@ fn spawn_ratatosk_unixsocket_server(socket_path: &Path, dir: &Path) -> io::Resul
         .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
         .env("RATATOSK_AUDIT_LOG", dir.join("audit.log"))
         .env("RATATOSK_AUDIT_CHAIN_STATE", dir.join("audit.state"))
-        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env("RATATOSK_METRICS_BIND", "127.0.0.1:0")
         .env("RATATOSK_ALLOW_NO_METRICS", "true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()?;
 
-    Ok(ChildGuard { child })
+    Ok(ChildGuard::new(child, "ratatosk", stdout_path, stderr_path))
 }
 
-fn wait_for_bound_port_file(path: &Path, child: &mut Child) -> io::Result<u16> {
+fn wait_for_bound_port_file(path: &Path, child: &mut ChildGuard) -> io::Result<u16> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         match fs::read_to_string(path) {
@@ -204,16 +216,13 @@ fn wait_for_bound_port_file(path: &Path, child: &mut Child) -> io::Result<u16> {
         }
 
         if let Some(status) = child.try_wait()? {
-            return Err(io::Error::other(format!(
-                "ratatosk exited before writing bound address file {}: {status}",
-                path.display()
-            )));
+            return Err(child.startup_exit_error(status));
         }
 
         thread::sleep(Duration::from_millis(50));
     }
 
-    Err(io::Error::new(
+    Err(child.error_with_logs(
         io::ErrorKind::TimedOut,
         format!(
             "timed out waiting for bound address file {}",
@@ -228,38 +237,93 @@ fn bound_port_from_file(contents: &str) -> Option<u16> {
     u16::try_from(port).ok()
 }
 
-fn spawn_redis_server(port: u16, dir: &Path) -> io::Result<Option<ChildGuard>> {
-    let child = match Command::new("redis-server")
+#[cfg(unix)]
+fn required_external_tool(name: &str) -> io::Result<PathBuf> {
+    let search_path = env::var_os("PATH").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("required external tool {name} is not installed or PATH is empty"),
+        )
+    })?;
+    let executable = env::split_paths(&search_path)
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("required external tool {name} was not found in PATH"),
+            )
+        })?;
+    let executable = fs::canonicalize(executable)?;
+    let check_dir = tempfile::tempdir()?;
+    let stdout_path = check_dir.path().join("version.stdout.log");
+    let stderr_path = check_dir.path().join("version.stderr.log");
+    let stdout_file = fs::File::create(&stdout_path)?;
+    let stderr_file = fs::File::create(&stderr_path)?;
+    let child = Command::new(&executable)
+        .current_dir(check_dir.path())
+        .env_clear()
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()?;
+    let mut child = ChildGuard::new(child, format!("{name} --version"), stdout_path, stderr_path);
+    let status = child.wait_for_exit(Duration::from_secs(5))?;
+    if !status.success() {
+        let stdout = fs::read_to_string(&child.stdout_path).unwrap_or_default();
+        let stderr = fs::read_to_string(&child.stderr_path).unwrap_or_default();
+        return Err(io::Error::other(format!(
+            "required external tool {name} failed its version check: {}; stdout={:?}; stderr={:?}",
+            status, stdout, stderr
+        )));
+    }
+
+    Ok(executable)
+}
+
+#[cfg(unix)]
+fn spawn_redis_server(executable: &Path, socket_path: &Path, dir: &Path) -> io::Result<ChildGuard> {
+    let stdout_path = dir.join("redis-server.stdout.log");
+    let stderr_path = dir.join("redis-server.stderr.log");
+    let stdout = fs::File::create(&stdout_path)?;
+    let stderr = fs::File::create(&stderr_path)?;
+    let child = Command::new(executable)
+        .current_dir(dir)
+        .env_clear()
         .arg("--port")
-        .arg(port.to_string())
-        .arg("--bind")
-        .arg("127.0.0.1")
+        .arg("0")
+        .arg("--unixsocket")
+        .arg(socket_path)
+        .arg("--unixsocketperm")
+        .arg("700")
         .arg("--save")
         .arg("")
         .arg("--appendonly")
         .arg("no")
         .arg("--dir")
         .arg(dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()?;
 
-    Ok(Some(ChildGuard { child }))
+    Ok(ChildGuard::new(
+        child,
+        "redis-server",
+        stdout_path,
+        stderr_path,
+    ))
 }
 
-fn send_frame(stream: &mut TcpStream, frame: RespFrame) -> io::Result<RespFrame> {
+fn send_frame<S: Read + Write>(stream: &mut S, frame: RespFrame) -> io::Result<RespFrame> {
     let mut payload = Vec::new();
     encode_to_vec(&frame, &mut payload);
     stream.write_all(&payload)?;
     read_frame(stream)
 }
 
-fn read_frame(stream: &mut TcpStream) -> io::Result<RespFrame> {
+fn read_frame<S: Read>(stream: &mut S) -> io::Result<RespFrame> {
     let mut buf = BytesMut::with_capacity(1024);
     loop {
         match parse(&mut buf) {
@@ -311,10 +375,8 @@ fn bulk_text(frame: RespFrame) -> io::Result<String> {
 #[test]
 fn sidecar_v1_wire_contract_smoke() -> io::Result<()> {
     let ratatosk_dir = tempfile::tempdir()?;
-    let ratatosk_port = reserve_port()?;
 
-    let _ratatosk = spawn_ratatosk_server(ratatosk_port, ratatosk_dir.path())?;
-    wait_for_tcp_listener(ratatosk_port)?;
+    let (_ratatosk, ratatosk_port) = spawn_ratatosk_server_on_dynamic_port(ratatosk_dir.path())?;
 
     let mut client = connect_client(ratatosk_port)?;
 
@@ -456,30 +518,23 @@ fn ratatosk_exits_successfully_on_sigterm() -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
+#[ignore = "requires redis-server in PATH; run with --include-ignored"]
 fn redis_interop_supported_subset_matches_redis_when_available() -> io::Result<()> {
+    let redis_server = required_external_tool("redis-server")?;
     let ratatosk_dir = tempfile::tempdir()?;
     let redis_dir = tempfile::tempdir()?;
-    let ratatosk_port = reserve_port()?;
-    let redis_port = reserve_port()?;
+    let redis_socket = redis_dir.path().join("redis.sock");
 
-    let _ratatosk = spawn_ratatosk_server(ratatosk_port, ratatosk_dir.path())?;
-    let Some(_redis) = spawn_redis_server(redis_port, redis_dir.path())? else {
-        if std::env::var_os("RATATOSK_REQUIRE_REDIS_INTEROP").is_some_and(|value| value == "1") {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Redis interop is required but redis-server is not installed",
-            ));
-        }
-        eprintln!("skipping redis interop smoke test because redis-server is not installed");
-        return Ok(());
-    };
-
-    wait_for_tcp_listener(ratatosk_port)?;
-    wait_for_tcp_listener(redis_port)?;
+    let mut redis_process = spawn_redis_server(&redis_server, &redis_socket, redis_dir.path())?;
+    wait_for_unix_listener(&redis_socket, &mut redis_process)?;
+    let (_ratatosk, ratatosk_port) = spawn_ratatosk_server_on_dynamic_port(ratatosk_dir.path())?;
 
     let mut ratatosk = connect_client(ratatosk_port)?;
-    let mut redis = connect_client(redis_port)?;
+    let mut redis = std::os::unix::net::UnixStream::connect(&redis_socket)?;
+    redis.set_read_timeout(Some(Duration::from_secs(2)))?;
+    redis.set_write_timeout(Some(Duration::from_secs(2)))?;
 
     let commands = vec![
         ("FLUSHALL", array(&["FLUSHALL"])),
@@ -561,39 +616,37 @@ fn redis_interop_supported_subset_matches_redis_when_available() -> io::Result<(
 
 #[cfg(unix)]
 #[test]
+#[ignore = "requires redis-cli in PATH; run with --include-ignored"]
 fn redis_cli_can_ping_ratatosk_over_unix_socket_when_available() -> io::Result<()> {
-    let redis_cli = match Command::new("redis-cli").arg("--version").output() {
-        Ok(_) => "redis-cli",
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            if std::env::var_os("RATATOSK_REQUIRE_REDIS_INTEROP").is_some_and(|value| value == "1")
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "Redis interop is required but redis-cli is not installed",
-                ));
-            }
-            eprintln!("skipping redis interop smoke test because redis-cli is not installed");
-            return Ok(());
-        }
-        Err(error) => return Err(error),
-    };
-
+    let redis_cli = required_external_tool("redis-cli")?;
     let dir = tempfile::tempdir()?;
     let socket_path = dir.path().join("ratatosk.sock");
-    let _ratatosk = spawn_ratatosk_unixsocket_server(&socket_path, dir.path())?;
-    wait_for_unix_listener(&socket_path)?;
+    let mut ratatosk = spawn_ratatosk_unixsocket_server(&socket_path, dir.path())?;
+    wait_for_unix_listener(&socket_path, &mut ratatosk)?;
 
-    let output = Command::new(redis_cli)
+    let stdout_path = dir.path().join("redis-cli.stdout.log");
+    let stderr_path = dir.path().join("redis-cli.stderr.log");
+    let stdout_file = fs::File::create(&stdout_path)?;
+    let stderr_file = fs::File::create(&stderr_path)?;
+    let child = Command::new(redis_cli)
+        .current_dir(dir.path())
+        .env_clear()
         .arg("-s")
         .arg(&socket_path)
         .arg("PING")
-        .output()?;
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()?;
+    let mut redis_cli = ChildGuard::new(child, "redis-cli", stdout_path, stderr_path);
+    let status = redis_cli.wait_for_exit(Duration::from_secs(5))?;
+    let stdout = fs::read_to_string(&redis_cli.stdout_path).unwrap_or_default();
+    let stderr = fs::read_to_string(&redis_cli.stderr_path).unwrap_or_default();
     assert!(
-        output.status.success(),
-        "redis-cli failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        status.success(),
+        "redis-cli failed: {status}; stdout={stdout:?}; stderr={stderr:?}"
     );
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "PONG");
+    assert_eq!(stdout.trim(), "PONG");
 
     Ok(())
 }

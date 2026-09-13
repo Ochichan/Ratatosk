@@ -1822,3 +1822,15 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 - [GitHub protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
 - [Dependabot version updates](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-dependabot-version-updates)
 - [Export SBOM](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/exporting-a-software-bill-of-materials-for-your-repository)
+
+## 외부 Redis 비교 시험 실행 (2026-09-13 갱신)
+
+기본 `cargo test --workspace`에서 외부 Redis가 필요한 두 시험은 `ignored`로 표시된다. 기본 gate의 성공은 Redis 비교 성공을 뜻하지 않는다. Unix 환경에서 실제 `redis-server`와 `redis-cli`를 준비한 뒤 명시적으로 실행한다.
+
+```bash
+cargo test -p ratatosk-server --test redis_interop -- --include-ignored --nocapture
+```
+
+이 명령은 두 외부 시험과 같은 파일의 Ratatosk 자체 시험을 실행하며, 외부 바이너리가 없거나 실패하면 시험도 실패한다. 기존 `RATATOSK_REQUIRE_REDIS_INTEROP=1` 플래그만으로는 ignored 시험이 실행되지 않는다. Redis Interop CI도 위 명령을 사용한다. 비교 대상 Redis는 소유한 임시 디렉터리의 Unix socket으로만 열고 TCP는 비활성화한다.
+
+결과에는 사용한 Redis 버전·바이너리 identity를 별도로 남긴다. 이 suite는 버전을 pin하지 않으며, 일부 응답 비교와 redis-cli PING 성공을 전체 Redis 호환성·격리망 배포 적격성으로 확대하지 않는다.
