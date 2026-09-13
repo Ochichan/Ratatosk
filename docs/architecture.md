@@ -2,9 +2,10 @@
 
 2026-09-06 persistence update: Part 3 below describes the current materialized
 BASE/INCR and timestamped AOF implementation. The older design review in Part 5
-predates those changes; its statements that BASE materialization and runtime AOF
-lifecycle are absent are superseded. Command notes in `docs/redis-gap-ledger.json`
-are authoritative over the historical embedded ledger.
+predates those changes. On 2026-09-13 its BASE/rewrite absence claims were
+corrected below; the remaining historical analysis is not a fresh qualification.
+Command notes in `docs/redis-gap-ledger.json` are authoritative over the historical
+embedded ledger.
 
 이 문서는 6개의 개별 문서를 통합한 단일 참조 문서다.
 
@@ -942,7 +943,7 @@ consumer별 pending ID와 seen time, PEL의 소유자·전달 횟수·전달 시
 보존한다. 이 metadata는 Ratatosk 전용 type 128/129로 저장하며 기존
 hash/stream 인코딩은 읽기 호환을 유지한다.
 
-`CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다.
+`CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다. 클라이언트·background 작업 정리 후 worker에 Shutdown을 보내 fsync 결과를 확인하고 종료한다. 성공한 명시적 종료는 INFO, 예기치 않은 채널 단절은 WARN, shutdown fsync 실패는 ERROR로 구분한다. 최종 종료의 응답 대기는 제한되지만 동기 fsync 자체를 중단하는 hard deadline은 아니다.
 
 `EXEC` 내부의 설정 변경은 최종 committed state를 기준으로 반영한다.
 활성화는 최종 snapshot 한 번으로 transaction을 포함하고, 비활성화는
@@ -1010,7 +1011,7 @@ Legacy single-file AOF 모드에서는 `aof_current_size`만 의미가 있으며
 | Manifest bootstrap/recovery | 구현 | manifest save/load, startup discovery, recovery-file 순차 replay가 baseline으로 연결된다. manifest가 가리키는 recovery file이 없으면 기본적으로 startup을 중단한다. |
 | server_cron 통합 | 부분 | SIGUSR1 수신은 구현되어 있고, 추가 save 정책 자동화는 별도 작업이다. |
 | LZF 압축 | 미구현 | RDB string 압축 (큰 값 전용) |
-| Manifest rewrite switch | 부분 | manifest candidate validation/cleanup helper와 manifest-backed rewrite 후 새 INCR 회전은 연결됐지만 BASE materialization과 full atomic manifest switch는 아직 남아 있다. |
+| Manifest rewrite switch | 구현; 장애 적격성은 별도 | `materialize_aof_base`가 현재 상태를 RDB BASE로 저장하고 새 INCR를 생성·fsync한 뒤 `commit_manifest_switch`로 검증된 manifest를 교체한다. 이전 lineage 파일은 보존한다. 모든 장애 경계·플랫폼의 복구를 이 구현 사실만으로 보장하지 않는다. |
 
 ---
 
@@ -1429,7 +1430,7 @@ Migration cost: high
 
 ### 5. Persistence background work가 Redis와 다른 비용 모델을 가진다
 
-Redis persistence 문서는 RDB background save와 AOF rewrite가 copy-on-write/fork와 background I/O를 활용하고, AOF rewrite는 현재 데이터셋을 재구성하는 최소 명령 집합을 만드는 방향이다. Ratatosk는 여전히 snapshot clone과 single-file rewrite에 크게 의존하지만, multipart AOF manifest의 bootstrap/startup recovery baseline은 이제 runtime에 연결됐다.
+Redis persistence 문서는 RDB background save와 AOF rewrite가 copy-on-write/fork와 background I/O를 활용하고, AOF rewrite는 현재 데이터셋을 재구성하는 최소 명령 집합을 만드는 방향이다. Ratatosk는 snapshot clone을 사용하며, 현재 runtime rewrite는 snapshot을 RDB BASE로 materialize하고 새 INCR과 manifest를 전환한다. 아래 persistence 설명은 2026-09-13 소스에 맞춰 정정했다.
 
 현재 코드:
 
@@ -1437,26 +1438,26 @@ Redis persistence 문서는 RDB background save와 AOF rewrite가 copy-on-write/
 - `BGSAVE` 시작 시 per-DB read lock을 순차적으로 잡아 snapshot clone을 만든다 (전체 DB를 한 번에 잠그지 않음): `crates/ratatosk-server/src/persistence/`
 - synchronous `SAVE`도 동일하게 clone 기반이다: `crates/ratatosk-server/src/persistence/:679-686`
 - runtime은 legacy single-file 경로를 compatibility fallback으로 유지하지만, appendonly bootstrap은 manifest를 우선 사용한다: `crates/ratatosk-server/src/persistence/`
-- `BGREWRITEAOF`는 여전히 기존 AOF를 읽어서 `SELECT`를 건너뛰고 동일 command stream을 다시 append한다: `crates/ratatosk-server/src/persistence/`
-- `AofManifest`는 save/load, bootstrap, startup recovery baseline에 더해 manifest-backed rewrite 후 새 incr 회전과 manifest commit baseline까지 runtime 경로에 연결됐다. 다만 BASE file materialization과 full atomic switch transaction은 아직 없다: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/switch.rs`, `crates/ratatosk-server/src/persistence/`
+- `BGREWRITEAOF`는 현재 상태 snapshot을 worker에 전달한다. 기존 로그 재작성 helper의 존재를 runtime의 current-state rewrite와 혼동하지 않는다: `crates/ratatosk-server/src/persistence/aof.rs`
+- `AofManifest`의 BASE materialization과 manifest switch는 runtime에 연결되어 있다. `rewrite_aof_and_reopen`과 runtime AOF enable은 `materialize_aof_base`를 호출한다. 현재 snapshot의 RDB BASE 저장 → 새 INCR 생성·fsync → candidate 검증과 manifest 저장 → writer 교체 순서이며, 이전 lineage는 rollback/조사를 위해 삭제하지 않는다. 파일별 atomic write와 manifest 교체가 모든 파일을 하나의 filesystem transaction으로 만드는 것은 아니다. 근거: `crates/ratatosk-server/src/persistence/aof.rs`, `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/switch.rs`.
 
 실제 영향:
 
 - 큰 데이터셋에서 `SAVE`/`BGSAVE` 시작 순간 메모리 사용량과 pause cost가 Redis보다 나빠질 수 있다.
-- AOF rewrite가 "현재 상태 compact"가 아니라 "기존 로그 재작성"에 가깝기 때문에 로그 정리 효과가 제한적이다.
-- Redis 7+ multipart AOF의 bootstrap/recovery/rewrite-rotation baseline에는 가까워졌지만, BASE materialization과 current-state compaction 모델은 아직 맞지 않는다.
+- 현재 상태를 BASE로 압축해도 이전 lineage 파일은 보존되므로 전체 디스크 사용량 감소는 별도의 보존/정리 정책에 달려 있다.
+- BASE/INCR 전환의 구현과 각 장애 경계의 복구 보장은 구분해야 한다. 실제 장애 주입·전체 데이터 대조 없이 모든 플랫폼의 내구성을 확정할 수 없다.
 
 미래 파손 시나리오:
 
 - 데이터셋이 커질수록 BGSAVE 트리거 순간 clone cost가 latency spike와 memory spike로 나타난다.
-- 긴 수명의 write-heavy 시스템에서 BGREWRITEAOF 이후에도 파일 압축 효과가 충분하지 않을 수 있다.
+- 긴 수명의 write-heavy 시스템에서 보존한 이전 lineage가 누적되면 rewrite 후에도 전체 디스크 사용량이 증가할 수 있다.
 
 권장 순서:
 
 1. persistence snapshot abstraction을 `ServerState` clone에서 분리
 2. 최소한 keyspace serialization 전용 snapshot view를 만들 것
-3. AOF rewrite는 current state materialization 기반으로 다시 설계할 것
-4. multipart AOF manifest switch와 rewrite rotation까지 runtime/persist 경계에 맞춰 완성할 것
+3. 구현된 current-state rewrite의 BASE/INCR/manifest 전환 경계별 장애 시험을 확보
+4. 이전 lineage 보존·정리 정책과 runtime/persist 책임 경계를 검토
 
 Migration cost: high
 
@@ -1599,10 +1600,10 @@ Fix:
 
 ### 1. `ratatosk-persist`의 multipart AOF abstraction이 runtime 전체 lifecycle을 아직 소유하지 못한다
 
-- 문제: `AofManifest` save/load, startup recovery, rewrite 후 incr rotation/manifest commit baseline은 올라왔지만, BASE materialization과 full atomic switch transaction은 아직 `ratatosk-server` orchestration과 기존 single-file rewrite 모델에 묶여 있다.
+- 현재 경계: BASE snapshot 생성, INCR 회전, manifest 교체는 구현되어 있으며 `ratatosk-server::persistence::aof::materialize_aof_base`가 순서를 조정한다. `ratatosk-persist`는 snapshot 저장·manifest 검증/교체를 제공한다. 남은 설계 과제는 구현 부재가 아니라 runtime 정책과 파일 lifecycle 사이의 책임 배분이다.
 - 증거: `crates/ratatosk-persist/src/aof/manifest.rs`, `crates/ratatosk-persist/src/aof/rewrite.rs`, `crates/ratatosk-server/src/persistence/`
 - 영향: Redis 7+ persistence evolution을 따라갈 때 crate 경계가 다시 흐려지고, multipart 운영 규칙이 runtime 정책과 섞인다.
-- fix: rewrite lifecycle과 file rotation 정책을 `ratatosk-persist` 쪽으로 더 끌어내릴 것
+- 검토할 대안: 파일 lifecycle API를 `ratatosk-persist`로 옮길 경우 runtime의 generation/worker 소유권은 유지하고 오류·취소 경계를 명시한다. 역할 이동 자체를 현재 rewrite의 기능 결함이나 완료 조건으로 취급하지 않는다.
 
 ### 2. Command surface가 실제 subsystem readiness보다 앞서 있다
 
@@ -1623,7 +1624,7 @@ P1:
 
 - ~~Blocking commands를 waiter model로 전환~~ → 완료
 - client-side caching invalidation을 redirect wakeup까지 확장
-- persistence rewrite를 current-state compaction 모델로 재설계
+- 구현된 current-state rewrite의 장애 경계와 보존 파일 용량 관리 검증
 
 P2:
 
@@ -1664,8 +1665,8 @@ P2:
 5. persistence 재설계
 
 - snapshot clone 제거 또는 축소
-- AOF rewrite를 current dataset materialization으로 전환
-- multipart AOF manifest switch와 rewrite rotation 완성
+- 구현된 current dataset materialization의 메모리 비용·복구 증거 확보
+- multipart AOF manifest switch의 장애 시험과 이전 lineage 보존 정책 보완
 
 6. 그 다음에만 Sentinel/Cluster 판단
 
