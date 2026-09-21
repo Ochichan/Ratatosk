@@ -296,20 +296,17 @@ pub(super) fn cmd_acl(
             if args.len() > 2 {
                 return wrong_arity("acl");
             }
-            let bits = if let Some(raw) = args.get(1) {
-                let Some(v) = parse_i64(raw) else {
+            let bits = match args.get(1).map(parse_i64) {
+                None => 256usize,
+                Some(Some(v @ 1..=4096)) => v as usize,
+                Some(_) => {
                     return CommandOutcome::reply(err(
-                        "ERR value is not an integer or out of range",
+                        "ERR ACL GENPASS argument must be the number of bits for the output password, a positive number up to 4096",
                     ));
-                };
-                if v <= 0 {
-                    return CommandOutcome::reply(err("ERR value is out of range"));
                 }
-                usize::try_from(v).unwrap_or(256)
-            } else {
-                256usize
             };
-            let chars = (bits / 4).clamp(8, 256);
+            // One hex character per four bits, rounded up, as in Redis.
+            let chars = bits.div_ceil(4);
             let bytes_len = chars.div_ceil(2);
             let mut entropy = vec![0u8; bytes_len];
             OsRng.fill_bytes(&mut entropy);

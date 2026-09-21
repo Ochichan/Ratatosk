@@ -13,7 +13,7 @@ pub enum PersistError {
     #[error("CRC64 checksum mismatch: expected {expected:#018x}, got {actual:#018x}")]
     CrcMismatch { expected: u64, actual: u64 },
 
-    #[error("corrupt RDB data: {reason}")]
+    #[error("corrupt persistence data: {reason}")]
     Corrupt { reason: String },
 
     #[error("unexpected EOF while reading RDB")]

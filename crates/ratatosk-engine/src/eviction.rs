@@ -205,17 +205,36 @@ pub fn needs_eviction(used_memory: usize, config: &EvictionConfig) -> bool {
 /// Estimate total memory used across all databases.
 ///
 /// When incremental tracking is available (`DataState::estimated_memory`),
-/// prefer that O(1) path.  This full-scan variant is kept for periodic
-/// drift correction in `server_cron`.
+/// prefer that O(1) path.
 pub fn estimate_used_memory(state: &ServerState) -> usize {
-    let mut total = 0usize;
-    for db_idx in 0..state.db_count() {
-        let db = state.db(db_idx);
-        for (key, value) in db.iter() {
-            total = total.saturating_add(estimate_object_memory(key, value));
-        }
-    }
-    total
+    (0..state.data.db_count())
+        .map(|db_idx| estimate_shard_memory(&state.data.read_db(db_idx)))
+        .fold(0usize, usize::saturating_add)
+}
+
+/// Replace each database's incremental memory counter with a full-scan
+/// estimate and return the new total.
+///
+/// This corrects drift in the counters, which do not follow in-place growth
+/// of a collection. Each database stays read-locked from the start of its
+/// scan until its counter is stored. Writers update the counter under the
+/// write lock, so no write lands between the two and drops out of the count.
+/// Other databases, and reads of the one being measured, keep running.
+pub fn recompute_memory_estimates(data: &crate::keyspace::DataState) -> usize {
+    (0..data.db_count())
+        .map(|db_idx| {
+            let shard = data.read_db(db_idx);
+            let bytes = estimate_shard_memory(&shard);
+            data.reset_memory(db_idx, bytes);
+            bytes
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
+fn estimate_shard_memory(shard: &crate::keyspace::DbShard) -> usize {
+    shard.data.iter().fold(0usize, |total, (key, value)| {
+        total.saturating_add(estimate_object_memory(key, value))
+    })
 }
 
 /// Perform eviction until memory drops below maxmemory.

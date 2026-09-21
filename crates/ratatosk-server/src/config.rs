@@ -246,7 +246,12 @@ impl ServerConfig {
     }
 
     pub fn listen_addr(&self) -> String {
-        format!("{}:{}", self.bind, self.port)
+        // An IPv6 literal needs brackets before the port can be appended.
+        if self.bind.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{}]:{}", self.bind, self.port)
+        } else {
+            format!("{}:{}", self.bind, self.port)
+        }
     }
 
     pub fn binds_to_loopback(&self) -> bool {
@@ -414,7 +419,7 @@ pub enum ConfigError {
     InvalidEnvironmentOverride { name: String, message: String },
 
     #[error(
-        "non-loopback RATATOSK_BIND '{value}' requires RATATOSK_ALLOW_INSECURE_BIND=true (or enable a TLS proxy)"
+        "non-loopback bind '{value}' requires RATATOSK_ALLOW_INSECURE_BIND=true (or enable a TLS proxy)"
     )]
     InsecureBindRequiresOptIn { value: String },
 
@@ -928,7 +933,9 @@ fn tokenize_config_line(line: &str) -> Result<Vec<String>, String> {
                 }
             },
             None => match ch {
-                '#' => break,
+                // Like Redis, `#` only starts a comment at the beginning of a
+                // token; inside a value such as a path it is literal.
+                '#' if !token_open => break,
                 '"' | '\'' => {
                     quote = Some(ch);
                     token_open = true;
@@ -1119,11 +1126,17 @@ fn format_scalar_value(value: &str) -> String {
     value.to_string()
 }
 
+/// Only a literal loopback address or `localhost` counts: a hostname that
+/// merely starts with `127.` could resolve anywhere.
 fn is_loopback_bind(bind: &str) -> bool {
+    let literal = bind
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(bind);
     bind.eq_ignore_ascii_case("localhost")
-        || bind == "::1"
-        || bind == "127.0.0.1"
-        || bind.starts_with("127.")
+        || literal
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -1677,8 +1690,36 @@ mod tests {
         assert!(is_loopback_bind("127.0.0.1"));
         assert!(is_loopback_bind("127.0.0.42"));
         assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("[::1]"));
         assert!(is_loopback_bind("localhost"));
         assert!(!is_loopback_bind("0.0.0.0"));
         assert!(!is_loopback_bind("192.168.0.10"));
+        assert!(!is_loopback_bind("127.attacker.example"));
+        assert!(!is_loopback_bind("::"));
+    }
+
+    #[test]
+    fn ipv6_binds_get_bracketed_listen_addresses() {
+        let mut config = ServerConfig {
+            bind: "::1".to_string(),
+            port: 6380,
+            ..ServerConfig::default()
+        };
+        assert_eq!(config.listen_addr(), "[::1]:6380");
+        config.bind = "127.0.0.1".to_string();
+        assert_eq!(config.listen_addr(), "127.0.0.1:6380");
+    }
+
+    #[test]
+    fn hash_only_starts_a_comment_at_a_token_boundary() {
+        assert_eq!(
+            super::tokenize_config_line("dir /data/#1 # trailing comment").expect("tokens"),
+            vec!["dir".to_string(), "/data/#1".to_string()]
+        );
+        assert!(
+            super::tokenize_config_line("# whole-line comment")
+                .expect("tokens")
+                .is_empty()
+        );
     }
 }

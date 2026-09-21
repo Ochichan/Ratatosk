@@ -249,10 +249,7 @@ pub(super) fn cmd_pubsub(args: &[Bytes], server: &ServerState) -> CommandOutcome
             ))
         }
         b"NUMSUB" => {
-            if args.len() < 2 {
-                return wrong_arity("pubsub");
-            }
-
+            // Like Redis, no channel arguments yields an empty reply.
             let pairs = server.pubsub.numsub(&args[1..]);
             let mut out = Vec::with_capacity(pairs.len().saturating_mul(2));
             for (channel, count) in pairs {
@@ -284,10 +281,7 @@ pub(super) fn cmd_pubsub(args: &[Bytes], server: &ServerState) -> CommandOutcome
             ))
         }
         b"SHARDNUMSUB" => {
-            if args.len() < 2 {
-                return wrong_arity("pubsub");
-            }
-
+            // Like Redis, no channel arguments yields an empty reply.
             let pairs = server.pubsub.shard_numsub(&args[1..]);
             let mut out = Vec::with_capacity(pairs.len().saturating_mul(2));
             for (channel, count) in pairs {

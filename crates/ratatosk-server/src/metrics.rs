@@ -2,11 +2,25 @@
 //!
 //! Provides Prometheus-compatible metrics export on a configurable port.
 
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::env;
 use std::net::SocketAddr;
 
 pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9090";
+
+/// Histogram buckets per unit suffix. Without explicit buckets the exporter
+/// renders summaries, which cannot be aggregated and have no `_bucket`
+/// series for the `histogram_quantile` queries in docs/SLO.md and the
+/// dashboard.
+const SECONDS_BUCKETS: &[f64] = &[
+    0.000_05, 0.000_1, 0.000_25, 0.000_5, 0.001, 0.002_5, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5,
+    1.0, 2.5,
+];
+const MILLISECONDS_BUCKETS: &[f64] = &[
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0,
+    5_000.0,
+];
+const COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0, 100.0];
 
 /// Initialize the metrics system with Prometheus exporter.
 ///
@@ -19,9 +33,16 @@ pub const DEFAULT_METRICS_BIND_ADDR: &str = "127.0.0.1:9090";
 pub fn init_metrics(bind_addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = bind_addr.parse()?;
 
+    // `install` binds the listener synchronously (so a busy port is reported
+    // here) and spawns both the HTTP exporter and the upkeep task that drains
+    // histogram samples. `install_recorder` would do neither: nothing would
+    // listen, and every recorded sample would be retained forever.
     PrometheusBuilder::new()
         .with_http_listener(addr)
-        .install_recorder()?;
+        .set_buckets_for_metric(Matcher::Suffix("_seconds".to_string()), SECONDS_BUCKETS)?
+        .set_buckets_for_metric(Matcher::Suffix("_ms".to_string()), MILLISECONDS_BUCKETS)?
+        .set_buckets_for_metric(Matcher::Suffix("_attempts".to_string()), COUNT_BUCKETS)?
+        .install()?;
 
     tracing::info!(
         target = "ratatosk::metrics",

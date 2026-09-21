@@ -71,7 +71,7 @@ use ratatosk_resp::frame::RespFrame;
 use crate::{
     eviction::estimate_used_memory,
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
-    keyspace::{AtomicStatsState, ClientSnapshot, DefaultAclPolicyState, ServerState},
+    keyspace::{AtomicStatsState, ClientSnapshot, DataState, DefaultAclPolicyState, ServerState},
     security::sanitize_error_message,
 };
 use registry::{
@@ -193,7 +193,7 @@ const COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "QUIT",
-        arity: 1,
+        arity: -1,
         flags: &["fast", "connection", "no_auth"],
         first_key: 0,
         last_key: 0,
@@ -1268,7 +1268,7 @@ const EXTRA_COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "PUBSUB NUMSUB",
-        arity: -3,
+        arity: -2,
         flags: &["pubsub", "readonly", "noscript"],
         first_key: 0,
         last_key: 0,
@@ -3688,6 +3688,17 @@ impl ClientState {
         self.tx_state.in_multi()
     }
 
+    /// Drop every WATCH registration this client holds.
+    ///
+    /// Must run whenever the watch set ends: EXEC, DISCARD, UNWATCH, RESET
+    /// and connection teardown. The server only records versions for keys
+    /// with live registrations.
+    pub fn release_watches(&mut self, data: &DataState) {
+        for ((db_index, key), _) in self.watched.drain() {
+            data.unwatch_key(db_index, &key);
+        }
+    }
+
     pub fn has_queued_writes(&self) -> bool {
         match &self.tx_state {
             TransactionState::InTransaction { queue, .. } => {
@@ -4180,9 +4191,9 @@ fn execute_argv_inner(
         b"TRIMSLOTS" => cmd_connection::cmd_trimslots(args),
         b"MULTI" => cmd_transaction::cmd_multi(args, client),
         b"EXEC" => cmd_transaction::cmd_exec(args, server, client, atomic_stats),
-        b"DISCARD" => cmd_transaction::cmd_discard(args, client),
+        b"DISCARD" => cmd_transaction::cmd_discard(args, server, client),
         b"WATCH" => cmd_transaction::cmd_watch(args, server, client),
-        b"UNWATCH" => cmd_transaction::cmd_unwatch(args, client),
+        b"UNWATCH" => cmd_transaction::cmd_unwatch(args, server, client),
         b"SUBSCRIBE" => cmd_pubsub::cmd_subscribe(args, server, client),
         b"SSUBSCRIBE" => cmd_pubsub::cmd_ssubscribe(args, server, client),
         b"PSUBSCRIBE" => cmd_pubsub::cmd_psubscribe(args, server, client),
@@ -5485,7 +5496,8 @@ mod tests {
 
     use super::{
         AtomicStatsState, ClientState, CommandOutcome, ExecuteArgvPrecheck, ServerAccess,
-        ServerState, command_spec_count, execute, now_ms, precheck_execute_argv_with_default_acl,
+        ServerState, all_command_specs, command_spec_count, execute, now_ms,
+        precheck_execute_argv_with_default_acl,
     };
 
     fn cmd(parts: &[&str]) -> RespFrame {
@@ -6810,15 +6822,15 @@ mod tests {
         );
         assert_eq!(
             run(&["HELLO", "proto"], &mut server, &mut client),
-            RespFrame::error_str("NOPROTO unsupported protocol version")
+            RespFrame::error_str("ERR Protocol version is not an integer or out of range")
         );
         assert_eq!(
             run(&["HELLO", "SETNAME"], &mut server, &mut client),
-            RespFrame::error_str("ERR syntax error")
+            RespFrame::error_str("ERR Syntax error in HELLO option 'SETNAME'")
         );
         assert_eq!(
             run(&["HELLO", "AUTH", "u"], &mut server, &mut client),
-            RespFrame::error_str("ERR syntax error")
+            RespFrame::error_str("ERR Syntax error in HELLO option 'AUTH'")
         );
 
         let hello2 = run(&["HELLO", "2"], &mut server, &mut client);
@@ -12760,5 +12772,885 @@ mod tests {
             other => panic!("expected invalidate push, got {other:?}"),
         }
         // Client 42 was removed, so _rx42 would only contain what was sent before removal.
+    }
+    #[test]
+    fn oversized_string_offsets_are_rejected_before_allocating() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let too_long = RespFrame::error_str(crate::object::STRING_TOO_LONG_ERR);
+        let bit_offset_err =
+            RespFrame::error_str("ERR bit offset is not an integer or out of range");
+
+        // Each of these used to resize the value to the requested offset and
+        // abort the process on the failed allocation.
+        assert_eq!(
+            run(
+                &["SETRANGE", "s", "1000000000000", "x"],
+                &mut server,
+                &mut client
+            ),
+            too_long
+        );
+        assert_eq!(
+            run(
+                &["SETRANGE", "s", "536870912", "x"],
+                &mut server,
+                &mut client
+            ),
+            too_long
+        );
+        assert_eq!(
+            run(
+                &["SETRANGE", "s", "1000000000000", ""],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(0)
+        );
+        for op in [
+            vec!["BITFIELD", "b", "SET", "u8", "99999999999999", "1"],
+            vec!["BITFIELD", "b", "INCRBY", "u8", "#999999999999", "1"],
+            vec!["BITFIELD", "b", "SET", "u8", "4294967289", "1"],
+        ] {
+            assert_eq!(run(&op, &mut server, &mut client), bit_offset_err, "{op:?}");
+        }
+        assert_eq!(
+            run(
+                &["BITFIELD", "b", "GET", "u8", "4294967288"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::Integer(0)])
+        );
+        assert_eq!(
+            run(&["EXISTS", "s", "b"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn sorted_sets_accept_infinite_scores_like_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        assert_eq!(
+            run(
+                &["ZADD", "z", "+inf", "a", "-inf", "b", "1", "c"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(3)
+        );
+        assert_eq!(
+            run(
+                &["ZRANGE", "z", "0", "-1", "WITHSCORES"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(
+                ["b", "-inf", "c", "1", "a", "inf"]
+                    .into_iter()
+                    .map(RespFrame::bulk_str)
+                    .collect()
+            )
+        );
+        assert_eq!(
+            run(&["ZINCRBY", "z", "-inf", "a"], &mut server, &mut client),
+            RespFrame::error_str("ERR resulting score is not a number (NaN)")
+        );
+        assert_eq!(
+            run(&["ZINCRBY", "fresh", "+inf", "m"], &mut server, &mut client),
+            RespFrame::bulk_str("inf")
+        );
+        assert_eq!(
+            run(&["ZSCORE", "fresh", "m"], &mut server, &mut client),
+            RespFrame::bulk_str("inf")
+        );
+    }
+
+    #[test]
+    fn zset_set_operations_follow_redis_input_and_nan_rules() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(
+            &["ZADD", "z", "+inf", "a", "2", "b"],
+            &mut server,
+            &mut client,
+        );
+        run(&["SADD", "s", "a", "c"], &mut server, &mut client);
+        run(&["SET", "str", "x"], &mut server, &mut client);
+
+        // Plain sets are accepted with score 1; inf * 0 and inf + -inf are 0.
+        assert_eq!(
+            run(
+                &["ZUNION", "2", "z", "s", "WEIGHTS", "0", "1", "WITHSCORES"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(
+                ["b", "0", "a", "1", "c", "1"]
+                    .into_iter()
+                    .map(RespFrame::bulk_str)
+                    .collect()
+            )
+        );
+        run(&["ZADD", "neg", "-inf", "a"], &mut server, &mut client);
+        assert_eq!(
+            run(
+                &["ZINTER", "2", "z", "neg", "WITHSCORES"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::bulk_str("a"), RespFrame::bulk_str("0")])
+        );
+
+        // A wrong-typed input fails even after an empty intermediate result.
+        for command in [
+            vec!["ZINTER", "3", "missing", "z", "str"],
+            vec!["ZDIFF", "3", "missing", "z", "str"],
+            vec!["ZINTERCARD", "3", "missing", "z", "str"],
+        ] {
+            assert_eq!(
+                run(&command, &mut server, &mut client),
+                RespFrame::wrongtype(),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_commands_follow_redis_edge_cases() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // Bare HELLO reports the current protocol instead of switching to RESP3.
+        let RespFrame::Map(fields) = run(&["HELLO"], &mut server, &mut client) else {
+            panic!("HELLO replies with a map");
+        };
+        assert!(fields.contains(&(RespFrame::bulk_str("proto"), RespFrame::Integer(2))));
+        assert_eq!(client.protocol_version(), 2);
+        assert_eq!(
+            run(&["HELLO", "three"], &mut server, &mut client),
+            RespFrame::error_str("ERR Protocol version is not an integer or out of range")
+        );
+        assert_eq!(
+            run(&["HELLO", "3", "SETNAME"], &mut server, &mut client),
+            RespFrame::error_str("ERR Syntax error in HELLO option 'SETNAME'")
+        );
+        assert_eq!(client.protocol_version(), 2);
+
+        assert_eq!(
+            run(&["PUBSUB", "NUMSUB"], &mut server, &mut client),
+            RespFrame::Array(Vec::new())
+        );
+        assert_eq!(
+            run(&["PUBSUB", "SHARDNUMSUB"], &mut server, &mut client),
+            RespFrame::Array(Vec::new())
+        );
+
+        let quit = run_outcome(&["QUIT", "extra"], &mut server, &mut client);
+        assert_eq!(quit.response, RespFrame::ok());
+        assert!(quit.close);
+    }
+
+    fn recorded_key_versions(server: &ServerState) -> usize {
+        (0..server.db_count())
+            .map(|db| server.data.read_db(db).key_versions.len())
+            .sum()
+    }
+
+    #[test]
+    fn unwatched_writes_do_not_accumulate_key_versions() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for i in 0..200 {
+            let key = format!("k{i}");
+            run(&["SET", &key, "v", "PX", "1"], &mut server, &mut client);
+            run(&["DEL", &key], &mut server, &mut client);
+        }
+        assert_eq!(recorded_key_versions(&server), 0);
+
+        // Versions exist only while someone watches, and go with the watch.
+        let mut watcher = ClientState::new(2);
+        run(&["WATCH", "k1"], &mut server, &mut watcher);
+        run(&["SET", "k1", "v"], &mut server, &mut client);
+        run(&["SET", "k2", "v"], &mut server, &mut client);
+        assert_eq!(recorded_key_versions(&server), 1);
+        run(&["UNWATCH"], &mut server, &mut watcher);
+        assert_eq!(recorded_key_versions(&server), 0);
+    }
+
+    #[test]
+    fn watch_detects_writes_flushes_swaps_and_expiry() {
+        let mut server = ServerState::with_default_dbs();
+        let mut writer = ClientState::new(1);
+        let mut watcher = ClientState::new(2);
+        let mut exec_after = |change: &[&str], server: &mut ServerState| {
+            run(&["SET", "w", "1"], server, &mut writer);
+            run(&["WATCH", "w"], server, &mut watcher);
+            if !change.is_empty() {
+                run(change, server, &mut writer);
+            }
+            run(&["MULTI"], server, &mut watcher);
+            run(&["PING"], server, &mut watcher);
+            run(&["EXEC"], server, &mut watcher)
+        };
+
+        assert_eq!(
+            exec_after(&[], &mut server),
+            RespFrame::Array(vec![RespFrame::pong()])
+        );
+        for change in [
+            &["SET", "w", "2"][..],
+            &["DEL", "w"],
+            &["FLUSHDB"],
+            &["SWAPDB", "0", "1"],
+        ] {
+            assert_eq!(
+                exec_after(change, &mut server),
+                RespFrame::NullArray,
+                "{change:?}"
+            );
+        }
+
+        // Expiry after WATCH aborts even when nothing else touches the key.
+        run(&["SET", "w", "1", "PX", "40"], &mut server, &mut writer);
+        run(&["WATCH", "w"], &mut server, &mut watcher);
+        std::thread::sleep(Duration::from_millis(80));
+        run(&["MULTI"], &mut server, &mut watcher);
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut watcher),
+            RespFrame::NullArray
+        );
+
+        // A watched key that never existed survives an unrelated flush.
+        run(&["WATCH", "never"], &mut server, &mut watcher);
+        run(&["FLUSHALL"], &mut server, &mut writer);
+        run(&["MULTI"], &mut server, &mut watcher);
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut watcher),
+            RespFrame::Array(Vec::new())
+        );
+        assert_eq!(recorded_key_versions(&server), 0);
+    }
+
+    #[test]
+    fn reset_releases_subscriptions_and_watches() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(7);
+        let _rx = server.pubsub.register_client(7);
+        run(&["SUBSCRIBE", "news"], &mut server, &mut client);
+        run(&["PSUBSCRIBE", "n*"], &mut server, &mut client);
+        run(&["WATCH", "k"], &mut server, &mut client);
+
+        assert_eq!(
+            run(&["RESET"], &mut server, &mut client),
+            RespFrame::simple_str("RESET")
+        );
+        assert_eq!(
+            run(&["PUBSUB", "NUMSUB", "news"], &mut server, &mut client),
+            RespFrame::Array(vec![RespFrame::bulk_str("news"), RespFrame::Integer(0)])
+        );
+        assert_eq!(
+            run(&["PUBSUB", "NUMPAT"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        run(&["SET", "k", "v"], &mut server, &mut client);
+        assert_eq!(recorded_key_versions(&server), 0);
+
+        // The delivery queue survives, so the connection can subscribe again.
+        run(&["SUBSCRIBE", "news"], &mut server, &mut client);
+        assert_eq!(
+            run(&["PUBSUB", "NUMSUB", "news"], &mut server, &mut client),
+            RespFrame::Array(vec![RespFrame::bulk_str("news"), RespFrame::Integer(1)])
+        );
+    }
+
+    fn run_bytes(parts: &[Bytes], server: &mut ServerState, client: &mut ClientState) -> RespFrame {
+        let mut access = ServerAccess::new_inline(server);
+        let frame = RespFrame::Array(
+            parts
+                .iter()
+                .map(|part| RespFrame::BulkString(Some(part.clone())))
+                .collect(),
+        );
+        execute(frame, &mut access, client).response
+    }
+
+    fn dump_and_restore(key: &str, copy: &str, server: &mut ServerState, client: &mut ClientState) {
+        let RespFrame::BulkString(Some(payload)) = run(&["DUMP", key], server, client) else {
+            panic!("DUMP {key} should return a payload");
+        };
+        let restore = [
+            Bytes::from_static(b"RESTORE"),
+            Bytes::copy_from_slice(copy.as_bytes()),
+            Bytes::from_static(b"0"),
+            payload,
+        ];
+        assert_eq!(run_bytes(&restore, server, client), RespFrame::ok());
+    }
+
+    #[test]
+    fn dump_restore_keeps_hash_field_ttls_and_stream_groups() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        run(
+            &["HSET", "h", "keep", "1", "ttl", "2"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["HPEXPIREAT", "h", "99999999999999", "FIELDS", "1", "ttl"],
+            &mut server,
+            &mut client,
+        );
+        dump_and_restore("h", "h2", &mut server, &mut client);
+        assert_eq!(
+            run(
+                &["HPEXPIRETIME", "h2", "FIELDS", "2", "keep", "ttl"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![
+                RespFrame::Integer(-1),
+                RespFrame::Integer(99_999_999_999_999)
+            ])
+        );
+
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "s", "2-1", "f", "v"], &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "alice",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        dump_and_restore("s", "s2", &mut server, &mut client);
+        for key in ["s", "s2"] {
+            let RespFrame::Array(summary) = run(&["XPENDING", key, "g"], &mut server, &mut client)
+            else {
+                panic!("XPENDING should return a summary");
+            };
+            assert_eq!(summary[0], RespFrame::Integer(1), "{key}");
+            assert_eq!(summary[1], RespFrame::bulk_str("1-1"), "{key}");
+        }
+
+        run(
+            &["XGROUP", "CREATE", "empty", "g", "$", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        );
+        dump_and_restore("empty", "empty2", &mut server, &mut client);
+        assert_eq!(
+            run(&["XLEN", "empty2"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_malformed_payloads_but_reads_version_one() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let payload = |magic: &[u8], kind: u8, body: &[u8]| {
+            let mut out = magic.to_vec();
+            out.push(kind);
+            out.extend_from_slice(body);
+            Bytes::from(out)
+        };
+        let item = |bytes: &[u8]| {
+            let mut out = (bytes.len() as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(bytes);
+            out
+        };
+        let restore = |key: &str, payload: Bytes| {
+            [
+                Bytes::from_static(b"RESTORE"),
+                Bytes::copy_from_slice(key.as_bytes()),
+                Bytes::from_static(b"0"),
+                payload,
+            ]
+        };
+        let bad = RespFrame::error_str("ERR DUMP payload version or checksum are wrong");
+
+        let empty_list = payload(b"RATSK2", b'l', &0u32.to_le_bytes());
+        let mut nan_zset = 1u32.to_le_bytes().to_vec();
+        nan_zset.extend(item(b"m"));
+        nan_zset.extend(f64::NAN.to_bits().to_le_bytes());
+        let mut unsorted = 2u32.to_le_bytes().to_vec();
+        for ms in [5i64, 4] {
+            unsorted.extend(ms.to_le_bytes());
+            unsorted.extend(0i64.to_le_bytes());
+            unsorted.extend(0u32.to_le_bytes());
+        }
+        unsorted.extend(0u32.to_le_bytes());
+        // A group whose two consumers each own one pending ID.
+        let group_pel = |ids: [i64; 2]| {
+            let mut body = 0u32.to_le_bytes().to_vec();
+            body.extend(1u32.to_le_bytes());
+            body.extend(item(b"g"));
+            body.extend([0u8; 16]);
+            body.extend(2u32.to_le_bytes());
+            for consumer in [b"c1", b"c2"] {
+                body.extend(item(consumer));
+                body.extend(0i64.to_le_bytes());
+            }
+            body.extend(2u32.to_le_bytes());
+            for (ms, consumer) in ids.into_iter().zip([b"c1", b"c2"]) {
+                body.extend(ms.to_le_bytes());
+                body.extend(0i64.to_le_bytes());
+                body.extend(item(consumer));
+                body.extend(1i64.to_le_bytes());
+                body.extend(0i64.to_le_bytes());
+            }
+            body
+        };
+        let shared_pel = group_pel([1, 1]);
+        assert_eq!(
+            run_bytes(
+                &restore("distinct-pel", payload(b"RATSK2", b'r', &group_pel([1, 2]))),
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        for (key, body) in [
+            ("a", empty_list),
+            ("b", payload(b"RATSK2", b'z', &nan_zset)),
+            ("c", payload(b"RATSK2", b'r', &unsorted)),
+            ("d", payload(b"RATSK2", b'r', &shared_pel)),
+        ] {
+            assert_eq!(
+                run_bytes(&restore(key, body), &mut server, &mut client),
+                bad,
+                "{key}"
+            );
+        }
+
+        let mut v1_hash = 1u32.to_le_bytes().to_vec();
+        v1_hash.extend(item(b"f"));
+        v1_hash.extend(item(b"v"));
+        assert_eq!(
+            run_bytes(
+                &restore("v1", payload(b"RATSK1", b'h', &v1_hash)),
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["HGET", "v1", "f"], &mut server, &mut client),
+            RespFrame::bulk_str("v")
+        );
+    }
+
+    #[test]
+    fn acl_genpass_sizes_the_password_like_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let password_len = |response: RespFrame| match response {
+            RespFrame::BulkString(Some(password)) => password.len(),
+            other => panic!("expected a password, got {other:?}"),
+        };
+
+        assert_eq!(
+            password_len(run(&["ACL", "GENPASS"], &mut server, &mut client)),
+            64
+        );
+        assert_eq!(
+            password_len(run(&["ACL", "GENPASS", "5"], &mut server, &mut client)),
+            2
+        );
+        assert_eq!(
+            password_len(run(&["ACL", "GENPASS", "4096"], &mut server, &mut client)),
+            1024
+        );
+        for bits in ["0", "4097", "x"] {
+            assert!(matches!(
+                run(&["ACL", "GENPASS", bits], &mut server, &mut client),
+                RespFrame::Error(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn index_ranges_follow_each_commands_redis_rules() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let strings = |parts: &[&str]| -> RespFrame {
+            RespFrame::Array(parts.iter().map(|part| RespFrame::bulk_str(part)).collect())
+        };
+        run(
+            &["ZADD", "z", "1", "a", "2", "b", "3", "c"],
+            &mut server,
+            &mut client,
+        );
+        run(&["RPUSH", "l", "a", "b", "c"], &mut server, &mut client);
+        run(&["SET", "s", "abc"], &mut server, &mut client);
+
+        // Lists and sorted sets: an end still negative after offsetting is empty.
+        for command in [
+            &["ZRANGE", "z", "0", "-100"][..],
+            &["ZRANGE", "z", "-100", "-100"],
+            &["ZREVRANGE", "z", "0", "-100"],
+            &["LRANGE", "l", "0", "-100"],
+        ] {
+            assert_eq!(
+                run(command, &mut server, &mut client),
+                strings(&[]),
+                "{command:?}"
+            );
+        }
+        assert_eq!(
+            run(&["ZRANGE", "z", "-2", "100"], &mut server, &mut client),
+            strings(&["b", "c"])
+        );
+
+        // Strings clamp a negative end to the first byte instead.
+        assert_eq!(
+            run(&["GETRANGE", "s", "0", "-100"], &mut server, &mut client),
+            RespFrame::bulk_str("a")
+        );
+        assert_eq!(
+            run(&["GETRANGE", "s", "-10", "-10"], &mut server, &mut client),
+            RespFrame::bulk_str("a")
+        );
+        assert_eq!(
+            run(&["GETRANGE", "s", "-1", "-2"], &mut server, &mut client),
+            RespFrame::bulk_str("")
+        );
+        assert_eq!(
+            run(&["BITCOUNT", "s", "0", "-100"], &mut server, &mut client),
+            RespFrame::Integer(3)
+        );
+        assert_eq!(
+            run(&["BITCOUNT", "s", "-1", "-2"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        assert_eq!(
+            run(&["BITPOS", "s", "1", "0", "-100"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+
+        assert_eq!(
+            run(&["LTRIM", "l", "0", "-100"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["EXISTS", "l"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn score_ranges_include_infinite_scores_and_reject_nan_bounds() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let strings = |parts: &[&str]| -> RespFrame {
+            RespFrame::Array(parts.iter().map(|part| RespFrame::bulk_str(part)).collect())
+        };
+        run(
+            &[
+                "ZADD", "z", "+inf", "top", "-inf", "bottom", "0", "zero", "-0", "negzero",
+            ],
+            &mut server,
+            &mut client,
+        );
+
+        assert_eq!(
+            run(
+                &["ZRANGEBYSCORE", "z", "+inf", "+inf"],
+                &mut server,
+                &mut client
+            ),
+            strings(&["top"])
+        );
+        assert_eq!(
+            run(&["ZCOUNT", "z", "-inf", "-inf"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(
+                &["ZRANGEBYSCORE", "z", "(0", "+inf"],
+                &mut server,
+                &mut client
+            ),
+            strings(&["top"])
+        );
+        assert_eq!(
+            run(
+                &["ZREVRANGEBYSCORE", "z", "0", "0"],
+                &mut server,
+                &mut client
+            ),
+            strings(&["zero", "negzero"])
+        );
+        assert_eq!(
+            run(
+                &["ZRANGE", "z", "(-inf", "(+inf", "BYSCORE"],
+                &mut server,
+                &mut client
+            ),
+            strings(&["negzero", "zero"])
+        );
+        assert_eq!(
+            run(&["ZCOUNT", "z", "5", "1"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        assert_eq!(
+            run(
+                &["ZRANGEBYSCORE", "z", "nan", "1"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR min or max is not a float")
+        );
+        assert_eq!(
+            run(
+                &["ZREMRANGEBYSCORE", "z", "-inf", "(0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["ZCARD", "z"], &mut server, &mut client),
+            RespFrame::Integer(3)
+        );
+    }
+    /// Every command, fed hostile argument lists, must answer instead of
+    /// panicking: release builds abort on panic, so one reachable panic is a
+    /// remote crash.
+    #[test]
+    fn no_command_panics_on_hostile_arguments() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        const TOKENS: &[&str] = &[
+            "",
+            "0",
+            "1",
+            "-1",
+            "2",
+            "-2",
+            "3",
+            "7",
+            "100000",
+            "-100000",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "99999999999999999999",
+            "4294967295",
+            "4294967296",
+            "inf",
+            "-inf",
+            "+inf",
+            "nan",
+            "(1",
+            "(inf",
+            "[a",
+            "(a",
+            "-",
+            "+",
+            "*",
+            "$",
+            "#",
+            "#9223372036854775807",
+            "0-0",
+            "1-1",
+            "9-*",
+            ">",
+            "u8",
+            "i64",
+            "u64",
+            "i0",
+            "str",
+            "list",
+            "hash",
+            "set",
+            "intset",
+            "zset",
+            "stream",
+            "missing",
+            "g",
+            "c",
+            "LIMIT",
+            "COUNT",
+            "MATCH",
+            "TYPE",
+            "BY",
+            "GET",
+            "STORE",
+            "WITHSCORES",
+            "WITHSCORE",
+            "BYSCORE",
+            "BYLEX",
+            "REV",
+            "FIELDS",
+            "NX",
+            "XX",
+            "GT",
+            "LT",
+            "CH",
+            "INCR",
+            "EX",
+            "PX",
+            "EXAT",
+            "PXAT",
+            "KEEPTTL",
+            "PERSIST",
+            "IDLE",
+            "TIME",
+            "RETRYCOUNT",
+            "FORCE",
+            "JUSTID",
+            "MAXLEN",
+            "MINID",
+            "~",
+            "=",
+            "LEFT",
+            "RIGHT",
+            "BEFORE",
+            "AFTER",
+            "RANK",
+            "WEIGHTS",
+            "AGGREGATE",
+            "SUM",
+            "MIN",
+            "MAX",
+            "BYTE",
+            "BIT",
+            "OVERFLOW",
+            "WRAP",
+            "SAT",
+            "FAIL",
+            "SET",
+            "INCRBY",
+            "RESET",
+            "ON",
+            "OFF",
+            "SKIP",
+            "ID",
+            "KILL",
+            "LIST",
+            "INFO",
+            "HELP",
+            "DOCS",
+            "ENCODING",
+            "FREQ",
+            "REFCOUNT",
+            "USAGE",
+            "SAMPLES",
+            "STREAMS",
+            "GROUP",
+            "NOACK",
+            "BLOCK",
+            "CREATE",
+            "MKSTREAM",
+            "ENTRIESREAD",
+            "DB",
+            "REPLACE",
+            "ABSTTL",
+            "ASC",
+            "DESC",
+            "ALPHA",
+            "FROMMEMBER",
+            "FROMLONLAT",
+            "BYRADIUS",
+            "BYBOX",
+            "km",
+            "m",
+            "WITHCOORD",
+            "WITHDIST",
+            "WITHHASH",
+            "ANY",
+            "10.5",
+            "-190",
+            "91",
+            "1e308",
+            "-0",
+            "0x10",
+            "\r\n",
+            "a\u{0}b",
+        ];
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut commands: Vec<Vec<String>> = all_command_specs()
+            .map(|spec| spec.name.split(' ').map(str::to_string).collect())
+            .collect();
+        commands.sort();
+        commands.dedup();
+
+        let seed_state = |server: &mut ServerState, client: &mut ClientState| {
+            server.config.set_dir(dir.path().to_path_buf());
+            for parts in [
+                &["SET", "str", "hello"][..],
+                &["SET", "int", "42"],
+                &["RPUSH", "list", "a", "b", "c"],
+                &["HSET", "hash", "f", "v", "g", "1"],
+                &["SADD", "set", "a", "b"],
+                &["SADD", "intset", "1", "2", "3"],
+                &["ZADD", "zset", "1", "a", "2", "b", "inf", "c"],
+                &["XADD", "stream", "1-1", "f", "v"],
+                &["XGROUP", "CREATE", "stream", "g", "0"],
+                &["PFADD", "hll", "a"],
+            ] {
+                run(parts, server, client);
+            }
+        };
+
+        let mut rng = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+
+        let mut panics = Vec::new();
+        for command in &commands {
+            if matches!(command[0].as_str(), "SHUTDOWN" | "DEBUG" | "MONITOR") {
+                continue;
+            }
+            let mut server = ServerState::with_default_dbs();
+            let mut client = ClientState::default();
+            seed_state(&mut server, &mut client);
+            for round in 0..48 {
+                let extra = (next() % 8) as usize;
+                let mut parts = command.clone();
+                for _ in 0..extra {
+                    parts.push(TOKENS[(next() % TOKENS.len() as u64) as usize].to_string());
+                }
+                if round % 16 == 15 {
+                    seed_state(&mut server, &mut client);
+                    client = ClientState::default();
+                }
+                let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    run(&refs, &mut server, &mut client);
+                }));
+                if outcome.is_err() {
+                    panics.push(parts);
+                    // A panic can leave the state inconsistent; start over.
+                    server = ServerState::with_default_dbs();
+                    client = ClientState::default();
+                    seed_state(&mut server, &mut client);
+                }
+            }
+        }
+        assert!(panics.is_empty(), "commands panicked: {panics:#?}");
     }
 }

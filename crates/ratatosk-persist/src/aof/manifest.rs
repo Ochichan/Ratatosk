@@ -172,10 +172,14 @@ impl AofManifest {
                     saw_next_seq = true;
                 }
                 "base" => {
-                    manifest.base_file = (value != "-").then(|| value.to_string());
+                    manifest.base_file = if value == "-" {
+                        None
+                    } else {
+                        Some(validated_file_name(path, value)?)
+                    };
                     saw_base = true;
                 }
-                "incr" => manifest.incr_files.push(value.to_string()),
+                "incr" => manifest.incr_files.push(validated_file_name(path, value)?),
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -201,6 +205,25 @@ impl AofManifest {
 
         Ok(manifest)
     }
+}
+
+/// Recovery files are named relative to the manifest directory. A separator
+/// or `..` would let an edited manifest pull files from anywhere.
+fn validated_file_name(manifest_path: &Path, value: &str) -> io::Result<String> {
+    let plain = Path::new(value)
+        .file_name()
+        .is_some_and(|name| name == std::ffi::OsStr::new(value));
+    if !plain || value == "." || value == ".." {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "AOF manifest '{}' names '{}', which is not a plain file name",
+                manifest_path.display(),
+                value
+            ),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 #[cfg(test)]
@@ -267,5 +290,26 @@ mod tests {
         assert_eq!(loaded.base_file(), manifest.base_file());
         assert_eq!(loaded.incr_files(), manifest.incr_files());
         assert_eq!(loaded.recovery_files(), manifest.recovery_files());
+    }
+
+    #[test]
+    fn manifest_rejects_paths_outside_its_directory() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let manifest_path = AofManifest::default_manifest_path(dir.path());
+        for entry in [
+            "base ../outside.rdb",
+            "base /etc/passwd",
+            "incr sub/appendonly.aof.1.incr.aof",
+            "incr ..",
+        ] {
+            let body = if entry.starts_with("base") {
+                format!("ratatosk-aof-manifest-v1\nnext_seq 2\n{entry}\n")
+            } else {
+                format!("ratatosk-aof-manifest-v1\nnext_seq 2\nbase -\n{entry}\n")
+            };
+            std::fs::write(&manifest_path, body).expect("write manifest");
+            let error = AofManifest::load_from_file(&manifest_path).expect_err(entry);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{entry}");
+        }
     }
 }

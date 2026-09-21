@@ -3,7 +3,7 @@ use bytes::Bytes;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, StoredValue, purge_expired_key};
-use crate::object::normalize_range;
+use crate::object::{PROTO_MAX_BULK_LEN, STRING_TOO_LONG_ERR, normalize_string_range};
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, wrong_arity, wrong_type_response,
@@ -33,6 +33,9 @@ pub(super) fn cmd_append(
 
     // Pre-allocate exact capacity for concatenated result
     let new_len = value.len() + append.len();
+    if new_len > PROTO_MAX_BULK_LEN {
+        return CommandOutcome::reply(err(STRING_TOO_LONG_ERR));
+    }
     let mut combined = Vec::with_capacity(new_len);
     combined.extend_from_slice(&value);
     combined.extend_from_slice(append);
@@ -96,7 +99,7 @@ pub(super) fn cmd_getrange(
     };
 
     let bytes = s.as_ref();
-    let Some((range_start, range_end)) = normalize_range(bytes.len(), start, end) else {
+    let Some((range_start, range_end)) = normalize_string_range(bytes.len(), start, end) else {
         return CommandOutcome::reply(RespFrame::bulk_str(""));
     };
 
@@ -123,6 +126,12 @@ pub(super) fn cmd_setrange(
     let Ok(offset) = usize::try_from(offset_i64) else {
         return CommandOutcome::reply(err("ERR offset is out of range"));
     };
+    // Checked before any allocation: an unchecked offset would otherwise
+    // resize the value to an arbitrary size and abort the process. Like
+    // Redis, an empty value writes nothing and skips the check.
+    if !value.is_empty() && offset.saturating_add(value.len()) > PROTO_MAX_BULK_LEN {
+        return CommandOutcome::reply(err(STRING_TOO_LONG_ERR));
+    }
 
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
@@ -148,7 +157,7 @@ pub(super) fn cmd_setrange(
     };
 
     let Some(required_len) = offset.checked_add(value.len()) else {
-        return CommandOutcome::reply(err("ERR offset is out of range"));
+        return CommandOutcome::reply(err(STRING_TOO_LONG_ERR));
     };
     if base.len() < required_len {
         base.resize(required_len, 0);

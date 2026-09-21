@@ -65,16 +65,43 @@ fn parse_weights_aggregate(
     Ok((weights, aggregate))
 }
 
+/// Redis turns the NaN produced by `inf * 0` or `inf + -inf` into 0.
+fn nan_to_zero(score: f64) -> f64 {
+    if score.is_nan() { 0.0 } else { score }
+}
+
+fn weighted_score(score: f64, weight: f64) -> f64 {
+    nan_to_zero(score * weight)
+}
+
 fn aggregate_score(agg: Aggregate, lhs: f64, rhs: f64) -> f64 {
     match agg {
-        Aggregate::Sum => lhs + rhs,
+        Aggregate::Sum => nan_to_zero(lhs + rhs),
         Aggregate::Min => lhs.min(rhs),
         Aggregate::Max => lhs.max(rhs),
     }
 }
 
-/// Read a sorted set from the db; returns an empty set if the key does not exist.
-/// Returns Err if the key exists but is the wrong type.
+/// Reject the whole command when any existing input is neither a sorted set
+/// nor a set, before an empty intermediate result can short-circuit the scan.
+#[allow(clippy::result_large_err)]
+fn ensure_zset_inputs(
+    db: &HashMap<Bytes, StoredValue>,
+    keys: &[Bytes],
+) -> Result<(), CommandOutcome> {
+    for key in keys {
+        if let Some(entry) = db.get(key) {
+            if !entry.is_sorted_set() && !entry.is_set() {
+                return Err(wrong_type_response());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read a sorted-set input; returns an empty set if the key does not exist.
+/// Like Redis, a plain set is accepted and each member scores 1.
+/// Returns Err if the key exists but is any other type.
 #[allow(clippy::result_large_err)]
 fn read_zset_or_empty(
     db: &HashMap<Bytes, StoredValue>,
@@ -83,10 +110,13 @@ fn read_zset_or_empty(
     let Some(entry) = db.get(key) else {
         return Ok(Vec::new());
     };
-    let Some(zset) = entry.as_sorted_set() else {
-        return Err(wrong_type_response());
-    };
-    Ok(sorted_entries(zset))
+    if let Some(zset) = entry.as_sorted_set() {
+        return Ok(sorted_entries(zset));
+    }
+    match entry.set_members() {
+        Some(members) => Ok(members.into_iter().map(|member| (member, 1.0)).collect()),
+        None => Err(wrong_type_response()),
+    }
 }
 
 #[allow(clippy::result_large_err)]
@@ -102,7 +132,7 @@ fn compute_union(
         let entries = read_zset_or_empty(db, key)?;
         let weight = weights.get(index).copied().unwrap_or(1.0);
         for (member, score) in entries {
-            let weighted = score * weight;
+            let weighted = weighted_score(score, weight);
             result
                 .entry(member)
                 .and_modify(|existing| *existing = aggregate_score(aggregate, *existing, weighted))
@@ -129,12 +159,13 @@ fn compute_inter(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
+    ensure_zset_inputs(db, keys)?;
 
     let first_entries = read_zset_or_empty(db, &keys[0])?;
     let first_weight = weights.first().copied().unwrap_or(1.0);
     let mut result: HashMap<Bytes, f64> = first_entries
         .into_iter()
-        .map(|(member, score)| (member, score * first_weight))
+        .map(|(member, score)| (member, weighted_score(score, first_weight)))
         .collect();
 
     for (index, key) in keys.iter().enumerate().skip(1) {
@@ -142,7 +173,7 @@ fn compute_inter(
         let weight = weights.get(index).copied().unwrap_or(1.0);
         let other: HashMap<Bytes, f64> = entries
             .into_iter()
-            .map(|(member, score)| (member, score * weight))
+            .map(|(member, score)| (member, weighted_score(score, weight)))
             .collect();
 
         result.retain(|member, existing| {
@@ -176,6 +207,7 @@ fn compute_diff(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
+    ensure_zset_inputs(db, keys)?;
 
     let first_entries = read_zset_or_empty(db, &keys[0])?;
     let mut result: HashMap<Bytes, f64> = first_entries.into_iter().collect();
@@ -467,6 +499,9 @@ pub(super) fn cmd_zintercard(
 
     if keys.is_empty() {
         return CommandOutcome::reply(RespFrame::Integer(0));
+    }
+    if let Err(outcome) = ensure_zset_inputs(&db, keys) {
+        return outcome;
     }
 
     let mut sets: Vec<Vec<(Bytes, f64)>> = Vec::with_capacity(keys.len());

@@ -114,6 +114,10 @@ pub(super) async fn collect_parsed_frames<S: SessionStream>(
     let mut parsed_frames = Vec::new();
     loop {
         match parse(input) {
+            // Like redis-server, an empty request (`*0`, `*-1` or a blank
+            // inline line) is consumed without a reply.
+            Ok(Some(RespFrame::NullArray)) => {}
+            Ok(Some(RespFrame::Array(items))) if items.is_empty() => {}
             Ok(Some(frame)) => parsed_frames.push(frame),
             Ok(None) => break,
             Err(error) => {

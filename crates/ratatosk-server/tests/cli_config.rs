@@ -486,6 +486,71 @@ fn unixsocket_is_removed_when_startup_fails_after_binding() -> io::Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn prometheus_endpoint_serves_command_and_memory_metrics() -> io::Result<()> {
+    // Reserve an ephemeral port for the exporter; `127.0.0.1:0` would not be
+    // discoverable from outside.
+    let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("ratatosk.sock");
+    let bound_addr_file = temp.path().join("bound-addr.json");
+    let mut command = unixsocket_server_command(temp.path(), &socket_path, &bound_addr_file)?;
+    command
+        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env_remove("RATATOSK_ALLOW_NO_METRICS");
+    let mut server = UnixServerGuard {
+        child: command.spawn()?,
+    };
+    wait_for_bound_addr_file(&bound_addr_file, &mut server.child).await?;
+
+    let mut client = UnixStream::connect(&socket_path).await?;
+    client
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        .await?;
+    let mut ok = [0_u8; 5];
+    client.read_exact(&mut ok).await?;
+    assert_eq!(&ok, b"+OK\r\n");
+
+    // The recorder used to be installed without its HTTP listener, so this
+    // endpoint never answered and histogram samples were never drained.
+    let used_memory = |body: &str| {
+        body.lines()
+            .find_map(|line| line.strip_prefix("ratatosk_memory_used_bytes "))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+    };
+    // The gauge is refreshed by the server cron, a tick after the write.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let mut http = tokio::net::TcpStream::connect(("127.0.0.1", metrics_port)).await?;
+        http.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        http.read_to_string(&mut response).await?;
+        if used_memory(&response).is_some_and(|bytes| bytes > 0.0) || Instant::now() >= deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(
+        body.contains("ratatosk_commands_total{command=\"SET\",status=\"success\"} 1"),
+        "{body}"
+    );
+    assert!(
+        used_memory(&body).is_some_and(|bytes| bytes > 0.0),
+        "one key must register as used memory: {body}"
+    );
+    // Latency is exported as a real histogram for `histogram_quantile`.
+    assert!(
+        body.contains("ratatosk_command_duration_seconds_bucket{command=\"SET\",le=\""),
+        "{body}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn unixsocket_server_accepts_clients_reports_metadata_and_cleans_up() -> io::Result<()> {
     let temp = tempfile::tempdir()?;
     let socket_path = temp.path().join("ratatosk.sock");

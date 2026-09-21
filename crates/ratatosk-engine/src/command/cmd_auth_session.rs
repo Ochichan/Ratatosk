@@ -136,6 +136,8 @@ pub(super) fn cmd_reset(
 
     server.tracking_remove_client(client.id());
     server.unregister_monitor(client.id());
+    server.pubsub.unsubscribe_all(client.id());
+    client.release_watches(&server.data);
     client.reset_for_connection();
     CommandOutcome::reply(RespFrame::simple_str("RESET"))
 }

@@ -7,7 +7,7 @@ use ratatosk_engine::{
     command::{ClientState, ServerAccess, execute},
     keyspace::ServerState,
 };
-use ratatosk_resp::{frame::RespFrame, parse};
+use ratatosk_resp::{RespParseError, frame::RespFrame, parse};
 
 use crate::error::PersistError;
 
@@ -89,52 +89,54 @@ impl AofRecovery {
         mut reader: R,
         state: &mut ServerState,
     ) -> Result<ReplayResult, PersistError> {
-        let mut buf = BytesMut::with_capacity(64 * 1024);
         let mut client = ClientState::new(0);
         let mut commands_replayed = 0usize;
         let mut corruption_positions = Vec::new();
 
-        // Read all data into buffer
         let mut raw = Vec::new();
         reader
             .read_to_end(&mut raw)
             .map_err(|e| std::io::Error::new(e.kind(), format!("reading AOF data: {e}")))?;
 
         let total_bytes = raw.len();
+        let has_header = raw.starts_with(AOF_VERSION_HEADER) || raw.starts_with(AOF_V1_HEADER);
+        // Parse in place instead of copying the whole file a second time.
+        let mut buf = BytesMut::from(bytes::Bytes::from(raw));
 
         // Check for version header
-        let (version_mismatch, legacy_format) =
-            if raw.starts_with(AOF_VERSION_HEADER) || raw.starts_with(AOF_V1_HEADER) {
-                // Skip header for parsing
-                buf.extend_from_slice(&raw[AOF_VERSION_HEADER.len()..]);
-                (false, false)
-            } else if raw.is_empty() {
-                // Fresh AOF file created on first boot.
-                (false, false)
-            } else if raw.starts_with(b"*") {
-                // Old format without header - still valid but warn
-                tracing::warn!(
-                    target = "ratatosk::aof",
-                    "AOF file has no version header (legacy format)"
-                );
-                buf.extend_from_slice(&raw);
-                (false, true)
-            } else {
-                // Unknown format
-                tracing::error!(
-                    target = "ratatosk::aof",
-                    "AOF file has unknown format (neither version header nor RESP)"
-                );
-                buf.extend_from_slice(&raw);
-                (true, false)
-            };
+        let (version_mismatch, legacy_format) = if has_header {
+            let _ = buf.split_to(AOF_VERSION_HEADER.len());
+            (false, false)
+        } else if buf.is_empty() {
+            // Fresh AOF file created on first boot.
+            (false, false)
+        } else if buf.starts_with(b"*") {
+            // Old format without header - still valid but warn
+            tracing::warn!(
+                target = "ratatosk::aof",
+                "AOF file has no version header (legacy format)"
+            );
+            (false, true)
+        } else {
+            tracing::error!(
+                target = "ratatosk::aof",
+                "AOF file has unknown format (neither version header nor RESP)"
+            );
+            (true, false)
+        };
 
         // Recover only a verified prefix. An incomplete transaction belongs
         // wholly to the discarded tail, including complete queued commands.
         let mut transaction_start: Option<(usize, usize)> = None;
         loop {
             let position = total_bytes - buf.len();
-            match parse(&mut buf) {
+            // Every AOF record is a RESP array. Anything else is damage, and
+            // must not reach the inline-command parser and be executed.
+            let frame = match buf.first() {
+                None | Some(b'*') => parse(&mut buf),
+                Some(_) => Err(RespParseError::InvalidFrameType(buf[0])),
+            };
+            match frame {
                 Ok(Some(frame)) => {
                     let (timestamp, frame) = decode_timed_command(frame)?;
                     let was_in_multi = client.in_multi();
@@ -170,9 +172,19 @@ impl AofRecovery {
                     }
                     break;
                 }
-                Err(_) => {
-                    // Never resynchronize at a RESP-looking byte in an invalid
-                    // value: it is not evidence of a command boundary.
+                Err(error) => {
+                    // Only a torn tail may be cut back. Damage followed by
+                    // more data would silently drop the acknowledged writes
+                    // after it, so replay stops instead, as Redis does. Never
+                    // resynchronize at a RESP-looking byte either: it is not
+                    // evidence of a command boundary.
+                    if !is_torn_tail(&buf) {
+                        return Err(PersistError::corrupt(format!(
+                            "AOF is damaged at byte {position} ({error}) and data follows the damage; \
+                             refusing to drop it. Back up the file; truncating it to {position} bytes \
+                             keeps only the records before the damage"
+                        )));
+                    }
                     let boundary = if let Some((start, committed_commands)) = transaction_start {
                         commands_replayed = committed_commands;
                         start
@@ -214,6 +226,25 @@ impl AofRecovery {
 
         Ok(result)
     }
+}
+
+/// Whether the unparseable rest of a file is what a crash leaves behind: one
+/// incomplete record, possibly followed by the zero fill some filesystems
+/// expose after losing unflushed data.
+fn is_torn_tail(rest: &[u8]) -> bool {
+    let data_len = rest
+        .iter()
+        .rposition(|&byte| byte != 0)
+        .map_or(0, |last| last + 1);
+    if data_len == rest.len() {
+        // No zero fill: the parser rejected real bytes, not a cut-off record.
+        return false;
+    }
+    if data_len == 0 {
+        return true;
+    }
+    let mut record = BytesMut::from(&rest[..data_len]);
+    rest[0] == b'*' && matches!(parse(&mut record), Ok(None))
 }
 
 fn response_is_error(frame: &RespFrame) -> bool {
@@ -551,8 +582,59 @@ mod tests {
         .expect("write corrupt transaction");
 
         let mut state = ServerState::with_default_dbs();
-        let result = AofRecovery::replay_file(&path, &mut state).expect("replay corrupt tail");
-        assert!(result.corruption_detected);
+        let error = AofRecovery::replay_file(&path, &mut state)
+            .expect_err("damage followed by more records must stop replay");
+        assert!(error.to_string().contains("damaged at byte"), "{error}");
         assert!(state.db(0).get(&Bytes::from("prefix")).is_none());
+    }
+
+    #[test]
+    fn replay_refuses_damage_in_the_middle_of_the_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("damaged.aof");
+        {
+            let mut writer = AofWriter::open(&path, FsyncPolicy::No).expect("open");
+            for key in ["a", "b", "c"] {
+                writer
+                    .append_command(0, &[Bytes::from("SET"), Bytes::from(key), Bytes::from("1")])
+                    .expect("append");
+            }
+        }
+        let raw = std::fs::read(&path).expect("read aof");
+        let records: Vec<usize> = raw
+            .windows(8)
+            .enumerate()
+            .filter(|(_, window)| window == b"*3\r\n$15\r")
+            .map(|(offset, _)| offset)
+            .collect();
+        assert_eq!(records.len(), 3, "one timestamp envelope per command");
+
+        // A flipped type byte and a bad length both sit before intact records.
+        for (offset, byte) in [(records[1], b'j'), (records[1] + 1, b'x')] {
+            let mut damaged = raw.clone();
+            damaged[offset] = byte;
+            std::fs::write(&path, &damaged).expect("write damaged aof");
+            let mut state = ServerState::with_default_dbs();
+            let error = AofRecovery::replay_file(&path, &mut state)
+                .expect_err("mid-file damage must stop replay");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("damaged at byte {}", records[1])),
+                "{error}"
+            );
+        }
+
+        // Zero fill after a torn or a complete last record is a crash tail.
+        for kept in [records[2] + 4, records[2]] {
+            let mut torn = raw[..kept].to_vec();
+            torn.extend_from_slice(&[0; 64]);
+            std::fs::write(&path, &torn).expect("write torn aof");
+            let mut state = ServerState::with_default_dbs();
+            let result = AofRecovery::replay_file(&path, &mut state).expect("replay torn tail");
+            assert_eq!(result.truncated_at, Some(records[2]));
+            assert!(state.db(0).get(&Bytes::from("b")).is_some());
+            assert!(state.db(0).get(&Bytes::from("c")).is_none());
+        }
     }
 }

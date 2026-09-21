@@ -53,9 +53,9 @@ code↔ledger drift audited and reconciled on 2026-06-02).
 | tier | count | meaning |
 |---|---:|---|
 | `behavioral_subset` | 275 | Useful Redis-compatible behavior; may omit some edge / distributed semantics. The differential-tested target set. |
-| `baseline_local` | 76 | Standalone single-node baseline; does not claim distributed Redis parity (e.g. `CLUSTER SLOTS` returns local-only info). |
+| `baseline_local` | 75 | Standalone single-node baseline; does not claim distributed Redis parity (e.g. `CLUSTER SLOTS` returns local-only info). |
 | `syntax_only` | 6 | Syntax/arity is accepted but there is **no Redis-equivalent operational effect**. ⚠️ silent-success risk. |
-| `unsupported` | 63 | Not supported in this build (distributed / functions / commands that always error on a single node). |
+| `unsupported` | 64 | Not supported in this build (distributed / functions / commands that always error on a single node). |
 | `distributed_parity` | 0 | No distributed parity is claimed anywhere. |
 
 > The 2026-06-02 audit reclassified 39 commands whose tier had drifted: working

@@ -103,6 +103,7 @@ async fn main() -> anyhow::Result<()> {
             .context(
                 "loading Ratatosk configuration from defaults, config file, and environment",
             )?;
+    ratatosk_engine::security::set_default_audit_dir(&loaded_config.config.dir);
 
     if args.check_config {
         run_startup_preflight(&loaded_config.config, false)

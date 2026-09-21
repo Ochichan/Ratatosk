@@ -25,8 +25,8 @@ embedded ledger.
 
 ## Snapshot
 
-- Workspace crates: `ratatosk-core`, `ratatosk-resp`, `ratatosk-engine`, `ratatosk-persist`, `ratatosk-server`
-- Runtime model: tokio TCP accept loop + per-client task + server_cron timer
+- Workspace crates: `ratatosk-core`, `ratatosk-resp`, `ratatosk-engine`, `ratatosk-persist`, `ratatosk-server`, `ratatosk-shm` (experimental, `shm-transport` feature), `ratatosk-ipc-bench` (dev harness)
+- Runtime model: tokio TCP / Unix-socket accept loop + per-client task + server_cron timer
 - Shared state: `SharedState` wrapping `Mutex<ServerState>` + per-DB `parking_lot::RwLock` + lock-free components
 - Protocol: RESP2/RESP3 호환 파싱 경로
 - Command catalog: `420` entries. 구현 상태와 Redis 의미론 tier는 [Part 6: Redis Gap Ledger](#part-6-redis-gap-ledger)를 함께 봐야 한다.
@@ -40,7 +40,8 @@ ratatosk-server
   ├── ratatosk-engine
   ├── ratatosk-persist
   ├── ratatosk-resp (frame 타입, 인코딩 길이 계산)
-  └── ratatosk-core
+  ├── ratatosk-core
+  └── ratatosk-shm (optional, `shm-transport` feature)
 
 ratatosk-persist
   ├── ratatosk-engine
@@ -51,24 +52,26 @@ ratatosk-engine
   ├── ratatosk-resp (frame type usage)
   └── ratatosk-core
 
-ratatosk-resp
-  └── ratatosk-core
+ratatosk-ipc-bench
+  └── ratatosk-shm (서버는 child process로 구동)
 
-ratatosk-core
-  └── (leaf crate — bytes, thiserror만 의존)
+ratatosk-resp, ratatosk-core, ratatosk-shm
+  └── (workspace 내부 의존 없음)
 ```
 
-의존 방향: `server → {engine, persist} → resp → core`. 역방향 의존 없음.
+의존 방향: `server → persist → engine → {resp, core}` (+ `server → shm`는 feature 한정). 역방향 의존 없음.
 
 ## Crate Responsibilities
 
 | Crate | Role | `unsafe` |
 |-------|------|----------|
-| `ratatosk-core` | 도메인 타입 (`ClientId`, `DbIndex`, `SlotId`), 비트마스크 플래그, 에러, 시간 유틸 | `forbid` |
+| `ratatosk-core` | 시계 유틸: wall clock(AOF replay용 command-time override 포함), monotonic clock | `forbid` |
 | `ratatosk-resp` | RESP2/RESP3 zero-copy 파서 + 인코더 | `forbid` |
 | `ratatosk-engine` | Keyspace, config/stats state, 420개 명령 핸들러, eviction, active expiry, pub/sub, notification, HLL, 슬롯, Lua scripting (`lua-scripting` feature) | `forbid` |
 | `ratatosk-persist` | RDB saver/loader, AOF writer/manifest/recovery, atomic file write, CRC64 | `forbid` |
-| `ratatosk-server` | TCP accept loop, per-client I/O, server_cron, lazy-free thread, config | — |
+| `ratatosk-server` | TCP/Unix-socket accept loop, per-client I/O, server_cron, lazy-free thread, config, metrics | 테스트의 env 조작만 |
+| `ratatosk-shm` | 실험적 shared-memory RESP byte-stream transport (mmap, `SCM_RIGHTS`) | `segment`/`fdpass`/doorbell/`getuid`에 한정 |
+| `ratatosk-ipc-bench` | 2-process IPC 지연 측정 하니스 | `getrusage`/`kill` 한정 |
 
 ## Request Lifecycle
 
@@ -298,8 +301,6 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 | RDB save | Background snapshot (`BGSAVE`) | tokio task + shutdown drain |
 | AOF rewrite | Background AOF 재작성 (`BGREWRITEAOF`) | AOF worker channel |
 
-참고: `crates/ratatosk-server/src/io_thread.rs`의 `IoThreadPool`은 현재 placeholder다.
-
 ## Security / Safety Controls
 
 ### Config guardrails
@@ -354,7 +355,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 ## Compatibility Notes
 
 - [Part 6: Redis Gap Ledger](#part-6-redis-gap-ledger) 기준 명령 카탈로그는 420개 엔트리이며, 현재 ledger는 status와 별도로 `capability_tier`를 기록한다.
-- 현재 tier summary는 `unsupported=63`, `syntax_only=6`, `baseline_local=76`, `behavioral_subset=275`, `distributed_parity=0`이다.
+- 현재 tier summary는 `unsupported=64`, `syntax_only=6`, `baseline_local=75`, `behavioral_subset=275`, `distributed_parity=0`이다.
 - 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
   - 예: 복제/클러스터 계열은 standalone 호환 응답 중심.
   - 단, `SAVE`/`BGSAVE`는 실제 RDB 스냅샷을 수행하며, `BGSAVE`는 background snapshot worker로 동작한다 (단순 timestamp 갱신이 아님).
@@ -411,7 +412,7 @@ cargo run -p ratatosk-server --bin ratatosk
 
 ## Source Index
 
-- Domain types: `crates/ratatosk-core/src/{types,flags,error,time}.rs`
+- Clocks (incl. the AOF replay command clock): `crates/ratatosk-core/src/time.rs`
 - RESP parse/encode: `crates/ratatosk-resp/src/{parse,encode}.rs`
 - Command dispatcher: `crates/ratatosk-engine/src/command/mod.rs`
 - Keyspace/state: `crates/ratatosk-engine/src/keyspace.rs`
@@ -921,10 +922,10 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 1. 파일 전체를 메모리에 읽기
 2. `ratatosk_resp::parse()`로 RESP 프레임 파싱
 3. `ratatosk_engine::command::execute()`로 각 명령 실행
-4. 최초 손상 또는 미완료 transaction 이전의 검증된 prefix에서 중단
-5. startup이 파일을 해당 경계로 truncate하고 fsync한 뒤 새 쓰기를 허용
+4. 잘린 꼬리(미완료 마지막 record, 뒤에 zero fill이 붙어도 됨) 또는 미완료 transaction 이전의 검증된 prefix에서 중단
+5. startup이 데이터가 있는 마지막 파일에 한해 해당 경계로 truncate하고 fsync한 뒤 새 쓰기를 허용
 
-완료되지 않은 `MULTI`는 부분 적용하지 않는다. 잘못된 데이터 안의 RESP 모양 바이트를 새 명령으로 간주하지 않는다. 실행 오류나 알 수 없는 format은 startup을 실패시킨다.
+완료되지 않은 `MULTI`는 부분 적용하지 않는다. 잘못된 데이터 안의 RESP 모양 바이트를 새 명령으로 간주하지 않는다. 손상 뒤에 데이터가 더 있거나 이후 manifest 파일이 의존하는 파일이 손상된 경우, 실행 오류, 알 수 없는 format은 startup을 실패시키고 파일을 그대로 둔다 (Redis의 `aof-load-truncated`와 같은 범위).
 
 ---
 
@@ -1188,15 +1189,15 @@ When `lua-scripting` is disabled, `EVAL` returns `ERR Scripting not supported in
 
 ## Capability Tier Summary
 
-From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-06-02:
+From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-09-13:
 
 | Tier | Count | Meaning |
 |------|-------|---------|
 | `distributed_parity` | 0 | No command achieves Redis distributed semantics |
 | `behavioral_subset` | 275 | Locally correct behavior for common use cases |
-| `baseline_local` | 76 | Standalone-compatible response shell |
+| `baseline_local` | 75 | Standalone-compatible response shell |
 | `syntax_only` | 6 | Parses and responds but lacks backing subsystem |
-| `unsupported` | 63 | Returns explicit error |
+| `unsupported` | 64 | Returns explicit error |
 
 The runtime exposes `ratatosk_capability_tier` in `COMMAND DOCS` responses so clients can programmatically inspect implementation depth.
 
@@ -1261,9 +1262,9 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 
 현재 ledger tier summary:
 
-- `unsupported=63`
+- `unsupported=64`
 - `syntax_only=6`
-- `baseline_local=76`
+- `baseline_local=75`
 - `behavioral_subset=275`
 - `distributed_parity=0`
 
@@ -1476,7 +1477,7 @@ Ratatosk는 per-client tokio task를 띄우지만, 실제 명령 실행은 여�
 - stats 갱신, config 읽기, client id 할당은 lock-free 경로로 분리됨
 - Pub/Sub delivery는 per-subscriber mpsc channel로 Mutex 밖에서 수행됨
 - accept loop는 클라이언트별 task를 무제한 생성하는 구조다: `crates/ratatosk-server/src/event_loop.rs`
-- `IoThreadPool`은 placeholder다: `crates/ratatosk-server/src/io_thread.rs`
+- `IoThreadPool`은 placeholder다: `crates/ratatosk-server/src/io_thread.rs` (이후 제거됨)
 
 실제 영향:
 
@@ -1853,9 +1854,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 
 | Tier | Value |
 | --- | ---: |
-| unsupported | 63 |
+| unsupported | 64 |
 | syntax_only | 6 |
-| baseline_local | 76 |
+| baseline_local | 75 |
 | behavioral_subset | 275 |
 | distributed_parity | 0 |
 

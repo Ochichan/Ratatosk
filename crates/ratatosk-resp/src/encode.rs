@@ -212,12 +212,12 @@ fn encode_into(frame: &RespFrame, out: &mut Vec<u8>) {
         }
         RespFrame::SimpleString(value) => {
             out.push(b'+');
-            out.extend_from_slice(value);
+            extend_line(out, value);
             out.extend_from_slice(b"\r\n");
         }
         RespFrame::Error(value) => {
             out.push(b'-');
-            out.extend_from_slice(value);
+            extend_line(out, value);
             out.extend_from_slice(b"\r\n");
         }
         RespFrame::Integer(value) => {
@@ -319,6 +319,30 @@ fn encode_for_version_into(frame: &RespFrame, out: &mut Vec<u8>, version: RespVe
             }
         }
     }
+}
+
+/// Appends the payload of a line-framed type (simple string or error).
+///
+/// A CR or LF inside the payload would end the line early and let the rest be
+/// read as further replies. Error messages routinely quote client input (an
+/// unknown command name, an option), so like Redis each is replaced with a
+/// space. The replacement keeps the encoded length unchanged.
+#[inline]
+fn extend_line(out: &mut Vec<u8>, value: &[u8]) {
+    if memchr::memchr2(b'\r', b'\n', value).is_none() {
+        out.extend_from_slice(value);
+    } else {
+        extend_line_replacing_breaks(out, value);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn extend_line_replacing_breaks(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend(value.iter().map(|&byte| match byte {
+        b'\r' | b'\n' => b' ',
+        other => other,
+    }));
 }
 
 fn shared_encoding(frame: &RespFrame) -> Option<&'static [u8]> {
@@ -442,6 +466,22 @@ mod tests {
         assert_eq!(
             encode_for_version(&frame, RespVersion::Resp3).as_ref(),
             b">1\r\n$9\r\nsubscribe\r\n>1\r\n$11\r\nunsubscribe\r\n"
+        );
+    }
+
+    #[test]
+    fn line_frames_cannot_smuggle_extra_replies() {
+        let error = RespFrame::error_str("ERR unknown command 'foo\r\n+OK'");
+        assert_eq!(
+            encode(&error).as_ref(),
+            b"-ERR unknown command 'foo  +OK'\r\n"
+        );
+        assert_eq!(encoded_len(&error), encode(&error).len());
+
+        let status = RespFrame::simple_str("a\nb\rc");
+        assert_eq!(
+            encode_for_version(&status, RespVersion::Resp3).as_ref(),
+            b"+a b c\r\n"
         );
     }
 

@@ -441,6 +441,20 @@ impl PubSubState {
 
     pub fn notify_client(&self, _client_id: i64) {}
 
+    /// Leave every channel, shard channel and pattern while keeping the
+    /// client's delivery queue, as RESET does.
+    pub fn unsubscribe_all(&mut self, client_id: i64) {
+        for channel in self.client_channels(client_id) {
+            self.unsubscribe_channel(client_id, &channel);
+        }
+        for channel in self.client_shard_channels(client_id) {
+            self.unsubscribe_shard_channel(client_id, &channel);
+        }
+        for pattern in self.client_patterns(client_id) {
+            self.unsubscribe_pattern(client_id, &pattern);
+        }
+    }
+
     pub fn remove_client(&mut self, client_id: i64) {
         if let Some(channels) = self.client_channel_subs.remove(&client_id) {
             for channel in channels {

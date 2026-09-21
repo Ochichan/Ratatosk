@@ -6,7 +6,13 @@ on:
       - main
       - master
   pull_request:
+  # New advisories land without any change to this repository.
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   security-checks:
@@ -18,6 +24,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Current month
+        id: month
+        run: echo "value=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo tools
         uses: actions/cache@v4
         with:
@@ -26,7 +36,10 @@ jobs:
             ~/.cargo/bin/cargo-audit
             ~/.cargo/registry
             ~/.cargo/git
-          key: security-tools-${{ runner.os }}
+          # A cache key is never overwritten, so a fixed key would keep the
+          # first cargo-deny/cargo-audit build and rebuild on every run after
+          # an upgrade. Rotating monthly re-saves the current tools.
+          key: security-tools-${{ runner.os }}-${{ steps.month.outputs.value }}
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked

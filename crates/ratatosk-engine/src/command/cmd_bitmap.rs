@@ -3,6 +3,7 @@ use bytes::Bytes;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, StoredValue, purge_expired_key};
+use crate::object::{clamp_index_range, normalize_string_range};
 
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
@@ -191,45 +192,21 @@ pub(super) fn cmd_bitcount(
 
     if bit_mode {
         let total_bits = data.len() * 8;
-        let (start, end) = resolve_range(start_raw, end_raw, total_bits);
-        if start > end || start >= total_bits {
+        let Some((start, end)) = normalize_string_range(total_bits, start_raw, end_raw) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
-        }
-        let end = end.min(total_bits - 1);
+        };
         let mut count: i64 = 0;
         for bit_pos in start..=end {
             count += get_bit(&data, bit_pos) as i64;
         }
         CommandOutcome::reply(RespFrame::Integer(count))
     } else {
-        let byte_len = data.len();
-        let (start, end) = resolve_range(start_raw, end_raw, byte_len);
-        if start > end || start >= byte_len {
+        let Some((start, end)) = normalize_string_range(data.len(), start_raw, end_raw) else {
             return CommandOutcome::reply(RespFrame::Integer(0));
-        }
-        let end = end.min(byte_len - 1);
+        };
         let count: i64 = data[start..=end].iter().map(|b| popcount_byte(*b)).sum();
         CommandOutcome::reply(RespFrame::Integer(count))
     }
-}
-
-/// Resolve negative indexes to positive, clamping to valid range.
-fn resolve_range(mut start: i64, mut end: i64, len: usize) -> (usize, usize) {
-    let len_i64 = len as i64;
-    if start < 0 {
-        start += len_i64;
-    }
-    if end < 0 {
-        end += len_i64;
-    }
-    if start < 0 {
-        start = 0;
-    }
-    if end < 0 {
-        // Both resolved negative: empty range
-        return (1, 0);
-    }
-    (start as usize, end as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -311,11 +288,9 @@ pub(super) fn cmd_bitpos(
 
     if bit_mode {
         let total_bits = data.len() * 8;
-        let (start, end) = resolve_range(start_raw, end_raw, total_bits);
-        if start > end || start >= total_bits {
+        let Some((start, end)) = clamp_index_range(total_bits, start_raw, end_raw) else {
             return CommandOutcome::reply(RespFrame::Integer(-1));
-        }
-        let end = end.min(total_bits - 1);
+        };
         for pos in start..=end {
             if get_bit(&data, pos) == target_bit {
                 return CommandOutcome::reply(RespFrame::Integer(pos as i64));
@@ -323,12 +298,9 @@ pub(super) fn cmd_bitpos(
         }
         CommandOutcome::reply(RespFrame::Integer(-1))
     } else {
-        let byte_len = data.len();
-        let (start_byte, end_byte) = resolve_range(start_raw, end_raw, byte_len);
-        if start_byte > end_byte || start_byte >= byte_len {
+        let Some((start_byte, end_byte)) = clamp_index_range(data.len(), start_raw, end_raw) else {
             return CommandOutcome::reply(RespFrame::Integer(-1));
-        }
-        let end_byte = end_byte.min(byte_len - 1);
+        };
         let start_bit = start_byte * 8;
         let end_bit = (end_byte + 1) * 8 - 1;
 

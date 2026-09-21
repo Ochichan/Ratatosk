@@ -172,27 +172,32 @@ pub(super) fn longest_common_subsequence(a: &[u8], b: &[u8]) -> Vec<u8> {
 
     let m = a.len();
     let n = b.len();
-    let mut dp = vec![vec![0u16; n + 1]; m + 1];
+    // One flat row-major table: a degenerate 16M x 1 input would otherwise
+    // cost one heap allocation per row. `cmd_lcs` bounds m * n by
+    // LCS_MAX_DP_CELLS, so min(m, n), and every length, fits in u16.
+    let width = n + 1;
+    let mut dp = vec![0u16; (m + 1) * width];
+    let cell = |i: usize, j: usize| i * width + j;
 
     for i in 0..m {
-        for (j, bj) in b.iter().enumerate().take(n) {
-            if a[i] == *bj {
-                dp[i + 1][j + 1] = dp[i][j].saturating_add(1);
+        for (j, bj) in b.iter().enumerate() {
+            dp[cell(i + 1, j + 1)] = if a[i] == *bj {
+                dp[cell(i, j)] + 1
             } else {
-                dp[i + 1][j + 1] = dp[i][j + 1].max(dp[i + 1][j]);
-            }
+                dp[cell(i, j + 1)].max(dp[cell(i + 1, j)])
+            };
         }
     }
 
     let mut i = m;
     let mut j = n;
-    let mut out = Vec::with_capacity(dp[m][n] as usize);
+    let mut out = Vec::with_capacity(dp[cell(m, n)] as usize);
     while i > 0 && j > 0 {
         if a[i - 1] == b[j - 1] {
             out.push(a[i - 1]);
             i -= 1;
             j -= 1;
-        } else if dp[i - 1][j] >= dp[i][j - 1] {
+        } else if dp[cell(i - 1, j)] >= dp[cell(i, j - 1)] {
             i -= 1;
         } else {
             j -= 1;

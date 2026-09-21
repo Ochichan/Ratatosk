@@ -41,14 +41,15 @@
 | tier | 개수 | 의미 |
 |---|---:|---|
 | `behavioral_subset` | 275 | Redis 의미론에 근접, differential 대상 |
-| `baseline_local` | 76 | 로컬 단일노드 한정 동작 |
+| `baseline_local` | 75 | 로컬 단일노드 한정 동작 |
 | `syntax_only` | 6 | 문법/arity만 검증, 의미 미보장 ⚠️ |
-| `unsupported` | 63 | 미지원 (distributed/functions/단일노드에서 항상 에러) |
+| `unsupported` | 64 | 미지원 (distributed/functions/단일노드에서 항상 에러) |
 | `distributed_parity` | 0 | 분산 parity 없음 |
 
 > _2026-06-02 갱신: 코드↔ledger tier를 명령별로 audit·reconcile하여 분포가 30/45/64 →_
 > _6/76/63으로 정정됨(working 명령이 `syntax_only`로 과분류돼 있었음). 이제
 > `capability_tier_matches_gap_ledger_for_every_spec` 테스트가 코드=ledger를 잠금._
+> _2026-09-13: `PSYNC`가 실제로 거부되므로 `baseline_local`→`unsupported`로 이동 (6/75/64)._
 
 > ⚠️ 핵심 리스크: `done=420`을 "Redis와 동일"로 마케팅하면 안 된다. `syntax_only` + no-op admin이
 > 클라이언트/툴에 거짓 성공을 준다 → **strict mode(Phase 0)** 로 막는 것이 v1 안전성의 핵심.

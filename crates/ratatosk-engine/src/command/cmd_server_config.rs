@@ -932,9 +932,20 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     )
     .map_err(|e| format!("writing config: {e}"))?;
 
+    // Dropping a BufWriter would swallow a failed final write; flush and sync
+    // explicitly so a partial file is never renamed over the old config.
+    file.flush()
+        .map_err(|e| format!("flushing config file: {e}"))?;
+    file.get_ref()
+        .sync_all()
+        .map_err(|e| format!("syncing config file: {e}"))?;
     drop(file);
 
     std::fs::rename(&temp_path, &config_path).map_err(|e| format!("renaming config file: {e}"))?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(config_dir) {
+        let _ = dir.sync_all();
+    }
 
     tracing::info!(
         target = "ratatosk::config",

@@ -42,23 +42,29 @@ pub(super) fn cmd_exec(
 
     if client.tx_state.has_error() {
         client.tx_state = TransactionState::default();
-        client.watched.clear();
+        client.release_watches(&server.data);
         return CommandOutcome::reply(err(
             "EXECABORT Transaction discarded because of previous errors.",
         ));
     }
 
-    let watched_dirty = client
-        .watched
-        .iter()
-        .any(|((db_index, key), watch)| server.key_version(*db_index, key) != watch.version);
+    // WATCH purged already-expired keys, so a watched key that is logically
+    // expired now expired afterwards, which Redis also treats as a change.
+    let now = now_ms();
+    let watched_dirty = client.watched.iter().any(|((db_index, key), watch)| {
+        server.key_version(*db_index, key) != watch.version
+            || server
+                .db(*db_index)
+                .get(key)
+                .is_some_and(|value| value.expire_at_ms().is_some_and(|at| at <= now))
+    });
 
     let queued = match std::mem::take(&mut client.tx_state) {
         TransactionState::InTransaction { queue, .. } => queue,
         TransactionState::Normal => Vec::new(),
     };
     client.tx_state = TransactionState::default();
-    client.watched.clear();
+    client.release_watches(&server.data);
 
     if watched_dirty {
         return CommandOutcome::reply(RespFrame::NullArray);
@@ -144,7 +150,11 @@ pub(super) fn cmd_exec(
     outcome
 }
 
-pub(super) fn cmd_discard(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
+pub(super) fn cmd_discard(
+    args: &[Bytes],
+    server: &ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("discard");
     }
@@ -154,7 +164,7 @@ pub(super) fn cmd_discard(args: &[Bytes], client: &mut ClientState) -> CommandOu
     }
 
     client.tx_state = TransactionState::default();
-    client.watched.clear();
+    client.release_watches(&server.data);
     CommandOutcome::reply(RespFrame::ok())
 }
 
@@ -181,21 +191,27 @@ pub(super) fn cmd_watch(
     }
 
     for key in args {
-        let version = server.key_version(db_index, key);
-        client
-            .watched
-            .insert((db_index, key.clone()), WatchedKey { version });
+        // Re-watching a key keeps its original registration and version.
+        let watched = (db_index, key.clone());
+        if !client.watched.contains_key(&watched) {
+            let version = server.data.watch_key(db_index, key);
+            client.watched.insert(watched, WatchedKey { version });
+        }
     }
 
     CommandOutcome::reply(RespFrame::ok())
 }
 
-pub(super) fn cmd_unwatch(args: &[Bytes], client: &mut ClientState) -> CommandOutcome {
+pub(super) fn cmd_unwatch(
+    args: &[Bytes],
+    server: &ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
     if !args.is_empty() {
         return wrong_arity("unwatch");
     }
 
-    client.watched.clear();
+    client.release_watches(&server.data);
     CommandOutcome::reply(RespFrame::ok())
 }
 

@@ -44,11 +44,9 @@ pub(super) fn cmd_echo(args: &[Bytes]) -> CommandOutcome {
     }
 }
 
-pub(super) fn cmd_quit(args: &[Bytes]) -> CommandOutcome {
-    if !args.is_empty() {
-        return wrong_arity("quit");
-    }
-
+pub(super) fn cmd_quit(_args: &[Bytes]) -> CommandOutcome {
+    // Redis answers QUIT before its arity check, so trailing arguments are
+    // ignored rather than rejected.
     CommandOutcome::close(RespFrame::ok())
 }
 
@@ -58,7 +56,8 @@ pub(super) fn cmd_hello(
     client: &mut ClientState,
 ) -> CommandOutcome {
     let mut idx = 0usize;
-    let mut proto = 3i64;
+    // Without an explicit protover HELLO reports, and keeps, the current protocol.
+    let mut proto = client.protocol_version();
     let mut auth_attempts = Vec::new();
     let mut client_name = None;
 
@@ -70,34 +69,37 @@ pub(super) fn cmd_hello(
             proto = version;
             idx = 1;
         } else {
+            // Ratatosk also accepts AUTH/SETNAME without a protover.
             let token = to_uppercase_bytes(first);
             if !matches!(token.as_slice(), b"AUTH" | b"SETNAME") {
-                return CommandOutcome::reply(err("NOPROTO unsupported protocol version"));
+                return CommandOutcome::reply(err(
+                    "ERR Protocol version is not an integer or out of range",
+                ));
             }
         }
     }
 
     while idx < args.len() {
         let option = to_uppercase_bytes(&args[idx]);
+        let more_args = args.len() - idx - 1;
         match option.as_slice() {
-            b"AUTH" => {
-                if idx + 2 >= args.len() {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
+            b"AUTH" if more_args >= 2 => {
                 auth_attempts.push((&args[idx + 1], &args[idx + 2]));
                 idx += 3;
             }
-            b"SETNAME" => {
-                if idx + 1 >= args.len() {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
+            b"SETNAME" if more_args >= 1 => {
                 if let Err(response) = cmd_client::validate_client_name(&args[idx + 1]) {
                     return CommandOutcome::reply(response);
                 }
                 client_name = Some(args[idx + 1].clone());
                 idx += 2;
             }
-            _ => return CommandOutcome::reply(err("ERR syntax error")),
+            _ => {
+                return CommandOutcome::reply(err(&format!(
+                    "ERR Syntax error in HELLO option '{}'",
+                    String::from_utf8_lossy(&args[idx])
+                )));
+            }
         }
     }
 
@@ -359,7 +361,10 @@ mod tests {
 
         let outcome = cmd_hello(&args, &server, &mut client);
 
-        assert_eq!(outcome.response, RespFrame::error_str("ERR syntax error"));
+        assert_eq!(
+            outcome.response,
+            RespFrame::error_str("ERR Syntax error in HELLO option 'UNKNOWN'")
+        );
         assert_eq!(client.auth_failure_count(), 0);
         assert!(!client.is_authenticated());
     }

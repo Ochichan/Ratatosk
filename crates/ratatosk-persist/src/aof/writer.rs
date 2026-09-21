@@ -76,10 +76,14 @@ impl AofWriter {
             // Upgrade only the container marker, preserving every legacy byte.
             // Atomic replacement leaves either complete version on failure.
             let mut input = File::open(path)?;
-            let mut header = [0; 14];
-            let count = input.read(&mut header)?;
-            if !header[..count].starts_with(AOF_VERSION_HEADER) {
-                let skip = if header[..count].starts_with(AOF_V1_HEADER) {
+            // `read` may return fewer bytes than asked for; take the header
+            // through `Read::take` so a short read cannot misidentify it.
+            let mut header = Vec::with_capacity(AOF_VERSION_HEADER.len());
+            (&mut input)
+                .take(AOF_VERSION_HEADER.len() as u64)
+                .read_to_end(&mut header)?;
+            if !header.starts_with(AOF_VERSION_HEADER) {
+                let skip = if header.starts_with(AOF_V1_HEADER) {
                     AOF_V1_HEADER.len()
                 } else if header.first() == Some(&b'*') {
                     0
@@ -90,7 +94,7 @@ impl AofWriter {
                 };
                 crate::atomic::atomic_write(path, |output| {
                     output.write_all(AOF_VERSION_HEADER)?;
-                    output.write_all(&header[skip..count])?;
+                    output.write_all(&header[skip..])?;
                     io::copy(&mut input, output)?;
                     Ok(())
                 })?;

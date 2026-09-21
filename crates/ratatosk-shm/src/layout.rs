@@ -72,6 +72,7 @@ pub enum LayoutError {
     BadMagic(u64),
     BadVersion(u32),
     SegmentTooSmall { expected: usize, actual: usize },
+    SegmentTooLarge { max: usize, actual: usize },
 }
 
 impl std::fmt::Display for LayoutError {
@@ -85,6 +86,9 @@ impl std::fmt::Display for LayoutError {
             Self::BadVersion(v) => write!(f, "segment version {v} is not {VERSION}"),
             Self::SegmentTooSmall { expected, actual } => {
                 write!(f, "segment is {actual} bytes, expected at least {expected}")
+            }
+            Self::SegmentTooLarge { max, actual } => {
+                write!(f, "segment is {actual} bytes, more than the maximum {max}")
             }
         }
     }

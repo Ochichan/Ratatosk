@@ -56,6 +56,12 @@ pub fn rewrite_single_file_in_place(aof_path: &Path) -> io::Result<()> {
 
     while !parser_buf.is_empty() {
         let parse_start = payload.len().saturating_sub(parser_buf.len());
+        if parser_buf[0] != b'*' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("AOF rewrite found a non-array record near byte {parse_start}"),
+            ));
+        }
         match parse(&mut parser_buf) {
             Ok(Some(frame)) => {
                 let (timestamp, frame) = decode_timed_command(frame).map_err(io::Error::other)?;
@@ -111,6 +117,7 @@ pub fn rewrite_single_file_in_place(aof_path: &Path) -> io::Result<()> {
             ),
         )
     })?;
+    crate::atomic::sync_dir(crate::atomic::parent_dir(aof_path));
 
     Ok(())
 }

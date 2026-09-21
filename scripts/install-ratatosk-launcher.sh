@@ -46,8 +46,8 @@ chmod +x "${LAUNCHER_PATH}"
 
 echo "Installed: ${LAUNCHER_PATH}"
 if [[ ":${PATH}:" != *":${INSTALL_DIR}:"* ]]; then
-  echo "PATH에 ${INSTALL_DIR} 추가 필요"
-  echo "예: echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.bashrc"
+  echo "Add ${INSTALL_DIR} to PATH, for example:"
+  echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.bashrc"
 fi
 
 echo "Run: ratatosk"

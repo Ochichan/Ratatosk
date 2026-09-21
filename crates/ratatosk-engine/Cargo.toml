@@ -7,14 +7,14 @@ rust-version.workspace = true
 publish = false
 
 [features]
-mimalloc = ["dep:libmimalloc-sys"]
+# Only labels MEMORY MALLOC-STATS; the allocator itself is chosen by the server.
+mimalloc = []
 lua-scripting = ["dep:mlua"]
 
 [dependencies]
 ratatosk-core = { workspace = true }
 ratatosk-resp = { workspace = true }
 bytes = { workspace = true }
-thiserror = { workspace = true }
 hashbrown = { workspace = true }
 smallvec = { workspace = true }
 rand = { workspace = true }
@@ -32,7 +32,6 @@ fs2 = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-libmimalloc-sys = { version = "0.1", optional = true }
 mlua = { workspace = true, optional = true }
 
 [dev-dependencies]

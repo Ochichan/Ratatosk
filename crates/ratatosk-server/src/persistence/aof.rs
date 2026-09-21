@@ -780,6 +780,7 @@ pub(crate) async fn await_aof_rewrite(
 pub(crate) async fn replay_startup_aof_file(
     server_state: &Arc<SharedState>,
     path: &Path,
+    may_truncate: bool,
 ) -> io::Result<()> {
     let result = {
         let mut state = server_state.meta.lock().await;
@@ -835,6 +836,15 @@ pub(crate) async fn replay_startup_aof_file(
     }
 
     if let Some(boundary) = result.truncated_at {
+        if !may_truncate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF file {} is damaged at byte {boundary} but is not the last file of the manifest chain; refusing startup because truncating it would drop writes that later files depend on",
+                    path.display()
+                ),
+            ));
+        }
         // Repair before admitting writes. Leaving the tail in place would
         // swallow later acknowledged writes or attach them to an old MULTI.
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -1445,6 +1455,95 @@ mod tests {
                 Some(Bytes::from(value))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn startup_refuses_to_truncate_a_damaged_earlier_chain_segment() {
+        use ratatosk_persist::aof::DEFAULT_SINGLE_FILE_AOF_FILENAME;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
+        let runtime = runtime_without_writer(
+            dir.path().join("dump.rdb"),
+            dir.path().join(DEFAULT_SINGLE_FILE_AOF_FILENAME),
+            Some(manifest_path.clone()),
+        );
+
+        let mut manifest = AofManifest::new(dir.path());
+        let incr_one = manifest.new_incr_file();
+        let incr_two = manifest.new_incr_file();
+        manifest
+            .save_to_file(&manifest_path)
+            .expect("save manifest");
+        for (path, key) in [(&incr_one, "one"), (&incr_two, "two")] {
+            let mut writer = AofWriter::open(path, FsyncPolicy::Always).expect("open aof writer");
+            writer
+                .append_command(0, &[Bytes::from("SET"), Bytes::from(key), Bytes::from("v")])
+                .expect("append aof command");
+        }
+        let damaged_len = std::fs::metadata(&incr_one).expect("incr one").len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_one)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nlo"))
+            .expect("tear the first segment");
+
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let error = load_startup_data(&shared, &runtime, true)
+            .await
+            .expect_err("a damaged earlier segment must stop startup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not the last file"), "{error}");
+        assert!(
+            std::fs::metadata(&incr_one).expect("incr one").len() > damaged_len,
+            "the damaged segment must be left for inspection"
+        );
+
+        // The same tear on the final segment is still repaired.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&incr_one)
+            .and_then(|file| file.set_len(damaged_len))
+            .expect("repair first segment");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_two)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET"))
+            .expect("tear the final segment");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        load_startup_data(&shared, &runtime, true)
+            .await
+            .expect("a torn final segment is truncated");
+        {
+            let loaded = shared.meta.lock().await;
+            assert!(loaded.db(0).contains_key(b"one".as_slice()));
+            assert!(loaded.db(0).contains_key(b"two".as_slice()));
+        }
+
+        // A header-only file after the damaged one, like the INCR file the
+        // writer opens before replay, adds no dependent writes.
+        std::fs::write(&incr_two, b"REDIS-AOF-002\n").expect("empty final segment");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_one)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET"))
+            .expect("tear the last segment with data");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        load_startup_data(&shared, &runtime, true)
+            .await
+            .expect("the last segment with data is truncated");
+        assert_eq!(
+            std::fs::metadata(&incr_one).expect("incr one").len(),
+            damaged_len
+        );
+        assert!(
+            shared
+                .meta
+                .lock()
+                .await
+                .db(0)
+                .contains_key(b"one".as_slice())
+        );
     }
 
     #[test]

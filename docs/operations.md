@@ -117,6 +117,7 @@ the contract — it is exercised by `scripts/recovery_matrix.sh` (Phase 4).
 Recovery invariants (asserted by `scripts/recovery_matrix.sh`):
 
 - **Truncated AOF tail** → server starts and recovers a consistent *prefix*; the incomplete transaction is omitted and the invalid tail is removed before new writes. A fully recorded write can be replayed even if the client did not receive its reply.
+- **Damage followed by more records** → server refuses to start and leaves the file untouched; the error names the byte offset. After taking a backup, truncating the file to that offset keeps the records before the damage.
 - **`kill -9` during `BGREWRITEAOF`** → restart recovers the full pre-rewrite dataset; no corruption.
 - **Missing manifest with segments on disk** → server either rebuilds or fails startup cleanly; it never reports an empty keyspace as a successful start (no silent data loss).
 - **Repeated `BGREWRITEAOF`** → keyspace size is stable across rewrites.
@@ -196,7 +197,7 @@ ratatosk --no-config-autoload --config /etc/ratatosk/ratatosk.conf
 ## Config File Format
 
 - One directive per line
-- `#` starts a comment
+- `#` at the start of a token starts a comment; inside a value (for example a path) it is literal
 - Values with spaces should be quoted
 - Empty string values can be written as `""`
 - `CONFIG REWRITE` writes a round-trippable `ratatosk.conf` under the active `dir`
@@ -343,7 +344,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - 명령 카탈로그: `420` entries
 - status summary: `done=420`
-- capability tier summary: `unsupported=63`, `syntax_only=6`, `baseline_local=76`, `behavioral_subset=275`, `distributed_parity=0`
+- capability tier summary: `unsupported=64`, `syntax_only=6`, `baseline_local=75`, `behavioral_subset=275`, `distributed_parity=0`
 - 즉, "명령 이름 존재"와 "Redis 행동 parity"는 같은 뜻이 아니다.
 
 ### 인프라 구현 상태
@@ -422,8 +423,10 @@ cargo run -p ratatosk-server --bin ratatosk --release
   Set `RATATOSK_PORT=6380` when running alongside Redis. A startup warning is emitted when using port 6379.
 - **Dynamic sidecar port**: `RATATOSK_PORT=0` asks the OS to choose an ephemeral loopback port.
   Sidecar supervisors should set `RATATOSK_BOUND_ADDR_FILE=/path/to/bound-addr.json`; Ratatosk
-  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` after the TCP listener binds,
-  with optional `unixsocket` and `shm_socket` keys when those local listeners are configured.
+  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` once the listeners are bound
+  and the persisted dataset has loaded, so the file also signals readiness. It carries optional
+  `unixsocket` and `shm_socket` keys when those local listeners are configured. A failed startup
+  never writes it; delete a stale file before relaunching.
   The structured startup log event `ratatosk listener bound` also includes `bound_port`.
 
 ### Autostart (systemd --user)
@@ -464,11 +467,18 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
 | `RATATOSK_ALLOW_INSECURE_BIND` | unset | non-loopback bind opt-in |
 | `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | allow shutdown to continue after appendonly flush failure |
-| `RATATOSK_AUDIT_LOG` | `/tmp/ratatosk-audit.log` | append-only audit event log path |
-| `RATATOSK_AUDIT_CHAIN_STATE` | `/tmp/ratatosk-audit-chain.state` | audit chain checkpoint path |
+| `RATATOSK_AUDIT_LOG` | `<dir>/ratatosk-audit.log` | append-only audit event log path |
+| `RATATOSK_AUDIT_CHAIN_STATE` | `<dir>/ratatosk-audit-chain.state` | audit chain checkpoint path |
 
 On Unix, SIGTERM enters the graceful shutdown path and should exit successfully
 after clients/background tasks drain within `RATATOSK_SHUTDOWN_GRACE_MS`.
+SIGUSR1 starts a background RDB save (like `BGSAVE`); a save already in
+progress is left to finish.
+
+The server holds an exclusive lock on `<dir>/ratatosk.lock` while it runs. A
+second instance pointed at the same data directory exits at startup instead of
+appending to the same AOF; the lock is released by the kernel when the process
+exits, even on `kill -9`, and the file itself can stay in place.
 
 On Linux and macOS, startup and `--check-config` compare the process's soft
 open-file limit with `max_clients + 128`. Insufficient headroom refuses startup;
@@ -879,10 +889,14 @@ Upstream services should:
 
 ## 1. Metrics
 
-- Prometheus exporter 기본 bind: `127.0.0.1:9090`
-- override: `RATATOSK_METRICS_BIND`
-- exporter 초기화 실패는 기본적으로 startup failure다
+- Prometheus exporter 기본 bind: `127.0.0.1:9090` (`GET /metrics`)
+- override: `RATATOSK_METRICS_BIND` — 한 호스트의 인스턴스마다 다른 주소가 필요하다
+- exporter 초기화 실패(예: 포트 사용 중)는 기본적으로 startup failure다
 - 예외적으로 `RATATOSK_ALLOW_NO_METRICS=true`에서만 metrics 없이 계속 실행할 수 있다
+- latency 계열(`*_seconds`, `*_ms`, `*_attempts`)은 bucket이 있는 Prometheus histogram이므로
+  `histogram_quantile(…_bucket…)`로 집계한다
+- `ratatosk_memory_used_bytes`는 `INFO memory`의 `used_memory`와 같은 논리 추정치이며
+  `maxmemory` 설정과 무관하게 매 cron tick 갱신된다(full-scan 보정 주기: 제한 시 10 tick, 무제한 시 90 tick)
 
 근거: `crates/ratatosk-server/src/metrics.rs`, `crates/ratatosk-server/src/main.rs`
 
@@ -1264,9 +1278,9 @@ README가 이미 선언하듯 Ratatosk의 현재 경계는 다음과 같다.
 gap-ledger 기준:
 
 - total commands: 420
-- `unsupported`: 63
+- `unsupported`: 64
 - `syntax_only`: 6
-- `baseline_local`: 76
+- `baseline_local`: 75
 - `behavioral_subset`: 275
 - `distributed_parity`: 0
 

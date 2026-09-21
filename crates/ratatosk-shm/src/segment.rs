@@ -1,9 +1,9 @@
 //! Anonymous shared-memory segment: creation, mapping, and atomic views.
 //!
-//! This is the only module (besides `fdpass`) that contains `unsafe`. All
-//! accesses to the mapping go through `AtomicU64` / `AtomicU32` / `AtomicU8`
-//! views; the crate never creates a `&[u8]` or `&mut [u8]` over the mapping,
-//! because another process (possibly hostile) can mutate it at any time.
+//! Every `unsafe` operation on the mapping lives in this module, and every
+//! access goes through `AtomicU64` / `AtomicU32` / `AtomicU8` views: the crate
+//! never creates a `&[u8]` or `&mut [u8]` over the mapping, because another
+//! process (possibly hostile) can mutate it at any time.
 
 use std::{
     io,
@@ -65,11 +65,14 @@ impl Segment {
     pub fn from_fd(fd: OwnedFd) -> io::Result<Self> {
         let len = file_len(&fd)?;
         let max = layout::segment_bytes(layout::MAX_RING_BYTES);
-        if len < layout::HEADER_BYTES || len > max {
+        if len < layout::HEADER_BYTES {
             return Err(invalid(LayoutError::SegmentTooSmall {
                 expected: layout::HEADER_BYTES,
                 actual: len,
             }));
+        }
+        if len > max {
+            return Err(invalid(LayoutError::SegmentTooLarge { max, actual: len }));
         }
         // Map with a provisional ring size, then validate from the header.
         let mut provisional = Self::map(fd, len, layout::MIN_RING_BYTES)?;

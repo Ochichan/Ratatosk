@@ -66,7 +66,7 @@ fn sendmsg_fd(sock: RawFd, payload: &[u8], fd: RawFd) -> io::Result<usize> {
         );
         std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>(), fd);
 
-        let n = libc::sendmsg(sock, &msg, 0);
+        let n = libc::sendmsg(sock, &msg, nosignal_flag());
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -191,6 +191,18 @@ fn controllen(msg: &libc::msghdr) -> usize {
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn controllen(msg: &libc::msghdr) -> usize {
     msg.msg_controllen as usize
+}
+
+/// A peer that vanished mid-handshake must surface as `EPIPE`, not as a
+/// `SIGPIPE` that kills a host process which has not ignored the signal.
+#[cfg(target_os = "linux")]
+fn nosignal_flag() -> libc::c_int {
+    libc::MSG_NOSIGNAL
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nosignal_flag() -> libc::c_int {
+    0
 }
 
 #[cfg(target_os = "linux")]

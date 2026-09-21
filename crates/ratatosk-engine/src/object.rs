@@ -2,13 +2,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
-pub fn now_ms() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
+/// Largest string value a command may build, Redis' default
+/// `proto-max-bulk-len` (512 MiB).
+pub const PROTO_MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 
+pub const STRING_TOO_LONG_ERR: &str =
+    "ERR string exceeds maximum allowed size (proto-max-bulk-len)";
+
+/// Wall-clock microseconds for display and sampling only. Command logic must
+/// use `ratatosk_core::time::now_ms`, which honours the replay clock.
 pub fn now_us() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_micros()).unwrap_or(i64::MAX),
@@ -85,43 +87,62 @@ pub fn format_f64_for_redis(value: f64) -> Bytes {
     Bytes::copy_from_slice(trimmed.as_bytes())
 }
 
-pub fn normalize_range(len: usize, mut start: i64, mut end: i64) -> Option<(usize, usize)> {
+/// Resolves a list or sorted-set index range (`LRANGE`, `LTRIM`, `ZRANGE`).
+///
+/// Negative indexes count from the end. As in Redis, a range whose end is
+/// still negative after that, or which starts past the last element, is
+/// empty.
+pub fn normalize_range(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
+    let len = i64::try_from(len).ok()?;
+    let start = if start < 0 {
+        start.saturating_add(len).max(0)
+    } else {
+        start
+    };
+    let end = if end < 0 {
+        end.saturating_add(len)
+    } else {
+        end
+    };
+    if start > end || start >= len {
+        return None;
+    }
+    Some((start as usize, end.min(len - 1) as usize))
+}
+
+/// Resolves a `GETRANGE` byte range.
+///
+/// Redis treats strings differently from lists here: a still-negative end is
+/// clamped to 0, so `GETRANGE s 0 -100` returns the first byte, while two
+/// negative indexes in the wrong order return nothing.
+pub fn normalize_string_range(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
+    if start < 0 && end < 0 && start > end {
+        return None;
+    }
+    clamp_index_range(len, start, end)
+}
+
+/// Resolves a range by clamping both ends into the value, the rule `BITPOS`
+/// uses (and `GETRANGE`/`BITCOUNT` after their negative-order check).
+pub fn clamp_index_range(len: usize, start: i64, end: i64) -> Option<(usize, usize)> {
+    let len = i64::try_from(len).ok()?;
     if len == 0 {
         return None;
     }
-
-    let len_i64 = len as i64;
-
-    if start < 0 {
-        start += len_i64;
+    let start = if start < 0 {
+        start.saturating_add(len).max(0)
+    } else {
+        start
+    };
+    let end = if end < 0 {
+        end.saturating_add(len).max(0)
+    } else {
+        end
     }
-    if end < 0 {
-        end += len_i64;
-    }
-
-    // Both indices resolved to out-of-range (still negative after offset)
-    let start_out_of_range = start < 0;
-    let end_out_of_range = end < 0;
-
-    if start_out_of_range && end_out_of_range {
+    .min(len - 1);
+    if start > end {
         return None;
     }
-
-    if start < 0 {
-        start = 0;
-    }
-    if end < 0 {
-        end = 0;
-    }
-
-    if end >= len_i64 {
-        end = len_i64 - 1;
-    }
-
-    if start > end || start >= len_i64 {
-        return None;
-    }
-
     Some((start as usize, end as usize))
 }
 
@@ -129,11 +150,31 @@ pub fn normalize_range(len: usize, mut start: i64, mut end: i64) -> Option<(usiz
 mod tests {
     use bytes::Bytes;
 
-    use super::{normalize_range, parse_i64, parse_usize};
+    use super::{normalize_range, normalize_string_range, parse_i64, parse_usize};
 
     #[test]
     fn normalize_range_deeply_negative_both_out_of_range() {
         assert_eq!(normalize_range(3, -10, -10), None);
+    }
+
+    #[test]
+    fn list_ranges_are_empty_when_the_end_stays_negative() {
+        assert_eq!(normalize_range(3, 0, -100), None);
+        assert_eq!(normalize_range(3, -100, -100), None);
+        assert_eq!(normalize_range(3, 1, 100), Some((1, 2)));
+        assert_eq!(normalize_range(3, 3, 5), None);
+        assert_eq!(normalize_range(0, 0, -1), None);
+        assert_eq!(normalize_range(3, i64::MIN, i64::MAX), Some((0, 2)));
+    }
+
+    #[test]
+    fn string_ranges_clamp_a_negative_end_like_getrange() {
+        assert_eq!(normalize_string_range(3, 0, -100), Some((0, 0)));
+        assert_eq!(normalize_string_range(3, -10, -10), Some((0, 0)));
+        assert_eq!(normalize_string_range(3, -1, -2), None);
+        assert_eq!(normalize_string_range(3, 1, 100), Some((1, 2)));
+        assert_eq!(normalize_string_range(3, 5, 10), None);
+        assert_eq!(normalize_string_range(0, 0, -1), None);
     }
 
     #[test]
