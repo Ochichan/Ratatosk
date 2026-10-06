@@ -613,7 +613,8 @@ Ratatosk은 선택적 의존성으로 취급한다.
 ### Backpressure and limits
 
 - query buffer limit: 1 MiB
-- output buffer limit: 기본 8 MiB. pub/sub와 MONITOR backlog가 이를 넘으면 연결을 끊는다. 명령 응답 하나는 한도보다 커도 끝까지 보낸다 (Redis의 normal client 기본값과 같음). 읽지 않는 클라이언트는 `client-write-timeout-sec`이 끊는다.
+- output buffer limit: 기본 8 MiB. pub/sub와 MONITOR backlog가 이를 넘으면 연결을 끊는다. 명령 응답 하나는 한도보다 커도 한도 크기 조각으로 나눠 끝까지 보낸다 (Redis의 normal client 기본값과 같음). 64 KiB 이상의 bulk 값은 복사하지 않으므로 응답 크기와 무관하게 클라이언트당 메모리는 한도 근처에 머문다.
+- `client-write-timeout-sec`(기본 5초)은 각 write 호출에 걸린다. 그 시간 동안 한 바이트도 보내지 못한 클라이언트만 끊으며, 천천히라도 계속 읽는 클라이언트는 큰 응답을 끝까지 받는다.
 - pubsub delivery: per-subscriber `mpsc::channel` (capacity = hard_limit). `try_send()` 실패 시 overflow -> disconnect
 - lazy free channel capacity: 4096
 

@@ -32,17 +32,29 @@ pub(super) async fn write_all_with_timeout<S: SessionStream>(
     payload: &[u8],
     write_timeout: Duration,
 ) -> io::Result<()> {
-    if payload.is_empty() {
-        return Ok(());
+    // The timeout bounds each write call, so it measures a lack of progress.
+    // A client that keeps reading a large reply is not cut off; one that stops
+    // reading is.
+    let mut written = 0;
+    while written < payload.len() {
+        match timeout(write_timeout, stream.write(&payload[written..])).await {
+            Ok(Ok(0)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "socket accepted no bytes",
+                ));
+            }
+            Ok(Ok(n)) => written += n,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "socket write timeout",
+                ));
+            }
+        }
     }
-
-    match timeout(write_timeout, stream.write_all(payload)).await {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "socket write timeout",
-        )),
-    }
+    Ok(())
 }
 
 pub(super) fn load_connection_runtime_config(

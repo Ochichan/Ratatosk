@@ -2,6 +2,10 @@ use super::shared_support::{append_encoded_frame, flush_pending_input_bytes};
 use super::*;
 use crate::transport::SessionStream;
 
+/// Bulk payloads at least this large are written from the stored value
+/// instead of being copied into the output buffer.
+const ZERO_COPY_BULK_BYTES: usize = 64 * 1024;
+
 pub(super) struct ProtocolCommandOutcome {
     outcome: CommandOutcome,
     protocol_version: i64,
@@ -13,6 +17,32 @@ async fn write_output_limit_error<S: SessionStream>(
 ) -> io::Result<()> {
     let response = encode(&RespFrame::error_str(OUTPUT_BUFFER_LIMIT_ERR));
     write_all_with_timeout(stream, &response, write_timeout).await
+}
+
+/// Send a reply larger than the output buffer limit piece by piece.
+///
+/// Memory stays near one piece of `piece_bytes` whatever the reply size, and
+/// a large value repeated in the reply (for example by MGET) is written from
+/// the same buffer each time rather than copied.
+#[allow(clippy::too_many_arguments)]
+async fn write_reply_in_pieces<S: SessionStream>(
+    stream: &mut S,
+    server_state: &SharedServerState,
+    frame: &RespFrame,
+    protocol_version: i64,
+    piece_bytes: usize,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    let version = RespVersion::from_protocol_version(protocol_version);
+    let mut written = 0u64;
+    for piece in ReplySegments::new(frame, version, piece_bytes, ZERO_COPY_BULK_BYTES) {
+        write_all_with_timeout(stream, &piece, write_timeout).await?;
+        written = written.saturating_add(piece.len() as u64);
+    }
+    server_state.stats.add_net_output_bytes(written);
+    let mut server = server_state.meta.lock().await;
+    server.stats.add_net_output_bytes(written);
+    Ok(())
 }
 
 async fn flush_output_buffer<S: SessionStream>(
@@ -254,18 +284,25 @@ pub(super) async fn apply_command_outcomes<S: SessionStream>(
                 // The command has already run, and a pop has already removed
                 // and logged what it returns, so the reply is still delivered,
                 // as Redis does for normal clients. Earlier pipelined replies
-                // go out first, and client-write-timeout-sec still drops a
-                // client that stops reading. The limit keeps bounding the
-                // pub/sub and MONITOR backlogs.
+                // go out first. The reply is written in pieces of the limit's
+                // size, so the limit still bounds memory per client, and
+                // client-write-timeout-sec drops a client that stops reading.
+                // The limit keeps bounding the pub/sub and MONITOR backlogs.
                 flush_output_buffer(stream, server_state, output, *write_timeout).await?;
-                append_encoded_frame(output, &outcome.response, usize::MAX, protocol_version);
                 tracing::debug!(
                     client_id = client_state.id(),
                     output_limit_bytes = output_limit_bytes,
-                    reply_bytes = output.len(),
-                    "sending command reply larger than the output buffer limit"
+                    "sending a command reply larger than the output buffer limit in pieces"
                 );
-                flush_output_buffer(stream, server_state, output, *write_timeout).await?;
+                write_reply_in_pieces(
+                    stream,
+                    server_state,
+                    &outcome.response,
+                    protocol_version,
+                    output_limit_bytes,
+                    *write_timeout,
+                )
+                .await?;
             }
 
             if output.len() >= *output_buffer_flush_threshold {

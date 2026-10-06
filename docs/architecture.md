@@ -89,8 +89,8 @@ ratatosk-resp, ratatosk-core, ratatosk-shm
 
 - 클라이언트마다 tokio task를 생성해 read/parse/execute/write 루프 수행.
 - `QUERY_BUFFER_LIMIT` = 1 MiB 초과 시 즉시 에러 후 연결 종료.
-- `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` (기본 8 MiB) 초과 응답은 에러 후 종료.
-- write는 5초 타임아웃으로 보호.
+- `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` (기본 8 MiB)를 넘는 명령 응답은 한도 크기 조각으로 나눠 끝까지 보낸다. 큰 bulk 값은 복사하지 않는다. pub/sub와 MONITOR backlog가 한도를 넘으면 에러 후 종료.
+- write는 `client-write-timeout-sec`(기본 5초)으로 보호한다. 각 write 호출에 걸리므로, 그 시간 동안 한 바이트도 보내지 못할 때만 끊는다.
 
 ### 3) Parse (zero-copy path)
 

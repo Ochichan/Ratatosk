@@ -22,8 +22,8 @@ pub mod fuzz_support;
 pub mod parse;
 
 pub use encode::{
-    RespVersion, encode, encode_for_version, encode_to_vec, encode_to_vec_for_version, encoded_len,
-    encoded_len_for_version,
+    ReplySegments, RespVersion, encode, encode_for_version, encode_to_vec,
+    encode_to_vec_for_version, encoded_len, encoded_len_for_version,
 };
 pub use frame::RespFrame;
 pub use parse::{RespParseError, parse};
