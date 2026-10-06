@@ -4,10 +4,18 @@ useDefault = true
 [[rules]]
 id = "literal-secret-in-toml"
 description = "Literal secret in config (should use env: prefix)"
-regex = '''(?i)(api_key|token|secret|password)\s*=\s*"(?!env:)[^"]{8,}"'''
+# Go's RE2 has no lookahead, so `env:` references are excluded by the allowlist.
+regex = '''(?i)(api_key|token|secret|password)\s*=\s*"[^"]{8,}"'''
 path = '''\.toml$'''
 
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = ['''=\s*"env:''']
+
 [allowlist]
+# The CLIENT TRACKING row ("direct-key invalidation, BCAST/...") trips generic-api-key.
+regexTarget = "line"
+regexes = ['''direct-key invalidation''']
 paths = [
     '''Cargo\.toml$''',
     '''Cargo\.lock$''',
