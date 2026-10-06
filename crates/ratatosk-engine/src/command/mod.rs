@@ -4595,25 +4595,7 @@ fn capture_durability_effects(
         // mutates the stream.  Replay the returned concrete ID, never the
         // caller's generator token.
         b"XADD" => canonical_xadd(argv, response),
-        b"SPOP" => {
-            let members = match response {
-                RespFrame::BulkString(Some(member)) => vec![member.clone()],
-                RespFrame::Array(items) => items
-                    .iter()
-                    .filter_map(|item| match item {
-                        RespFrame::BulkString(Some(member)) => Some(member.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            if members.is_empty() {
-                return None;
-            }
-            let mut removal = vec![Bytes::from_static(b"SREM"), argv.get(1)?.clone()];
-            removal.extend(members);
-            Some(removal)
-        }
+        b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
         // These commands are administrative/session actions, not keyspace
         // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
         // a successful CONFIG reply as if it were data.
@@ -4626,6 +4608,62 @@ fn capture_durability_effects(
     }?;
 
     Some(DurabilityEffects::single(db_index, canonical))
+}
+
+/// Members per replayed `SREM`, well under the RESP parser's array limit.
+const SPOP_AOF_SREM_BATCH: usize = 100_000;
+
+/// Record SPOP by its outcome, since the members it picked are random.
+///
+/// A pop that empties the set is logged as `DEL`. Otherwise the removed
+/// members become `SREM` commands of at most [`SPOP_AOF_SREM_BATCH`] members,
+/// grouped as one transaction so replay applies all of them or none.
+fn spop_durability_effects(
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<DurabilityEffects> {
+    let key = argv.get(1)?;
+    let members: Vec<Bytes> = match response {
+        RespFrame::BulkString(Some(member)) => vec![member.clone()],
+        RespFrame::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                RespFrame::BulkString(Some(member)) => Some(member.clone()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    if members.is_empty() {
+        return None;
+    }
+    if server.db(db_index).get(key).is_none() {
+        return Some(DurabilityEffects::single(
+            db_index,
+            vec![Bytes::from_static(b"DEL"), key.clone()],
+        ));
+    }
+
+    let mut commands: Vec<DurableCommand> = members
+        .chunks(SPOP_AOF_SREM_BATCH)
+        .map(|chunk| {
+            let mut removal = Vec::with_capacity(chunk.len() + 2);
+            removal.push(Bytes::from_static(b"SREM"));
+            removal.push(key.clone());
+            removal.extend_from_slice(chunk);
+            DurableCommand {
+                db_index,
+                argv: removal,
+            }
+        })
+        .collect();
+    if commands.len() == 1 {
+        let only = commands.pop()?;
+        return Some(DurabilityEffects::single(db_index, only.argv));
+    }
+    Some(DurabilityEffects::transaction(commands))
 }
 
 fn set_command_was_applied(
@@ -12020,7 +12058,7 @@ mod tests {
     }
 
     #[test]
-    fn m2_count_limit_guards_return_errors() {
+    fn count_on_missing_keys_and_numkeys_limits() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
 
@@ -12054,7 +12092,11 @@ mod tests {
             else {
                 panic!("LPOP with count should return array");
             };
-            assert_eq!(items.len(), 3);
+            assert_eq!(items, ["a", "b", "c"].map(RespFrame::bulk_str).to_vec());
+            assert_eq!(
+                run(&["EXISTS", "l"], &mut server, &mut client),
+                RespFrame::Integer(0)
+            );
 
             run(&["SADD", "s", "a", "b", "c"], &mut server, &mut client);
             let RespFrame::Array(items) = run(&["SPOP", "s", count], &mut server, &mut client)
@@ -12062,6 +12104,10 @@ mod tests {
                 panic!("SPOP with count should return array");
             };
             assert_eq!(items.len(), 3);
+            assert_eq!(
+                run(&["EXISTS", "s"], &mut server, &mut client),
+                RespFrame::Integer(0)
+            );
 
             run(
                 &["ZADD", "z", "1", "a", "2", "b", "3", "c"],
@@ -12073,6 +12119,10 @@ mod tests {
                 panic!("ZPOPMIN with count should return array");
             };
             assert_eq!(items.len(), 6);
+            assert_eq!(
+                run(&["EXISTS", "z"], &mut server, &mut client),
+                RespFrame::Integer(0)
+            );
 
             run(&["RPUSH", "l", "a", "b", "c"], &mut server, &mut client);
             let RespFrame::Array(reply) = run(
@@ -12119,8 +12169,63 @@ mod tests {
                     panic!("{cmd} with positive count should return array");
                 };
                 assert_eq!(items.len(), 3, "{cmd} count {count}");
+                let distinct: std::collections::HashSet<_> = items
+                    .iter()
+                    .map(|item| match item {
+                        RespFrame::BulkString(Some(value)) => value.clone(),
+                        other => panic!("{cmd} returned a non-bulk item: {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(distinct.len(), 3, "{cmd} count {count} repeated an item");
             }
         }
+    }
+
+    #[test]
+    fn spop_logs_del_when_emptied_and_batched_srem_otherwise() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        run(&["SADD", "small", "a", "b"], &mut server, &mut client);
+        client.take_durability_effects();
+        run(&["SPOP", "small", "10"], &mut server, &mut client);
+        let effects = client.take_durability_effects().expect("SPOP effects");
+        assert!(!effects.transaction);
+        assert_eq!(
+            effects.commands[0].argv,
+            vec![Bytes::from_static(b"DEL"), Bytes::from_static(b"small")]
+        );
+
+        let total = super::SPOP_AOF_SREM_BATCH + 10;
+        let members: Vec<String> = (0..total).map(|i| format!("m{i}")).collect();
+        let mut sadd = vec!["SADD", "big"];
+        sadd.extend(members.iter().map(String::as_str));
+        run(&sadd, &mut server, &mut client);
+        client.take_durability_effects();
+
+        let popped = super::SPOP_AOF_SREM_BATCH + 5;
+        let RespFrame::Array(items) = run(
+            &["SPOP", "big", &popped.to_string()],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("SPOP with count should return array");
+        };
+        assert_eq!(items.len(), popped);
+        let effects = client.take_durability_effects().expect("SPOP effects");
+        assert!(effects.transaction);
+        assert_eq!(effects.commands.len(), 2);
+        let removed: usize = effects
+            .commands
+            .iter()
+            .map(|command| {
+                assert_eq!(command.argv[0], Bytes::from_static(b"SREM"));
+                assert!(command.argv.len() <= super::SPOP_AOF_SREM_BATCH + 2);
+                command.argv.len() - 2
+            })
+            .sum();
+        assert_eq!(removed, popped);
     }
 
     #[test]
