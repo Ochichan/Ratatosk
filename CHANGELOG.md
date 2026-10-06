@@ -175,6 +175,9 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
+- `XSETID` and `XCFGSET` are now `syntax_only`, so `compatibility-mode strict`
+  rejects them. They validate arguments and reply OK without changing stream
+  state.
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
 - `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.
@@ -190,9 +193,6 @@ The format is based on Keep a Changelog and the versioning policy in
   contract verbatim; `ratatosk.conf` documents `compatibility-mode` and
   `protected-mode` with a pointer to it.
 - `cargo-deny` configuration updated to match the current tool schema
-- `XSETID` and `XCFGSET` are now `syntax_only`, so `compatibility-mode strict`
-  rejects them. They validate arguments and reply OK without changing stream
-  state.
 
 ### Removed
 
