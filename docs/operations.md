@@ -444,7 +444,7 @@ cargo run -p ratatosk-server --bin ratatosk --release
 ./scripts/install-ratatosk-autostart-macos.sh
 ```
 
-- macOS 기본 포트: `6379`.
+- macOS 기본 포트: `6380` (systemd unit과 같으며, 수동 실행 기본값 `6379`나 같은 기계의 Redis와 충돌하지 않는다).
 - plist 경로: `~/Library/LaunchAgents/dev.ratatosk.serve.plist`
 - 로그 경로: `~/Library/Logs/Ratatosk/`
 - 데이터/audit 경로: `<repo>/data/`
@@ -649,7 +649,7 @@ Ratatosk은 선택적 의존성으로 취급한다.
 | Protocol | TCP (RESP2/RESP3) |
 | TLS | Not built-in; proxy-layer termination recommended (stunnel, nginx stream, envoy) |
 
-A startup warning is emitted when using port 6379. The systemd autostart unit defaults to 6380.
+A startup warning is emitted when using port 6379. Both autostart installers (systemd and launchd) default to 6380.
 
 Ratatosk keeps `_PORT` and `_BIND` as separate variables and defaults to loopback
 (`127.0.0.1`); a non-loopback bind requires an explicit opt-in.
