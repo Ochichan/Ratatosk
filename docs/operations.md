@@ -344,7 +344,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - 명령 카탈로그: `420` entries
 - status summary: `done=420`
-- capability tier summary: `unsupported=64`, `syntax_only=8`, `baseline_local=75`, `behavioral_subset=273`, `distributed_parity=0`
+- capability tier summary: `unsupported=64`, `syntax_only=7`, `baseline_local=75`, `behavioral_subset=274`, `distributed_parity=0`
 - 즉, "명령 이름 존재"와 "Redis 행동 parity"는 같은 뜻이 아니다.
 
 ### 인프라 구현 상태
@@ -1148,9 +1148,9 @@ gap-ledger 기준:
 
 - total commands: 420
 - `unsupported`: 64
-- `syntax_only`: 8
+- `syntax_only`: 7
 - `baseline_local`: 75
-- `behavioral_subset`: 273
+- `behavioral_subset`: 274
 - `distributed_parity`: 0
 
 근거: [gap-ledger summary](./redis-gap-ledger.md#L11-L30)

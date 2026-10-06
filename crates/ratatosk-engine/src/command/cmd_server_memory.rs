@@ -124,7 +124,9 @@ fn estimate_value_memory_usage(key: &Bytes, value: &StoredValue) -> i64 {
                     .saturating_add(24);
             }
         }
-        ValueData::Stream { entries, groups } => {
+        ValueData::Stream {
+            entries, groups, ..
+        } => {
             total = total.saturating_add(64);
             for entry in entries {
                 total = total.saturating_add(32);

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::Path;
 
 use bytes::Bytes;
-use ratatosk_engine::keyspace::{DbSnapshot, ServerState, StoredValue, ValueData};
+use ratatosk_engine::keyspace::{DbSnapshot, ServerState, StoredValue, StreamMeta, ValueData};
 
 use super::checksum::Crc64Digest;
 use super::format::*;
@@ -216,8 +216,17 @@ impl<W: Write> RdbSaver<W> {
                     self.write_bytes(&score_bytes)?;
                 }
             }
-            ValueData::Stream { entries, groups } => {
-                self.write_bytes(&[RDB_TYPE_RATATOSK_STREAM_GROUPS])?;
+            ValueData::Stream {
+                entries,
+                groups,
+                meta,
+            } => {
+                let with_meta = **meta != StreamMeta::derived_from(entries);
+                self.write_bytes(&[if with_meta {
+                    RDB_TYPE_RATATOSK_STREAM_META
+                } else {
+                    RDB_TYPE_RATATOSK_STREAM_GROUPS
+                }])?;
                 self.write_string(key)?;
                 self.write_length(entries.len() as u64)?;
                 for entry in entries {
@@ -254,6 +263,13 @@ impl<W: Write> RdbSaver<W> {
                         self.write_bytes(&pending.deliveries.to_le_bytes())?;
                         self.write_bytes(&pending.last_delivered_ms.to_le_bytes())?;
                     }
+                }
+                if with_meta {
+                    self.write_bytes(&meta.last_id.ms.to_le_bytes())?;
+                    self.write_bytes(&meta.last_id.seq.to_le_bytes())?;
+                    self.write_bytes(&meta.entries_added.to_le_bytes())?;
+                    self.write_bytes(&meta.max_deleted_id.ms.to_le_bytes())?;
+                    self.write_bytes(&meta.max_deleted_id.seq.to_le_bytes())?;
                 }
             }
         }

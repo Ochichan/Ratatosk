@@ -93,7 +93,9 @@ pub(super) fn cmd_xgroup(
                     "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.",
                 ));
             };
-            let Some((stream, groups)) = entry.as_stream_mut() else {
+            // `$` is the stream's last generated ID.
+            let last_id = entry.as_stream_meta().map(|meta| meta.last_id);
+            let Some(groups) = entry.as_stream_groups_mut() else {
                 return wrong_type_response();
             };
 
@@ -102,10 +104,7 @@ pub(super) fn cmd_xgroup(
             }
 
             let id = if id_raw.as_ref() == b"$" {
-                stream
-                    .last()
-                    .map(|item| item.id)
-                    .unwrap_or(StreamId { ms: 0, seq: 0 })
+                last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
                 let Some(parsed) = parse_stream_id(id_raw) else {
                     return CommandOutcome::reply(err(
@@ -164,7 +163,9 @@ pub(super) fn cmd_xgroup(
             let Some(entry) = db.get_mut(key) else {
                 return xreadgroup_nogroup_error(key, group_name);
             };
-            let Some((stream, groups)) = entry.as_stream_mut() else {
+            // `$` is the stream's last generated ID.
+            let last_id = entry.as_stream_meta().map(|meta| meta.last_id);
+            let Some(groups) = entry.as_stream_groups_mut() else {
                 return wrong_type_response();
             };
             let Some(group) = groups.get_mut(group_name) else {
@@ -172,10 +173,7 @@ pub(super) fn cmd_xgroup(
             };
 
             group.last_delivered_id = if id_raw.as_ref() == b"$" {
-                stream
-                    .last()
-                    .map(|item| item.id)
-                    .unwrap_or(StreamId { ms: 0, seq: 0 })
+                last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
                 let Some(parsed) = parse_stream_id(id_raw) else {
                     return CommandOutcome::reply(err(
@@ -769,13 +767,13 @@ pub(super) fn cmd_xinfo(
             let Some((stream, groups_ref)) = entry.as_stream() else {
                 return wrong_type_response();
             };
+            let meta = entry
+                .as_stream_meta()
+                .copied()
+                .unwrap_or_else(|| crate::keyspace::StreamMeta::derived_from(stream));
 
             let first_id = stream
                 .first()
-                .map(|item| item.id)
-                .unwrap_or(StreamId { ms: 0, seq: 0 });
-            let last_id = stream
-                .last()
                 .map(|item| item.id)
                 .unwrap_or(StreamId { ms: 0, seq: 0 });
             let group_count = groups_ref.len();
@@ -788,11 +786,11 @@ pub(super) fn cmd_xinfo(
                 RespFrame::bulk_str("radix-tree-nodes"),
                 RespFrame::Integer(if stream.is_empty() { 0 } else { 1 }),
                 RespFrame::bulk_str("last-generated-id"),
-                RespFrame::BulkString(Some(stream_id_to_bytes(last_id))),
+                RespFrame::BulkString(Some(stream_id_to_bytes(meta.last_id))),
                 RespFrame::bulk_str("max-deleted-entry-id"),
-                RespFrame::bulk_str("0-0"),
+                RespFrame::BulkString(Some(stream_id_to_bytes(meta.max_deleted_id))),
                 RespFrame::bulk_str("entries-added"),
-                RespFrame::Integer(stream.len() as i64),
+                RespFrame::Integer(i64::try_from(meta.entries_added).unwrap_or(i64::MAX)),
                 RespFrame::bulk_str("recorded-first-entry-id"),
                 RespFrame::BulkString(Some(stream_id_to_bytes(first_id))),
                 RespFrame::bulk_str("groups"),

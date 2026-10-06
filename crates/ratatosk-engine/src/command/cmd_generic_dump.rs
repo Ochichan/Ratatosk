@@ -17,8 +17,10 @@ const RESTORE_MAX_COLLECTION_ITEMS: usize = 1_000_000;
 const RESTORE_MAX_STREAM_FIELDS_PER_ENTRY: usize = 1_000_000;
 /// Cap on capacity reserved from a count in an untrusted payload.
 const RESTORE_MAX_PREALLOC: usize = 1024;
-/// Version 2 adds hash field deadlines and stream consumer groups.
-const DUMP_MAGIC_CURRENT: &[u8] = b"RATSK2";
+/// Version 2 adds hash field deadlines and stream consumer groups; version 3
+/// adds stream metadata (last generated ID, entries added, max deleted ID).
+const DUMP_MAGIC_CURRENT: &[u8] = b"RATSK3";
+const DUMP_MAGIC_V2: &[u8] = b"RATSK2";
 const DUMP_MAGIC_V1: &[u8] = b"RATSK1";
 const DUMP_MAGIC_LEGACY: &[u8] = &[0x41, 0x58, 0x4f, 0x4e, 0x44, 0x31];
 
@@ -224,7 +226,11 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
                 put_i64(&mut out, entry.score.0.to_bits() as i64);
             }
         }
-        ValueData::Stream { entries, groups } => {
+        ValueData::Stream {
+            entries,
+            groups,
+            meta,
+        } => {
             out.push(b'r');
             put_u32(&mut out, entries.len());
             for item in entries {
@@ -258,6 +264,12 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
                     put_i64(&mut out, entry.last_delivered_ms);
                 }
             }
+            put_stream_id(&mut out, meta.last_id);
+            put_i64(
+                &mut out,
+                i64::try_from(meta.entries_added).unwrap_or(i64::MAX),
+            );
+            put_stream_id(&mut out, meta.max_deleted_id);
         }
     }
 
@@ -314,6 +326,8 @@ fn deserialize_stored_value(payload: &Bytes) -> Option<StoredValue> {
 
     let magic = &raw[..DUMP_MAGIC_CURRENT.len()];
     let version = if magic == DUMP_MAGIC_CURRENT {
+        3
+    } else if magic == DUMP_MAGIC_V2 {
         2
     } else if magic == DUMP_MAGIC_V1 || magic == DUMP_MAGIC_LEGACY {
         1
@@ -463,6 +477,20 @@ fn take_stream(raw: &[u8], idx: &mut usize, version: u8) -> Option<StoredValue> 
         if groups.insert(name, group).is_some() {
             return None;
         }
+    }
+    if version >= 3 {
+        let last_id = take_stream_id(raw, idx)?;
+        let entries_added = u64::try_from(take_i64(raw, idx)?).ok()?;
+        let max_deleted_id = take_stream_id(raw, idx)?;
+        let meta = crate::keyspace::StreamMeta {
+            last_id,
+            entries_added,
+            max_deleted_id,
+        };
+        if !meta.is_valid_for(value.as_stream_entries()?) {
+            return None;
+        }
+        *value.as_stream_meta_mut()? = meta;
     }
     Some(value)
 }

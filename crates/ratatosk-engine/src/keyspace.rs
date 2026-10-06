@@ -47,6 +47,39 @@ pub struct StreamEntry {
     pub fields: Vec<(Bytes, Bytes)>,
 }
 
+/// Stream state that the entries alone do not record, as in Redis.
+///
+/// `last_id` only moves forward: XADD advances it and XSETID can raise it, but
+/// deleting entries leaves it in place, so a later `XADD *` never reuses an ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamMeta {
+    pub last_id: StreamId,
+    pub entries_added: u64,
+    pub max_deleted_id: StreamId,
+}
+
+impl StreamMeta {
+    /// The metadata a stream holding exactly `entries` would have if nothing
+    /// was ever deleted from it or set by XSETID.
+    pub fn derived_from(entries: &[StreamEntry]) -> Self {
+        Self {
+            last_id: entries
+                .last()
+                .map(|entry| entry.id)
+                .unwrap_or(StreamId { ms: 0, seq: 0 }),
+            entries_added: entries.len() as u64,
+            max_deleted_id: StreamId { ms: 0, seq: 0 },
+        }
+    }
+
+    /// Whether the metadata is consistent with the entries it describes.
+    pub fn is_valid_for(&self, entries: &[StreamEntry]) -> bool {
+        entries.last().is_none_or(|last| last.id <= self.last_id)
+            && self.entries_added >= entries.len() as u64
+            && self.max_deleted_id <= self.last_id
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamPendingEntry {
     pub consumer: Bytes,
@@ -498,6 +531,8 @@ pub enum ValueData {
     Stream {
         entries: Vec<StreamEntry>,
         groups: HashMap<Bytes, StreamGroup>,
+        /// Boxed so streams do not widen every other value.
+        meta: Box<StreamMeta>,
     },
 }
 
@@ -582,10 +617,12 @@ impl StoredValue {
     }
 
     pub fn stream(entries: Vec<StreamEntry>, expire_at_ms: Option<i64>) -> Self {
+        let meta = Box::new(StreamMeta::derived_from(&entries));
         Self::new(
             ValueData::Stream {
                 entries,
                 groups: HashMap::new(),
+                meta,
             },
             expire_at_ms,
             Encoding::StreamTree,
@@ -882,7 +919,9 @@ impl StoredValue {
 
     pub fn as_stream(&self) -> Option<(&Vec<StreamEntry>, &HashMap<Bytes, StreamGroup>)> {
         match &*self.data {
-            ValueData::Stream { entries, groups } => Some((entries, groups)),
+            ValueData::Stream {
+                entries, groups, ..
+            } => Some((entries, groups)),
             _ => None,
         }
     }
@@ -891,7 +930,33 @@ impl StoredValue {
         &mut self,
     ) -> Option<(&mut Vec<StreamEntry>, &mut HashMap<Bytes, StreamGroup>)> {
         match &mut *self.data {
-            ValueData::Stream { entries, groups } => Some((entries, groups)),
+            ValueData::Stream {
+                entries, groups, ..
+            } => Some((entries, groups)),
+            _ => None,
+        }
+    }
+
+    pub fn as_stream_meta(&self) -> Option<&StreamMeta> {
+        match &*self.data {
+            ValueData::Stream { meta, .. } => Some(meta),
+            _ => None,
+        }
+    }
+
+    pub fn as_stream_meta_mut(&mut self) -> Option<&mut StreamMeta> {
+        match &mut *self.data {
+            ValueData::Stream { meta, .. } => Some(meta),
+            _ => None,
+        }
+    }
+
+    /// Entries and metadata together, for commands that change both.
+    pub fn as_stream_entries_and_meta_mut(
+        &mut self,
+    ) -> Option<(&mut Vec<StreamEntry>, &mut StreamMeta)> {
+        match &mut *self.data {
+            ValueData::Stream { entries, meta, .. } => Some((entries, meta)),
             _ => None,
         }
     }

@@ -150,7 +150,9 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
                 .saturating_mul(per_entry)
                 .saturating_add(member_payload)
         }
-        ValueData::Stream { entries, groups } => {
+        ValueData::Stream {
+            entries, groups, ..
+        } => {
             let entries_size: usize = entries
                 .iter()
                 .map(|e| {

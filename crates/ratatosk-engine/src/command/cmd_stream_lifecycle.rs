@@ -274,7 +274,18 @@ pub(super) fn cmd_xdel(
     });
 
     prune_stream_removed_ids(entry, &removed_ids);
+    record_deleted_ids(entry, removed_ids.iter().copied());
     CommandOutcome::reply(RespFrame::Integer(removed_ids.len() as i64))
+}
+
+/// Raise the stream's max deleted ID to cover `deleted`, as Redis does for
+/// XDEL, XDELEX and XACKDEL. XTRIM leaves it unchanged.
+fn record_deleted_ids(entry: &mut StoredValue, deleted: impl IntoIterator<Item = StreamId>) {
+    if let Some(meta) = entry.as_stream_meta_mut() {
+        if let Some(max) = deleted.into_iter().max() {
+            meta.max_deleted_id = meta.max_deleted_id.max(max);
+        }
+    }
 }
 
 pub(super) fn cmd_xclaim(
@@ -646,9 +657,17 @@ pub(super) fn cmd_xackdel(
     }
 
     if !removed_ids.is_empty() {
+        let mut deleted = Vec::new();
         if let Some(stream) = entry.as_stream_entries_mut() {
-            stream.retain(|item| !removed_ids.contains(&item.id));
+            stream.retain(|item| {
+                let keep = !removed_ids.contains(&item.id);
+                if !keep {
+                    deleted.push(item.id);
+                }
+                keep
+            });
         }
+        record_deleted_ids(entry, deleted);
     }
 
     CommandOutcome::reply(RespFrame::Array(out))
@@ -734,9 +753,17 @@ pub(super) fn cmd_xdelex(
     }
 
     if !removed_ids.is_empty() {
+        let mut deleted = Vec::new();
         if let Some(stream) = entry.as_stream_entries_mut() {
-            stream.retain(|item| !removed_ids.contains(&item.id));
+            stream.retain(|item| {
+                let keep = !removed_ids.contains(&item.id);
+                if !keep {
+                    deleted.push(item.id);
+                }
+                keep
+            });
         }
+        record_deleted_ids(entry, deleted);
     }
 
     CommandOutcome::reply(RespFrame::Array(out))

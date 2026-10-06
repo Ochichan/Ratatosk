@@ -257,6 +257,74 @@ fn aof_replays_absolute_ttl_and_resolved_stream_id() -> io::Result<()> {
 }
 
 #[test]
+fn stream_metadata_survives_aof_replay_and_rewrite() -> io::Result<()> {
+    fn stream_info(client: &mut Client) -> io::Result<Vec<RespFrame>> {
+        let RespFrame::Array(items) = client.command(&["XINFO", "STREAM", "events"])? else {
+            panic!("XINFO STREAM should return an array");
+        };
+        let field = |name: &str| {
+            let at = items
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str(name))
+                .unwrap_or_else(|| panic!("XINFO STREAM has no {name}"));
+            items[at + 1].clone()
+        };
+        Ok(vec![
+            field("last-generated-id"),
+            field("entries-added"),
+            field("max-deleted-entry-id"),
+        ])
+    }
+
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    client.command(&["XADD", "events", "5-1", "f", "v"])?;
+    client.command(&["XADD", "events", "6-0", "f", "v"])?;
+    assert_eq!(
+        client.command(&["XDEL", "events", "6-0"])?,
+        RespFrame::Integer(1)
+    );
+    assert_ok(client.command(&["XSETID", "events", "9-9", "ENTRIESADDED", "12"])?);
+    let expected = vec![
+        RespFrame::bulk_str("9-9"),
+        RespFrame::Integer(12),
+        RespFrame::bulk_str("6-0"),
+    ];
+    assert_eq!(stream_info(&mut client)?, expected);
+    drop(client);
+
+    // Replaying the AOF rebuilds the metadata from the logged commands.
+    server.restart(false)?;
+    let mut client = server.client()?;
+    assert_eq!(stream_info(&mut client)?, expected);
+
+    // A rewrite stores the stream in the RDB BASE, which must keep it too.
+    client.command(&["BGREWRITEAOF"])?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let RespFrame::BulkString(Some(info)) = client.command(&["INFO", "persistence"])? else {
+            panic!("INFO should return a bulk string");
+        };
+        if String::from_utf8_lossy(&info).contains("aof_rewrite_in_progress:0") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "AOF rewrite did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(client);
+    server.restart(false)?;
+    let mut client = server.client()?;
+    assert_eq!(stream_info(&mut client)?, expected);
+    assert_eq!(
+        client.command(&["XADD", "events", "9-9", "f", "v"])?,
+        RespFrame::Error(Bytes::from_static(
+            b"ERR The ID specified in XADD is equal or smaller than the target stream top item"
+        ))
+    );
+    Ok(())
+}
+
+#[test]
 fn strict_mode_restart_replays_commands_it_rejects_from_clients() -> io::Result<()> {
     let mut server = Server::new(true)?;
     let mut client = server.client()?;
@@ -267,14 +335,14 @@ fn strict_mode_restart_replays_commands_it_rejects_from_clients() -> io::Result<
     drop(client);
     server.stop(false)?;
 
-    // Older builds logged XSETID. Append such a record to the newest INCR file.
+    // Older builds logged XCFGSET. Append such a record to the newest INCR file.
     let mut incr_files = std::fs::read_dir(server.dir.path())?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.to_string_lossy().ends_with(".incr.aof"))
         .collect::<Vec<_>>();
     incr_files.sort();
     let incr = incr_files.last().expect("AOF INCR file");
-    let record = b"*3\r\n$15\r\nRATATOSK.AOF.AT\r\n:1\r\n*3\r\n$6\r\nXSETID\r\n$6\r\nevents\r\n$3\r\n9-0\r\n";
+    let record = b"*3\r\n$15\r\nRATATOSK.AOF.AT\r\n:1\r\n*4\r\n$7\r\nXCFGSET\r\n$6\r\nevents\r\n$13\r\nIDMP-DURATION\r\n$2\r\n10\r\n";
     std::fs::OpenOptions::new()
         .append(true)
         .open(incr)?
@@ -284,11 +352,13 @@ fn strict_mode_restart_replays_commands_it_rejects_from_clients() -> io::Result<
     server.start()?;
     let mut client = server.client()?;
     assert_eq!(client.command(&["XLEN", "events"])?, RespFrame::Integer(1));
-    let RespFrame::Error(message) = client.command(&["XSETID", "events", "9-0"])? else {
-        panic!("strict mode should reject XSETID from a client");
+    let RespFrame::Error(message) =
+        client.command(&["XCFGSET", "events", "IDMP-DURATION", "10"])?
+    else {
+        panic!("strict mode should reject XCFGSET from a client");
     };
     assert!(
-        message.starts_with(b"ERR command XSETID is not supported in Ratatosk strict"),
+        message.starts_with(b"ERR command XCFGSET is not supported in Ratatosk strict"),
         "unexpected error: {}",
         String::from_utf8_lossy(&message)
     );

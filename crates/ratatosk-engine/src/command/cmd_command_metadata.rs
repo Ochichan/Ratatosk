@@ -247,8 +247,8 @@ pub(super) fn command_capability_tier(spec: CommandSpec) -> &'static str {
     if matches!(
         name,
         // SFLUSH parses its mode and returns OK without flushing anything.
-        // XSETID/XCFGSET validate arguments and reply OK without changing stream state.
-        "ASKING" | "READONLY" | "READWRITE" | "CLIENT UNBLOCK" | "SFLUSH" | "XSETID" | "XCFGSET"
+        // XCFGSET validates arguments and replies OK without storing them.
+        "ASKING" | "READONLY" | "READWRITE" | "CLIENT UNBLOCK" | "SFLUSH" | "XCFGSET"
     ) {
         return "syntax_only";
     }

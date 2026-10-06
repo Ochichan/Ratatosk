@@ -7,7 +7,7 @@ use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use ratatosk_engine::keyspace::{
     DbSnapshot, HashFieldEntry, ServerState, SortedSet, StoredValue, StreamConsumer, StreamEntry,
-    StreamGroup, StreamId, StreamPendingEntry,
+    StreamGroup, StreamId, StreamMeta, StreamPendingEntry,
 };
 
 use crate::error::PersistError;
@@ -252,7 +252,7 @@ impl<R: Read> RdbLoader<R> {
                 }
                 StoredValue::sorted_set(zset, expire_ms)
             }
-            RDB_TYPE_STREAM | RDB_TYPE_RATATOSK_STREAM_GROUPS => {
+            RDB_TYPE_STREAM | RDB_TYPE_RATATOSK_STREAM_GROUPS | RDB_TYPE_RATATOSK_STREAM_META => {
                 let entry_count = self.read_length()?;
                 let mut entries = Vec::with_capacity(prealloc(entry_count, MAX_PREALLOC));
                 for _ in 0..entry_count {
@@ -275,7 +275,7 @@ impl<R: Read> RdbLoader<R> {
                     entries.push(StreamEntry { id, fields });
                 }
                 let mut value = StoredValue::stream(entries, expire_ms);
-                if type_byte == RDB_TYPE_RATATOSK_STREAM_GROUPS {
+                if type_byte != RDB_TYPE_STREAM {
                     let groups = value.as_stream_groups_mut().expect("stream value");
                     let group_count = self.read_length()?;
                     for _ in 0..group_count {
@@ -321,6 +321,23 @@ impl<R: Read> RdbLoader<R> {
                             },
                         );
                     }
+                }
+                if type_byte == RDB_TYPE_RATATOSK_STREAM_META {
+                    let last_id = self.read_stream_id()?;
+                    let entries_added = self.read_i64()? as u64;
+                    let max_deleted_id = self.read_stream_id()?;
+                    let meta = StreamMeta {
+                        last_id,
+                        entries_added,
+                        max_deleted_id,
+                    };
+                    let entries = value.as_stream_entries().expect("stream value");
+                    if !meta.is_valid_for(entries) {
+                        return Err(PersistError::corrupt(
+                            "stream metadata is behind its entries",
+                        ));
+                    }
+                    *value.as_stream_meta_mut().expect("stream value") = meta;
                 }
                 value
             }
@@ -808,6 +825,60 @@ mod tests {
             matches!(result, Err(PersistError::Corrupt { .. })),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn stream_metadata_roundtrips_and_is_validated() {
+        let state = ServerState::with_default_dbs();
+        let entries = vec![StreamEntry {
+            id: StreamId { ms: 5, seq: 1 },
+            fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+        }];
+        let mut moved = StoredValue::stream(entries.clone(), None);
+        let meta = StreamMeta {
+            last_id: StreamId { ms: 100, seq: 5 },
+            entries_added: 40,
+            max_deleted_id: StreamId { ms: 3, seq: 0 },
+        };
+        *moved.as_stream_meta_mut().expect("stream") = meta;
+        state.db_mut(0).insert(Bytes::from("moved"), moved);
+        state
+            .db_mut(0)
+            .insert(Bytes::from("plain"), StoredValue::stream(entries, None));
+
+        let loaded = roundtrip_state(&state);
+        let db = loaded.db(0);
+        assert_eq!(
+            db.get(&Bytes::from("moved"))
+                .and_then(|value| value.as_stream_meta().copied()),
+            Some(meta)
+        );
+        let plain = db.get(&Bytes::from("plain")).expect("plain stream");
+        assert_eq!(
+            plain.as_stream_meta().copied(),
+            Some(StreamMeta::derived_from(
+                plain.as_stream_entries().expect("entries")
+            ))
+        );
+
+        // Metadata behind its own entries is corrupt, not silently accepted.
+        let broken = ServerState::with_default_dbs();
+        let mut value = StoredValue::stream(
+            vec![StreamEntry {
+                id: StreamId { ms: 9, seq: 0 },
+                fields: Vec::new(),
+            }],
+            None,
+        );
+        value.as_stream_meta_mut().expect("stream").last_id = StreamId { ms: 1, seq: 0 };
+        broken.db_mut(0).insert(Bytes::from("s"), value);
+        let mut bytes = Vec::new();
+        RdbSaver::new(&mut bytes).save_state(&broken).expect("save");
+        let mut target = ServerState::with_default_dbs();
+        assert!(matches!(
+            RdbLoader::new(bytes.as_slice()).load_into(&mut target),
+            Err(PersistError::Corrupt { .. })
+        ));
     }
 
     #[test]

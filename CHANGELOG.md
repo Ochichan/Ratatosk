@@ -175,9 +175,15 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
-- `XSETID` and `XCFGSET` are now `syntax_only`, so `compatibility-mode strict`
-  rejects them. They validate arguments and reply OK without changing stream
-  state.
+- `XCFGSET` is now `syntax_only`, so `compatibility-mode strict` rejects it. It
+  validates its arguments and replies OK without storing them.
+- `XSETID` now works: it sets the stream's last generated ID and, with
+  `ENTRIESADDED` and `MAXDELETEDID`, its counters, using Redis's checks and
+  error messages. Streams keep that metadata, so `XADD` (including `*` and
+  `ms-*`), `XREAD $` and `XGROUP CREATE/SETID $` follow the last generated ID
+  even after its entry is deleted, `XDEL`/`XDELEX`/`XACKDEL` record the largest
+  deleted ID, and `XINFO STREAM` reports real `last-generated-id`,
+  `entries-added` and `max-deleted-entry-id` values. `DUMP` emits `RATSK3`.
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
 - `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.
@@ -225,4 +231,10 @@ The format is based on Keep a Changelog and the versioning policy in
   empties the list. Run `BGREWRITEAOF` on the old build before upgrading to
   carry its dataset over exactly.
 - `RATSK2` `DUMP` payloads cannot be restored by older Ratatosk builds.
+- A stream whose metadata differs from what its entries imply (after `XSETID`,
+  or after deleting its newest entry) is saved with the private RDB type 130,
+  which older Ratatosk builds reject. Other streams keep type 129. Snapshots
+  without type 130 still load on older builds, and older snapshots load here
+  with the metadata derived from the entries as before. `RATSK3` `DUMP`
+  payloads likewise need this build.
 

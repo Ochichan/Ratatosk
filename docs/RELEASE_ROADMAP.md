@@ -40,9 +40,9 @@
 
 | tier | 개수 | 의미 |
 |---|---:|---|
-| `behavioral_subset` | 273 | Redis 의미론에 근접, differential 대상 |
+| `behavioral_subset` | 274 | Redis 의미론에 근접, differential 대상 |
 | `baseline_local` | 75 | 로컬 단일노드 한정 동작 |
-| `syntax_only` | 8 | 문법/arity만 검증, 의미 미보장 ⚠️ |
+| `syntax_only` | 7 | 문법/arity만 검증, 의미 미보장 ⚠️ |
 | `unsupported` | 64 | 미지원 (distributed/functions/단일노드에서 항상 에러) |
 | `distributed_parity` | 0 | 분산 parity 없음 |
 

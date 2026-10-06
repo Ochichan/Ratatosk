@@ -48,33 +48,26 @@ pub(super) fn parse_stream_range_bound(raw: &Bytes) -> Option<StreamId> {
     Some(id)
 }
 
-pub(super) fn next_stream_id(entries: &[StreamEntry]) -> StreamId {
+/// The ID `XADD *` assigns after `last_id`, the stream's last generated ID.
+pub(super) fn next_stream_id(last_id: StreamId) -> StreamId {
     let now = now_ms();
-    let Some(last) = entries.last() else {
-        return StreamId { ms: now, seq: 0 };
-    };
-
-    if now > last.id.ms {
+    if now > last_id.ms {
         StreamId { ms: now, seq: 0 }
     } else {
         StreamId {
-            ms: last.id.ms,
-            seq: last.id.seq.saturating_add(1),
+            ms: last_id.ms,
+            seq: last_id.seq.saturating_add(1),
         }
     }
 }
 
-fn next_stream_id_for_ms(entries: &[StreamEntry], ms: i64) -> StreamId {
-    let Some(last) = entries.last() else {
-        return StreamId { ms, seq: 0 };
-    };
-
-    if ms > last.id.ms {
+fn next_stream_id_for_ms(last_id: StreamId, ms: i64) -> StreamId {
+    if ms > last_id.ms {
         StreamId { ms, seq: 0 }
-    } else if ms == last.id.ms {
+    } else if ms == last_id.ms {
         StreamId {
             ms,
-            seq: last.id.seq.saturating_add(1),
+            seq: last_id.seq.saturating_add(1),
         }
     } else {
         // The ordinary monotonicity check below reports the compatibility
@@ -151,12 +144,12 @@ pub(super) fn cmd_xadd(
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(err("ERR internal error"));
     };
-    let Some(stream) = entry.as_stream_entries_mut() else {
+    let Some((stream, meta)) = entry.as_stream_entries_and_meta_mut() else {
         return wrong_type_response();
     };
 
     let id = if id_raw.as_ref() == b"*" {
-        next_stream_id(stream)
+        next_stream_id(meta.last_id)
     } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
         let Some(ms_text) = std::str::from_utf8(ms_raw).ok() else {
             return CommandOutcome::reply(err(
@@ -168,7 +161,7 @@ pub(super) fn cmd_xadd(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
         };
-        next_stream_id_for_ms(stream, ms)
+        next_stream_id_for_ms(meta.last_id, ms)
     } else {
         let Some(parsed) = parse_stream_id(id_raw) else {
             return CommandOutcome::reply(err(
@@ -182,7 +175,9 @@ pub(super) fn cmd_xadd(
         return CommandOutcome::reply(err("ERR The ID specified in XADD must be greater than 0-0"));
     }
 
-    if stream.last().is_some_and(|last| id <= last.id) {
+    // Compared with the last generated ID, not the top entry, so deleting
+    // entries never lets an older ID back in.
+    if id <= meta.last_id {
         return CommandOutcome::reply(err(
             "ERR The ID specified in XADD is equal or smaller than the target stream top item",
         ));
@@ -196,6 +191,8 @@ pub(super) fn cmd_xadd(
     }
 
     stream.push(StreamEntry { id, fields });
+    meta.last_id = id;
+    meta.entries_added = meta.entries_added.saturating_add(1);
     CommandOutcome::reply(RespFrame::BulkString(Some(stream_id_to_bytes(id))))
 }
 
@@ -393,8 +390,10 @@ pub(super) fn cmd_xread(
         };
 
         let threshold = if id_raw.as_ref() == b"$" {
-            stream
-                .and_then(|entries| entries.last().map(|last| last.id))
+            // `$` is the last generated ID, which survives deleting entries.
+            db.get(key)
+                .and_then(|entry| entry.as_stream_meta())
+                .map(|meta| meta.last_id)
                 .unwrap_or(StreamId { ms: 0, seq: 0 })
         } else {
             let Some(parsed) = parse_stream_id(id_raw) else {
