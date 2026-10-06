@@ -29,7 +29,7 @@ jobs:
         run: echo "value=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
 
       - name: Cache cargo tools
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/bin/cargo-deny
