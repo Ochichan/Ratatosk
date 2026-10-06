@@ -21,6 +21,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Current month
+        id: month
+        run: echo "value=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -28,9 +32,9 @@ jobs:
             ~/.cargo/bin/cargo-cyclonedx
             ~/.cargo/registry
             ~/.cargo/git
-          key: sbom-tools-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            sbom-tools-${{ runner.os }}-
+          # Rotating monthly without a prefix fallback re-installs the current
+          # cargo-cyclonedx; an older cached binary would otherwise skip the install.
+          key: sbom-tools-${{ runner.os }}-${{ steps.month.outputs.value }}
 
       # The cache restores the binary, and `cargo install` refuses to overwrite it.
       - name: Install cargo-cyclonedx
