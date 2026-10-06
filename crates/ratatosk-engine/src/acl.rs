@@ -1,7 +1,5 @@
 use argon2::Argon2;
-use argon2::password_hash::{
-    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
-};
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use bytes::Bytes;
 use hashbrown::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
@@ -202,9 +200,9 @@ impl AclState {
     }
 
     pub fn hash_password(raw_password: &[u8]) -> Option<Bytes> {
-        let salt = SaltString::generate(&mut OsRng);
+        // Draws a 16-byte random salt from the OS.
         let hash = Argon2::default()
-            .hash_password(raw_password, &salt)
+            .hash_password(raw_password)
             .ok()?
             .to_string();
         Some(Bytes::from(hash))
@@ -406,12 +404,9 @@ fn verify_password_hash(stored: &Bytes, candidate: &[u8]) -> bool {
     let Ok(hash_str) = std::str::from_utf8(stored) else {
         return false;
     };
-    let Ok(parsed) = PasswordHash::new(hash_str) else {
-        return false;
-    };
-
+    // Parses the PHC string and verifies with the parameters stored in it.
     Argon2::default()
-        .verify_password(candidate, &parsed)
+        .verify_password(candidate, hash_str)
         .is_ok()
 }
 
