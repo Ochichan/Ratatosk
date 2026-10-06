@@ -368,11 +368,19 @@ fn shared_encoding(frame: &RespFrame) -> Option<&'static [u8]> {
 /// send a reply of any size while holding at most one piece in memory, even
 /// when the reply repeats a large value many times.
 pub struct ReplySegments<'a> {
-    pending: Vec<(&'a RespFrame, RespVersion)>,
+    /// Work left, innermost last. Aggregates keep an iterator over their
+    /// children, so this grows with nesting depth rather than reply width.
+    pending: Vec<Pending<'a>>,
     ready: std::collections::VecDeque<Bytes>,
     buf: Vec<u8>,
     chunk_bytes: usize,
     zero_copy_min: usize,
+}
+
+enum Pending<'a> {
+    One(&'a RespFrame, RespVersion),
+    Items(std::slice::Iter<'a, RespFrame>, RespVersion),
+    Entries(std::slice::Iter<'a, (RespFrame, RespFrame)>, RespVersion),
 }
 
 impl<'a> ReplySegments<'a> {
@@ -384,7 +392,7 @@ impl<'a> ReplySegments<'a> {
         zero_copy_min: usize,
     ) -> Self {
         Self {
-            pending: vec![(frame, version)],
+            pending: vec![Pending::One(frame, version)],
             ready: std::collections::VecDeque::new(),
             buf: Vec::new(),
             chunk_bytes: chunk_bytes.max(1),
@@ -399,13 +407,13 @@ impl<'a> ReplySegments<'a> {
     /// Writes one frame's own bytes and queues its children in wire order.
     fn step(&mut self, frame: &'a RespFrame, version: RespVersion) {
         match frame {
-            RespFrame::Versioned { version, frame } => self
-                .pending
-                .push((frame, RespVersion::from_protocol_version(*version))),
+            RespFrame::Versioned { version, frame } => self.pending.push(Pending::One(
+                frame,
+                RespVersion::from_protocol_version(*version),
+            )),
             RespFrame::Array(items) => {
                 write_aggregate_header(b'*', items.len(), &mut self.buf);
-                self.pending
-                    .extend(items.iter().rev().map(|item| (item, version)));
+                self.pending.push(Pending::Items(items.iter(), version));
             }
             RespFrame::Push(items) => {
                 let marker = match version {
@@ -413,8 +421,7 @@ impl<'a> ReplySegments<'a> {
                     RespVersion::Resp3 => b'>',
                 };
                 write_aggregate_header(marker, items.len(), &mut self.buf);
-                self.pending
-                    .extend(items.iter().rev().map(|item| (item, version)));
+                self.pending.push(Pending::Items(items.iter(), version));
             }
             RespFrame::Map(entries) => {
                 match version {
@@ -425,14 +432,11 @@ impl<'a> ReplySegments<'a> {
                         write_aggregate_header(b'*', entries.len().saturating_mul(2), &mut self.buf)
                     }
                 }
-                for (key, value) in entries.iter().rev() {
-                    self.pending.push((value, version));
-                    self.pending.push((key, version));
-                }
+                self.pending.push(Pending::Entries(entries.iter(), version));
             }
-            RespFrame::Sequence(frames) => self
-                .pending
-                .extend(frames.iter().rev().map(|frame| (frame, version))),
+            RespFrame::Sequence(frames) => {
+                self.pending.push(Pending::Items(frames.iter(), version))
+            }
             RespFrame::BulkString(Some(value)) if value.len() >= self.zero_copy_min => {
                 self.buf.push(b'$');
                 let mut len_buf = Buffer::new();
@@ -460,10 +464,25 @@ impl Iterator for ReplySegments<'_> {
             if self.buf.len() >= self.chunk_bytes {
                 return Some(self.take_buf());
             }
-            let Some((frame, version)) = self.pending.pop() else {
+            let Some(work) = self.pending.pop() else {
                 return (!self.buf.is_empty()).then(|| self.take_buf());
             };
-            self.step(frame, version);
+            match work {
+                Pending::One(frame, version) => self.step(frame, version),
+                Pending::Items(mut items, version) => {
+                    if let Some(item) = items.next() {
+                        self.pending.push(Pending::Items(items, version));
+                        self.step(item, version);
+                    }
+                }
+                Pending::Entries(mut entries, version) => {
+                    if let Some((key, value)) = entries.next() {
+                        self.pending.push(Pending::Entries(entries, version));
+                        self.pending.push(Pending::One(value, version));
+                        self.step(key, version);
+                    }
+                }
+            }
         }
     }
 }

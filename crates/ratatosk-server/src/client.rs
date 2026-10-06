@@ -2420,7 +2420,9 @@ mod tests {
             .await
             .expect("set write timeout");
         assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
-        let size = 3 * 1024 * 1024;
+        // Larger than the loopback socket buffers can absorb (up to 4 MiB on
+        // each side on macOS), so the server must keep writing past the timeout.
+        let size = 16 * 1024 * 1024;
         client
             .write_all(format!("SETRANGE big {} x\r\n", size - 1).as_bytes())
             .await
@@ -2430,13 +2432,13 @@ mod tests {
             format!(":{size}\r\n").as_bytes()
         );
 
-        // Reading 16 KiB every 10 ms takes about two seconds, twice the write
-        // timeout, while the server keeps making progress.
+        // Reading 64 KiB every 10 ms takes about 2.5 seconds, more than twice
+        // the write timeout, while the server keeps making progress.
         client.write_all(b"GET big\r\n").await.expect("write get");
         let header = format!("${size}\r\n");
         let total = header.len() + size + 2;
         let mut received = Vec::with_capacity(total);
-        let mut chunk = vec![0u8; 16 * 1024];
+        let mut chunk = vec![0u8; 64 * 1024];
         while received.len() < total {
             let n = timeout(Duration::from_secs(5), client.read(&mut chunk))
                 .await
