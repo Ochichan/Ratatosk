@@ -1089,6 +1089,11 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     // the configured cap is lower than the persisted dataset. Admission is
     // enabled only after startup loading has completed.
     initial_state.config.set_maxmemory(0);
+    // Strict mode is a client-facing policy. An AOF written in compat mode may
+    // hold commands strict mode rejects, and replay must still apply them.
+    initial_state
+        .config
+        .set_compatibility_mode(Bytes::from_static(b"compat"));
     let server_state = Arc::new(SharedState::new(initial_state));
 
     // Taken before the persistence runtime opens (and may upgrade) any file.
@@ -1123,6 +1128,9 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     {
         let mut state = server_state.meta.lock().await;
         state.config.set_maxmemory(config.maxmemory);
+        state
+            .config
+            .set_compatibility_mode(Bytes::from(config.compatibility_mode.clone()));
         server_state.update_config_cache(&state.config);
     }
 

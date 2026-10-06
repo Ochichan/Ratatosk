@@ -4619,6 +4619,9 @@ fn capture_durability_effects(
         // a successful CONFIG reply as if it were data.
         b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SELECT" | b"CONFIG"
         | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF" | b"PUBLISH" | b"SPUBLISH" => None,
+        // XSETID/XCFGSET reply OK without changing stream state, and strict
+        // mode rejects them, so logging them would only make replay fragile.
+        b"XSETID" | b"XCFGSET" => None,
         _ if is_write_command(argv) && raw_command_changed_state(command, response) => {
             Some(argv.to_vec())
         }
@@ -6335,6 +6338,34 @@ mod tests {
                 )))
             );
         }
+    }
+
+    #[test]
+    fn stream_admin_commands_that_change_no_state_are_not_logged() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        run(
+            &["XADD", "mystream", "5-1", "a", "b"],
+            &mut server,
+            &mut client,
+        );
+        assert!(client.take_durability_effects().is_some());
+        assert_eq!(
+            run(&["XSETID", "mystream", "9-0"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert!(client.take_durability_effects().is_none());
+        assert_eq!(
+            run(
+                &["XCFGSET", "mystream", "IDMP-DURATION", "10"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert!(client.take_durability_effects().is_none());
     }
 
     #[test]

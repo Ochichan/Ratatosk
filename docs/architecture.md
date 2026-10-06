@@ -1855,9 +1855,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | Tier | Value |
 | --- | ---: |
 | unsupported | 64 |
-| syntax_only | 6 |
+| syntax_only | 8 |
 | baseline_local | 75 |
-| behavioral_subset | 275 |
+| behavioral_subset | 273 |
 | distributed_parity | 0 |
 
 ## Group Progress
@@ -1900,7 +1900,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | server | 0 | 34 | 41 | 1 | 7 | 83 |
 | set | 0 | 17 | 0 | 0 | 0 | 17 |
 | sorted_set | 0 | 35 | 0 | 0 | 0 | 35 |
-| stream | 0 | 28 | 0 | 0 | 0 | 28 |
+| stream | 0 | 26 | 0 | 2 | 0 | 28 |
 | string | 0 | 25 | 0 | 0 | 0 | 25 |
 | transactions | 0 | 5 | 0 | 0 | 0 | 5 |
 
@@ -2272,7 +2272,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XACKDEL` | stream | 8.2.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
 | `XADD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (auto-ID and explicit ID checks, field/value append). |
 | `XAUTOCLAIM` | stream | 6.2.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
-| `XCFGSET` | stream | 8.6.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
+| `XCFGSET` | stream | 8.6.0 | done | syntax_only | m3-events | Validates arguments and returns OK without changing stream state. IDMP-DURATION and IDMP-MAXSIZE are parsed and not stored. |
 | `XCLAIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XDEL` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `XDELEX` | stream | 8.2.0 | done | behavioral_subset | m3-events | Batch-6 stream extended deletion/config baseline implemented. |
@@ -2294,7 +2294,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). |
 | `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). |
 | `XREVRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (reverse inclusive range + COUNT option). |
-| `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
+| `XSETID` | stream | 5.0.0 | done | syntax_only | m3-events | Validates arguments and returns OK without changing stream state. No last-ID metadata is kept, so a later XADD * can generate an ID lower than the one given. |
 | `XTRIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `ZADD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
 | `ZCARD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
