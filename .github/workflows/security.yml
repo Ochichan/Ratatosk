@@ -41,11 +41,18 @@ jobs:
           # an upgrade. Rotating monthly re-saves the current tools.
           key: security-tools-${{ runner.os }}-${{ steps.month.outputs.value }}
 
+      # The cache restores the binaries, and `cargo install` refuses to overwrite them.
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: |
+          if ! cargo deny --version >/dev/null 2>&1; then
+            cargo install cargo-deny --locked
+          fi
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: |
+          if ! cargo audit --version >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
 
       - name: Cargo deny
         run: cargo deny check advisories bans licenses sources
