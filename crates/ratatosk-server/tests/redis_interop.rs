@@ -254,7 +254,9 @@ fn required_external_tool(name: &str) -> io::Result<PathBuf> {
                 format!("required external tool {name} was not found in PATH"),
             )
         })?;
-    let executable = fs::canonicalize(executable)?;
+    // Keep symlinks: Debian's redis-server links to the multi-call redis-check-rdb,
+    // which picks its mode from argv[0].
+    let executable = std::path::absolute(executable)?;
     let check_dir = tempfile::tempdir()?;
     let stdout_path = check_dir.path().join("version.stdout.log");
     let stderr_path = check_dir.path().join("version.stderr.log");
