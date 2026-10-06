@@ -117,6 +117,7 @@ the contract — it is exercised by `scripts/recovery_matrix.sh` (Phase 4).
 Recovery invariants (asserted by `scripts/recovery_matrix.sh`):
 
 - **Truncated AOF tail** → server starts and recovers a consistent *prefix*; the incomplete transaction is omitted and the invalid tail is removed before new writes. A fully recorded write can be replayed even if the client did not receive its reply.
+- **Damage followed by more records** → server refuses to start and leaves the file untouched; the error names the byte offset. After taking a backup, truncating the file to that offset keeps the records before the damage.
 - **`kill -9` during `BGREWRITEAOF`** → restart recovers the full pre-rewrite dataset; no corruption.
 - **Missing manifest with segments on disk** → server either rebuilds or fails startup cleanly; it never reports an empty keyspace as a successful start (no silent data loss).
 - **Repeated `BGREWRITEAOF`** → keyspace size is stable across rewrites.
@@ -196,7 +197,7 @@ ratatosk --no-config-autoload --config /etc/ratatosk/ratatosk.conf
 ## Config File Format
 
 - One directive per line
-- `#` starts a comment
+- `#` at the start of a token starts a comment; inside a value (for example a path) it is literal
 - Values with spaces should be quoted
 - Empty string values can be written as `""`
 - `CONFIG REWRITE` writes a round-trippable `ratatosk.conf` under the active `dir`
@@ -335,7 +336,7 @@ re-evaluate the already-bound socket.
 # Ratatosk Ecosystem Integration
 
 Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Sub 이벤트 버스 역할을 맡는다.
-이 문서는 **현재 코드 상태**(2026-06-02)와 외부 프로젝트 통합 기준을 정리한다.
+이 문서는 **현재 코드 상태**(2026-06-02)와 다른 서비스와 함께 쓸 때의 통합 기준을 정리한다.
 
 ## Implementation Status (2026-06-02)
 
@@ -343,7 +344,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - 명령 카탈로그: `420` entries
 - status summary: `done=420`
-- capability tier summary: `unsupported=63`, `syntax_only=6`, `baseline_local=76`, `behavioral_subset=275`, `distributed_parity=0`
+- capability tier summary: `unsupported=64`, `syntax_only=6`, `baseline_local=75`, `behavioral_subset=275`, `distributed_parity=0`
 - 즉, "명령 이름 존재"와 "Redis 행동 parity"는 같은 뜻이 아니다.
 
 ### 인프라 구현 상태
@@ -401,13 +402,12 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 ## Integration Matrix
 
-| Service | Role with Ratatosk | Protocol | Typical Use |
+| Workload | Role with Ratatosk | Protocol | Typical Use |
 | --- | --- | --- | --- |
-| Conductor | 실행 상태 캐시 + 실행 이벤트 fanout | RESP3 TCP | DAG node intermediate result, execution events |
-| Ironclaw | 세션 캐시 + provider rate-limit counter | RESP3 TCP | session context TTL, API quota counter |
-| command-center | TUI 상태 공유 + Pub/Sub 수신 | RESP3 TCP | live event stream, undo/clipboard cache |
-| Rustmux | 세션 메타데이터 캐시(선택) | RESP3 TCP | terminal session index/cache |
-| Muninn | 검색 결과 단기 캐시(선택) | RESP3 TCP | hot query result cache |
+| Workflow engine | 실행 상태 캐시 + 실행 이벤트 fanout | RESP3 TCP | DAG node intermediate result, execution events |
+| API gateway | 세션 캐시 + provider rate-limit counter | RESP3 TCP | session context TTL, API quota counter |
+| Interactive client (TUI 등) | 상태 공유 + Pub/Sub 수신 | RESP3 TCP | live event stream, undo/clipboard cache |
+| Search service | 검색 결과 단기 캐시(선택) | RESP3 TCP | hot query result cache |
 
 ## Deployment Baseline
 
@@ -422,8 +422,10 @@ cargo run -p ratatosk-server --bin ratatosk --release
   Set `RATATOSK_PORT=6380` when running alongside Redis. A startup warning is emitted when using port 6379.
 - **Dynamic sidecar port**: `RATATOSK_PORT=0` asks the OS to choose an ephemeral loopback port.
   Sidecar supervisors should set `RATATOSK_BOUND_ADDR_FILE=/path/to/bound-addr.json`; Ratatosk
-  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` after the TCP listener binds,
-  with optional `unixsocket` and `shm_socket` keys when those local listeners are configured.
+  writes `{"bound_addr":"127.0.0.1:<port>","bound_port":<port>}` once the listeners are bound
+  and the persisted dataset has loaded, so the file also signals readiness. It carries optional
+  `unixsocket` and `shm_socket` keys when those local listeners are configured. A failed startup
+  never writes it; delete a stale file before relaunching.
   The structured startup log event `ratatosk listener bound` also includes `bound_port`.
 
 ### Autostart (systemd --user)
@@ -442,7 +444,7 @@ cargo run -p ratatosk-server --bin ratatosk --release
 ./scripts/install-ratatosk-autostart-macos.sh
 ```
 
-- macOS 기본 포트: `6379` -- Kirei bridges.toml 설정과 일치.
+- macOS 기본 포트: `6379`.
 - plist 경로: `~/Library/LaunchAgents/dev.ratatosk.serve.plist`
 - 로그 경로: `~/Library/Logs/Ratatosk/`
 - 데이터/audit 경로: `<repo>/data/`
@@ -464,33 +466,103 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
 | `RATATOSK_ALLOW_INSECURE_BIND` | unset | non-loopback bind opt-in |
 | `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | allow shutdown to continue after appendonly flush failure |
-| `RATATOSK_AUDIT_LOG` | `/tmp/ratatosk-audit.log` | append-only audit event log path |
-| `RATATOSK_AUDIT_CHAIN_STATE` | `/tmp/ratatosk-audit-chain.state` | audit chain checkpoint path |
+| `RATATOSK_AUDIT_LOG` | `<dir>/ratatosk-audit.log` | append-only audit event log path |
+| `RATATOSK_AUDIT_CHAIN_STATE` | `<dir>/ratatosk-audit-chain.state` | audit chain checkpoint path |
 
 On Unix, SIGTERM enters the graceful shutdown path and should exit successfully
 after clients/background tasks drain within `RATATOSK_SHUTDOWN_GRACE_MS`.
+SIGUSR1 starts a background RDB save (like `BGSAVE`); a save already in
+progress is left to finish.
+
+The server holds an exclusive lock on `<dir>/ratatosk.lock` while it runs. A
+second instance pointed at the same data directory exits at startup instead of
+appending to the same AOF; the lock is released by the kernel when the process
+exits, even on `kill -9`, and the file itself can stay in place.
+
+On Linux and macOS, startup and `--check-config` compare the process's soft
+open-file limit with `max_clients + 128`. Insufficient headroom refuses startup;
+the server does not change the host's limits. Linux reads `/proc/self/limits`.
+macOS queries the inherited limit through the fixed `/bin/sh` builtin
+`ulimit -S -n`, with an empty environment and no stdin. Query or parse failures
+on macOS are errors. The local builtin query is synchronous; it has no separate
+subprocess deadline. Other platforms still report the preflight as unsupported.
 
 런타임 `CONFIG SET` 지원:
-- `timeout`, `hz`, `appendonly`, `appendfsync` (always/everysec/no)
+- `timeout`, `hz`, `maxmemory` (바이트, `0`은 무제한), `appendonly`, `appendfsync` (always/everysec/no)
 - `compatibility-mode`, `protected-mode`, `dbfilename`, `dir`, `save`
 - `slowlog-log-slower-than`, `slowlog-max-len`, `latency-tracking`
 - `pubsub-queue-hard-limit` (mpsc channel capacity), `pubsub-queue-soft-limit`, `pubsub-queue-soft-seconds`
 - `active-expire-cycle-lookups`, `active-expire-cycle-threshold-pct`
 - `query-buffer-limit`, `output-buffer-flush-threshold`, `client-write-timeout-sec`
-- `maxmemory`/`maxmemory-policy`/`maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET`에서만 노출되며 런타임 `CONFIG SET`으로는 변경할 수 없다(catch-all에서 `ERR Unknown option` 반환).
+- `maxmemory-policy`/`maxmemory-samples`, `notify-keyspace-events`, `tcp-keepalive`, `lazyfree-lazy-*`는 `CONFIG GET`에서만 노출되며 런타임 `CONFIG SET`으로는 변경할 수 없다(catch-all에서 `ERR Unknown option` 반환).
+
+## Memory admission under noeviction
+
+`maxmemory` is a byte limit on the estimated stored dataset, not a process RSS or
+allocator quota. With `noeviction` and a nonzero limit, commands that may grow the
+dataset are rejected with `OOM` when the current estimate already exceeds it.
+Reads, deletion and administrative recovery remain available. An accepted large
+command, transaction or Lua invocation can cross the limit; later growing work is
+refused. Raising the limit or setting it to `0` permits writes again.
+
+The limited path measures current values instead of relying on the periodically
+corrected counter, so repeated in-place hash/list growth and shrinking values are
+visible without waiting for cron. This requires a dataset scan and has a cost
+that increases with dataset size. The default unlimited path avoids that scan.
+Estimates include sorted-set member bytes, but are not exact allocator accounting.
+Other eviction policies continue to use the existing cron eviction behavior.
+
+OOM while queueing a growing command dirties MULTI, causing EXECABORT. If the
+server is already over its limit when EXEC begins, a transaction containing
+memory-growing commands is rejected before its first operation. Once admitted,
+EXEC and a Lua invocation run as a unit for this admission check; they are not
+partially rejected solely because their own earlier writes crossed the limit.
+With `lua-scripting`, `EVAL_RO` and `EVALSHA_RO` reject nested commands outside
+an explicit data-read allowlist before dispatch, for both `redis.call` and
+`redis.pcall`. This boundary restricts Redis command effects; it is not a general
+host sandbox. AUTH and HELLO are forbidden inside all Lua callbacks.
+
+All four EVAL variants retain conservative potentially-growing admission because
+script execution/caching can allocate. RO requests can therefore be rejected
+under OOM even when their dataset reads would be safe. Ordinary read commands
+remain available. This differs from full Redis EVAL_RO behavior; the scripting
+tier is not promoted by this change.
+
+## Reliability report qualification
+
+`bash scripts/reliability_report.sh` writes a report and a separate log for each
+executed check under `RELIABILITY_OUT_DIR` (default: `benchmarks/`). The default
+release policy requires `format,build,lint,test,audit,deny,gap-ledger,strict-mode,
+recovery-matrix,backup-restore-drill,perf-guardrail,redis-differential,resp-fuzz`.
+Missing tools or disabled checks remain SKIP. Differential and fuzz are currently
+unwired in this local report, so the default report is INCOMPLETE, not a release
+PASS. Existing recovery/performance commands retain their own runtime requirements.
+
+Exit `0` requires every declared required check to pass; required FAIL, SKIP or
+missing evidence exits `1`. An invalid required-check policy or malformed report
+integrity exits `2`. An explicit `RELIABILITY_REQUIRED_CHECKS` override selects a
+nonempty, unique list of known IDs. Its success is `PASS (SCOPED)` for that list
+and is explicitly not full release qualification. Setting
+`RELIABILITY_RUN_RECOVERY=0` or `RELIABILITY_RUN_PERF=0` does not waive a required
+check: it makes the report incomplete. Per-check logs retain the actual command
+output and exit status; recognized warning diagnostics also fail the check.
+
+`python3 -W error scripts/test_reliability_report.py` exercises this decision
+logic in a temporary fixture with controlled commands. It does not execute or
+qualify actual Redis differential, fuzz, recovery, supply-chain or performance
+checks.
 
 ## Recommended Key Naming
 
-- Conductor: `conductor:exec:<exec_id>:node:<node_id>`
-- Ironclaw session: `ironclaw:session:<sid>`
-- Ironclaw rate-limit: `ironclaw:ratelimit:<provider>:<window>`
-- command-center session: `cc:session:<sid>:state`
-- Muninn cache: `muninn:cache:<query_hash>`
+- Workflow state: `<service>:exec:<exec_id>:node:<node_id>`
+- Session: `<service>:session:<sid>`
+- Rate limit: `<service>:ratelimit:<provider>:<window>`
+- Query cache: `<service>:cache:<query_hash>`
 
 운영 규칙:
 - 공유 키는 서비스 prefix를 강제한다.
 - 캐시 키는 TTL을 기본값으로 둔다(무기한 키 금지).
-- Pub/Sub 채널은 도메인 prefix로 분리한다(`conductor:events:*`).
+- Pub/Sub 채널은 도메인 prefix로 분리한다(`<service>:events:*`).
 
 ### Key Prefix Convention
 
@@ -499,29 +571,29 @@ Ratatosk does **not** implement built-in key-prefix enforcement — there is no
 are an operational **convention** for services that coexist on one instance,
 enforced by clients/operators rather than by the server:
 
-- `conductor:`, `ironclaw:`, `cc:`, `muninn:`, `rustmux:`
+- one short prefix per service, such as `<service>:`, with no prefix shared by two services
 
 ## Integration Playbooks
 
-### Conductor -> Ratatosk
+### Workflow engine -> Ratatosk
 
 - 중간 산출물은 TTL key로 저장하고, 완료 이벤트는 Pub/Sub으로 전파.
 - 장애 시 fallback: 프로세스 로컬 메모리 캐시 + polling 이벤트 경로.
 
-### Ironclaw -> Ratatosk
+### API gateway -> Ratatosk
 
 - active session context를 TTL key로 저장.
 - provider quota는 `INCR` + `EXPIRE` 조합으로 window counter 구현.
 
-### command-center -> Ratatosk
+### Interactive client -> Ratatosk
 
-- TUI 상태를 hash/list로 저장하고, Pub/Sub으로 실시간 이벤트 수신.
+- 클라이언트 상태를 hash/list로 저장하고, Pub/Sub으로 실시간 이벤트 수신.
 - Ratatosk 미가용 시 로컬 상태 모드로 degrade.
 
-### Muninn -> Ratatosk
+### Search service -> Ratatosk
 
 - semantic search 결과를 short TTL로 캐시.
-- 캐시 미스 시에만 Muninn 검색 경로 실행.
+- 캐시 미스 시에만 검색 서비스 경로 실행.
 
 ## Operational Notes
 
@@ -533,7 +605,7 @@ Ratatosk은 선택적 의존성으로 취급한다.
 ### Security defaults
 
 - loopback bind 기본 + insecure bind explicit opt-in.
-- AUTH brute force prevention: per-connection progressive delay (지수 백오프 + 지터, 최대 2초) + 5회 연속 실패 시 연결 종료, per-IP `AuthRateLimiter` (60초 윈도우 내 20회 실패 시 거부).
+- AUTH/HELLO AUTH: 연결별 지수 지연(기본 상한 2초에 jitter 적용)과 5회 연속 실패 시 종료. 공유 TCP peer IP는 60초 내 20회 실패 후 인증을 거절하며 성공·재접속·RESET으로 기록이 지워지지 않는다. IP 최대4096개에 도달하면 새 IP 인증도 공간 확보 전까지 거절한다. UDS/SHM은 연결별 제한만 적용한다. proxy/NAT 공유 IP와 프로세스 재시작 시 초기화에 유의한다.
 - audit trail은 append log를 `flush + sync_all` 한 뒤 checkpoint state를 atomic rename으로 저장한다. checkpoint가 뒤처져도 startup에서 durable audit log를 우선해 복구한다.
 - `MONITOR`는 `+OK`를 반환하고 해당 연결을 monitor 모드로 등록하며, 이후 실행된 명령을 `Arc<Notify>` 기반으로 등록된 클라이언트에게 broadcast한다 (baseline 수준, full Redis parity는 아님). 명령 인자가 그대로 노출되므로 신뢰된 운영 연결에서만 사용할 것.
 - TLS 종단은 프록시 계층(stunnel, nginx stream, envoy 등)에서 처리 권장.
@@ -561,29 +633,11 @@ Ratatosk은 선택적 의존성으로 취급한다.
 
 ---
 
-## Part 4: Ecosystem Port Configuration
+## Part 4: Port Configuration
 
 <!-- Source: ecosystem-ports.md -->
 
-# Ecosystem Port Configuration
-
-Standard port assignments and configuration for all services in the ecosystem.
-
-## Quick Reference
-
-| Service | Port | Protocol | Purpose | Env Override |
-|---------|------|----------|---------|--------------|
-| Ratatosk | 6379 | TCP (RESP3) | Redis-compatible data store (default) | `RATATOSK_PORT` |
-| Ratatosk | 6380 | TCP (RESP3) | Recommended coexistence port | `RATATOSK_PORT` |
-| Muninn | 6333 | HTTP | REST API (axum) | `MUNINN_PORT` |
-| Muninn | 6334 | gRPC | gRPC API (tonic) | `MUNINN_GRPC_PORT` |
-| Conductor | 9100 | TCP (JSON-RPC) | Command-center bridge | `CONDUCTOR_COMMAND_CENTER_ADDR` |
-| Conductor | 8090 | HTTP | Planner (FastAPI/uvicorn) | `CONDUCTOR_PLANNER_URL` |
-| Ironclaw | 8080 | HTTP/WebSocket | Gateway | `IRONCLAW_GATEWAY_PORT` |
-
-## Ratatosk
-
-RESP3 in-memory data store serving as cache and Pub/Sub event bus.
+# Port Configuration
 
 | Property | Value |
 |----------|-------|
@@ -597,101 +651,8 @@ RESP3 in-memory data store serving as cache and Pub/Sub event bus.
 
 A startup warning is emitted when using port 6379. The systemd autostart unit defaults to 6380.
 
-## Muninn
-
-Vector database with REST and gRPC interfaces for semantic search and memory.
-
-### REST API
-
-| Property | Value |
-|----------|-------|
-| Default port | `6333` |
-| Port env var | `MUNINN_PORT` |
-| Bind address | `127.0.0.1` |
-| Bind env var | `MUNINN_HOST` |
-| Protocol | HTTP (axum) |
-| TLS | Not built-in; non-loopback bind requires `MUNINN_ALLOW_INSECURE_BIND=true` or TLS proxy |
-
-### gRPC API
-
-| Property | Value |
-|----------|-------|
-| Default port | `6334` |
-| Port env var | `MUNINN_GRPC_PORT` |
-| Bind address | `127.0.0.1` (shares `MUNINN_HOST`) |
-| Protocol | gRPC (tonic) |
-| TLS | Not built-in; same insecure-bind guard as REST |
-
-## Conductor
-
-Workflow execution engine with a JSON-RPC bridge and HTTP planner.
-
-### Command-center bridge (TCP)
-
-| Property | Value |
-|----------|-------|
-| Default address | `127.0.0.1:9100` |
-| Env var | `CONDUCTOR_COMMAND_CENTER_ADDR` (full `host:port`) |
-| Protocol | TCP line-delimited JSON-RPC |
-| TLS | Not built-in |
-
-### Platform API
-
-| Property | Value |
-|----------|-------|
-| Default address | `127.0.0.1:9150` |
-| Env var | `CONDUCTOR_PLATFORM_API_ADDR` (full `host:port`) |
-| Protocol | TCP JSON-RPC |
-| TLS | Not built-in |
-
-### Planner (HTTP)
-
-| Property | Value |
-|----------|-------|
-| Default URL | `http://127.0.0.1:8090` |
-| Env var | `CONDUCTOR_PLANNER_URL` (full URL) |
-| Protocol | HTTP (FastAPI/uvicorn) |
-| TLS | Required for non-local hosts (enforced by `PlannerEndpoint`) |
-
-## Ironclaw
-
-AI agent gateway serving HTTP and WebSocket connections.
-
-| Property | Value |
-|----------|-------|
-| Default port | `8080` |
-| Port env var | `IRONCLAW_GATEWAY_PORT` |
-| Bind address | `127.0.0.1` (loopback) |
-| Bind env var | `IRONCLAW_GATEWAY_BIND` |
-| Protocol | HTTP + WebSocket |
-| TLS | Configurable via `gateway.require_tls`; proxy-layer termination supported via `trusted_proxies` |
-
-## Standardized Naming Convention
-
-Environment variables follow a `{SERVICE}_{COMPONENT}` pattern:
-
-| Pattern | Examples |
-|---------|----------|
-| `{SERVICE}_PORT` | `RATATOSK_PORT`, `MUNINN_PORT`, `IRONCLAW_GATEWAY_PORT` |
-| `{SERVICE}_BIND` | `RATATOSK_BIND`, `MUNINN_HOST`, `IRONCLAW_GATEWAY_BIND` |
-| `{SERVICE}_ADDR` | `CONDUCTOR_COMMAND_CENTER_ADDR` (combined `host:port`) |
-| `{SERVICE}_URL` | `CONDUCTOR_PLANNER_URL` (full URL with scheme) |
-
-Conventions:
-- Separate `_PORT` / `_BIND` variables when the service uses a simple TCP/HTTP listener.
-- Combined `_ADDR` (`host:port`) when the variable configures a connection target rather than a listener.
-- Full `_URL` (with scheme) when the protocol may vary (HTTP vs HTTPS).
-- All services default to loopback (`127.0.0.1`) and require explicit opt-in for non-loopback binding.
-
-## Cross-Service Dependencies
-
-| Consumer | Dependency | Default Target | Env Override (consumer side) |
-|----------|------------|----------------|------------------------------|
-| Ironclaw | Ratatosk (cache) | `redis://127.0.0.1/` | `IRONCLAW_STORAGE_REDIS_URL` |
-| Ironclaw | Muninn (memory) | `http://127.0.0.1:8000` | `IRONCLAW_STORAGE_MUNINN_URL` |
-| Ironclaw | Conductor (bridge) | env-only, no default | `IRONCLAW_CONDUCTOR_ADDR` |
-| Conductor | Muninn | env-only | `CONDUCTOR_MUNINN_ADDR` |
-| Conductor | Ratatosk | via planner/runtime | `CONDUCTOR_PLANNER_URL` |
+Ratatosk keeps `_PORT` and `_BIND` as separate variables and defaults to loopback
+(`127.0.0.1`); a non-loopback bind requires an explicit opt-in.
 
 ---
 
@@ -769,24 +730,6 @@ Ratatosk persistence/health surfaces also expose:
 - `INFO persistence`: `audit_chain_dirty`, `audit_recovery_status`
 - `PING HEALTH`: `status`, `audit_chain_dirty`, `audit_recovery_status`
 
-### Muninn
-
-- **Endpoint**: `GET /health`
-- **Components**: inference (engine health), disk (space check), storage (write probe), recovery (WAL replay status)
-- **Contract version**: Field in health JSON response
-
-### Conductor
-
-- **Endpoint**: Bridge health handler (JSON-RPC `health` method)
-- **Components**: planner (HTTP ready check), sqlite (ping), memory (adapter health), cache (circuit breaker state), inference_pool (if configured)
-- **Contract version**: Field in health JSON response
-
-### Ironclaw
-
-- **Endpoint**: `health` RPC method
-- **Components**: storage (session backend), channels (per-channel connected status), memory (Muninn gateway), agent (LLM provider), mcp (server statuses)
-- **Contract version**: Field in health JSON response
-
 ## Probing
 
 Upstream services should:
@@ -815,10 +758,14 @@ Upstream services should:
 
 ## 1. Metrics
 
-- Prometheus exporter 기본 bind: `127.0.0.1:9090`
-- override: `RATATOSK_METRICS_BIND`
-- exporter 초기화 실패는 기본적으로 startup failure다
+- Prometheus exporter 기본 bind: `127.0.0.1:9090` (`GET /metrics`)
+- override: `RATATOSK_METRICS_BIND` — 한 호스트의 인스턴스마다 다른 주소가 필요하다
+- exporter 초기화 실패(예: 포트 사용 중)는 기본적으로 startup failure다
 - 예외적으로 `RATATOSK_ALLOW_NO_METRICS=true`에서만 metrics 없이 계속 실행할 수 있다
+- latency 계열(`*_seconds`, `*_ms`, `*_attempts`)은 bucket이 있는 Prometheus histogram이므로
+  `histogram_quantile(…_bucket…)`로 집계한다
+- `ratatosk_memory_used_bytes`는 `INFO memory`의 `used_memory`와 같은 논리 추정치이며
+  `maxmemory` 설정과 무관하게 매 cron tick 갱신된다(full-scan 보정 주기: 제한 시 10 tick, 무제한 시 90 tick)
 
 근거: `crates/ratatosk-server/src/metrics.rs`, `crates/ratatosk-server/src/main.rs`
 
@@ -1200,9 +1147,9 @@ README가 이미 선언하듯 Ratatosk의 현재 경계는 다음과 같다.
 gap-ledger 기준:
 
 - total commands: 420
-- `unsupported`: 63
+- `unsupported`: 64
 - `syntax_only`: 6
-- `baseline_local`: 76
+- `baseline_local`: 75
 - `behavioral_subset`: 275
 - `distributed_parity`: 0
 
@@ -1763,3 +1710,23 @@ Ratatosk는 persistence 쪽이 예상보다 강하다.
 - [GitHub protected branches](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)
 - [Dependabot version updates](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/configuring-dependabot-version-updates)
 - [Export SBOM](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/exporting-a-software-bill-of-materials-for-your-repository)
+
+## 외부 Redis 비교 시험 실행 (2026-09-13 갱신)
+
+기본 `cargo test --workspace`에서 외부 Redis가 필요한 두 시험은 `ignored`로 표시된다. 기본 gate의 성공은 Redis 비교 성공을 뜻하지 않는다. Unix 환경에서 실제 `redis-server`와 `redis-cli`를 준비한 뒤 명시적으로 실행한다.
+
+```bash
+cargo test -p ratatosk-server --test redis_interop -- --include-ignored --nocapture
+```
+
+이 명령은 두 외부 시험과 같은 파일의 Ratatosk 자체 시험을 실행하며, 외부 바이너리가 없거나 실패하면 시험도 실패한다. 기존 `RATATOSK_REQUIRE_REDIS_INTEROP=1` 플래그만으로는 ignored 시험이 실행되지 않는다. Redis Interop CI도 위 명령을 사용한다. 비교 대상 Redis는 소유한 임시 디렉터리의 Unix socket으로만 열고 TCP는 비활성화한다.
+
+결과에는 사용한 Redis 버전·바이너리 identity를 별도로 남긴다. 이 suite는 버전을 pin하지 않으며, 일부 응답 비교와 redis-cli PING 성공을 전체 Redis 호환성·격리망 배포 적격성으로 확대하지 않는다.
+
+## 인증 실패로 종료되는 pipeline / EXEC
+
+AUTH와 HELLO AUTH는 같은 자격 증명 검사·실패 지연·종료 경로를 사용한다. 연결 종료가 요청되면 같은 pipeline의 뒤 명령은 실행하지 않는다. EXEC 안에서도 terminal outcome 뒤의 큐를 실행하지 않고, 이미 실행한 명령의 응답·변경·영속성 기록만 유지한다. 인증 실패로 중단된 EXEC는 전체 rollback이 아니므로, 자격 증명 협상은 업무 transaction 전에 끝낸다. 정상 EXEC의 기존 성공 동작은 유지한다.
+
+Lua compatibility change: the OS library is no longer exposed in `lua-scripting` builds, including `os.time` and `os.date`. Obtain timestamps with TIME outside an RO script and pass ARGV, or use redis.call('TIME') in ordinary EVAL/EVALSHA. Date formatting remains caller work. This removes process/file OS entry points without asserting a complete hostile-code sandbox.
+
+Lua 오류 traceback과 err/ok 응답 테이블의 CR/LF는 RESP line framing을 깨지 않도록 공백으로 변환한다. 일반 Lua 문자열의 bulk payload는 그대로 보존한다. 오류 후에도 같은 연결의 다음 응답을 정상적으로 읽을 수 있어야 한다.

@@ -15,6 +15,18 @@ use crate::error::PersistError;
 use super::checksum::Crc64Digest;
 use super::format::*;
 
+/// Cap on capacity reserved up front from a length read out of the file.
+///
+/// Lengths are untrusted until the trailing CRC is verified, and a corrupt
+/// one must fail as an error rather than abort on a huge allocation. Larger
+/// containers grow as their elements are actually read.
+const MAX_PREALLOC: usize = 4096;
+const MAX_STRING_PREALLOC: usize = 1024 * 1024;
+
+fn prealloc(len: u64, cap: usize) -> usize {
+    usize::try_from(len).map_or(cap, |len| len.min(cap))
+}
+
 /// RDB loader: deserializes a binary RDB file into a `ServerState`.
 pub struct RdbLoader<R: Read> {
     reader: R,
@@ -181,24 +193,24 @@ impl<R: Read> RdbLoader<R> {
                 StoredValue::string(data, expire_ms)
             }
             RDB_TYPE_LIST => {
-                let len = self.read_length()? as usize;
-                let mut list = VecDeque::with_capacity(len);
+                let len = self.read_length()?;
+                let mut list = VecDeque::with_capacity(prealloc(len, MAX_PREALLOC));
                 for _ in 0..len {
                     list.push_back(self.read_string()?);
                 }
                 StoredValue::list(list, expire_ms)
             }
             RDB_TYPE_SET => {
-                let len = self.read_length()? as usize;
-                let mut set = HashSet::with_capacity(len);
+                let len = self.read_length()?;
+                let mut set = HashSet::with_capacity(prealloc(len, MAX_PREALLOC));
                 for _ in 0..len {
                     set.insert(self.read_string()?);
                 }
                 StoredValue::set(set, expire_ms)
             }
             RDB_TYPE_HASH | RDB_TYPE_RATATOSK_HASH_TTL => {
-                let len = self.read_length()? as usize;
-                let mut hash = HashMap::with_capacity(len);
+                let len = self.read_length()?;
+                let mut hash = HashMap::with_capacity(prealloc(len, MAX_PREALLOC));
                 for _ in 0..len {
                     let field = self.read_string()?;
                     let value = self.read_string()?;
@@ -226,20 +238,23 @@ impl<R: Read> RdbLoader<R> {
                 StoredValue::hash(hash, expire_ms)
             }
             RDB_TYPE_ZSET => {
-                let len = self.read_length()? as usize;
+                let len = self.read_length()?;
                 let mut zset = SortedSet::default();
                 for _ in 0..len {
                     let member = self.read_string()?;
                     let mut score_buf = [0u8; 8];
                     self.read_bytes(&mut score_buf)?;
                     let score = f64::from_bits(u64::from_le_bytes(score_buf));
+                    if score.is_nan() {
+                        return Err(PersistError::corrupt("sorted set score is NaN"));
+                    }
                     zset.insert(member, score);
                 }
                 StoredValue::sorted_set(zset, expire_ms)
             }
             RDB_TYPE_STREAM | RDB_TYPE_RATATOSK_STREAM_GROUPS => {
-                let entry_count = self.read_length()? as usize;
-                let mut entries = Vec::with_capacity(entry_count);
+                let entry_count = self.read_length()?;
+                let mut entries = Vec::with_capacity(prealloc(entry_count, MAX_PREALLOC));
                 for _ in 0..entry_count {
                     let mut ms_buf = [0u8; 8];
                     let mut seq_buf = [0u8; 8];
@@ -250,8 +265,8 @@ impl<R: Read> RdbLoader<R> {
                         seq: i64::from_le_bytes(seq_buf),
                     };
 
-                    let field_count = self.read_length()? as usize;
-                    let mut fields = Vec::with_capacity(field_count);
+                    let field_count = self.read_length()?;
+                    let mut fields = Vec::with_capacity(prealloc(field_count, MAX_PREALLOC));
                     for _ in 0..field_count {
                         let fk = self.read_string()?;
                         let fv = self.read_string()?;
@@ -410,8 +425,17 @@ impl<R: Read> RdbLoader<R> {
                     _ => unreachable!(),
                 };
 
-                let mut data = vec![0u8; len as usize];
-                self.read_bytes(&mut data)?;
+                // Read incrementally: a corrupt length must hit EOF, not
+                // allocate the whole claimed size first.
+                let mut data = Vec::with_capacity(prealloc(len, MAX_STRING_PREALLOC));
+                (&mut self.reader)
+                    .take(len)
+                    .read_to_end(&mut data)
+                    .map_err(|_| PersistError::UnexpectedEof)?;
+                if data.len() as u64 != len {
+                    return Err(PersistError::UnexpectedEof);
+                }
+                self.digest.update(&data);
                 Ok(Bytes::from(data))
             }
             3 => {
@@ -743,6 +767,47 @@ mod tests {
             result.unwrap_err(),
             PersistError::CrcMismatch { .. }
         ));
+    }
+
+    fn header_then(body: &[u8]) -> Vec<u8> {
+        let mut raw = Vec::from(&b"REDIS0012"[..]);
+        raw.extend_from_slice(body);
+        raw
+    }
+
+    #[test]
+    fn corrupt_lengths_fail_without_allocating_the_claimed_size() {
+        let huge = [RDB_64BITLEN, 0x10, 0, 0, 0, 0, 0, 0, 0]; // 2^60
+        let cases = [
+            // String value whose length claims 2^60 bytes.
+            [&[RDB_TYPE_STRING, 1, b'k'][..], &huge[..]].concat(),
+            // List claiming 2^60 elements.
+            [&[RDB_TYPE_LIST, 1, b'k'][..], &huge[..]].concat(),
+            // Hash claiming 2^60 fields.
+            [&[RDB_TYPE_HASH, 1, b'k'][..], &huge[..]].concat(),
+        ];
+        for body in cases {
+            let raw = header_then(&body);
+            let mut loaded = ServerState::with_default_dbs();
+            let result = RdbLoader::new(raw.as_slice()).load_into(&mut loaded);
+            assert!(
+                matches!(result, Err(PersistError::UnexpectedEof)),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_sorted_set_score_is_corruption() {
+        let mut body = vec![RDB_TYPE_ZSET, 1, b'z', 1, 1, b'm'];
+        body.extend_from_slice(&f64::NAN.to_bits().to_le_bytes());
+        let raw = header_then(&body);
+        let mut loaded = ServerState::with_default_dbs();
+        let result = RdbLoader::new(raw.as_slice()).load_into(&mut loaded);
+        assert!(
+            matches!(result, Err(PersistError::Corrupt { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]

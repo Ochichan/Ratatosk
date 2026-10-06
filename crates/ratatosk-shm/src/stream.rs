@@ -114,6 +114,7 @@ impl ShmStream {
         loop {
             match self.control.try_read(&mut scratch) {
                 Ok(0) => return Ok(Drain::Eof),
+                Err(error) if peer_reset(&error) => return Ok(Drain::Eof),
                 Ok(_) => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     return Ok(Drain::Drained);
@@ -153,6 +154,7 @@ impl ShmStream {
             loop {
                 match self.control.try_read(&mut scratch) {
                     Ok(0) => return Ok(true),
+                    Err(error) if peer_reset(&error) => return Ok(true),
                     Ok(_) => continue,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -161,6 +163,13 @@ impl ShmStream {
             }
         }
     }
+}
+
+/// Linux resets a Unix stream socket, instead of reporting EOF, when the peer
+/// closes it with doorbell bytes still unread. The control socket carries only
+/// doorbells, so a reset means the peer closed.
+fn peer_reset(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ConnectionReset
 }
 
 /// Send one doorbell byte with a direct non-blocking `send(2)`.
@@ -437,6 +446,17 @@ mod tests {
         assert_eq!(n, 0, "EOF expected");
         let error = server.write_all(b"x").await.expect_err("write must fail");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn peer_drop_with_unread_doorbells_yields_eof() {
+        let (mut server, client) = pair(4096, 0);
+        ring_doorbell(&server.control);
+        drop(client);
+        let mut buf = [0u8; 8];
+        let n = server.read(&mut buf).await.expect("read after peer drop");
+        assert_eq!(n, 0, "EOF expected");
+        assert!(server.peer_closed().await.expect("peer_closed"));
     }
 
     #[tokio::test]

@@ -21,6 +21,13 @@ else
   exit 1
 fi
 
+# OpenBSD/GNU nc needs -N to shut the socket down after EOF; Apple nc uses -N
+# for something else, so only pass it where it means "shutdown".
+NC_OPTS=(-w 1)
+if [[ "$REDIS_CLIENT_MODE" == "nc" ]] && nc -h 2>&1 | grep -qiE -- '-N[[:space:]].*shutdown'; then
+  NC_OPTS=(-N -w 1)
+fi
+
 if command -v cargo >/dev/null 2>&1; then
   CARGO_CMD=(cargo)
 else
@@ -74,7 +81,7 @@ resp_request() {
 
 redis_cmd_nc() {
   local raw first first_char
-  raw="$(resp_request "$@" | nc -N -w 1 127.0.0.1 "$PORT" 2>/dev/null)" || return 1
+  raw="$(resp_request "$@" | nc "${NC_OPTS[@]}" 127.0.0.1 "$PORT" 2>/dev/null)" || return 1
   first="$(printf '%s' "$raw" | head -n 1 | tr -d '\r')"
   first_char="${first:0:1}"
 
@@ -156,6 +163,7 @@ start_server() {
   RATATOSK_MAX_CLIENTS="$MAX_CLIENTS" \
   RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS="$CONN_RATE_LIMIT_MAX_ATTEMPTS" \
   RATATOSK_APPENDFSYNC=always \
+  RATATOSK_DISABLE_CONFIG_AUTOLOAD=true \
   "$SERVER_BIN" >"$logfile" 2>&1 &
   SERVER_PID="$!"
   wait_for_ready
@@ -181,7 +189,8 @@ populate_dataset() {
 
 echo "[smoke] using client mode: $REDIS_CLIENT_MODE"
 echo "[smoke] building ratatosk-server ($PROFILE profile)"
-"${CARGO_CMD[@]}" build -p ratatosk-server --bin ratatosk "${BUILD_ARGS[@]}"
+# `${a[@]+...}` keeps an empty array legal under `set -u` on bash 3.2 (macOS).
+"${CARGO_CMD[@]}" build -p ratatosk-server --bin ratatosk ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"}
 
 echo "[smoke] scenario 1/2: appendonly=true (BGREWRITEAOF success path)"
 AOF_ON_DIR="$WORK_DIR/aof-on"

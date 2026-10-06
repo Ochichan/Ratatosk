@@ -62,18 +62,24 @@ fn parse_bitfield_encoding(raw: &Bytes) -> Option<BitfieldEncoding> {
     Some(BitfieldEncoding { bits, signed })
 }
 
+/// Bits addressable in a `proto-max-bulk-len` string.
+const MAX_BITFIELD_BITS: usize = crate::object::PROTO_MAX_BULK_LEN * 8;
+
+/// Parses a bit offset, or `#index` scaled by the field width, and rejects
+/// fields that would end past the largest allowed string. Without that bound
+/// a SET or INCRBY would grow the value to an arbitrary size.
 fn parse_bitfield_offset(raw: &Bytes, encoding: &BitfieldEncoding) -> Option<usize> {
     let s = std::str::from_utf8(raw).ok()?;
     if s.is_empty() {
         return None;
     }
-    if let Some(rest) = s.strip_prefix('#') {
+    let offset = if let Some(rest) = s.strip_prefix('#') {
         let multiplier: usize = rest.parse().ok()?;
-        Some(multiplier.checked_mul(encoding.bits as usize)?)
+        multiplier.checked_mul(encoding.bits as usize)?
     } else {
-        let offset: usize = s.parse().ok()?;
-        Some(offset)
-    }
+        s.parse().ok()?
+    };
+    (offset.checked_add(encoding.bits as usize)? <= MAX_BITFIELD_BITS).then_some(offset)
 }
 
 fn read_bits(data: &[u8], bit_offset: usize, bits: u8, signed: bool) -> i64 {

@@ -4,7 +4,7 @@ mod util;
 
 use std::{
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -218,8 +218,16 @@ pub async fn load_startup_data(
 ) -> io::Result<()> {
     if appendonly {
         let recovery_paths = startup_aof_recovery_paths(runtime)?;
-        if aof_chain_has_authoritative_data(&recovery_paths)? {
-            for path in recovery_paths {
+        // Files after the last one holding data are empty or header-only,
+        // like the INCR file the writer opens before startup replays.
+        let mut last_data_index = None;
+        for (index, path) in recovery_paths.iter().enumerate() {
+            if aof_file_has_data(path)? {
+                last_data_index = Some(index);
+            }
+        }
+        if let Some(last_data_index) = last_data_index {
+            for (index, path) in recovery_paths.into_iter().enumerate() {
                 if path.extension().is_some_and(|extension| extension == "rdb") {
                     let snapshot = ratatosk_persist::rdb::loader::load(&path).map_err(|error| {
                         io::Error::other(format!("loading AOF BASE snapshot: {error}"))
@@ -229,7 +237,10 @@ pub async fn load_startup_data(
                     state.load_from_rdb(snapshot);
                     tracing::info!(path = %path.display(), keys = key_count, "loaded authoritative AOF BASE snapshot");
                 } else {
-                    replay_startup_aof_file(server_state, &path).await?;
+                    // Only the file still being appended to can have a torn
+                    // tail. Cutting an earlier file would drop writes that
+                    // later files build on, so that is refused instead.
+                    replay_startup_aof_file(server_state, &path, index >= last_data_index).await?;
                 }
             }
             return Ok(());
@@ -263,42 +274,39 @@ pub async fn load_startup_data(
     Ok(())
 }
 
-fn aof_chain_has_authoritative_data(paths: &[PathBuf]) -> io::Result<bool> {
-    const AOF_HEADER_LEN: u64 = b"REDIS-AOF-001\n".len() as u64;
-
-    for path in paths {
-        if path.extension().is_some_and(|extension| extension == "rdb") {
-            return Ok(true);
-        }
-
-        let metadata = std::fs::metadata(path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "reading AOF recovery metadata '{}': {error}",
-                    path.display()
-                ),
-            )
-        })?;
-        if metadata.len() == 0 {
-            continue;
-        }
-
-        let header = std::fs::read(path).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("reading AOF recovery file '{}': {error}", path.display()),
-            )
-        })?;
-        if (header.starts_with(b"REDIS-AOF-001\n") || header.starts_with(b"REDIS-AOF-002\n"))
-            && metadata.len() <= AOF_HEADER_LEN
-        {
-            continue;
-        }
+/// Whether a recovery file holds data: any BASE snapshot, or an AOF with more
+/// than its version header.
+fn aof_file_has_data(path: &Path) -> io::Result<bool> {
+    if path.extension().is_some_and(|extension| extension == "rdb") {
         return Ok(true);
     }
 
-    Ok(false)
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "reading AOF recovery metadata '{}': {error}",
+                path.display()
+            ),
+        )
+    })?;
+    const V2_HEADER: &[u8] = b"REDIS-AOF-002\n";
+    const V1_HEADER: &[u8] = b"REDIS-AOF-001\n";
+    let header_len = V2_HEADER.len() as u64;
+    if metadata.len() > header_len {
+        return Ok(true);
+    }
+    if metadata.len() == 0 {
+        return Ok(false);
+    }
+
+    let head = std::fs::read(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("reading AOF recovery file '{}': {error}", path.display()),
+        )
+    })?;
+    Ok(head != V2_HEADER && head != V1_HEADER)
 }
 
 pub async fn start_bgsave(server_state: Arc<SharedState>, rdb_path: PathBuf) -> bool {

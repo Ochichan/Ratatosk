@@ -8,7 +8,7 @@ use ratatosk_engine::{
     command::supports_readonly_batch_command,
     eviction::estimate_object_memory,
     keyspace::{DbShard, LexBound, ScoreBound, SortedSet},
-    object::{format_f64_for_redis, parse_i64},
+    object::{format_f64_for_redis, normalize_string_range, parse_i64},
 };
 
 use super::*;
@@ -99,23 +99,6 @@ fn popcount_byte(byte: u8) -> i64 {
     i64::from(byte.count_ones())
 }
 
-fn resolve_range(mut start: i64, mut end: i64, len: usize) -> (usize, usize) {
-    let len_i64 = len as i64;
-    if start < 0 {
-        start += len_i64;
-    }
-    if end < 0 {
-        end += len_i64;
-    }
-    if start < 0 {
-        start = 0;
-    }
-    if end < 0 {
-        return (1, 0);
-    }
-    (start as usize, end as usize)
-}
-
 fn tracked_remove_from_shard<Q>(
     shard: &mut DbShard,
     server_state: &SharedServerState,
@@ -132,6 +115,8 @@ fn tracked_remove_from_shard<Q>(
     shard.expires.remove(owned_key.as_ref());
     let freed = estimate_object_memory(&owned_key, &value);
     server_state.data.sub_memory(selected_db, freed);
+    // An expiry is a modification for WATCH, whichever path removes the key.
+    server_state.data.record_modification(shard, &owned_key);
 }
 
 fn purge_expired_key_in_shard(
@@ -169,13 +154,7 @@ fn purge_expired_keys_in_shard(
 }
 
 fn parse_score_bound(raw: &Bytes) -> Option<ScoreBound> {
-    let raw = std::str::from_utf8(raw).ok()?;
-    match raw {
-        "-inf" => Some(ScoreBound::NegInf),
-        "+inf" | "inf" => Some(ScoreBound::PosInf),
-        _ if raw.starts_with('(') => Some(ScoreBound::Exclusive(raw[1..].parse::<f64>().ok()?)),
-        _ => Some(ScoreBound::Inclusive(raw.parse::<f64>().ok()?)),
-    }
+    ScoreBound::parse(raw)
 }
 
 fn parse_lex_bound(raw: &Bytes) -> Option<LexBound> {
@@ -192,22 +171,6 @@ fn parse_lex_bound(raw: &Bytes) -> Option<LexBound> {
         return Some(LexBound::Exclusive(Bytes::copy_from_slice(&raw[1..])));
     }
     None
-}
-
-fn score_in_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
-    let above_min = match min {
-        ScoreBound::NegInf => true,
-        ScoreBound::Inclusive(value) => score >= *value,
-        ScoreBound::Exclusive(value) => score > *value,
-        ScoreBound::PosInf => false,
-    };
-    let below_max = match max {
-        ScoreBound::PosInf => true,
-        ScoreBound::Inclusive(value) => score <= *value,
-        ScoreBound::Exclusive(value) => score < *value,
-        ScoreBound::NegInf => false,
-    };
-    above_min && below_max
 }
 
 fn member_in_lex_range(member: &Bytes, min: &LexBound, max: &LexBound) -> bool {
@@ -374,27 +337,10 @@ fn collect_lock_free_zrange_entries(
                 ));
             };
 
-            let len = zset.len();
-            if len == 0 {
-                Vec::new()
-            } else {
-                let len_i64 = len as i64;
-                let start = if start_i < 0 {
-                    (start_i + len_i64).max(0) as usize
-                } else {
-                    usize::try_from(start_i).unwrap_or(usize::MAX)
-                };
-                let mut stop = if stop_i < 0 {
-                    (stop_i + len_i64).max(0) as usize
-                } else {
-                    usize::try_from(stop_i).unwrap_or(usize::MAX)
-                };
-
-                stop = stop.min(len.saturating_sub(1));
-                if start > stop || start >= len {
-                    Vec::new()
-                } else {
-                    let take_len = stop.saturating_sub(start).saturating_add(1);
+            match normalize_range(zset.len(), start_i, stop_i) {
+                None => Vec::new(),
+                Some((start, stop)) => {
+                    let take_len = stop - start + 1;
                     if rev {
                         zset.by_score
                             .keys()
@@ -433,17 +379,14 @@ fn collect_lock_free_zrange_entries(
                 (low, high)
             };
 
+            let entries = zset.range_by_score(min, max);
             if rev {
-                zset.by_score
-                    .keys()
+                entries
                     .rev()
-                    .filter(|entry| score_in_range(entry.score.value(), &min, &max))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             } else {
-                zset.by_score
-                    .keys()
-                    .filter(|entry| score_in_range(entry.score.value(), &min, &max))
+                entries
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             }
@@ -787,33 +730,26 @@ pub(super) fn try_execute_lock_free_fast_command(
                             false
                         };
 
-                        if bit_mode {
-                            let total_bits = data.len().saturating_mul(8);
-                            let (start, end) = resolve_range(start_raw, end_raw, total_bits);
-                            if start > end || start >= total_bits {
-                                RespFrame::Integer(0)
-                            } else {
-                                let end = end.min(total_bits.saturating_sub(1));
+                        let unit_len = if bit_mode {
+                            data.len().saturating_mul(8)
+                        } else {
+                            data.len()
+                        };
+                        match normalize_string_range(unit_len, start_raw, end_raw) {
+                            None => RespFrame::Integer(0),
+                            Some((start, end)) if bit_mode => {
                                 let mut count = 0i64;
                                 for bit_pos in start..=end {
                                     count += i64::from(get_bit(&data, bit_pos));
                                 }
                                 RespFrame::Integer(count)
                             }
-                        } else {
-                            let byte_len = data.len();
-                            let (start, end) = resolve_range(start_raw, end_raw, byte_len);
-                            if start > end || start >= byte_len {
-                                RespFrame::Integer(0)
-                            } else {
-                                let end = end.min(byte_len.saturating_sub(1));
-                                RespFrame::Integer(
-                                    data[start..=end]
-                                        .iter()
-                                        .map(|byte| popcount_byte(*byte))
-                                        .sum(),
-                                )
-                            }
+                            Some((start, end)) => RespFrame::Integer(
+                                data[start..=end]
+                                    .iter()
+                                    .map(|byte| popcount_byte(*byte))
+                                    .sum(),
+                            ),
                         }
                     }
                 }
@@ -912,7 +848,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                     Some(entry) => {
                         let bytes = entry.as_string_bytes().unwrap_or_default();
                         if let Some((range_start, range_end)) =
-                            normalize_range(bytes.len(), start, end)
+                            normalize_string_range(bytes.len(), start, end)
                         {
                             RespFrame::BulkString(Some(Bytes::copy_from_slice(
                                 &bytes[range_start..=range_end],
@@ -1392,15 +1328,8 @@ pub(super) fn try_execute_lock_free_fast_command(
                     Some(entry) => match entry.as_sorted_set() {
                         None => RespFrame::wrongtype(),
                         Some(zset) => RespFrame::Integer(
-                            i64::try_from(
-                                zset.by_score
-                                    .keys()
-                                    .filter(|member| {
-                                        score_in_range(member.score.value(), &min, &max)
-                                    })
-                                    .count(),
-                            )
-                            .unwrap_or(i64::MAX),
+                            i64::try_from(zset.range_by_score(min, max).count())
+                                .unwrap_or(i64::MAX),
                         ),
                     },
                 }
@@ -2227,4 +2156,31 @@ pub(super) async fn try_run_readonly_batch(
     );
 
     Ok(outcomes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatosk_engine::keyspace::{ServerState, SharedState, StoredValue};
+
+    #[test]
+    fn lock_free_expiry_counts_as_a_watched_modification() {
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let key = Bytes::from_static(b"k");
+        shared.data.write_db(0).data.insert(
+            key.clone(),
+            StoredValue::string(Bytes::from_static(b"v"), Some(1)),
+        );
+        let watched_version = shared.data.watch_key(0, &key);
+
+        let mut db = shared.data.write_db(0);
+        purge_expired_key_in_shard(&mut db, &shared, 0, &key, 2);
+        assert!(!db.data.contains_key(&key));
+        drop(db);
+
+        // EXEC compares this version with the one WATCH recorded.
+        assert_ne!(shared.data.watch_key(0, &key), watched_version);
+        shared.data.unwatch_key(0, &key);
+        shared.data.unwatch_key(0, &key);
+    }
 }

@@ -1,21 +1,82 @@
-import socket, time, sys, json, statistics
-mode, target = sys.argv[1], sys.argv[2]
-n = int(sys.argv[3]) if len(sys.argv) > 3 else 20000
-if mode == "tcp":
-    host, port = target.rsplit(":", 1)
-    s = socket.create_connection((host, int(port)))
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-else:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(target)
-req = b"*1\r\n$4\r\nPING\r\n"
-def rt():
-    s.sendall(req); b = b""
-    while not b.endswith(b"\r\n"): b += s.recv(64)
-    assert b == b"+PONG\r\n", b
-for _ in range(2000): rt()
-xs = []
-for _ in range(n):
-    t = time.perf_counter_ns(); rt(); xs.append(time.perf_counter_ns() - t)
-xs.sort()
-q = lambda p: xs[min(len(xs)-1, int(p*len(xs)))]
-print(json.dumps({"mode": mode, "n": n, "p50_us": q(0.5)/1e3, "p95_us": q(0.95)/1e3, "p99_us": q(0.99)/1e3, "p999_us": q(0.999)/1e3, "max_us": xs[-1]/1e3}))
+"""Minimal lockstep PING round-trip latency probe (Python stdlib only).
+
+Usage:
+    python3 scripts/ipc_rtt_lite.py tcp 127.0.0.1:6380 [samples]
+    python3 scripts/ipc_rtt_lite.py unix /path/to/ratatosk.sock [samples]
+
+Prints one JSON line with p50/p95/p99/p99.9/max in microseconds. It is a quick
+sanity check; `cargo run -p ratatosk-ipc-bench` is the real harness.
+"""
+
+import json
+import socket
+import sys
+import time
+
+REQUEST = b"*1\r\n$4\r\nPING\r\n"
+REPLY = b"+PONG\r\n"
+WARMUP = 2000
+
+
+def connect(mode: str, target: str) -> socket.socket:
+    if mode == "tcp":
+        host, port = target.rsplit(":", 1)
+        sock = socket.create_connection((host, int(port)))
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+    if mode == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(target)
+        return sock
+    raise SystemExit(f"unknown mode {mode!r}; expected 'tcp' or 'unix'")
+
+
+def round_trip(sock: socket.socket) -> None:
+    sock.sendall(REQUEST)
+    reply = b""
+    while not reply.endswith(b"\r\n"):
+        chunk = sock.recv(64)
+        if not chunk:
+            raise SystemExit("server closed the connection")
+        reply += chunk
+    if reply != REPLY:
+        raise SystemExit(f"unexpected reply {reply!r}")
+
+
+def main() -> None:
+    if len(sys.argv) < 3:
+        raise SystemExit(__doc__)
+    mode, target = sys.argv[1], sys.argv[2]
+    samples = int(sys.argv[3]) if len(sys.argv) > 3 else 20000
+
+    with connect(mode, target) as sock:
+        for _ in range(WARMUP):
+            round_trip(sock)
+        latencies = []
+        for _ in range(samples):
+            started = time.perf_counter_ns()
+            round_trip(sock)
+            latencies.append(time.perf_counter_ns() - started)
+
+    latencies.sort()
+
+    def quantile(p: float) -> float:
+        return latencies[min(len(latencies) - 1, int(p * len(latencies)))] / 1e3
+
+    print(
+        json.dumps(
+            {
+                "mode": mode,
+                "n": samples,
+                "p50_us": quantile(0.5),
+                "p95_us": quantile(0.95),
+                "p99_us": quantile(0.99),
+                "p999_us": quantile(0.999),
+                "max_us": latencies[-1] / 1e3,
+            }
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

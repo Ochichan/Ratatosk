@@ -27,11 +27,11 @@ pub enum PeerKind {
 #[derive(Debug, Clone)]
 pub struct ConnInfo {
     pub kind: PeerKind,
-    /// Redis `CLIENT LIST` addr= value. TCP: "ip:port". Unix: "<socket-path>:0".
+    /// Redis `CLIENT LIST` addr= value. TCP: `ip:port`. Unix: `<socket-path>:0`.
     pub addr: Bytes,
-    /// Redis `CLIENT LIST` laddr= value. TCP: "ip:port". Unix: "<socket-path>:0".
+    /// Redis `CLIENT LIST` laddr= value. TCP: `ip:port`. Unix: `<socket-path>:0`.
     pub laddr: Bytes,
-    /// Human-readable remote for tracing spans / logs (TCP: "ip:port"; Unix: "unix:<path>").
+    /// Human-readable remote for tracing spans / logs (TCP: `ip:port`; Unix: `unix:<path>`).
     pub remote_display: String,
     /// Peer IP for the connection rate limiter; None for Unix.
     pub peer_ip: Option<IpAddr>,

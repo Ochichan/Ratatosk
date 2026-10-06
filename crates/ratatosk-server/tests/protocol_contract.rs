@@ -437,6 +437,57 @@ where
 }
 
 #[tokio::test]
+async fn hostile_frames_cannot_crash_the_server_or_desync_replies() {
+    let (addr, server_task) = start_tcp_server(3).await;
+
+    // A few hundred kilobytes of nested arrays used to overflow the parser's
+    // stack and abort the whole process before any authentication.
+    let mut nested = TcpStream::connect(addr)
+        .await
+        .expect("connect nested client");
+    let mut payload = b"*1\r\n".repeat(100_000);
+    payload.extend_from_slice(&bulk("PING"));
+    nested
+        .write_all(&payload)
+        .await
+        .expect("write nested frame");
+    expect_wire(&mut nested, b"-ERR protocol error\r\n").await;
+    // Closing with unread input may surface as a reset instead of EOF.
+    let mut rest = Vec::new();
+    match timeout(Duration::from_secs(1), nested.read_to_end(&mut rest))
+        .await
+        .expect("closed after protocol error")
+    {
+        Ok(_) => assert!(rest.is_empty()),
+        Err(error) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset),
+    }
+
+    // A CR/LF quoted back in an error cannot inject a second reply.
+    let mut client = TcpStream::connect(addr).await.expect("connect client");
+    let mut pipeline = aggregate(b'*', &[bulk("foo\r\n+PWNED")]);
+    pipeline.extend(command(&["PING"]));
+    client.write_all(&pipeline).await.expect("write pipeline");
+    expect_wire(&mut client, b"-ERR unknown command 'foo  +PWNED'\r\n").await;
+    expect_wire(&mut client, b"+PONG\r\n").await;
+    drop(client);
+
+    // Inline commands end at LF and honour quoting, like redis-server, and
+    // empty requests get no reply at all.
+    let mut inline = TcpStream::connect(addr)
+        .await
+        .expect("connect inline client");
+    inline
+        .write_all(b"\r\n*0\r\n*-1\r\nSET greeting \"hello world\"\nGET greeting\r\n")
+        .await
+        .expect("write inline commands");
+    expect_wire(&mut inline, b"+OK\r\n").await;
+    expect_wire(&mut inline, &bulk("hello world")).await;
+    drop(inline);
+
+    finish_server(server_task).await;
+}
+
+#[tokio::test]
 async fn hello_replies_follow_each_negotiated_protocol_in_a_pipeline() {
     let (addr, server_task) = start_tcp_server(1).await;
     hello_replies_case(TcpStream::connect(addr).await.expect("connect client")).await;

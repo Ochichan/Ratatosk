@@ -5,6 +5,7 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{
     LexBound, ScoreBound, ServerState, SortedSet, StoredValue, purge_expired_key,
 };
+use crate::object::normalize_range;
 
 use super::cmd_sorted_set::entries_to_resp;
 use super::{
@@ -13,19 +14,7 @@ use super::{
 };
 
 fn parse_score_bound(raw: &Bytes) -> Option<ScoreBound> {
-    let s = std::str::from_utf8(raw).ok()?;
-    match s {
-        "-inf" => Some(ScoreBound::NegInf),
-        "+inf" | "inf" => Some(ScoreBound::PosInf),
-        _ if s.starts_with('(') => {
-            let val = s[1..].parse::<f64>().ok()?;
-            Some(ScoreBound::Exclusive(val))
-        }
-        _ => {
-            let val = s.parse::<f64>().ok()?;
-            Some(ScoreBound::Inclusive(val))
-        }
-    }
+    ScoreBound::parse(raw)
 }
 
 fn parse_lex_bound(raw: &Bytes) -> Option<LexBound> {
@@ -42,22 +31,6 @@ fn parse_lex_bound(raw: &Bytes) -> Option<LexBound> {
         return Some(LexBound::Exclusive(Bytes::copy_from_slice(&raw[1..])));
     }
     None
-}
-
-fn score_in_range(score: f64, min: &ScoreBound, max: &ScoreBound) -> bool {
-    let above_min = match min {
-        ScoreBound::NegInf => true,
-        ScoreBound::Inclusive(v) => score >= *v,
-        ScoreBound::Exclusive(v) => score > *v,
-        ScoreBound::PosInf => false,
-    };
-    let below_max = match max {
-        ScoreBound::PosInf => true,
-        ScoreBound::Inclusive(v) => score <= *v,
-        ScoreBound::Exclusive(v) => score < *v,
-        ScoreBound::NegInf => false,
-    };
-    above_min && below_max
 }
 
 fn member_in_lex_range(member: &Bytes, min: &LexBound, max: &LexBound) -> bool {
@@ -107,27 +80,10 @@ fn zrange_collect(
                 return Err(err("ERR value is not an integer or out of range"));
             };
 
-            let len = zset.len();
-            if len == 0 {
-                Vec::new()
-            } else {
-                let len_i64 = len as i64;
-                let start = if start_i < 0 {
-                    (start_i + len_i64).max(0) as usize
-                } else {
-                    usize::try_from(start_i).unwrap_or(usize::MAX)
-                };
-                let mut stop = if stop_i < 0 {
-                    (stop_i + len_i64).max(0) as usize
-                } else {
-                    usize::try_from(stop_i).unwrap_or(usize::MAX)
-                };
-
-                stop = stop.min(len.saturating_sub(1));
-                if start > stop || start >= len {
-                    Vec::new()
-                } else {
-                    let take_len = stop.saturating_sub(start).saturating_add(1);
+            match normalize_range(zset.len(), start_i, stop_i) {
+                None => Vec::new(),
+                Some((start, stop)) => {
+                    let take_len = stop - start + 1;
                     if rev {
                         zset.by_score
                             .keys()
@@ -168,17 +124,14 @@ fn zrange_collect(
                 (low, high)
             };
 
+            let entries = zset.range_by_score(smin, smax);
             if rev {
-                zset.by_score
-                    .keys()
+                entries
                     .rev()
-                    .filter(|entry| score_in_range(entry.score.value(), &smin, &smax))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             } else {
-                zset.by_score
-                    .keys()
-                    .filter(|entry| score_in_range(entry.score.value(), &smin, &smax))
+                entries
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             }
@@ -775,11 +728,7 @@ pub(super) fn cmd_zcount(
         return wrong_type_response();
     };
 
-    let count = zset
-        .by_score
-        .keys()
-        .filter(|entry| score_in_range(entry.score.value(), &smin, &smax))
-        .count();
+    let count = zset.range_by_score(smin, smax).count();
 
     CommandOutcome::reply(RespFrame::Integer(count as i64))
 }
@@ -963,9 +912,7 @@ pub(super) fn cmd_zremrangebyscore(
     };
 
     let to_remove: Vec<Bytes> = zset
-        .by_score
-        .keys()
-        .filter(|entry| score_in_range(entry.score.value(), &smin, &smax))
+        .range_by_score(smin, smax)
         .map(|entry| entry.member.clone())
         .collect();
 

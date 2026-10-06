@@ -12,8 +12,8 @@ use ratatosk_core::time::now_ms;
 use ratatosk_engine::{
     acl::AclState,
     eviction::{
-        EvictionConfig, EvictionPolicy, estimate_object_memory, estimate_used_memory,
-        needs_eviction, perform_eviction,
+        EvictionConfig, EvictionPolicy, needs_eviction, perform_eviction,
+        recompute_memory_estimates,
     },
     expiry::{active_expire_cycle, detect_clock_jump},
     keyspace::{ServerState, SharedState},
@@ -41,7 +41,12 @@ use crate::{
 
 const ACCEPT_ERROR_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
 const ACCEPT_ERROR_BACKOFF_MAX: Duration = Duration::from_secs(2);
+/// Cron ticks between full-scan memory estimates while maxmemory is set.
 const MEMORY_ESTIMATE_INTERVAL: u64 = 10;
+/// Cron ticks between full-scan memory estimates without a maxmemory limit.
+/// Stays below the 100-tick freshness SLO in `docs/SLO.md`, which the
+/// `RatatoskMemoryEstimateStale` alert enforces.
+const UNLIMITED_MEMORY_ESTIMATE_INTERVAL: u64 = 90;
 const DEFAULT_CONN_RATE_LIMIT_WINDOW_SECS: u64 = 10;
 const DEFAULT_CONN_RATE_LIMIT_MAX_ATTEMPTS: usize = 10;
 const ALLOW_DEFAULT_USER_NOPASS_ENV: &str = "RATATOSK_ALLOW_DEFAULT_USER_NOPASS";
@@ -69,7 +74,19 @@ fn is_transient_accept_error(error: &io::Error) -> bool {
         return true;
     }
 
-    matches!(error.raw_os_error(), Some(11 | 23 | 24))
+    // Descriptor exhaustion and transient resource shortage are worth
+    // retrying after a backoff instead of stopping the accept loop.
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(libc::EAGAIN | libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -186,7 +203,7 @@ impl Drop for SocketFileGuard {
 /// the socket path, regardless of what a connect probe says.
 #[cfg(unix)]
 fn acquire_socket_lock(path: &Path) -> io::Result<(PathBuf, fs::File)> {
-    use std::os::unix::io::AsRawFd;
+    use fs2::FileExt;
     let mut lock_name = path.as_os_str().to_owned();
     lock_name.push(".lock");
     let lock_path = PathBuf::from(lock_name);
@@ -202,10 +219,8 @@ fn acquire_socket_lock(path: &Path) -> io::Result<(PathBuf, fs::File)> {
                 format!("opening socket lock {}: {error}", lock_path.display()),
             )
         })?;
-    // SAFETY: valid descriptor owned by `file`; flock has no memory-safety preconditions.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let error = io::Error::last_os_error();
+    // `flock(LOCK_EX | LOCK_NB)` through fs2's safe wrapper.
+    if let Err(error) = file.try_lock_exclusive() {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
             format!(
@@ -216,6 +231,71 @@ fn acquire_socket_lock(path: &Path) -> io::Result<(PathBuf, fs::File)> {
         ));
     }
     Ok((lock_path, file))
+}
+
+/// Name of the per-directory instance lock.
+const DATA_DIR_LOCK_FILE: &str = "ratatosk.lock";
+
+/// Hold an exclusive lock on `<dir>/ratatosk.lock` for the life of the
+/// process. Two instances sharing a directory (easy with the default `dir .`
+/// and `RATATOSK_PORT=0`) would otherwise append to the same AOF and replace
+/// each other's snapshots. The lock dies with the process, even on `kill -9`.
+/// A filesystem without lock support only logs a warning.
+fn acquire_data_dir_lock(dir: &std::path::Path) -> io::Result<Option<std::fs::File>> {
+    use fs2::FileExt;
+
+    let path = dir.join(DATA_DIR_LOCK_FILE);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => file,
+        // A missing or unwritable directory is reported by the persistence
+        // preflight with more context.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("opening data directory lock {}: {error}", path.display()),
+            ));
+        }
+    };
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(file)),
+        Err(error)
+            if error.kind() == io::ErrorKind::WouldBlock
+                || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!(
+                    "data directory {} is in use by another running ratatosk instance (lock {} held); give each instance its own dir",
+                    dir.display(),
+                    path.display()
+                ),
+            ))
+        }
+        Err(error) => {
+            tracing::warn!(
+                target = "ratatosk::startup",
+                path = %path.display(),
+                error = %error,
+                "data directory lock unavailable on this filesystem; continuing without instance exclusion"
+            );
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -685,7 +765,7 @@ async fn flush_persistence_before_shutdown(
     let started_at = std::time::Instant::now();
     let best_effort = shutdown_best_effort_enabled();
 
-    match flush_aof(persistence).await {
+    match persistence.shutdown_aof_for_exit().await {
         Ok(()) => {
             let duration_ms = started_at.elapsed().as_secs_f64() * 1000.0;
             crate::metrics::record_shutdown_aof_flush_duration_ms(duration_ms, "success");
@@ -693,7 +773,7 @@ async fn flush_persistence_before_shutdown(
             tracing::info!(
                 target = "ratatosk::shutdown",
                 duration_ms = duration_ms,
-                "AOF flushed before shutdown"
+                "AOF flushed and worker stopped before shutdown"
             );
             Ok(true)
         }
@@ -791,6 +871,24 @@ fn build_eviction_config(state: &ServerState) -> EvictionConfig {
 async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_sec_interval: u64) {
     detect_clock_jump();
 
+    // Full-scan memory estimate that corrects drift in the incremental
+    // counters (in-place growth is not tracked) and feeds INFO memory,
+    // PING HEALTH and the Prometheus gauge. A maxmemory limit needs it every
+    // second; without one a slower cadence keeps those readings meaningful
+    // instead of reporting 0 forever. It runs before the server lock is taken
+    // and blocks only writers to the one database it is measuring, for a time
+    // proportional to its keys and collection elements.
+    let limited = server_state.config_cache.load().maxmemory() > 0;
+    let estimate_interval = if limited {
+        MEMORY_ESTIMATE_INTERVAL
+    } else {
+        UNLIMITED_MEMORY_ESTIMATE_INTERVAL
+    };
+    let recomputed = *cron_tick % estimate_interval == 0;
+    if recomputed {
+        recompute_memory_estimates(&server_state.data);
+    }
+
     let mut server = server_state.meta.lock().await;
     let current_ms = now_ms();
 
@@ -800,35 +898,23 @@ async fn server_cron(server_state: &Arc<SharedState>, cron_tick: &mut u64, ops_s
         tracing::debug!(expired, "active expiry cycle removed keys");
     }
 
-    // 2. Eviction check (incremental O(1) tracking + periodic full-scan correction)
+    let last_scan_tick = if recomputed {
+        *cron_tick
+    } else {
+        server.stats.last_memory_estimate_tick()
+    };
+    // Report the O(1) incremental counter, which follows every insert and
+    // delete and was just corrected if a scan ran; the age below counts ticks
+    // since that last correction.
+    let used_memory = server_state.data.estimated_memory() as u64;
+    server
+        .stats
+        .set_cached_memory_estimate(used_memory, last_scan_tick);
+    crate::metrics::set_memory_used(used_memory);
+
+    // 2. Eviction check (incremental O(1) tracking, corrected above)
     let eviction_config = build_eviction_config(&server);
     if eviction_config.maxmemory > 0 {
-        // Periodic full-scan correction to fix drift in incremental counters.
-        if *cron_tick % MEMORY_ESTIMATE_INTERVAL == 0 {
-            let full_scan = estimate_used_memory(&server);
-            let tracked = server_state.data.estimated_memory();
-
-            // Correct per-DB counters when drift exceeds 5%.
-            if full_scan > 0 {
-                let drift_pct =
-                    (full_scan as f64 - tracked as f64).abs() / full_scan as f64 * 100.0;
-                if drift_pct > 5.0 {
-                    // Reset per-DB counters from full scan.
-                    for db_idx in 0..server.db_count() {
-                        let db = server.db(db_idx);
-                        let db_mem: usize =
-                            db.iter().map(|(k, v)| estimate_object_memory(k, v)).sum();
-                        server_state.data.reset_memory(db_idx, db_mem);
-                    }
-                }
-            }
-
-            server
-                .stats
-                .set_cached_memory_estimate(full_scan as u64, *cron_tick);
-            crate::metrics::set_memory_used(full_scan as u64);
-        }
-
         // Use O(1) incremental estimate for eviction decisions.
         let used = server_state.data.estimated_memory();
         if needs_eviction(used, &eviction_config) {
@@ -935,18 +1021,6 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
         ..ratatosk_shm::ServerConfig::default()
     });
 
-    write_bound_addr_file_if_requested(
-        bound_addr,
-        config.unixsocket.as_deref(),
-        config.shm_socket.as_deref(),
-    )
-    .map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("writing bound TCP listener address file: {error}"),
-        )
-    })?;
-
     if config.port == 6379 {
         tracing::warn!(
             target = "ratatosk::startup",
@@ -1011,8 +1085,14 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
     load_acl_state_from_disk(&mut initial_state, &config)?;
     bootstrap_default_user_for_bind(&mut initial_state, &config)?;
     initial_state.set_lazy_free_sender(lazy_free_tx);
+    // Recovery must replay every previously acknowledged command even when
+    // the configured cap is lower than the persisted dataset. Admission is
+    // enabled only after startup loading has completed.
+    initial_state.config.set_maxmemory(0);
     let server_state = Arc::new(SharedState::new(initial_state));
 
+    // Taken before the persistence runtime opens (and may upgrade) any file.
+    let _data_dir_lock = acquire_data_dir_lock(&config.dir)?;
     let persistence = Arc::new(PersistenceRuntime::from_config(&config).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -1040,6 +1120,26 @@ pub async fn run(config: ServerConfig) -> io::Result<()> {
                 format!("loading startup persistence data: {error}"),
             )
         })?;
+    {
+        let mut state = server_state.meta.lock().await;
+        state.config.set_maxmemory(config.maxmemory);
+        server_state.update_config_cache(&state.config);
+    }
+
+    // Publish the address only once the dataset is loaded and commands can be
+    // served, so the handoff file doubles as a readiness signal and a failed
+    // load never advertises a port that is about to close.
+    write_bound_addr_file_if_requested(
+        bound_addr,
+        config.unixsocket.as_deref(),
+        config.shm_socket.as_deref(),
+    )
+    .map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("writing bound TCP listener address file: {error}"),
+        )
+    })?;
 
     let client_permits = Arc::new(Semaphore::new(config.max_clients));
     crate::metrics::set_semaphore_available_permits(client_permits.available_permits());
@@ -1552,6 +1652,46 @@ mod tests {
             .expect("env lock")
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_exhaustion_is_a_transient_accept_error_on_every_unix() {
+        for errno in [libc::EAGAIN, libc::EMFILE, libc::ENFILE] {
+            assert!(super::is_transient_accept_error(
+                &io::Error::from_raw_os_error(errno)
+            ));
+        }
+        assert!(!super::is_transient_accept_error(
+            &io::Error::from_raw_os_error(libc::EBADF)
+        ));
+    }
+
+    #[test]
+    fn data_dir_lock_excludes_a_second_instance_until_released() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let first = super::acquire_data_dir_lock(dir.path())
+            .expect("first lock")
+            .expect("lock supported");
+        let error = super::acquire_data_dir_lock(dir.path()).expect_err("second instance");
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            error
+                .to_string()
+                .contains("another running ratatosk instance")
+        );
+
+        drop(first);
+        assert!(
+            super::acquire_data_dir_lock(dir.path())
+                .expect("relock")
+                .is_some()
+        );
+        assert!(
+            super::acquire_data_dir_lock(&dir.path().join("missing"))
+                .expect("missing dir is left to the persistence preflight")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn drain_client_tasks_completes_ready_tasks() {
         let mut tasks: JoinSet<()> = JoinSet::new();
@@ -1579,14 +1719,16 @@ mod tests {
 
     #[test]
     fn shutdown_best_effort_defaults_to_false() {
-        // SAFETY: test-only env isolation for this process.
+        let _guard = env_guard();
+        // SAFETY: serialized with other environment tests by env_guard().
         unsafe { std::env::remove_var(SHUTDOWN_BEST_EFFORT_ENV) };
         assert!(!shutdown_best_effort_enabled());
     }
 
     #[test]
     fn shutdown_best_effort_reads_truthy_env() {
-        // SAFETY: test-only env isolation for this process.
+        let _guard = env_guard();
+        // SAFETY: serialized with other environment tests by env_guard().
         unsafe { std::env::set_var(SHUTDOWN_BEST_EFFORT_ENV, "true") };
         assert!(shutdown_best_effort_enabled());
         // SAFETY: test-only env isolation for this process.

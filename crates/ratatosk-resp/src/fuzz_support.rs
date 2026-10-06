@@ -75,6 +75,28 @@ mod tests {
     }
 
     #[test]
+    fn random_resp_shaped_input_upholds_the_invariants() {
+        // A stable-toolchain stand-in for the libFuzzer campaign: bytes drawn
+        // from the characters that steer the parser, including inline quoting.
+        const ALPHABET: &[u8] = b"*$+-:%_0123456789\r\n\r\n\"'\\ xa";
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        let mut input = Vec::with_capacity(64);
+        for _ in 0..20_000 {
+            input.clear();
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = (state % 48) as usize;
+            let mut bits = state;
+            for _ in 0..len {
+                bits = bits.rotate_left(5) ^ 0x9e37_79b9_7f4a_7c15;
+                input.push(ALPHABET[(bits % ALPHABET.len() as u64) as usize]);
+            }
+            drain_and_roundtrip(&input);
+        }
+    }
+
+    #[test]
     fn malformed_and_partial_input_never_panics() {
         for input in [
             b"".as_slice(),

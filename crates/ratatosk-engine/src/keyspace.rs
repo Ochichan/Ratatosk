@@ -138,10 +138,10 @@ impl SortedSet {
     /// Insert a member with a score into the sorted set.
     ///
     /// Returns `true` if this is a new member, `false` if the score was updated
-    /// for an existing member. Rejects NaN and infinite scores.
+    /// for an existing member. NaN is rejected; like Redis, `-inf` and `+inf`
+    /// are valid scores.
     pub fn insert(&mut self, member: Bytes, score: f64) -> bool {
-        // 1. Score validity check (must be first - reject NaN/Inf)
-        if !score.is_finite() {
+        if score.is_nan() {
             return false;
         }
 
@@ -219,6 +219,48 @@ impl SortedSet {
             .map(|r| self.len().saturating_sub(1).saturating_sub(r))
     }
 
+    /// Members whose score lies within `[min, max]`, in ascending order.
+    ///
+    /// The ordered index is seeked to both ends, so this costs
+    /// O(log n + matches) rather than a scan of the whole set; iterate with
+    /// `.rev()` for descending order. The seek bounds are deliberately a
+    /// little wide (the index orders `-0.0` before `0.0`) and the exact range
+    /// test is applied to every candidate.
+    pub fn range_by_score(
+        &self,
+        min: ScoreBound,
+        max: ScoreBound,
+    ) -> impl DoubleEndedIterator<Item = &SortedSetEntry> + '_ {
+        use std::ops::Bound;
+
+        let probe = |score: f64| SortedSetEntry {
+            score: SortedSetScore(score),
+            member: Bytes::new(),
+        };
+        let low = min.value();
+        let lower = if low == f64::NEG_INFINITY {
+            Bound::Unbounded
+        } else {
+            Bound::Included(probe(if low == 0.0 { -0.0 } else { low }))
+        };
+        let high = max.value();
+        let upper = if high == f64::INFINITY {
+            Bound::Unbounded
+        } else {
+            Bound::Excluded(probe(next_score_up(high)))
+        };
+        // An inverted range would make `BTreeMap::range` panic.
+        let empty = matches!((&lower, &upper), (Bound::Included(a), Bound::Excluded(b)) if a >= b);
+        let range = if empty {
+            self.by_score.range(probe(0.0)..probe(0.0))
+        } else {
+            self.by_score.range((lower, upper))
+        };
+        range
+            .map(|(entry, ())| entry)
+            .filter(move |entry| score_in_range(entry.score.value(), min, max))
+    }
+
     /// Remove all members whose score is in `[min, max]` (inclusive).
     ///
     /// Uses `BTreeMap::range` to seek to `min` in O(log n), avoiding a full
@@ -242,12 +284,71 @@ impl SortedSet {
     }
 }
 
-#[derive(Debug, Clone)]
+/// One end of a sorted-set score range (`ZRANGEBYSCORE`, `ZCOUNT`, ...).
+///
+/// `-inf` and `+inf` are ordinary inclusive bounds: as in Redis, a member
+/// whose score is `+inf` matches `ZRANGEBYSCORE key +inf +inf`.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScoreBound {
-    NegInf,
-    PosInf,
     Inclusive(f64),
     Exclusive(f64),
+}
+
+impl ScoreBound {
+    /// Parses `x`, `(x`, `-inf` or `+inf`; NaN is not a valid bound.
+    pub fn parse(raw: &[u8]) -> Option<Self> {
+        let (exclusive, text) = match raw.strip_prefix(b"(") {
+            Some(rest) => (true, rest),
+            None => (false, raw),
+        };
+        let value = std::str::from_utf8(text).ok()?.parse::<f64>().ok()?;
+        if value.is_nan() {
+            return None;
+        }
+        Some(if exclusive {
+            Self::Exclusive(value)
+        } else {
+            Self::Inclusive(value)
+        })
+    }
+
+    fn value(self) -> f64 {
+        match self {
+            Self::Inclusive(value) | Self::Exclusive(value) => value,
+        }
+    }
+
+    fn admits_above(self, score: f64) -> bool {
+        match self {
+            Self::Inclusive(min) => score >= min,
+            Self::Exclusive(min) => score > min,
+        }
+    }
+
+    fn admits_below(self, score: f64) -> bool {
+        match self {
+            Self::Inclusive(max) => score <= max,
+            Self::Exclusive(max) => score < max,
+        }
+    }
+}
+
+/// Whether `score` lies between `min` and `max` under Redis range rules.
+pub fn score_in_range(score: f64, min: ScoreBound, max: ScoreBound) -> bool {
+    min.admits_above(score) && max.admits_below(score)
+}
+
+/// Smallest `f64` greater than `value` in IEEE order (`f64::next_up` needs a
+/// newer toolchain than the workspace MSRV).
+fn next_score_up(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f64::from_bits(if value > 0.0 { bits + 1 } else { bits - 1 })
 }
 
 #[derive(Debug, Clone)]
@@ -583,7 +684,7 @@ impl StoredValue {
     }
 
     /// Returns the raw `Bytes` reference for `String` variant only.
-    /// For `StringInt`, use [`as_string_bytes()`] which materialises the value.
+    /// For `StringInt`, use [`Self::as_string_bytes`] which materialises the value.
     pub fn as_string(&self) -> Option<&Bytes> {
         match &*self.data {
             ValueData::String(v) => Some(v),
@@ -974,13 +1075,44 @@ pub fn should_lazy_free(value: &StoredValue) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct DbShard {
     pub data: HashMap<Bytes, StoredValue>,
+    /// Modification versions for WATCHed keys. Only keys in `watch_refs` are
+    /// recorded, so the map stays bounded by what clients currently watch
+    /// instead of growing with every key ever written.
     pub key_versions: HashMap<Bytes, u64>,
+    /// Number of client WATCH registrations per key.
+    watch_refs: HashMap<Bytes, usize>,
     /// Keys with a TTL. Maps key → `expire_at_ms` for O(1) volatile-count
     /// and efficient sampling in the active-expiry cycle.
     pub expires: HashMap<Bytes, i64>,
 }
 
 impl DbShard {
+    /// Record a modification of `key` if a client watches it.
+    fn record_modification(&mut self, key: &Bytes, versions: &AtomicU64) {
+        if self.watch_refs.contains_key(key) {
+            let version = versions.fetch_add(1, AtomicOrdering::Relaxed);
+            self.key_versions.insert(key.clone(), version);
+        }
+    }
+
+    /// Mark every watched key that currently exists as modified, for
+    /// operations that replace the whole database (FLUSHDB, SWAPDB, reload).
+    fn record_watched_existing(&mut self, versions: &AtomicU64) {
+        if self.watch_refs.is_empty() {
+            return;
+        }
+        let existing: Vec<Bytes> = self
+            .watch_refs
+            .keys()
+            .filter(|key| self.data.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in existing {
+            let version = versions.fetch_add(1, AtomicOrdering::Relaxed);
+            self.key_versions.insert(key, version);
+        }
+    }
+
     /// Synchronise the expires side-index after setting or clearing a TTL.
     #[inline]
     pub fn sync_expires(&mut self, key: &Bytes, expire_at_ms: Option<i64>) {
@@ -1009,6 +1141,9 @@ impl DbShard {
 pub struct DataState {
     shards: Arc<[parking_lot::RwLock<DbShard>]>,
     next_key_version: Arc<AtomicU64>,
+    /// Distinct watched keys across all shards; zero lets writes skip the
+    /// WATCH bookkeeping without taking a shard lock.
+    watched_keys: Arc<AtomicUsize>,
     /// Per-DB estimated memory in bytes — updated incrementally on insert/remove,
     /// corrected periodically via full scan in `server_cron`.
     db_memory_bytes: Arc<[AtomicUsize]>,
@@ -1043,8 +1178,13 @@ impl DataState {
         Self {
             shards: Arc::from(shards),
             next_key_version: Arc::new(AtomicU64::new(1)),
+            watched_keys: Arc::new(AtomicUsize::new(0)),
             db_memory_bytes: Arc::from(mem),
         }
+    }
+
+    fn has_watched_keys(&self) -> bool {
+        self.watched_keys.load(AtomicOrdering::Relaxed) > 0
     }
 
     // -- incremental memory tracking -----------------------------------------
@@ -1065,6 +1205,8 @@ impl DataState {
     /// Subtract `bytes` from the estimated memory for a specific database.
     pub fn sub_memory(&self, db_idx: usize, bytes: usize) {
         // Use saturating semantics to avoid underflow from drift.
+        // Newer Rust renames fetch_update to try_update; MSRV 1.85 only has fetch_update.
+        #[allow(deprecated)]
         let _ = self.db_memory_bytes[db_idx].fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
@@ -1113,6 +1255,39 @@ impl DataState {
         self.shards.iter().map(parking_lot::RwLock::write).collect()
     }
 
+    /// Register one client WATCH on `key` and return its current version.
+    pub fn watch_key(&self, db_idx: usize, key: &Bytes) -> u64 {
+        let mut shard = self.write_db(db_idx);
+        let refs = shard.watch_refs.entry(key.clone()).or_insert(0);
+        if *refs == 0 {
+            self.watched_keys.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        *refs += 1;
+        shard.key_versions.get(key).copied().unwrap_or(0)
+    }
+
+    /// Drop one client WATCH on `key`; its version is forgotten with the
+    /// last registration.
+    pub fn unwatch_key(&self, db_idx: usize, key: &Bytes) {
+        let mut shard = self.write_db(db_idx);
+        let Some(refs) = shard.watch_refs.get_mut(key) else {
+            return;
+        };
+        *refs -= 1;
+        if *refs == 0 {
+            shard.watch_refs.remove(key);
+            shard.key_versions.remove(key);
+            self.watched_keys.fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+    }
+
+    /// Record a change to `key` for WATCH on a shard the caller holds
+    /// write-locked. Code that edits `DbShard::data` directly, such as the
+    /// server's lock-free read path, must call it for every key it removes.
+    pub fn record_modification(&self, shard: &mut DbShard, key: &Bytes) {
+        shard.record_modification(key, &self.next_key_version);
+    }
+
     /// Allocate the next key version (atomic, lock-free).
     pub fn alloc_key_version(&self) -> u64 {
         self.next_key_version.fetch_add(1, AtomicOrdering::Relaxed)
@@ -1134,8 +1309,9 @@ impl DataState {
         let mut guards = self.write_all_dbs();
         for (i, db_data) in snapshot.into_iter().enumerate() {
             if i < guards.len() {
+                guards[i].record_watched_existing(&self.next_key_version);
                 guards[i].data = db_data;
-                guards[i].key_versions.clear();
+                guards[i].record_watched_existing(&self.next_key_version);
 
                 // Rebuild expires index + memory estimate from loaded data.
                 guards[i].expires.clear();
@@ -1279,6 +1455,9 @@ impl<'a> DbWriteGuard<'a> {
             .is_some_and(|value| value.expire_at_ms().is_some_and(|ts| ts <= now_ms))
         {
             self.remove(key.as_ref());
+            // An expiry is a modification for WATCH, as in Redis.
+            self.shard
+                .record_modification(key, &self.data_state.next_key_version);
             true
         } else {
             false
@@ -1297,6 +1476,8 @@ impl<'a> DbWriteGuard<'a> {
 
         for key in expired_keys {
             self.remove(&key);
+            self.shard
+                .record_modification(&key, &self.data_state.next_key_version);
         }
     }
 
@@ -1331,6 +1512,7 @@ pub struct ServerState {
     pub pubsub: PubSubState,
     pub stats: StatsState,
     pub acl: AclState,
+    pub(crate) auth_rate_limiter: parking_lot::Mutex<crate::auth_rate_limiter::AuthRateLimiter>,
     pub config: ConfigState,
     pub script_cache: ScriptCache,
     pub cluster_node_id: Bytes,
@@ -1376,6 +1558,7 @@ impl ServerState {
             pubsub,
             stats: StatsState::default(),
             acl: AclState::default(),
+            auth_rate_limiter: parking_lot::Mutex::default(),
             config,
             script_cache: ScriptCache::default(),
             cluster_node_id: node_id,
@@ -1439,21 +1622,34 @@ impl ServerState {
 
     pub fn clear_db(&self, idx: usize) {
         let mut shard = self.data.write_db(idx);
+        shard.record_watched_existing(&self.data.next_key_version);
         shard.data.clear();
-        shard.key_versions.clear();
         shard.expires.clear();
         self.data.reset_memory(idx, 0);
     }
 
+    /// Exchange two databases' contents. WATCH registrations stay with the
+    /// database index a client selected; watched keys present on either side
+    /// become modified, as in Redis.
     pub fn swap_dbs(&self, left: usize, right: usize) {
         let (mut a, mut b) = self.data.write_two_dbs(left, right);
-        std::mem::swap(&mut *a, &mut *b);
+        let versions = &self.data.next_key_version;
+        a.record_watched_existing(versions);
+        b.record_watched_existing(versions);
+        std::mem::swap(&mut a.data, &mut b.data);
+        std::mem::swap(&mut a.expires, &mut b.expires);
+        a.record_watched_existing(versions);
+        b.record_watched_existing(versions);
+        let left_memory = self.data.db_memory_bytes[left].load(AtomicOrdering::Relaxed);
+        let right_memory = self.data.db_memory_bytes[right].load(AtomicOrdering::Relaxed);
+        self.data.reset_memory(left, right_memory);
+        self.data.reset_memory(right, left_memory);
     }
 
     pub fn clear_all_dbs(&self) {
         for (i, mut shard) in self.data.write_all_dbs().into_iter().enumerate() {
+            shard.record_watched_existing(&self.data.next_key_version);
             shard.data.clear();
-            shard.key_versions.clear();
             shard.expires.clear();
             self.data.reset_memory(i, 0);
         }
@@ -1472,10 +1668,13 @@ impl ServerState {
         shard.key_versions.get(key).copied().unwrap_or(0)
     }
 
+    /// Record a write to `key` for any client that WATCHes it.
     pub fn touch_key_version(&self, db_idx: usize, key: Bytes) {
+        if !self.data.has_watched_keys() {
+            return;
+        }
         let mut shard = self.data.write_db(db_idx);
-        let version = self.data.alloc_key_version();
-        shard.key_versions.insert(key, version);
+        shard.record_modification(&key, &self.data.next_key_version);
     }
 
     pub fn lazy_free_del(&self, db_idx: usize, key: &Bytes) -> bool {
@@ -1486,8 +1685,7 @@ impl ServerState {
         shard.expires.remove(&owned_key);
         let freed = crate::eviction::estimate_object_memory(&owned_key, &value);
         self.data.sub_memory(db_idx, freed);
-        let version = self.data.alloc_key_version();
-        shard.key_versions.insert(owned_key, version);
+        shard.record_modification(&owned_key, &self.data.next_key_version);
         drop(shard);
         self.try_lazy_free(value);
         true
@@ -1495,8 +1693,8 @@ impl ServerState {
 
     pub fn lazy_free_flush_db(&self, db_idx: usize) {
         let mut shard = self.data.write_db(db_idx);
+        shard.record_watched_existing(&self.data.next_key_version);
         let old_db = std::mem::take(&mut shard.data);
-        shard.key_versions.clear();
         shard.expires.clear();
         self.data.reset_memory(db_idx, 0);
         drop(shard);
@@ -2608,6 +2806,7 @@ mod tests {
             };
             assert_eq!(outer_seen, Some(Bytes::from("outer-value")));
 
+            server.data.watch_key(0, &outer_key);
             server.touch_key_version(0, outer_key.clone());
 
             let mut db = server.db_mut(0);

@@ -10,10 +10,15 @@
 /result-*
 /.direnv/
 
-# Runtime data
+# Runtime data (the default `dir` is the working directory)
 /data/
 *.rdb
 *.aof
+*.aof.manifest
+/users.acl.toml
+/ratatosk.lock
+/ratatosk-audit.log*
+/ratatosk-audit-chain.state
 
 # IDE
 /.idea/
@@ -43,6 +48,5 @@ __pycache__/
 # Local-only material (agent harness, maintainer notes, private experiments)
 # is excluded through .git/info/exclude, not listed here.
 /AGENTS.md
-/.command-center/
 /settings.local.json
 /docs/ai/

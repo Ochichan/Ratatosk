@@ -15,6 +15,13 @@ use crate::keyspace::ServerState;
 
 use super::ClientState;
 
+/// Command-dispatch permissions for one script invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScriptMode {
+    ReadWrite,
+    ReadOnly,
+}
+
 /// Maximum memory a single Lua VM may allocate (1 MB).
 const LUA_MEMORY_LIMIT: usize = 1_048_576;
 
@@ -52,24 +59,10 @@ where
 
 /// Execute a Lua script with the given KEYS and ARGV arrays.
 /// `redis.call()` / `redis.pcall()` are bridged back through `execute()`.
-pub(crate) fn eval_script(
-    source: &[u8],
-    keys: &[Bytes],
-    argv: &[Bytes],
-    server: &mut ServerState,
-    client: &mut ClientState,
-) -> RespFrame {
-    let request = EvalRequest {
-        source,
-        keys,
-        argv,
-        server,
-        client,
-    };
-
+pub(crate) fn eval_script(request: EvalRequest<'_>) -> RespFrame {
     match with_lua_runtime(|rt| rt.eval(request)) {
         Ok(frame) => frame,
-        Err(msg) => RespFrame::error_str(&msg),
+        Err(msg) => RespFrame::Error(inline_reply_bytes(msg.as_bytes())),
     }
 }
 
@@ -81,21 +74,22 @@ struct LuaRuntime {
     lua: Lua,
 }
 
-struct EvalRequest<'a> {
-    source: &'a [u8],
-    keys: &'a [Bytes],
-    argv: &'a [Bytes],
-    server: &'a mut ServerState,
-    client: &'a mut ClientState,
+pub(crate) struct EvalRequest<'a> {
+    pub(crate) source: &'a [u8],
+    pub(crate) keys: &'a [Bytes],
+    pub(crate) argv: &'a [Bytes],
+    pub(crate) server: &'a mut ServerState,
+    pub(crate) client: &'a mut ClientState,
+    pub(crate) mode: ScriptMode,
 }
 
 impl LuaRuntime {
     fn new() -> LuaResult<Self> {
-        // Safe subset: no PACKAGE (no require/dofile), no IO, no DEBUG.
+        // Safe subset: no PACKAGE (no require/dofile), no IO, no OS, no DEBUG.
         // The base library (pcall, print, tostring, type, etc.) is always
         // included by new_with().
         let lua = Lua::new_with(
-            StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::OS,
+            StdLib::TABLE | StdLib::STRING | StdLib::MATH,
             mlua::LuaOptions::default(),
         )?;
 
@@ -136,6 +130,7 @@ impl LuaRuntime {
             argv,
             server,
             client,
+            mode,
         } = request;
 
         // Wrap mutable references in RefCell for shared access by closures.
@@ -164,13 +159,31 @@ impl LuaRuntime {
                 let call_fn = scope.create_function(|lua, args: MultiValue| {
                     let mut srv = server_cell.borrow_mut();
                     let mut cli = client_cell.borrow_mut();
-                    redis_call_impl(lua, args, &mut srv, &mut cli, false)
+                    redis_call_impl(
+                        lua,
+                        args,
+                        &mut srv,
+                        &mut cli,
+                        RedisCallPolicy {
+                            protected: false,
+                            mode,
+                        },
+                    )
                 })?;
 
                 let pcall_fn = scope.create_function(|lua, args: MultiValue| {
                     let mut srv = server_cell.borrow_mut();
                     let mut cli = client_cell.borrow_mut();
-                    redis_call_impl(lua, args, &mut srv, &mut cli, true)
+                    redis_call_impl(
+                        lua,
+                        args,
+                        &mut srv,
+                        &mut cli,
+                        RedisCallPolicy {
+                            protected: true,
+                            mode,
+                        },
+                    )
                 })?;
 
                 // redis.log()
@@ -250,6 +263,11 @@ impl LuaRuntime {
 // redis.call() / redis.pcall() implementation
 // ---------------------------------------------------------------------------
 
+struct RedisCallPolicy {
+    protected: bool,
+    mode: ScriptMode,
+}
+
 /// Bridge from Lua `redis.call(cmd, ...)` / `redis.pcall(cmd, ...)` back into
 /// the engine's `execute()`.
 fn redis_call_impl(
@@ -257,8 +275,9 @@ fn redis_call_impl(
     args: MultiValue,
     server: &mut ServerState,
     client: &mut ClientState,
-    protected: bool,
+    policy: RedisCallPolicy,
 ) -> LuaResult<Value> {
+    let RedisCallPolicy { protected, mode } = policy;
     // Marshal Lua arguments to Bytes
     let mut cmd_args: Vec<Bytes> = Vec::with_capacity(args.len());
     for val in args {
@@ -290,19 +309,9 @@ fn redis_call_impl(
         ));
     }
 
-    // Reject nested EVAL/EVALSHA
     let cmd_upper: Vec<u8> = cmd_args[0].iter().map(|b| b.to_ascii_uppercase()).collect();
-    match cmd_upper.as_slice() {
-        b"EVAL" | b"EVALSHA" | b"EVAL_RO" | b"EVALSHA_RO" => {
-            let msg = "ERR Lua scripts can't execute EVAL or EVALSHA commands";
-            if protected {
-                let tbl = lua.create_table()?;
-                tbl.set("err", msg)?;
-                return Ok(Value::Table(tbl));
-            }
-            return Err(mlua::Error::RuntimeError(msg.into()));
-        }
-        _ => {}
+    if let Some(message) = script_command_restriction(&cmd_upper, mode) {
+        return reject_script_call(lua, protected, message);
     }
 
     // Build a RespFrame::Array for execute()
@@ -328,6 +337,128 @@ fn redis_call_impl(
     }
 
     resp_to_lua(lua, &outcome.response)
+}
+
+fn reject_script_call(lua: &Lua, protected: bool, message: &'static str) -> LuaResult<Value> {
+    if protected {
+        let table = lua.create_table()?;
+        table.set("err", message)?;
+        Ok(Value::Table(table))
+    } else {
+        Err(mlua::Error::RuntimeError(message.into()))
+    }
+}
+
+/// Return an error before dispatch whenever a script command is forbidden.
+///
+/// `noscript` metadata applies to every script mode. Authentication commands
+/// are explicit because their current metadata predates that Redis rule. RO
+/// scripts then use a source-audited allowlist, so newly added commands remain
+/// forbidden until their handlers have been checked for command-visible side
+/// effects.
+fn script_command_restriction(command: &[u8], mode: ScriptMode) -> Option<&'static str> {
+    if matches!(command, b"EVAL" | b"EVALSHA" | b"EVAL_RO" | b"EVALSHA_RO") {
+        return Some("ERR Lua scripts can't execute EVAL or EVALSHA commands");
+    }
+
+    if matches!(command, b"AUTH" | b"HELLO") {
+        return Some("ERR This Redis command is not allowed from script");
+    }
+
+    if super::registry::find_command_spec_upper(command)
+        .is_some_and(|spec| spec.flags.contains(&"noscript"))
+    {
+        return Some("ERR This Redis command is not allowed from script");
+    }
+
+    if mode == ScriptMode::ReadOnly && !is_read_only_script_command(command) {
+        return Some("ERR Write commands are not allowed from read-only scripts");
+    }
+
+    None
+}
+
+/// Commands admitted by Ratatosk's current read-only Lua subset.
+///
+/// This intentionally does not promise full Redis EVAL_RO parity. The listed
+/// handlers only read dataset values (apart from lazy expiry and read
+/// bookkeeping). Dynamic commands such as SORT, GEO*, and BITFIELD* remain
+/// fail-closed even when a particular argument form could be read-only.
+fn is_read_only_script_command(command: &[u8]) -> bool {
+    matches!(
+        command,
+        // Connection-local commands with no state transition.
+        b"PING"
+            | b"ECHO"
+            // Strings and generic key reads.
+            | b"GET"
+            | b"MGET"
+            | b"STRLEN"
+            | b"GETRANGE"
+            | b"SUBSTR"
+            | b"EXISTS"
+            | b"TTL"
+            | b"PTTL"
+            | b"EXPIRETIME"
+            | b"PEXPIRETIME"
+            | b"TYPE"
+            | b"KEYS"
+            | b"SCAN"
+            | b"RANDOMKEY"
+            | b"DUMP"
+            | b"DIGEST"
+            // Hash reads.
+            | b"HGET"
+            | b"HMGET"
+            | b"HGETALL"
+            | b"HKEYS"
+            | b"HVALS"
+            | b"HSTRLEN"
+            | b"HRANDFIELD"
+            | b"HEXISTS"
+            | b"HLEN"
+            | b"HSCAN"
+            | b"HTTL"
+            | b"HPTTL"
+            | b"HEXPIRETIME"
+            | b"HPEXPIRETIME"
+            // List reads.
+            | b"LRANGE"
+            | b"LLEN"
+            | b"LPOS"
+            | b"LINDEX"
+            // Set reads.
+            | b"SISMEMBER"
+            | b"SMISMEMBER"
+            | b"SMEMBERS"
+            | b"SCARD"
+            | b"SRANDMEMBER"
+            | b"SSCAN"
+            | b"SDIFF"
+            | b"SINTER"
+            | b"SINTERCARD"
+            | b"SUNION"
+            // Sorted-set reads.
+            | b"ZSCORE"
+            | b"ZCARD"
+            | b"ZMSCORE"
+            | b"ZRANGE"
+            | b"ZRANGEBYSCORE"
+            | b"ZREVRANGEBYSCORE"
+            | b"ZRANGEBYLEX"
+            | b"ZREVRANGEBYLEX"
+            | b"ZREVRANGE"
+            | b"ZCOUNT"
+            | b"ZLEXCOUNT"
+            | b"ZRANK"
+            | b"ZREVRANK"
+            | b"ZUNION"
+            | b"ZINTER"
+            | b"ZINTERCARD"
+            | b"ZDIFF"
+            | b"ZRANDMEMBER"
+            | b"ZSCAN"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +498,24 @@ fn lua_value_to_resp(val: &Value) -> RespFrame {
     }
 }
 
+// RESP simple strings and errors are line-delimited. Lua exception traces
+// and user-supplied status tables may contain CR/LF; never let those bytes
+// introduce another wire frame. Bulk string payloads remain byte-preserving.
+fn inline_reply_bytes(value: &[u8]) -> Bytes {
+    Bytes::from(
+        value
+            .iter()
+            .map(|&byte| {
+                if matches!(byte, b'\r' | b'\n') {
+                    b' '
+                } else {
+                    byte
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// Convert a Lua table to a RespFrame.
 ///
 /// Redis convention:
@@ -376,10 +525,10 @@ fn lua_value_to_resp(val: &Value) -> RespFrame {
 fn table_to_resp(tbl: &mlua::Table) -> RespFrame {
     // Check for err/ok status tables first.
     if let Ok(Value::String(s)) = tbl.raw_get::<Value>("err") {
-        return RespFrame::Error(Bytes::copy_from_slice(&s.as_bytes()));
+        return RespFrame::Error(inline_reply_bytes(&s.as_bytes()));
     }
     if let Ok(Value::String(s)) = tbl.raw_get::<Value>("ok") {
-        return RespFrame::SimpleString(Bytes::copy_from_slice(&s.as_bytes()));
+        return RespFrame::SimpleString(inline_reply_bytes(&s.as_bytes()));
     }
 
     // Sequential array table: iterate integer keys 1..n
@@ -465,5 +614,75 @@ fn lua_err(e: mlua::Error) -> String {
             format!("ERR Script exceeded memory limit: {msg}")
         }
         other => format!("ERR {other}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn readonly_allowlist_is_fail_closed_and_covers_audited_data_families() {
+        for command in [
+            b"PING".as_slice(),
+            b"ECHO",
+            b"GET",
+            b"HGET",
+            b"LRANGE",
+            b"SISMEMBER",
+            b"ZRANGE",
+        ] {
+            assert_eq!(
+                script_command_restriction(command, ScriptMode::ReadOnly),
+                None,
+                "{} should be allowed",
+                String::from_utf8_lossy(command)
+            );
+        }
+
+        for command in [
+            b"SET".as_slice(),
+            b"PUBLISH",
+            b"SPUBLISH",
+            b"SELECT",
+            b"RESET",
+            b"SORT_RO",
+            b"GEOSEARCH",
+            b"BITFIELD_RO",
+            b"FUTURE_READ_COMMAND",
+        ] {
+            assert_eq!(
+                script_command_restriction(command, ScriptMode::ReadOnly),
+                Some("ERR Write commands are not allowed from read-only scripts"),
+                "{} should fail closed",
+                String::from_utf8_lossy(command)
+            );
+        }
+    }
+
+    #[test]
+    fn authentication_nested_eval_and_noscript_metadata_apply_to_all_modes() {
+        for mode in [ScriptMode::ReadWrite, ScriptMode::ReadOnly] {
+            for command in [b"AUTH".as_slice(), b"HELLO"] {
+                assert_eq!(
+                    script_command_restriction(command, mode),
+                    Some("ERR This Redis command is not allowed from script")
+                );
+            }
+
+            assert_eq!(
+                script_command_restriction(b"EVAL", mode),
+                Some("ERR Lua scripts can't execute EVAL or EVALSHA commands")
+            );
+            assert_eq!(
+                script_command_restriction(b"CONFIG", mode),
+                Some("ERR This Redis command is not allowed from script")
+            );
+        }
+
+        assert_eq!(
+            script_command_restriction(b"SET", ScriptMode::ReadWrite),
+            None
+        );
     }
 }

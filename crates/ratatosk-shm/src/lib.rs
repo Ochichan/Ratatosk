@@ -20,8 +20,9 @@
 //! * ring indices are always masked before use, so no arithmetic performed on
 //!   peer-controlled values can produce an out-of-bounds access.
 //!
-//! `unsafe` is confined to [`segment`] (mapping / atomic views) and
-//! [`fdpass`] (`sendmsg` / `recvmsg` with ancillary data).
+//! `unsafe` is confined to [`segment`] (mapping / atomic views), [`fdpass`]
+//! (`sendmsg` / `recvmsg` with ancillary data), the doorbell `send(2)` in
+//! [`stream`] and the `getuid(2)` peer check in [`handshake`].
 //!
 //! The ring algorithm itself ([`ring`]) is sans-IO and generic over the atomic
 //! storage, which is what allows it to be model-checked with `loom`

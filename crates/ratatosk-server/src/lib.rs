@@ -1,21 +1,23 @@
 //! # ratatosk-server
 //!
-//! TCP server and event loop — the "nervous system" of Ratatosk.
+//! TCP / Unix-socket server and event loop — the "nervous system" of Ratatosk.
 //!
-//! - [`event_loop`] — Main `tokio::select!` loop: TCP accept, server_cron timer
+//! - [`event_loop`] — Main `tokio::select!` loop: TCP and Unix-socket accept, server_cron timer
 //!   (active expiry + eviction), signal handling (SIGINT/SIGTERM/SIGUSR1),
 //!   and lazy-free background thread management.
 //! - [`client`] — Per-client I/O task: read → parse → execute → write pipeline
 //!   with query buffer limits, output buffer limits, and pub/sub message drain.
 //! - [`config`] — Server configuration resolution from defaults, Redis-style
 //!   config files, and environment overrides.
-//! - [`io_thread`] — I/O thread pool (placeholder for future parallel I/O).
+//! - [`persistence`] — RDB/AOF runtime: startup recovery, the AOF writer
+//!   worker, background saves and rewrites.
+//! - [`transport`] — the stream abstraction shared by TCP, Unix-socket and
+//!   shared-memory sessions.
 
 pub mod breadcrumbs;
 pub mod client;
 pub mod config;
 pub mod event_loop;
-pub mod io_thread;
 pub mod metrics;
 pub mod persistence;
 pub mod rate_limiter;

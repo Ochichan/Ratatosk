@@ -25,11 +25,13 @@
 **진실의 원천**
 
 - 코드 + `docs/redis-gap-ledger.json` + 이 트래커. 셋이 어긋나면 ship 불가.
-- 마지막 코드/문서 동기화 스냅샷: **2026-06-02**.
+- 전체 스냅샷: **2026-06-02**. **2026-09-13 부분 재확인:** Phase 4 BASE/manifest 구현 선언을 현재 소스에 맞춰 정정했다. 과거 점수·PASS를 현재 후보의 적격성으로 승계하지 않는다.
 
 ---
 
-## 1. 현재 상태 스냅샷 (2026-06-02 검증)
+## 1. 과거 상태 스냅샷 (2026-06-02 검증)
+
+> 아래 목록·점수·실행 결과는 당시 기록이다. BASE materialization/manifest switch의 현재 상태는 [Phase 4](#persistence-current)를 따른다. 아래의 “미완” 선언은 현재 코드 판정으로 사용하지 않는다.
 
 **Release readiness:** 평균 **6.6/10**. public GA 기준 **NO-SHIP**.
 단, 현재 README 경계(`single-node durable cache + Pub/Sub + local persistence`) 안에서는 강한 pre-production 단계.
@@ -39,14 +41,15 @@
 | tier | 개수 | 의미 |
 |---|---:|---|
 | `behavioral_subset` | 275 | Redis 의미론에 근접, differential 대상 |
-| `baseline_local` | 76 | 로컬 단일노드 한정 동작 |
+| `baseline_local` | 75 | 로컬 단일노드 한정 동작 |
 | `syntax_only` | 6 | 문법/arity만 검증, 의미 미보장 ⚠️ |
-| `unsupported` | 63 | 미지원 (distributed/functions/단일노드에서 항상 에러) |
+| `unsupported` | 64 | 미지원 (distributed/functions/단일노드에서 항상 에러) |
 | `distributed_parity` | 0 | 분산 parity 없음 |
 
 > _2026-06-02 갱신: 코드↔ledger tier를 명령별로 audit·reconcile하여 분포가 30/45/64 →_
 > _6/76/63으로 정정됨(working 명령이 `syntax_only`로 과분류돼 있었음). 이제
 > `capability_tier_matches_gap_ledger_for_every_spec` 테스트가 코드=ledger를 잠금._
+> _2026-09-13: `PSYNC`가 실제로 거부되므로 `baseline_local`→`unsupported`로 이동 (6/75/64)._
 
 > ⚠️ 핵심 리스크: `done=420`을 "Redis와 동일"로 마케팅하면 안 된다. `syntax_only` + no-op admin이
 > 클라이언트/툴에 거짓 성공을 준다 → **strict mode(Phase 0)** 로 막는 것이 v1 안전성의 핵심.
@@ -248,16 +251,19 @@ P0 제품경계 ──▶ P1 상태모델 ──▶ ┬─▶ P2 관측성 ─�
 
 ---
 
+<a id="persistence-current"></a>
+
 ## Phase 4 — persistence / recovery 마감  ⏱ 2주  ·  의존성: 없음(독립)  ·  위험: **높음**  ·  **병렬 가능**
 
 **목표:** local durability를 제품 신뢰의 핵심으로. 장애 시 "무엇이 살아남는가"를 표로 못 박는다.
 
 **Exit gate:** AOF current-state materialization 기반 compact rewrite + atomic manifest switch 완료(또는 명확히 제외 선언) · crash/fault matrix 자동화 green · backup/restore/rollback drill 스크립트화 · fsync 정책별 durability contract 문서화.
 
-- [ ] **AOF current-state materialization rewrite** — BGREWRITEAOF를 stream replay가 아닌 현재 상태 직렬화 기반 compact rewrite로.
-  - 파일: `crates/ratatosk-persist/src/aof/`.
-- [ ] **atomic manifest switch** — BASE materialization + full atomic manifest switch 완료. (현재 candidate validation까지 진행, BASE/atomic switch 미완)
-  - _대안 결정:_ v1에 못 넣으면 **명확히 제외 선언** + strict-mode/docs 반영.
+- [x] **AOF current-state materialization rewrite 구현** — `rewrite_aof_and_reopen` → `materialize_aof_base`: 현재 snapshot을 RDB BASE로 저장하고 새 INCR writer로 전환한다. (2026-09-13 소스 재확인, baseline `cb0133aed`)
+  - 파일: `crates/ratatosk-server/src/persistence/aof.rs`; 기존 `rewrite_aof_via_worker_keeps_writer_usable` 시험은 rewrite 후 writer 사용을 검사한다.
+- [x] **BASE/manifest switch 구현** — BASE 저장, 새 INCR 생성·fsync 후 `commit_manifest_switch`가 candidate를 검증하고 manifest를 교체한다. 이전 lineage는 runtime에서 보존한다. (2026-09-13 소스 재확인, baseline `cb0133aed`)
+  - 파일: `crates/ratatosk-persist/src/aof/{manifest,switch}.rs`. 기존 `commit_manifest_switch_persists_manifest_and_cleans_stale_files`는 helper의 manifest 저장·cleanup을 검사하며 runtime이 이전 lineage를 삭제한다는 뜻은 아니다.
+- [ ] **현재 후보의 장애 적격성** — BASE 저장·INCR fsync·manifest 교체 경계에 실제로 도달한 장애 주입 증거, 전체 데이터/TTL 복구 대조, disk-full·플랫폼별 복구를 별도로 확보한다. 구현 체크와 과거 matrix PASS만으로 전원 손실·복수 장치 적격성을 선언하지 않는다.
 - [x] **crash / fault injection matrix** — `scripts/recovery_matrix.sh` 신규. **로컬 실행 검증 완료(7/7 pass)**: clean RDB restart, AOF clean restart, kill-9(always-fsync 무손실), kill-9 중 BGREWRITEAOF(무손상), truncated AOF(consistent-prefix 복구), missing manifest(segment 재구성, silent loss 없음), repeated rewrite(안정). disk full은 constrained-FS 필요로 명시 skip(`ratatosk_aof_write_errors_total` alert로 커버).
 - [x] **durability contract 표** — `docs/operations.md §4`에 fsync 정책(Always/EverySec/No)별 acknowledged-write 손실 윈도우 + recovery invariants 표. `recovery_matrix.sh`가 표를 강제.
 - [x] **backup / restore / rollback drill 스크립트** — `scripts/backup_restore_drill.sh` 신규. **로컬 실행 검증 완료(5/5 stage pass)**: seed→backup→loss→restore→mutate→rollback, 결정적 dataset 검증.
@@ -329,7 +335,7 @@ P0 제품경계 ──▶ P1 상태모델 ──▶ ┬─▶ P2 관측성 ─�
   - Perf guardrail (set@256, ping@256): PASS
   ```
   - 소스: Phase 4 matrix + Phase 5 differential + Phase 6 perf.
-  - **구현:** `scripts/reliability_report.sh` 신규 — fmt/clippy/test/audit/deny/ledger/strict-mode/recovery-matrix/drill/perf 게이트를 PASS/FAIL/SKIP로 집계해 `benchmarks/reliability-report-*.md` 생성. SKIP은 외부 도구 부재 시 명시(silent 아님).
+  - **구현:** `scripts/reliability_report.sh` 신규 — fmt/clippy/test/audit/deny/ledger/strict-mode/recovery-matrix/drill/perf 게이트를 PASS/FAIL/SKIP로 집계해 `benchmarks/reliability-report-*.md` 생성. 필수 SKIP·누락은 INCOMPLETE/exit 1이며, 현재 local differential/fuzz 미배선 때문에 default release PASS는 나오지 않는다. 명시적 부분 검사 정책의 PASS (SCOPED)는 전체 릴리즈 적격성이 아니다.
 - [~] **benchmark report** + **recovery report** 산출물화 — recovery report는 `recovery_matrix.sh`, 통합 report는 `reliability_report.sh`가 생성. differential/fuzz는 외부 도구(redis/valkey, cargo-fuzz) 환경에서 채워짐.
 - [ ] **RC 발행 + soak** — `v1.0.0-rc1` 태그(서명), soak(24–72h) 시작.
 - [ ] **GA 체크리스트** — §7 전체 통과 확인 → `v1.0.0`.
@@ -432,7 +438,7 @@ v1에서 구현하지 않는다. 제품 페이지에서 **숨기지 않고** 명
 
 - **A. Honest Redis compatibility** — 모든 명령이 capability tier를 노출하고, supported subset은 Redis/Valkey로 검증된다.
 - **B. Single-node durability without operational mystery** — RDB·AOF·manifest recovery gate·shutdown flush·crash drill이 릴리즈 계약의 일부.
-- **C. Small, safe, observable cache/event bus** — cache·Pub/Sub·TTL·rate limit·session·local workflow state를 위한 컴팩트 Rust 서버 (Conductor/Ironclaw/command-center/Muninn 통합).
+- **C. Small, safe, observable cache/event bus** — cache·Pub/Sub·TTL·rate limit·session·local workflow state를 위한 컴팩트 Rust 서버.
 - **D. Strict mode prevents compatibility footguns** — 미지원/`syntax_only` 명령은 거짓 성공 대신 명확히 실패한다.
 
 ---

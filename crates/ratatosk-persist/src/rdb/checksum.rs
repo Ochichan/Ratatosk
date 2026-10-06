@@ -1,8 +1,10 @@
 use crc::{CRC_64_ECMA_182, Crc};
 
-/// CRC64 digest compatible with Redis RDB files.
+/// CRC-64/ECMA-182 digest over everything before the trailing checksum.
 ///
-/// Uses the ECMA-182 polynomial.
+/// This is not Redis' CRC-64 (Jones coefficients, reflected), so Ratatosk
+/// snapshots and Redis `dump.rdb` files do not verify against each other.
+/// Changing the polynomial would invalidate every existing snapshot.
 pub struct Crc64Digest {
     crc: Crc<u64>,
     state: u64,
@@ -60,11 +62,12 @@ mod tests {
     }
 
     #[test]
-    fn crc64_known_value() {
+    fn crc64_matches_the_ecma_182_check_value() {
+        // Catalogued check value of CRC-64/ECMA-182 for "123456789". Pinning
+        // it keeps existing snapshots loadable across dependency upgrades.
         let mut d = Crc64Digest::new();
-        d.update(b"123456789");
-        // Known CRC-64/ECMA-182 for "123456789"
-        let result = d.finalize();
-        assert_ne!(result, 0, "CRC of non-empty data should be non-zero");
+        d.update(b"1234");
+        d.update(b"56789");
+        assert_eq!(d.finalize(), 0x6c40_df5f_0b49_7347);
     }
 }

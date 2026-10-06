@@ -234,7 +234,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 compatibility baseline implemented (accepts AUTH <username> <password>)."
+      "notes": "AUTH and HELLO AUTH share per-connection delay/close and bounded process-local TCP peer-IP failure limits (20/60s, 4096 IPs). Success resets only connection history; RESET/reconnect cannot clear peer history. Local transports have connection limits only."
     },
     {
       "name": "BGREWRITEAOF",
@@ -1274,7 +1274,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch."
+      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. maxmemory accepts decimal byte limits at runtime (0 disables the cap); noeviction admission uses a current dataset estimate. Policies/samples remain startup-only."
     },
     {
       "name": "COPY",
@@ -1430,7 +1430,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": ""
+      "notes": "Default build unsupported. With lua-scripting, Lua callbacks reject AUTH/HELLO and nested scripting; feature behavior does not establish full Redis parity."
     },
     {
       "name": "EVALSHA",
@@ -1443,7 +1443,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": ""
+      "notes": "Default build unsupported; lua-scripting enables cached execution with the same callback restrictions as EVAL."
     },
     {
       "name": "EVALSHA_RO",
@@ -1456,7 +1456,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": ""
+      "notes": "Default build unsupported. With lua-scripting, SHA execution uses the same read allowlist and conservative OOM admission as EVAL_RO."
     },
     {
       "name": "EVAL_RO",
@@ -1469,7 +1469,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": ""
+      "notes": "Default build unsupported. With lua-scripting, explicit data-read allowlist enforced before redis.call/pcall dispatch; other nested commands fail. Conservative OOM admission remains; not a host sandbox or full Redis parity."
     },
     {
       "name": "EXEC",
@@ -1482,7 +1482,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m1-kv-core",
       "owner": "",
-      "notes": "Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping."
+      "notes": "Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. Inner terminal outcomes stop the remaining queue and propagate close plus accumulated delay; only the executed prefix persists (no rollback claim), with executed-command stats accounting."
     },
     {
       "name": "EXISTS",
@@ -1963,7 +1963,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "RESP2 negotiation returns a flat array; RESP3 returns a map. Pipelined and transactional protocol changes preserve previously completed replies."
+      "notes": "RESP2 negotiation returns a flat array; RESP3 a map. Completed pipeline/EXEC replies keep their protocol. AUTH option shares credential failure delay/close and TCP peer-IP budget with AUTH; malformed options are not credential guesses."
     },
     {
       "name": "HEXISTS",
@@ -3273,10 +3273,10 @@
       "path": "psync.json",
       "summary": "An internal command used in replication.",
       "status": "done",
-      "capability_tier": "baseline_local",
+      "capability_tier": "unsupported",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented with stateful FULLRESYNC handshake over the current replid/offset."
+      "notes": "Returns ERR in standalone mode; no FULLRESYNC handshake, partial resynchronization, or replication stream is implemented."
     },
     {
       "name": "PTTL",
@@ -3510,7 +3510,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented with standalone role transition between master and configured upstream replica."
+      "notes": "REPLICAOF NO ONE confirms standalone mode and returns OK; every upstream host/port request returns ERR. No replica connection or failover is implemented."
     },
     {
       "name": "RESET",
@@ -4238,7 +4238,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "M0 replication-control baseline implemented as REPLICAOF alias."
+      "notes": "REPLICAOF alias: NO ONE returns OK as standalone confirmation; upstream host/port requests return ERR. No replica connection is created."
     },
     {
       "name": "SLOWLOG",

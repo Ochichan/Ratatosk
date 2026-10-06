@@ -34,8 +34,10 @@ fn parse_keys_argv<'a>(
         }
     };
 
-    // Validate argument count: script + numkeys + numkeys keys + remaining argv
-    if args.len() < 2 + numkeys {
+    // Validate argument count without adding an untrusted `numkeys` to the
+    // fixed prefix length. A parsed usize::MAX must be an ordinary error, not
+    // an overflow panic.
+    if numkeys > args.len().saturating_sub(2) {
         return Err(err(
             "ERR Number of keys can't be greater than number of args",
         ));
@@ -55,7 +57,24 @@ pub(super) fn cmd_eval(
     server: &mut ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    let (keys, argv) = match parse_keys_argv(args, "eval") {
+    cmd_eval_with_mode(
+        args,
+        server,
+        client,
+        "eval",
+        super::lua_runtime::ScriptMode::ReadWrite,
+    )
+}
+
+#[cfg(feature = "lua-scripting")]
+fn cmd_eval_with_mode(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+    command_name: &str,
+    mode: super::lua_runtime::ScriptMode,
+) -> CommandOutcome {
+    let (keys, argv) = match parse_keys_argv(args, command_name) {
         Ok(pair) => pair,
         Err(response) => return CommandOutcome::reply(response),
     };
@@ -70,7 +89,14 @@ pub(super) fn cmd_eval(
         .scripts
         .insert(sha_bytes, script.clone());
 
-    let result = super::lua_runtime::eval_script(script, keys, argv, server, client);
+    let result = super::lua_runtime::eval_script(super::lua_runtime::EvalRequest {
+        source: script,
+        keys,
+        argv,
+        server,
+        client,
+        mode,
+    });
     CommandOutcome::reply(result)
 }
 
@@ -80,7 +106,24 @@ pub(super) fn cmd_evalsha(
     server: &mut ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    let (keys, argv) = match parse_keys_argv(args, "evalsha") {
+    cmd_evalsha_with_mode(
+        args,
+        server,
+        client,
+        "evalsha",
+        super::lua_runtime::ScriptMode::ReadWrite,
+    )
+}
+
+#[cfg(feature = "lua-scripting")]
+fn cmd_evalsha_with_mode(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &mut ClientState,
+    command_name: &str,
+    mode: super::lua_runtime::ScriptMode,
+) -> CommandOutcome {
+    let (keys, argv) = match parse_keys_argv(args, command_name) {
         Ok(pair) => pair,
         Err(response) => return CommandOutcome::reply(response),
     };
@@ -103,7 +146,14 @@ pub(super) fn cmd_evalsha(
         }
     };
 
-    let result = super::lua_runtime::eval_script(&script, keys, argv, server, client);
+    let result = super::lua_runtime::eval_script(super::lua_runtime::EvalRequest {
+        source: &script,
+        keys,
+        argv,
+        server,
+        client,
+        mode,
+    });
     CommandOutcome::reply(result)
 }
 
@@ -113,7 +163,13 @@ pub(super) fn cmd_eval_ro(
     server: &mut ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    cmd_eval(args, server, client)
+    cmd_eval_with_mode(
+        args,
+        server,
+        client,
+        "eval_ro",
+        super::lua_runtime::ScriptMode::ReadOnly,
+    )
 }
 
 #[cfg(feature = "lua-scripting")]
@@ -122,7 +178,13 @@ pub(super) fn cmd_evalsha_ro(
     server: &mut ServerState,
     client: &mut ClientState,
 ) -> CommandOutcome {
-    cmd_evalsha(args, server, client)
+    cmd_evalsha_with_mode(
+        args,
+        server,
+        client,
+        "evalsha_ro",
+        super::lua_runtime::ScriptMode::ReadOnly,
+    )
 }
 
 // ---- Feature: lua-scripting disabled (stubs) ----
@@ -483,6 +545,78 @@ fn sha1_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn lua_inline_replies_cannot_inject_frames_or_break_following_replies() {
+        use bytes::BytesMut;
+        use ratatosk_resp::{encode_to_vec, parse};
+
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for body in [
+            "return redis.call('SET','forbidden','v')",
+            "error('first\\r\\n+FORGED\\r\\n')",
+            "return redis.error_reply('first\\r\\n+FORGED\\r\\n')",
+            "return redis.status_reply('OK\\r\\n+FORGED\\r\\n')",
+            "return {{err='first\\r\\n+FORGED'}, {ok='OK\\n'}}",
+        ] {
+            let reply = run_command(&["EVAL_RO", body, "0"], &mut server, &mut client);
+            let mut encoded = Vec::new();
+            encode_to_vec(&reply, &mut encoded);
+            encode_to_vec(&RespFrame::pong(), &mut encoded);
+            let mut wire = BytesMut::from(encoded.as_slice());
+            assert_eq!(parse(&mut wire).expect("valid Lua reply"), Some(reply));
+            assert_eq!(
+                parse(&mut wire).expect("following PONG"),
+                Some(RespFrame::pong())
+            );
+            assert!(wire.is_empty(), "Lua response injected extra bytes");
+        }
+        assert_eq!(
+            run_command(
+                &["EVAL_RO", "return 'a\\r\\nb'", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("a\r\nb")
+        );
+        assert_eq!(
+            run_command(&["GET", "forbidden"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    fn arguments(parts: &[&str]) -> Vec<Bytes> {
+        parts
+            .iter()
+            .map(|part| Bytes::copy_from_slice(part.as_bytes()))
+            .collect()
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    fn assert_error_contains(response: &RespFrame, expected: &str) {
+        let RespFrame::Error(message) = response else {
+            panic!("expected error containing {expected:?}, got {response:?}");
+        };
+        assert!(
+            String::from_utf8_lossy(message).contains(expected),
+            "unexpected error: {}",
+            String::from_utf8_lossy(message)
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    fn run_command(
+        parts: &[&str],
+        server: &mut ServerState,
+        client: &mut ClientState,
+    ) -> RespFrame {
+        let frame = RespFrame::Array(parts.iter().map(|part| RespFrame::bulk_str(part)).collect());
+        let mut access = super::super::ServerAccess::new_inline(server);
+        super::super::execute(frame, &mut access, client).response
+    }
+
     #[test]
     fn test_sha1_empty() {
         // SHA1("") = da39a3ee5e6b4b0d3255bfef95601890afd80709
@@ -512,5 +646,220 @@ mod tests {
             sha1_hex(b"return 1"),
             "e0e1f9fabfc9d4800c877a703b823ac0578ff8db"
         );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn parse_keys_argv_rejects_usize_max_without_overflow() {
+        let numkeys = usize::MAX.to_string();
+        let args = vec![Bytes::from_static(b"return 1"), Bytes::from(numkeys)];
+
+        let error = parse_keys_argv(&args, "eval").unwrap_err();
+        assert_error_contains(
+            &error,
+            "Number of keys can't be greater than number of args",
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn readonly_aliases_reject_call_and_pcall_without_dataset_or_durable_effects() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        let call = arguments(&["return redis.call('SET','call-write','value')", "0"]);
+        let response = cmd_eval_ro(&call, &mut server, &mut client).response;
+        assert_error_contains(&response, "read-only scripts");
+        assert!(
+            !server
+                .db(0)
+                .contains_key(&Bytes::from_static(b"call-write"))
+        );
+        assert!(client.take_durability_effects().is_none());
+
+        let script = Bytes::from_static(b"return redis.pcall('SET','pcall-write','value')");
+        let RespFrame::BulkString(Some(sha)) =
+            script_load(std::slice::from_ref(&script), &mut server).response
+        else {
+            panic!("SCRIPT LOAD did not return a SHA");
+        };
+        let response =
+            cmd_evalsha_ro(&[sha, Bytes::from_static(b"0")], &mut server, &mut client).response;
+        assert_error_contains(&response, "read-only scripts");
+        assert!(
+            !server
+                .db(0)
+                .contains_key(&Bytes::from_static(b"pcall-write"))
+        );
+        assert!(client.take_durability_effects().is_none());
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn readonly_reads_succeed_and_mode_is_scoped_to_one_invocation() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        let write = arguments(&["return redis.call('SET','seed','value')", "0"]);
+        assert_eq!(
+            cmd_eval(&write, &mut server, &mut client).response,
+            RespFrame::ok()
+        );
+
+        let mixed_case_read = arguments(&["return redis.call('gEt','seed')", "0"]);
+        assert_eq!(
+            cmd_eval_ro(&mixed_case_read, &mut server, &mut client).response,
+            RespFrame::bulk_str("value")
+        );
+
+        let rejected = arguments(&["return redis.call('sEt','blocked','value')", "0"]);
+        assert_error_contains(
+            &cmd_eval_ro(&rejected, &mut server, &mut client).response,
+            "read-only scripts",
+        );
+
+        let following_write = arguments(&["return redis.call('SET','after-ro','value')", "0"]);
+        assert_eq!(
+            cmd_eval(&following_write, &mut server, &mut client).response,
+            RespFrame::ok()
+        );
+        assert!(server.db(0).contains_key(&Bytes::from_static(b"after-ro")));
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn os_library_is_not_exposed_in_writable_or_readonly_scripts() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let check = arguments(&["return type(os)", "0"]);
+
+        assert_eq!(
+            cmd_eval(&check, &mut server, &mut client).response,
+            RespFrame::bulk_str("nil")
+        );
+        assert_eq!(
+            cmd_eval_ro(&check, &mut server, &mut client).response,
+            RespFrame::bulk_str("nil")
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn readonly_rejections_precede_server_connection_transaction_and_pubsub_effects() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(42);
+        client.set_durability_capture_enabled(true);
+        let mut receiver = server.pubsub.register_client(99);
+        server
+            .pubsub
+            .subscribe_channel(99, Bytes::from_static(b"events"));
+        server
+            .pubsub
+            .subscribe_shard_channel(99, Bytes::from_static(b"events"));
+
+        let forbidden = [
+            "return redis.pcall('PUBLISH','events','payload')",
+            "return redis.pcall('SPUBLISH','events','payload')",
+            "return redis.pcall('SUBSCRIBE','events')",
+            "return redis.pcall('CONFIG','SET','maxmemory','1')",
+            "return redis.pcall('CLIENT','SETNAME','lua')",
+            "return redis.pcall('SELECT','1')",
+            "return redis.pcall('RESET')",
+            "return redis.pcall('MULTI')",
+            "return redis.pcall('EXEC')",
+            "return redis.pcall('EVAL','return 1','0')",
+        ];
+
+        for source in forbidden {
+            let response =
+                cmd_eval_ro(&arguments(&[source, "0"]), &mut server, &mut client).response;
+            assert!(
+                matches!(response, RespFrame::Error(_)),
+                "{source}: {response:?}"
+            );
+        }
+
+        assert_eq!(server.config.maxmemory(), 0);
+        assert_eq!(client.selected_db(), 0);
+        assert!(!client.in_multi());
+        assert_eq!(client.acl_user(), &Bytes::from_static(b"default"));
+        assert_eq!(
+            server.pubsub.numsub(&[Bytes::from_static(b"events")])[0].1,
+            1
+        );
+        assert_eq!(
+            server.pubsub.shard_numsub(&[Bytes::from_static(b"events")])[0].1,
+            1
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a rejected publish reached the subscriber"
+        );
+        assert!(client.take_durability_effects().is_none());
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn all_scripts_reject_auth_hello_and_noscript_commands_before_dispatch() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(43);
+        let forbidden = [
+            "return redis.pcall('AUTH','bad-password')",
+            "return redis.pcall('HELLO','3','AUTH','default','bad-password')",
+            "return redis.pcall('CONFIG','GET','maxmemory')",
+            "return redis.pcall('CLIENT','GETNAME')",
+            "return redis.pcall('MULTI')",
+        ];
+
+        for source in forbidden {
+            let response = cmd_eval(&arguments(&[source, "0"]), &mut server, &mut client).response;
+            assert_error_contains(&response, "not allowed from script");
+        }
+
+        assert!(!client.is_authenticated());
+        assert_eq!(client.auth_failure_count(), 0);
+        assert_eq!(client.protocol_version(), 2);
+        assert!(!client.in_multi());
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn readonly_script_queued_in_multi_is_rejected_by_exec_without_mutation() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        assert_eq!(
+            run_command(&["MULTI"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run_command(
+                &[
+                    "EVAL_RO",
+                    "return redis.call('SET','queued-write','value')",
+                    "0",
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::SimpleString(Bytes::from_static(b"QUEUED"))
+        );
+        let response = run_command(&["EXEC"], &mut server, &mut client);
+        let RespFrame::Array(items) = response else {
+            panic!("expected EXEC array, got {response:?}");
+        };
+        assert_eq!(items.len(), 1);
+        assert_error_contains(&items[0], "read-only scripts");
+        assert!(
+            !server
+                .db(0)
+                .contains_key(&Bytes::from_static(b"queued-write"))
+        );
+        assert!(client.take_durability_effects().is_none());
     }
 }

@@ -181,10 +181,11 @@ async fn handle_client_inner<S: SessionStream>(
 ) -> io::Result<()> {
     let mut client_state = ClientState::new(client_id);
     client_state.set_unix_socket(matches!(&info.kind, PeerKind::Unix | PeerKind::Shm));
+    client_state.set_peer_ip(info.peer_ip);
     let mut runtime =
         initialize_session_runtime(info, server_state, client_id, &client_state).await;
 
-    run_client_session_loop(
+    let result = run_client_session_loop(
         &mut stream,
         server_state,
         persistence,
@@ -192,7 +193,12 @@ async fn handle_client_inner<S: SessionStream>(
         &mut runtime,
         io_limits,
     )
-    .await
+    .await;
+
+    // A connection that ends mid-WATCH must release its registrations, or
+    // writes would keep recording versions for keys nobody watches.
+    client_state.release_watches(&server_state.data);
+    result
 }
 #[cfg(test)]
 mod tests {
@@ -373,6 +379,152 @@ mod tests {
             out.extend_from_slice(&chunk);
         }
         out
+    }
+
+    /// The lock-free read path parses arguments separately from the engine;
+    /// it must never panic on hostile input either (release builds abort).
+    #[test]
+    fn lock_free_fast_path_never_panics_on_hostile_arguments() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        const COMMANDS: &[&str] = &[
+            "PING",
+            "ECHO",
+            "TIME",
+            "DBSIZE",
+            "TYPE",
+            "EXISTS",
+            "GET",
+            "MGET",
+            "STRLEN",
+            "BITCOUNT",
+            "GETRANGE",
+            "SUBSTR",
+            "HGET",
+            "HMGET",
+            "HGETALL",
+            "HKEYS",
+            "HVALS",
+            "HEXISTS",
+            "HLEN",
+            "HSTRLEN",
+            "SISMEMBER",
+            "SMISMEMBER",
+            "SCARD",
+            "ZSCORE",
+            "ZCARD",
+            "ZMSCORE",
+            "ZCOUNT",
+            "ZLEXCOUNT",
+            "ZRANGE",
+            "ZRANGEBYSCORE",
+            "ZREVRANGEBYSCORE",
+            "ZRANGEBYLEX",
+            "ZREVRANGEBYLEX",
+            "ZREVRANGE",
+            "ZRANK",
+            "ZREVRANK",
+            "LLEN",
+            "LINDEX",
+            "LRANGE",
+            "TTL",
+            "PTTL",
+            "EXPIRETIME",
+            "PEXPIRETIME",
+            "GETBIT",
+        ];
+        const TOKENS: &[&str] = &[
+            "",
+            "0",
+            "1",
+            "-1",
+            "2",
+            "-2",
+            "100000",
+            "-100000",
+            "9223372036854775807",
+            "-9223372036854775808",
+            "99999999999999999999",
+            "4294967296",
+            "inf",
+            "-inf",
+            "+inf",
+            "nan",
+            "(1",
+            "(inf",
+            "[a",
+            "(a",
+            "-",
+            "+",
+            "str",
+            "list",
+            "hash",
+            "set",
+            "zset",
+            "missing",
+            "LIMIT",
+            "WITHSCORES",
+            "WITHSCORE",
+            "BYSCORE",
+            "BYLEX",
+            "REV",
+            "BYTE",
+            "BIT",
+            "a",
+        ];
+
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        {
+            let mut zset = SortedSet::default();
+            zset.insert(Bytes::from_static(b"a"), 1.0);
+            zset.insert(Bytes::from_static(b"b"), f64::INFINITY);
+            let mut hash = HashMap::new();
+            hash.insert(
+                Bytes::from_static(b"a"),
+                HashFieldEntry::new(Bytes::from_static(b"1")),
+            );
+            let mut set = HashSet::new();
+            set.insert(Bytes::from_static(b"a"));
+            let mut db = shared.data.write_db(0);
+            for (key, value) in [
+                (
+                    "str",
+                    StoredValue::string(Bytes::from_static(b"hello"), None),
+                ),
+                (
+                    "list",
+                    StoredValue::list(VecDeque::from([Bytes::from_static(b"a")]), None),
+                ),
+                ("hash", StoredValue::hash(hash, None)),
+                ("set", StoredValue::set(set, None)),
+                ("zset", StoredValue::sorted_set(zset, None)),
+            ] {
+                db.data.insert(Bytes::from(key), value);
+            }
+        }
+
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut panics = Vec::new();
+        for command in COMMANDS {
+            for _ in 0..200 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let mut argv = vec![Bytes::from_static(command.as_bytes())];
+                for shift in 0..(rng % 7) {
+                    let pick = (rng >> (8 * shift + 3)) as usize % TOKENS.len();
+                    argv.push(Bytes::from_static(TOKENS[pick].as_bytes()));
+                }
+                let mut client = ClientState::new(1);
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    try_execute_lock_free_fast_command(&argv, &shared, &mut client)
+                }));
+                if outcome.is_err() {
+                    panics.push(argv);
+                }
+            }
+        }
+        assert!(panics.is_empty(), "fast path panicked: {panics:#?}");
     }
 
     #[test]
@@ -2098,6 +2250,44 @@ mod tests {
             server.stats.total_commands_processed()
         );
         assert_eq!(shared.stats.total_commands_processed(), 4);
+    }
+
+    #[tokio::test]
+    async fn pipelined_fast_path_matches_redis_range_edges() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+        {
+            let mut zset = SortedSet::default();
+            assert!(zset.insert(Bytes::from_static(b"a"), 1.0));
+            assert!(zset.insert(Bytes::from_static(b"top"), f64::INFINITY));
+            let mut db = shared.data.write_db(0);
+            db.data.insert(
+                Bytes::from_static(b"zset"),
+                StoredValue::sorted_set(zset, None),
+            );
+            db.data.insert(
+                Bytes::from_static(b"s"),
+                StoredValue::string(Bytes::from_static(b"abc"), None),
+            );
+        }
+
+        // One write keeps the batch on the lock-free read path.
+        client
+            .write_all(
+                b"ZRANGE zset 0 -100\r\nZRANGEBYSCORE zset +inf +inf\r\nZCOUNT zset -inf +inf\r\nGETRANGE s 0 -100\r\nBITCOUNT s 0 -100\r\n",
+            )
+            .await
+            .expect("write readonly batch");
+
+        let expected = b"*0\r\n*1\r\n$3\r\ntop\r\n:2\r\n$1\r\na\r\n:3\r\n";
+        assert_eq!(
+            read_exact_reply(&mut client, expected.len()).await,
+            expected
+        );
+
+        client.write_all(b"QUIT\r\n").await.expect("write quit");
+        assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
+        server_task.await.expect("server task complete");
     }
 
     #[tokio::test]

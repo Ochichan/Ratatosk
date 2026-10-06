@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PLIST_LABEL="dev.ratatosk.serve"
 DOMAIN_TARGET="gui/$(id -u)"
 LOG_DIR="${HOME}/Library/Logs/Ratatosk"
+PLIST_PATH="${HOME}/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
 cd "$(cd "${SCRIPT_DIR}/.." && pwd)"
 
@@ -31,10 +32,12 @@ launchctl print "${DOMAIN_TARGET}/${PLIST_LABEL}" 2>&1 | head -20 || true
 
 echo
 echo "[ratatosk] port probe:"
-if nc -z 127.0.0.1 6379 2>/dev/null; then
-  echo "TCP port 6379: open"
+# set-ratatosk-autostart-port-macos.sh may have changed the port.
+PORT="$(plutil -extract EnvironmentVariables.RATATOSK_PORT raw "${PLIST_PATH}" 2>/dev/null || echo 6379)"
+if nc -z 127.0.0.1 "${PORT}" 2>/dev/null; then
+  echo "TCP port ${PORT}: open"
 else
-  echo "TCP port 6379: closed (server may still be starting)"
+  echo "TCP port ${PORT}: closed (server may still be starting)"
 fi
 
 echo

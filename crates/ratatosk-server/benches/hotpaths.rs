@@ -1,3 +1,14 @@
+// The server binary picks its allocator in `main.rs`; benches link only the
+// library, so they must install the same allocator for `--features mimalloc`
+// or `--features jemalloc` to measure anything different.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use std::{collections::VecDeque, time::Duration};
 
 use bytes::Bytes;

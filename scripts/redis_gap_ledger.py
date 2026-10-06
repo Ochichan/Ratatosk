@@ -214,6 +214,7 @@ def _infer_capability_tier(status: str, name: str, notes: str) -> str:
 
     unsupported_commands = {
         "SYNC",
+        "PSYNC",
         "SENTINEL",
         "EVAL",
         "EVALSHA",
@@ -260,7 +261,6 @@ def _infer_capability_tier(status: str, name: str, notes: str) -> str:
     }
     baseline_local_commands = {
         "REPLCONF",
-        "PSYNC",
         "REPLICAOF",
         "SLAVEOF",
         "CLIENT",
@@ -719,6 +719,20 @@ def cmd_check(args: argparse.Namespace) -> int:
 
     status_counts = Counter(str(c["status"]) for c in ledger_commands)
     tier_counts = Counter(str(c["capability_tier"]) for c in ledger_commands)
+
+    stale_summaries = []
+    for doc in args.summary_doc:
+        doc_path = Path(doc).resolve()
+        for tier, documented in _documented_tier_counts(doc_path).items():
+            if documented != tier_counts.get(tier, 0):
+                stale_summaries.append(
+                    f"  - {doc}: {tier}={documented}, ledger has {tier_counts.get(tier, 0)}"
+                )
+    if stale_summaries:
+        print("[check] capability tier tables disagree with the ledger:")
+        print("\n".join(stale_summaries))
+        return 1
+
     summary = ", ".join(
         f"{status}={status_counts.get(status, 0)}" for status in VALID_STATUSES
     )
@@ -727,6 +741,26 @@ def cmd_check(args: argparse.Namespace) -> int:
     )
     print(f"[check] OK: commands={len(ledger_commands)}; {summary}; {tier_summary}")
     return 0
+
+
+def _documented_tier_counts(doc_path: Path) -> dict[str, int]:
+    """Read a prose document's tier table: rows starting with a backticked
+    tier name, taking the first cell that holds only an integer."""
+    counts: dict[str, int] = {}
+    for line in doc_path.read_text(encoding="utf-8").splitlines():
+        cells = _split_markdown_row(line) if line.startswith("|") else []
+        if not cells:
+            continue
+        tier = cells[0].strip("` ")
+        if tier not in VALID_CAPABILITY_TIERS or not cells[0].startswith("`"):
+            continue
+        for cell in cells[1:]:
+            if cell.isdigit():
+                counts[tier] = int(cell)
+                break
+    if not counts:
+        raise ValueError(f"{doc_path} has no capability tier table")
+    return counts
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -785,6 +819,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--markdown",
         default="docs/redis-gap-ledger.md",
         help="Generated markdown report path.",
+    )
+    p_check.add_argument(
+        "--summary-doc",
+        action="append",
+        default=[],
+        help="Hand-written document whose capability tier table must match the ledger (repeatable).",
     )
     p_check.set_defaults(func=cmd_check)
 

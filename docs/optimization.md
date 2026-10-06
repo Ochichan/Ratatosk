@@ -79,6 +79,10 @@ Two-process transport latency is measured separately under `benchmarks/ipc/`.
 
 - 현재 기본 allocator를 유지한다.
 - `mimalloc`은 feature flag(`--features mimalloc`)로 재측정할 수 있다.
+- bench 타깃은 `main.rs`가 아니라 라이브러리만 링크하므로 각 bench 파일이
+  feature에 맞는 `#[global_allocator]`를 직접 설치한다. 2026-09-21 이전의
+  `benchmarks/*mimalloc*` 로그는 이 설치가 없던 시기의 것으로, 실제로는
+  시스템 allocator끼리 비교한 결과다.
 - allocator 전환은 최소 2회 이상 일관된 개선 결과가 있을 때만 검토한다.
 
 #### Record Template

@@ -44,11 +44,9 @@ pub(super) fn cmd_echo(args: &[Bytes]) -> CommandOutcome {
     }
 }
 
-pub(super) fn cmd_quit(args: &[Bytes]) -> CommandOutcome {
-    if !args.is_empty() {
-        return wrong_arity("quit");
-    }
-
+pub(super) fn cmd_quit(_args: &[Bytes]) -> CommandOutcome {
+    // Redis answers QUIT before its arity check, so trailing arguments are
+    // ignored rather than rejected.
     CommandOutcome::close(RespFrame::ok())
 }
 
@@ -58,7 +56,10 @@ pub(super) fn cmd_hello(
     client: &mut ClientState,
 ) -> CommandOutcome {
     let mut idx = 0usize;
-    let mut proto = 3i64;
+    // Without an explicit protover HELLO reports, and keeps, the current protocol.
+    let mut proto = client.protocol_version();
+    let mut auth_attempts = Vec::new();
+    let mut client_name = None;
 
     if let Some(first) = args.first() {
         if let Some(version) = parse_i64(first) {
@@ -68,44 +69,44 @@ pub(super) fn cmd_hello(
             proto = version;
             idx = 1;
         } else {
+            // Ratatosk also accepts AUTH/SETNAME without a protover.
             let token = to_uppercase_bytes(first);
             if !matches!(token.as_slice(), b"AUTH" | b"SETNAME") {
-                return CommandOutcome::reply(err("NOPROTO unsupported protocol version"));
+                return CommandOutcome::reply(err(
+                    "ERR Protocol version is not an integer or out of range",
+                ));
             }
         }
     }
 
     while idx < args.len() {
         let option = to_uppercase_bytes(&args[idx]);
+        let more_args = args.len() - idx - 1;
         match option.as_slice() {
-            b"AUTH" => {
-                if idx + 2 >= args.len() {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
-
-                if !super::cmd_auth_session::authenticate_client(
-                    server,
-                    &args[idx + 1],
-                    &args[idx + 2],
-                    client,
-                ) {
-                    return CommandOutcome::reply(err(
-                        "ERR invalid username-password pair or user is disabled.",
-                    ));
-                }
+            b"AUTH" if more_args >= 2 => {
+                auth_attempts.push((&args[idx + 1], &args[idx + 2]));
                 idx += 3;
             }
-            b"SETNAME" => {
-                if idx + 1 >= args.len() {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
+            b"SETNAME" if more_args >= 1 => {
                 if let Err(response) = cmd_client::validate_client_name(&args[idx + 1]) {
                     return CommandOutcome::reply(response);
                 }
-                client.name = Some(args[idx + 1].clone());
+                client_name = Some(args[idx + 1].clone());
                 idx += 2;
             }
-            _ => return CommandOutcome::reply(err("ERR syntax error")),
+            _ => {
+                return CommandOutcome::reply(err(&format!(
+                    "ERR Syntax error in HELLO option '{}'",
+                    String::from_utf8_lossy(&args[idx])
+                )));
+            }
+        }
+    }
+
+    for (username, password) in auth_attempts {
+        match super::cmd_auth_session::authenticate_client(server, username, password, client) {
+            super::cmd_auth_session::AuthenticationResult::Authenticated => {}
+            super::cmd_auth_session::AuthenticationResult::Rejected(outcome) => return outcome,
         }
     }
 
@@ -113,6 +114,10 @@ pub(super) fn cmd_hello(
         return CommandOutcome::reply(err(
             "NOAUTH HELLO must be called with the client already authenticated",
         ));
+    }
+
+    if let Some(name) = client_name {
+        client.name = Some(name);
     }
 
     client.set_protocol_version(proto);
@@ -335,5 +340,32 @@ fn check_aof_health(dir: &Path, aof_enabled: bool) -> (bool, Option<String>) {
     match OpenOptions::new().create(true).append(true).open(&aof_path) {
         Ok(_) => (true, None),
         Err(error) => (false, Some(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn malformed_hello_does_not_dispatch_an_embedded_auth_attempt() {
+        let server = ServerState::with_default_dbs();
+        let mut client = ClientState::new(1);
+        let args = [
+            Bytes::from_static(b"3"),
+            Bytes::from_static(b"AUTH"),
+            Bytes::from_static(b"missing"),
+            Bytes::from_static(b"wrong"),
+            Bytes::from_static(b"UNKNOWN"),
+        ];
+
+        let outcome = cmd_hello(&args, &server, &mut client);
+
+        assert_eq!(
+            outcome.response,
+            RespFrame::error_str("ERR Syntax error in HELLO option 'UNKNOWN'")
+        );
+        assert_eq!(client.auth_failure_count(), 0);
+        assert!(!client.is_authenticated());
     }
 }

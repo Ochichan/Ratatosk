@@ -33,7 +33,9 @@ run_once() {
   {
     echo "# Ratatosk allocator A/B ($ts)"
     echo "# mode: ${mode}"
-    "${CARGO_CMD[@]}" bench -p ratatosk-server "${features[@]}" --bench "$BENCH_TARGET" -- --sample-size "$SAMPLE_SIZE"
+    # `${a[@]+...}` keeps the empty default-mode array legal under `set -u`
+    # on bash 3.2 (macOS).
+    "${CARGO_CMD[@]}" bench -p ratatosk-server ${features[@]+"${features[@]}"} --bench "$BENCH_TARGET" -- --sample-size "$SAMPLE_SIZE"
   } | tee "$log"
 
   if [[ "$BENCH_TARGET" == "pipeline" ]]; then

@@ -9,8 +9,10 @@ SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 SERVICE_PATH="${SYSTEMD_USER_DIR}/${SERVICE_NAME}"
 LEGACY_SERVICE_PATH="${SYSTEMD_USER_DIR}/${LEGACY_SERVICE_NAME}"
 LAUNCHER_PATH="${XDG_BIN_HOME:-${HOME}/.local/bin}/ratatosk"
+DATA_DIR="${REPO_ROOT}/data"
 
-mkdir -p "${SYSTEMD_USER_DIR}"
+# The server refuses to start in a missing data directory.
+mkdir -p "${SYSTEMD_USER_DIR}" "${DATA_DIR}"
 
 "${SCRIPT_DIR}/install-ratatosk-launcher.sh"
 
@@ -25,7 +27,11 @@ Type=simple
 WorkingDirectory=${REPO_ROOT}
 Environment=RATATOSK_BIND=127.0.0.1
 Environment=RATATOSK_PORT=6380
-Environment=RATATOSK_DIR=${REPO_ROOT}/data
+Environment=RATATOSK_DIR=${DATA_DIR}
+# Keep serving if the metrics port (9090, Prometheus' own default) is taken.
+Environment=RATATOSK_ALLOW_NO_METRICS=true
+# The launcher runs cargo, which systemd's minimal PATH does not include.
+Environment=PATH=${HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 LimitNOFILE=65535
 ExecStart=${LAUNCHER_PATH}
 Restart=always

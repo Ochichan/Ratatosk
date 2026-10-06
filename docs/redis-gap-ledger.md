@@ -23,9 +23,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 
 | Tier | Value |
 | --- | ---: |
-| unsupported | 63 |
+| unsupported | 64 |
 | syntax_only | 6 |
-| baseline_local | 76 |
+| baseline_local | 75 |
 | behavioral_subset | 275 |
 | distributed_parity | 0 |
 
@@ -66,7 +66,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | pubsub | 0 | 15 | 0 | 0 | 0 | 15 |
 | scripting | 0 | 1 | 11 | 0 | 11 | 23 |
 | sentinel | 0 | 0 | 0 | 1 | 21 | 22 |
-| server | 0 | 34 | 41 | 1 | 7 | 83 |
+| server | 0 | 34 | 40 | 1 | 8 | 83 |
 | set | 0 | 17 | 0 | 0 | 0 | 17 |
 | sorted_set | 0 | 35 | 0 | 0 | 0 | 35 |
 | stream | 0 | 28 | 0 | 0 | 0 | 28 |
@@ -93,7 +93,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `ACL WHOAMI` | server | 6.0.0 | done | behavioral_subset | m0-foundation | M0 ACL baseline implemented (current authenticated ACL user). |
 | `APPEND` | string | 2.0.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `ASKING` | cluster | 3.0.0 | done | syntax_only | m5-advanced |  |
-| `AUTH` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented (accepts AUTH <username> <password>). |
+| `AUTH` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | AUTH and HELLO AUTH share per-connection delay/close and bounded process-local TCP peer-IP failure limits (20/60s, 4096 IPs). Success resets only connection history; RESET/reconnect cannot clear peer history. Local transports have connection limits only. |
 | `BGREWRITEAOF` | server | 1.0.0 | done | behavioral_subset | m3-persistence | Async AOF worker rewrite path wired (start/in-progress gate/shutdown drain). Materializes the current dataset including hash-field TTLs and complete stream group state before switching BASE/INCR manifest. |
 | `BGSAVE` | server | 1.0.0 | done | behavioral_subset | m3-persistence | M3 baseline implemented (non-blocking acknowledgement path with timestamp update). |
 | `BITCOUNT` | bitmap | 2.6.0 | done | behavioral_subset | m4-extended-types | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
@@ -173,7 +173,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `CONFIG HELP` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG RESETSTAT` | server | 2.0.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented. |
 | `CONFIG REWRITE` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 operational baseline implemented (in-memory acknowledge path). |
-| `CONFIG SET` | server | 2.0.0 | done | baseline_local | m0-foundation | Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. |
+| `CONFIG SET` | server | 2.0.0 | done | baseline_local | m0-foundation | Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. maxmemory accepts decimal byte limits at runtime (0 disables the cap); noeviction admission uses a current dataset estimate. Policies/samples remain startup-only. |
 | `COPY` | generic | 6.2.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented (DB/REPLACE options). |
 | `DBSIZE` | server | 1.0.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `DEBUG` | server | 1.0.0 | done | unsupported | m0-foundation | M0 admin baseline implemented (HELP + unsupported subcommand response). |
@@ -185,11 +185,11 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `DISCARD` | transactions | 2.0.0 | done | behavioral_subset | m1-kv-core | M1 transaction baseline implemented. |
 | `DUMP` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RATSK1 internal payload serialization for string/hash/list/set. |
 | `ECHO` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
-| `EVAL` | scripting | 2.6.0 | done | unsupported | m5-advanced |  |
-| `EVALSHA` | scripting | 2.6.0 | done | unsupported | m5-advanced |  |
-| `EVALSHA_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
-| `EVAL_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced |  |
-| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. |
+| `EVAL` | scripting | 2.6.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, Lua callbacks reject AUTH/HELLO and nested scripting; feature behavior does not establish full Redis parity. |
+| `EVALSHA` | scripting | 2.6.0 | done | unsupported | m5-advanced | Default build unsupported; lua-scripting enables cached execution with the same callback restrictions as EVAL. |
+| `EVALSHA_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, SHA execution uses the same read allowlist and conservative OOM admission as EVAL_RO. |
+| `EVAL_RO` | scripting | 7.0.0 | done | unsupported | m5-advanced | Default build unsupported. With lua-scripting, explicit data-read allowlist enforced before redis.call/pcall dispatch; other nested commands fail. Conservative OOM admission remains; not a host sandbox or full Redis parity. |
+| `EXEC` | transactions | 1.2.0 | done | behavioral_subset | m1-kv-core | Successful nested mutations persist in an atomic AOF envelope, including selected DBs; WATCH abort uses RESP2 null array / RESP3 null. Replies retain protocol versions across nested HELLO. Inner CONFIG/ACL dirty flags propagate; runtime AOF enable snapshots final committed state once and disable flushes its effects before stopping. Inner terminal outcomes stop the remaining queue and propagate close plus accumulated delay; only the executed prefix persists (no rollback claim), with executed-command stats accounting. |
 | `EXISTS` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `EXPIRE` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `EXPIREAT` | generic | 1.2.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
@@ -226,7 +226,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `GETRANGE` | string | 2.4.0 | done | behavioral_subset | m1-kv-core | Local baseline treats integer-encoded strings as their decimal ASCII bytes; string mutations preserve key expiry and reject other value types. |
 | `GETSET` | string | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 string baseline implemented. |
 | `HDEL` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
-| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | RESP2 negotiation returns a flat array; RESP3 returns a map. Pipelined and transactional protocol changes preserve previously completed replies. |
+| `HELLO` | connection | 6.0.0 | done | behavioral_subset | m0-foundation | RESP2 negotiation returns a flat array; RESP3 a map. Completed pipeline/EXEC replies keep their protocol. AUTH option shares credential failure delay/close and TCP peer-IP budget with AUTH; malformed options are not credential guesses. |
 | `HEXISTS` | hash | 2.0.0 | done | behavioral_subset | m2-collections | M2 hash core baseline implemented. |
 | `HEXPIRE` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Relative field deadlines survive timestamped AOF replay and lossless RDB/BASE snapshots. |
 | `HEXPIREAT` | hash | 7.4.0 | done | behavioral_subset | m2-collections |  Absolute field deadlines survive RDB/BASE snapshots and AOF replay. |
@@ -327,7 +327,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `PING` | connection | 1.0.0 | done | behavioral_subset | m0-foundation | M0 implemented and tested. |
 | `PSETEX` | string | 2.6.0 | done | behavioral_subset | m1-kv-core | Local expiry baseline; successful AOF effects retain absolute deadlines rather than restarting relative TTLs during replay. |
 | `PSUBSCRIBE` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | Independent acknowledgement per target (RESP2 arrays / RESP3 pushes), including EXEC; standard/pattern and shard subscription counts are separate. |
-| `PSYNC` | server | 2.8.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with stateful FULLRESYNC handshake over the current replid/offset. |
+| `PSYNC` | server | 2.8.0 | done | unsupported | m0-foundation | Returns ERR in standalone mode; no FULLRESYNC handshake, partial resynchronization, or replication stream is implemented. |
 | `PTTL` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `PUBLISH` | pubsub | 2.0.0 | done | behavioral_subset | m3-events | M3 events baseline implemented with receiver counting and server-side fanout queue. |
 | `PUBSUB` | pubsub | 2.8.0 | done | behavioral_subset | m3-events | M3 pubsub baseline implemented with CHANNELS/NUMSUB/NUMPAT/HELP dispatch. |
@@ -345,7 +345,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `RENAME` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `RENAMENX` | generic | 1.0.0 | done | behavioral_subset | m1-kv-core | M1 generic baseline implemented. |
 | `REPLCONF` | server | 3.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with LISTENING-PORT/CAPA/ACK/GETACK/IP-ADDRESS subset backed by per-client replica metadata. |
-| `REPLICAOF` | server | 5.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented with standalone role transition between master and configured upstream replica. |
+| `REPLICAOF` | server | 5.0.0 | done | baseline_local | m0-foundation | REPLICAOF NO ONE confirms standalone mode and returns OK; every upstream host/port request returns ERR. No replica connection or failover is implemented. |
 | `RESET` | connection | 6.2.0 | done | behavioral_subset | m0-foundation | M0 compatibility baseline implemented. |
 | `RESTORE` | generic | 2.6.0 | done | behavioral_subset | m1-kv-core | M1 baseline implemented: RESTORE payload import with REPLACE/ABSTTL support and BUSYKEY handling. AOF v2 preserves the execution clock for relative key TTL during replay; native payload compatibility limits remain. |
 | `RESTORE-ASKING` | server | 3.0.0 | done | behavioral_subset | m0-foundation | M0 replication-control baseline implemented as RESTORE alias behavior. |
@@ -401,7 +401,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `SINTERCARD` | set | 7.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented (numkeys/LIMIT parser + cardinality-only path). |
 | `SINTERSTORE` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set algebra baseline implemented. |
 | `SISMEMBER` | set | 1.0.0 | done | behavioral_subset | m2-collections | M2 set core baseline implemented. |
-| `SLAVEOF` | server | 1.0.0 | done | baseline_local | m0-foundation | M0 replication-control baseline implemented as REPLICAOF alias. |
+| `SLAVEOF` | server | 1.0.0 | done | baseline_local | m0-foundation | REPLICAOF alias: NO ONE returns OK as standalone confirmation; upstream host/port requests return ERR. No replica connection is created. |
 | `SLOWLOG` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented (GET/LEN/RESET/HELP subset). |
 | `SLOWLOG GET` | server | 2.2.12 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |
 | `SLOWLOG HELP` | server | 6.2.0 | done | behavioral_subset | m0-foundation | M0 operational baseline implemented. |

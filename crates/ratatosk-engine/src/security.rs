@@ -204,17 +204,34 @@ struct AuditChainState {
 }
 
 static AUDIT_CHAIN_STATE: OnceLock<Mutex<AuditChainState>> = OnceLock::new();
+static AUDIT_DEFAULT_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep the default audit files with this instance's data.
+///
+/// Without it they fall back to the shared `/tmp`, where every instance on
+/// the host would append to one log and overwrite one chain checkpoint. Call
+/// once at startup, before the first audit event; the `RATATOSK_AUDIT_LOG`
+/// and `RATATOSK_AUDIT_CHAIN_STATE` variables still take precedence.
+pub fn set_default_audit_dir(dir: &Path) {
+    let _ = AUDIT_DEFAULT_DIR.set(dir.to_path_buf());
+}
+
+fn default_audit_file(name: &str) -> PathBuf {
+    AUDIT_DEFAULT_DIR
+        .get()
+        .map_or_else(|| Path::new("/tmp").join(name), |dir| dir.join(name))
+}
 
 fn audit_state_path() -> PathBuf {
     env::var("RATATOSK_AUDIT_CHAIN_STATE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/ratatosk-audit-chain.state"))
+        .unwrap_or_else(|_| default_audit_file("ratatosk-audit-chain.state"))
 }
 
 fn audit_log_path() -> PathBuf {
     env::var("RATATOSK_AUDIT_LOG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp/ratatosk-audit.log"))
+        .unwrap_or_else(|_| default_audit_file("ratatosk-audit.log"))
 }
 
 pub fn audit_paths_from_env() -> (PathBuf, PathBuf) {

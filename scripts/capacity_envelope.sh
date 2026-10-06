@@ -41,6 +41,13 @@ else
   exit 1
 fi
 
+# OpenBSD/GNU nc needs -N to shut the socket down after EOF; Apple nc uses -N
+# for something else, so only pass it where it means "shutdown".
+NC_OPTS=(-w 2)
+if [[ "$REDIS_CLIENT_MODE" == "nc" ]] && nc -h 2>&1 | grep -qiE -- '-N[[:space:]].*shutdown'; then
+  NC_OPTS=(-N -w 2)
+fi
+
 if command -v cargo >/dev/null 2>&1; then
   CARGO_CMD=(cargo)
 else
@@ -88,7 +95,7 @@ resp_request() {
 
 redis_cmd_nc() {
   local raw first first_char
-  raw="$(resp_request "$@" | nc -w 2 127.0.0.1 "$PORT" 2>/dev/null)" || return 1
+  raw="$(resp_request "$@" | nc "${NC_OPTS[@]}" 127.0.0.1 "$PORT" 2>/dev/null)" || return 1
   first="$(printf '%s' "$raw" | head -n 1 | tr -d '\r')"
   first_char="${first:0:1}"
   case "$first_char" in
@@ -195,7 +202,17 @@ start_server() {
 #   "TEST","rps","avg","min","p50","p95","p99","max"
 # Newer redis-benchmark CSV reports percentiles; fall back to rps-only when the
 # percentile columns are absent.
-declare -A RESULT_RPS RESULT_P50 RESULT_P99
+#
+# macOS still ships bash 3.2, which has no associative arrays, so each result
+# lives in its own variable (RESULT_<METRIC>_<WORKLOAD>_p<DEPTH>).
+set_result() {
+  printf -v "RESULT_${1}_${2//-/_}" '%s' "$3"
+}
+
+get_result() {
+  local name="RESULT_${1}_${2//-/_}"
+  printf '%s' "${!name:-n/a}"
+}
 
 run_benchmark_case() {
   local workload="$1"
@@ -211,9 +228,9 @@ run_benchmark_case() {
   local out
   if ! out="$(redis-benchmark "${args[@]}" 2>/dev/null)"; then
     echo "[capacity][warn] redis-benchmark failed for $label" >&2
-    RESULT_RPS[$label]="n/a"
-    RESULT_P50[$label]="n/a"
-    RESULT_P99[$label]="n/a"
+    set_result RPS "$label" "n/a"
+    set_result P50 "$label" "n/a"
+    set_result P99 "$label" "n/a"
     return 0
   fi
 
@@ -225,9 +242,9 @@ run_benchmark_case() {
     line="$(printf '%s\n' "$out" | grep -E '^".*",".*"' | head -n 1)"
   fi
   if [[ -z "$line" ]]; then
-    RESULT_RPS[$label]="n/a"
-    RESULT_P50[$label]="n/a"
-    RESULT_P99[$label]="n/a"
+    set_result RPS "$label" "n/a"
+    set_result P50 "$label" "n/a"
+    set_result P99 "$label" "n/a"
     return 0
   fi
 
@@ -242,9 +259,9 @@ run_benchmark_case() {
     p50="${cols[4]:-n/a}"
     p99="${cols[6]:-n/a}"
   fi
-  RESULT_RPS[$label]="$rps"
-  RESULT_P50[$label]="$p50"
-  RESULT_P99[$label]="$p99"
+  set_result RPS "$label" "$rps"
+  set_result P50 "$label" "$p50"
+  set_result P99 "$label" "$p99"
   echo "[capacity] $label -> rps=$rps p50=${p50}ms p99=${p99}ms"
 }
 
@@ -355,7 +372,7 @@ REPORT="$OUT_DIR/capacity-envelope-$TS.md"
     for workload in "${WORKLOADS[@]}"; do
       for depth in "${PIPELINE_DEPTHS[@]}"; do
         label="${workload}-p${depth}"
-        echo "| ${workload} (pipeline ${depth}) | ${RESULT_P50[$label]:-n/a} | ${RESULT_P99[$label]:-n/a} | ${RESULT_RPS[$label]:-n/a} |"
+        echo "| ${workload} (pipeline ${depth}) | $(get_result P50 "$label") | $(get_result P99 "$label") | $(get_result RPS "$label") |"
       done
     done
   else

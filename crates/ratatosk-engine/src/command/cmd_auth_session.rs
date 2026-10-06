@@ -10,98 +10,84 @@ use super::{ClientState, CommandOutcome, err, wrong_arity};
 const AUTH_FAILURE: &str = "ERR invalid username-password pair or user is disabled.";
 const AUTH_FAILURE_THRESHOLD: u32 = 5;
 
+pub(super) enum AuthenticationResult {
+    Authenticated,
+    Rejected(CommandOutcome),
+}
+
 pub(super) fn authenticate_client(
     server: &ServerState,
     username: &Bytes,
     password: &Bytes,
     client: &mut ClientState,
-) -> bool {
-    if server.acl.authenticate_user(username, password) {
+) -> AuthenticationResult {
+    if client.auth_failure_count() >= AUTH_FAILURE_THRESHOLD {
+        record_auth_attempt(username, client, false);
+        return AuthenticationResult::Rejected(auth_failure_outcome(
+            client.auth_failure_count(),
+            true,
+        ));
+    }
+
+    let (authenticated, shared_ip_blocked) = if let Some(peer_ip) = client.peer_ip() {
+        // Admission, password verification, and failure recording are one
+        // critical section so concurrent connections from the same IP cannot
+        // all pass the threshold check at once.
+        let mut limiter = server.auth_rate_limiter.lock();
+        if limiter.is_blocked(peer_ip) {
+            (false, true)
+        } else if server.acl.authenticate_user(username, password) {
+            (true, false)
+        } else {
+            (false, limiter.record_failure(peer_ip))
+        }
+    } else {
+        (server.acl.authenticate_user(username, password), false)
+    };
+
+    if authenticated {
         client.authenticated = true;
         client.acl_user = username.clone();
-        return true;
+        client.reset_auth_failures();
+        record_auth_attempt(username, client, true);
+        return AuthenticationResult::Authenticated;
     }
-    false
+
+    let failures = client.increment_auth_failures();
+    let should_close = shared_ip_blocked || failures >= AUTH_FAILURE_THRESHOLD;
+    if should_close {
+        tracing::warn!(
+            target = "ratatosk::security",
+            client_id = client.id(),
+            "authentication failure threshold reached; disconnecting client"
+        );
+    }
+    record_auth_attempt(username, client, false);
+    AuthenticationResult::Rejected(auth_failure_outcome(failures, should_close))
 }
 
 fn auth_failure_delay_ms(failures: u32) -> u64 {
     use rand::Rng;
-    let base = std::cmp::min(
-        100u64.saturating_mul(1u64 << (failures.saturating_sub(1))),
-        2000,
-    );
+    let exponent = failures.saturating_sub(1).min(5);
+    let base = 100u64.saturating_mul(1u64 << exponent).min(2000);
     let jitter: f64 = rand::thread_rng().gen_range(0.8..1.2);
     (base as f64 * jitter) as u64
 }
 
-fn auth_failure_outcome(failures: u32) -> CommandOutcome {
+fn auth_failure_outcome(failures: u32, should_close: bool) -> CommandOutcome {
     let delay = auth_failure_delay_ms(failures);
-    if failures >= AUTH_FAILURE_THRESHOLD {
+    if should_close {
         CommandOutcome::close_with_delay(err(AUTH_FAILURE), delay)
     } else {
         CommandOutcome::reply_with_delay(err(AUTH_FAILURE), delay)
     }
 }
 
-pub(super) fn cmd_auth(
-    args: &[Bytes],
-    server: &ServerState,
-    client: &mut ClientState,
-) -> CommandOutcome {
-    let username = args.first().map(|_| {
-        if args.len() == 1 {
-            Bytes::from_static(b"default")
-        } else {
-            args[0].clone()
-        }
-    });
-
-    let result = match args {
-        [password] => {
-            if authenticate_client(server, &Bytes::from_static(b"default"), password, client) {
-                client.reset_auth_failures();
-                CommandOutcome::reply(RespFrame::ok())
-            } else {
-                let failures = client.increment_auth_failures();
-                if failures >= AUTH_FAILURE_THRESHOLD {
-                    tracing::warn!(
-                        target = "ratatosk::security",
-                        client_id = client.id(),
-                        failures,
-                        "AUTH failure threshold reached, disconnecting client"
-                    );
-                }
-                auth_failure_outcome(failures)
-            }
-        }
-        [username, password] => {
-            if authenticate_client(server, username, password, client) {
-                client.reset_auth_failures();
-                CommandOutcome::reply(RespFrame::ok())
-            } else {
-                let failures = client.increment_auth_failures();
-                if failures >= AUTH_FAILURE_THRESHOLD {
-                    tracing::warn!(
-                        target = "ratatosk::security",
-                        client_id = client.id(),
-                        failures,
-                        "AUTH failure threshold reached, disconnecting client"
-                    );
-                }
-                auth_failure_outcome(failures)
-            }
-        }
-        _ => wrong_arity("auth"),
-    };
-
-    let success = !matches!(result.response, RespFrame::Error(_));
+fn record_auth_attempt(username: &Bytes, client: &ClientState, success: bool) {
     let result_label = if success { "success" } else { "failure" };
-    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label.to_string())
-        .increment(1);
+    metrics::counter!("ratatosk_auth_attempts_total", "result" => result_label).increment(1);
 
-    let username_text =
-        String::from_utf8_lossy(username.as_ref().unwrap_or(&Bytes::from_static(b"unknown")))
-            .into_owned();
+    let username_text = String::from_utf8_lossy(username).into_owned();
     let payload = format!(
         "event=AUTH client_id={} username={} success={}",
         client.id(),
@@ -120,8 +106,23 @@ pub(super) fn cmd_auth(
         success,
         "ACL authentication attempt"
     );
+}
 
-    result
+pub(super) fn cmd_auth(
+    args: &[Bytes],
+    server: &ServerState,
+    client: &mut ClientState,
+) -> CommandOutcome {
+    let (username, password) = match args {
+        [password] => (Bytes::from_static(b"default"), password),
+        [username, password] => (username.clone(), password),
+        _ => return wrong_arity("auth"),
+    };
+
+    match authenticate_client(server, &username, password, client) {
+        AuthenticationResult::Authenticated => CommandOutcome::reply(RespFrame::ok()),
+        AuthenticationResult::Rejected(outcome) => outcome,
+    }
 }
 
 pub(super) fn cmd_reset(
@@ -135,6 +136,55 @@ pub(super) fn cmd_reset(
 
     server.tracking_remove_client(client.id());
     server.unregister_monitor(client.id());
+    server.pubsub.unsubscribe_all(client.id());
+    client.release_watches(&server.data);
     client.reset_for_connection();
     CommandOutcome::reply(RespFrame::simple_str("RESET"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acl::AclState;
+
+    fn password_server() -> ServerState {
+        let mut server = ServerState::with_default_dbs();
+        let default = server
+            .acl
+            .get_or_create_user_mut(&Bytes::from_static(b"default"));
+        default.nopass = false;
+        default
+            .passwords
+            .insert(AclState::hash_password(b"secret").expect("test password should hash"));
+        server
+    }
+
+    #[test]
+    fn malformed_auth_is_not_a_guess_and_success_resets_only_connection_count() {
+        let server = password_server();
+        let mut client = ClientState::new(1);
+
+        for _ in 0..5 {
+            assert!(matches!(
+                cmd_auth(&[], &server, &mut client).response,
+                RespFrame::Error(_)
+            ));
+        }
+        assert_eq!(client.auth_failure_count(), 0);
+
+        for _ in 0..4 {
+            let outcome = cmd_auth(&[Bytes::from_static(b"wrong")], &server, &mut client);
+            assert!(!outcome.close);
+        }
+        assert_eq!(client.auth_failure_count(), 4);
+
+        let success = cmd_auth(&[Bytes::from_static(b"secret")], &server, &mut client);
+        assert_eq!(success.response, RespFrame::ok());
+        assert_eq!(client.auth_failure_count(), 0);
+
+        for _ in 0..4 {
+            assert!(!cmd_auth(&[Bytes::from_static(b"wrong")], &server, &mut client).close);
+        }
+        assert!(cmd_auth(&[Bytes::from_static(b"wrong")], &server, &mut client).close);
+    }
 }

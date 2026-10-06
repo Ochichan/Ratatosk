@@ -33,9 +33,9 @@ carry a capability tier, visible through `COMMAND DOCS` and recorded in the
 | Tier | Meaning | Count |
 |---|---|---|
 | `behavioral_subset` | implemented and tested for real Redis semantics on a single node | 275 |
-| `baseline_local` | works locally with standalone semantics (for example `WAIT` answers immediately, `CLUSTER` reports one node) | 76 |
+| `baseline_local` | works locally with standalone semantics (for example `WAIT` answers immediately, `CLUSTER` reports one node) | 75 |
 | `syntax_only` | parsed and acknowledged, no real effect | 6 |
-| `unsupported` | rejected | 63 |
+| `unsupported` | rejected | 64 |
 | `distributed_parity` | reserved; nothing claims it | 0 |
 
 A test locks the runtime tier of every command spec to the ledger, so the docs
@@ -57,14 +57,18 @@ A recovery matrix script exercises crash, `kill -9`, truncated-AOF,
 missing-manifest, and repeated-rewrite paths.
 
 **It runs comfortably next to something else.** Ratatosk is built to be a
-sidecar: `RATATOSK_PORT=0` picks a free port and writes it to
-`RATATOSK_BOUND_ADDR_FILE`, `PING HEALTH` reports readiness with named reasons,
-SIGTERM drains gracefully within a configurable grace window, and a Prometheus
-endpoint plus a Grafana dashboard ship in [`monitoring/`](monitoring/).
+sidecar: `RATATOSK_PORT=0` picks a free port and, once the dataset is loaded,
+writes it to `RATATOSK_BOUND_ADDR_FILE`; a local Unix-domain socket is one
+directive away; `PING HEALTH` reports readiness with named reasons; SIGTERM
+drains gracefully within a configurable grace window; and a Prometheus endpoint
+plus a Grafana dashboard ship in [`monitoring/`](monitoring/).
 
-**Memory safety by construction.** Four of the five crates are
-`#![forbid(unsafe_code)]`. The server crate's only `unsafe` blocks set
-environment variables inside its own tests.
+**Memory safety by construction.** The protocol, engine, and persistence crates
+are `#![forbid(unsafe_code)]`. The server binary has no `unsafe` outside its
+tests (which set environment variables). `unsafe` is confined to the
+experimental shared-memory transport (`ratatosk-shm`, behind the
+`shm-transport` feature) and to two libc calls in the IPC benchmark harness,
+each with a documented safety argument.
 
 ## What it is good for
 
@@ -92,7 +96,17 @@ cargo run -p ratatosk-server --bin ratatosk --release
 ```
 
 The server listens on `127.0.0.1:6379` and exports Prometheus metrics on
-`127.0.0.1:9090`. Set `RATATOSK_PORT=6380` to coexist with a local Redis.
+`127.0.0.1:9090`. Set `RATATOSK_PORT=6380` to coexist with a local Redis. Each
+instance on a host needs its own `RATATOSK_METRICS_BIND` (or
+`RATATOSK_ALLOW_NO_METRICS=true`) and its own data directory; a second
+instance using the same directory refuses to start.
+
+Lua scripting (`EVAL`, `EVALSHA`, `SCRIPT`) is an opt-in build feature that
+compiles a vendored Lua 5.1 and needs a C compiler:
+
+```bash
+cargo run -p ratatosk-server --bin ratatosk --release --features lua-scripting
+```
 
 Configuration is resolved in this order: built-in defaults, `--config PATH`,
 `RATATOSK_CONFIG`, an auto-loaded `./ratatosk.conf` when present, then
@@ -111,8 +125,10 @@ ratatosk --print-config json
 ratatosk --config ./ratatosk.conf
 ```
 
-The shipped [`ratatosk.conf`](ratatosk.conf) is a real startup config, and
-`CONFIG REWRITE` writes the running config back to it.
+The shipped [`ratatosk.conf`](ratatosk.conf) is a real startup config.
+`CONFIG REWRITE` writes the running configuration to `ratatosk.conf` in the
+data directory (`dir`), which is this file when the server runs with its
+defaults from the repository root.
 
 ### Binding beyond loopback
 
@@ -143,13 +159,17 @@ the docs under `share/doc/ratatosk`.
 
 | Crate | Role |
 |---|---|
-| `ratatosk-core` | shared types, flags, errors, time utilities |
+| `ratatosk-core` | clocks, including the pinned command clock used by AOF replay |
 | `ratatosk-resp` | RESP2/RESP3 zero-copy parser and encoder, with a libFuzzer target |
 | `ratatosk-engine` | keyspace, command handlers, eviction, expiry, Pub/Sub, ACL, client tracking |
 | `ratatosk-persist` | RDB and AOF codecs, manifest, recovery |
-| `ratatosk-server` | TCP accept loop, per-client I/O, config, metrics, persistence runtime |
+| `ratatosk-server` | TCP and Unix-socket listeners, per-client I/O, config, metrics, persistence runtime |
+| `ratatosk-shm` | experimental shared-memory transport (Unix, `shm-transport` feature) |
+| `ratatosk-ipc-bench` | development harness for IPC round-trip latency |
 
-Dependencies point one way: `server → {engine, persist} → resp → core`.
+Dependencies point one way: `server → persist → engine → {resp, core}`, with
+`server → shm` only under the `shm-transport` feature. `resp`, `core`, and
+`shm` depend on no other workspace crate.
 
 ## Quality gate
 
@@ -162,12 +182,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --quiet
 ```
 
-CI runs the same gate plus the Redis interop suite, a latency guardrail on the
-pipeline benchmarks, `cargo-deny`, and an SBOM build.
-To make the interop comparison mandatory locally:
+CI runs the same gate (plus the `shm-transport` and `lua-scripting` feature
+builds) together with the Redis interop suite, a latency guardrail on the
+pipeline benchmarks, `cargo-deny`, and an SBOM build. The interop comparison is
+ignored by default because it needs `redis-server` and `redis-cli` on `PATH`;
+run it locally with:
 
 ```bash
-RATATOSK_REQUIRE_REDIS_INTEROP=1 cargo test -p ratatosk-server --test redis_interop
+cargo test -p ratatosk-server --test redis_interop -- --include-ignored
 ```
 
 ## Documentation

@@ -41,9 +41,14 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
+        # Cargo sources plus the gap ledger, which the engine's tier-consistency
+        # test reads at run time.
         src = lib.cleanSourceWith {
           src = ./.;
-          filter = craneLib.filterCargoSources;
+          filter =
+            path: type:
+            (craneLib.filterCargoSources path type)
+            || (builtins.match ".*/docs/redis-gap-ledger\\.json" path != null);
         };
 
         commonArgs = {

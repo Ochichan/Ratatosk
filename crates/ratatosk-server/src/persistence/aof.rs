@@ -83,11 +83,20 @@ pub(crate) fn spawn_aof_worker(
     crate::metrics::set_aof_queue_depth(0);
 
     tokio::spawn(async move {
+        enum Exit {
+            GracefulShutdown,
+            ShutdownFsyncFailed(String),
+            ChannelClosed,
+        }
+
         let mut writer = writer;
         let mut active_aof_path = aof_path;
         let mut manifest_path = manifest_path;
         let mut policy = policy;
-        while let Some(command) = rx.recv().await {
+        let exit = loop {
+            let Some(command) = rx.recv().await else {
+                break Exit::ChannelClosed;
+            };
             crate::metrics::set_aof_queue_depth(rx.len());
             match command {
                 AofWorkerCommand::Append {
@@ -144,18 +153,41 @@ pub(crate) fn spawn_aof_worker(
                     let result = writer
                         .force_fsync()
                         .map_err(|error| format!("flushing AOF before shutdown: {error}"));
+                    let exit = match &result {
+                        Ok(()) => Exit::GracefulShutdown,
+                        Err(error) => Exit::ShutdownFsyncFailed(error.clone()),
+                    };
                     let _ = reply.send(result);
-                    break;
+                    break exit;
                 }
             }
-        }
+        };
 
         crate::metrics::set_aof_queue_depth(0);
-        tracing::warn!(
-            target = "ratatosk::aof",
-            path = %active_aof_path.display(),
-            "AOF worker channel closed; worker exiting"
-        );
+        match exit {
+            Exit::GracefulShutdown => {
+                tracing::info!(
+                    target = "ratatosk::aof",
+                    path = %active_aof_path.display(),
+                    "AOF worker shut down gracefully"
+                );
+            }
+            Exit::ShutdownFsyncFailed(error) => {
+                tracing::error!(
+                    target = "ratatosk::aof",
+                    path = %active_aof_path.display(),
+                    error = %error,
+                    "AOF worker shutdown fsync failed"
+                );
+            }
+            Exit::ChannelClosed => {
+                tracing::warn!(
+                    target = "ratatosk::aof",
+                    path = %active_aof_path.display(),
+                    "AOF worker channel closed; worker exiting"
+                );
+            }
+        }
     });
 
     tx
@@ -490,6 +522,25 @@ pub(crate) fn enable_aof_from_snapshot(
 }
 
 pub(crate) async fn disable_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
+    disable_aof_with_reply_timeout(runtime, None, false).await
+}
+
+impl PersistenceRuntime {
+    /// Stop the AOF worker during terminal server shutdown.
+    ///
+    /// Unlike CONFIG SET appendonly no, process exit has no configuration
+    /// rollback to reconcile, so the final worker acknowledgement is bounded
+    /// by the same deadline previously used for the terminal flush request.
+    pub(crate) async fn shutdown_aof_for_exit(&self) -> io::Result<()> {
+        disable_aof_with_reply_timeout(self, Some(AOF_FLUSH_REPLY_TIMEOUT), true).await
+    }
+}
+
+async fn disable_aof_with_reply_timeout(
+    runtime: &PersistenceRuntime,
+    reply_timeout: Option<Duration>,
+    record_fsync_metrics: bool,
+) -> io::Result<()> {
     let Some((sender, generation)) = runtime.aof_sender_with_generation() else {
         return Ok(());
     };
@@ -519,11 +570,26 @@ pub(crate) async fn disable_aof(runtime: &PersistenceRuntime) -> io::Result<()> 
         Ok(Ok(())) => {}
     }
 
-    // Once Shutdown has entered the worker queue it is not safe to time out:
-    // the worker may still flush and exit after the caller rolls CONFIG back.
-    // Wait for the definitive result so configuration follows the known writer
-    // lifecycle rather than a speculative timeout.
-    match reply_rx.await {
+    let reply = if let Some(reply_timeout) = reply_timeout {
+        match tokio::time::timeout(reply_timeout, reply_rx).await {
+            Ok(reply) => reply,
+            Err(_) => {
+                clear_aof_sender_if_current(runtime, generation);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for AOF shutdown completion",
+                ));
+            }
+        }
+    } else {
+        // Once Shutdown has entered the worker queue it is not safe for CONFIG
+        // SET appendonly no to time out: the worker may still flush and exit
+        // after the caller rolls configuration back. Wait for the definitive
+        // result so configuration follows the known writer lifecycle.
+        reply_rx.await
+    };
+
+    match reply {
         Err(_) => {
             clear_aof_sender_if_current(runtime, generation);
             Err(io::Error::new(
@@ -536,10 +602,16 @@ pub(crate) async fn disable_aof(runtime: &PersistenceRuntime) -> io::Result<()> 
             // result, even if the flush failed. Do not leave a stale sender
             // that makes INFO/configuration claim persistence is still live.
             clear_aof_sender_if_current(runtime, generation);
+            if record_fsync_metrics {
+                crate::metrics::record_aof_write_error();
+            }
             Err(io::Error::other(error))
         }
         Ok(Ok(())) => {
             clear_aof_sender_if_current(runtime, generation);
+            if record_fsync_metrics {
+                crate::metrics::record_aof_write("always");
+            }
             Ok(())
         }
     }
@@ -708,6 +780,7 @@ pub(crate) async fn await_aof_rewrite(
 pub(crate) async fn replay_startup_aof_file(
     server_state: &Arc<SharedState>,
     path: &Path,
+    may_truncate: bool,
 ) -> io::Result<()> {
     let result = {
         let mut state = server_state.meta.lock().await;
@@ -763,6 +836,15 @@ pub(crate) async fn replay_startup_aof_file(
     }
 
     if let Some(boundary) = result.truncated_at {
+        if !may_truncate {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "AOF file {} is damaged at byte {boundary} but is not the last file of the manifest chain; refusing startup because truncating it would drop writes that later files depend on",
+                    path.display()
+                ),
+            ));
+        }
         // Repair before admitting writes. Leaving the tail in place would
         // swallow later acknowledged writes or attach them to an old MULTI.
         let file = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -970,10 +1052,68 @@ mod tests {
     use ratatosk_persist::rdb;
     use std::{
         ffi::OsString,
+        io::Write,
         sync::{Mutex, MutexGuard, OnceLock},
     };
 
     use crate::config::ServerConfig;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLogWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for CapturedLogs {
+        type Writer = CapturedLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    fn aof_log_subscriber(logs: Arc<Mutex<Vec<u8>>>) -> impl tracing::Subscriber + Send + Sync {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(CapturedLogs(logs))
+            .finish()
+    }
+
+    async fn wait_for_aof_log(logs: &Arc<Mutex<Vec<u8>>>, path: &Path, message: &str) -> String {
+        let path = path.display().to_string();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = {
+                    let bytes = logs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                if output
+                    .lines()
+                    .any(|line| line.contains(&path) && line.contains(message))
+                {
+                    return output;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for '{message}' for {path}"))
+    }
 
     fn env_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1317,6 +1457,95 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn startup_refuses_to_truncate_a_damaged_earlier_chain_segment() {
+        use ratatosk_persist::aof::DEFAULT_SINGLE_FILE_AOF_FILENAME;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let manifest_path = dir.path().join(DEFAULT_AOF_MANIFEST_FILENAME);
+        let runtime = runtime_without_writer(
+            dir.path().join("dump.rdb"),
+            dir.path().join(DEFAULT_SINGLE_FILE_AOF_FILENAME),
+            Some(manifest_path.clone()),
+        );
+
+        let mut manifest = AofManifest::new(dir.path());
+        let incr_one = manifest.new_incr_file();
+        let incr_two = manifest.new_incr_file();
+        manifest
+            .save_to_file(&manifest_path)
+            .expect("save manifest");
+        for (path, key) in [(&incr_one, "one"), (&incr_two, "two")] {
+            let mut writer = AofWriter::open(path, FsyncPolicy::Always).expect("open aof writer");
+            writer
+                .append_command(0, &[Bytes::from("SET"), Bytes::from(key), Bytes::from("v")])
+                .expect("append aof command");
+        }
+        let damaged_len = std::fs::metadata(&incr_one).expect("incr one").len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_one)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET\r\n$2\r\nlo"))
+            .expect("tear the first segment");
+
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let error = load_startup_data(&shared, &runtime, true)
+            .await
+            .expect_err("a damaged earlier segment must stop startup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not the last file"), "{error}");
+        assert!(
+            std::fs::metadata(&incr_one).expect("incr one").len() > damaged_len,
+            "the damaged segment must be left for inspection"
+        );
+
+        // The same tear on the final segment is still repaired.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&incr_one)
+            .and_then(|file| file.set_len(damaged_len))
+            .expect("repair first segment");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_two)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET"))
+            .expect("tear the final segment");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        load_startup_data(&shared, &runtime, true)
+            .await
+            .expect("a torn final segment is truncated");
+        {
+            let loaded = shared.meta.lock().await;
+            assert!(loaded.db(0).contains_key(b"one".as_slice()));
+            assert!(loaded.db(0).contains_key(b"two".as_slice()));
+        }
+
+        // A header-only file after the damaged one, like the INCR file the
+        // writer opens before replay, adds no dependent writes.
+        std::fs::write(&incr_two, b"REDIS-AOF-002\n").expect("empty final segment");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&incr_one)
+            .and_then(|mut file| file.write_all(b"*3\r\n$3\r\nSET"))
+            .expect("tear the last segment with data");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        load_startup_data(&shared, &runtime, true)
+            .await
+            .expect("the last segment with data is truncated");
+        assert_eq!(
+            std::fs::metadata(&incr_one).expect("incr one").len(),
+            damaged_len
+        );
+        assert!(
+            shared
+                .meta
+                .lock()
+                .await
+                .db(0)
+                .contains_key(b"one".as_slice())
+        );
+    }
+
     #[test]
     fn detect_legacy_aof_returns_path_when_legacy_exists_without_manifest() {
         use ratatosk_persist::aof::DEFAULT_SINGLE_FILE_AOF_FILENAME;
@@ -1625,6 +1854,142 @@ mod tests {
             state.generation = 3;
         }
         assert!(disable_aof(&runtime).await.is_err());
+        assert!(runtime.aof_sender().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_worker_shutdown_is_graceful_without_a_warning() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(aof_log_subscriber(Arc::clone(&logs)));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("graceful-worker.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::No).expect("open AOF writer");
+        let sender = spawn_aof_worker(path.clone(), None, writer, FsyncPolicy::No, 1);
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        sender
+            .send(AofWorkerCommand::Shutdown { reply: reply_tx })
+            .await
+            .expect("enqueue shutdown");
+        reply_rx
+            .await
+            .expect("worker shutdown reply")
+            .expect("worker shutdown fsync");
+
+        let output = wait_for_aof_log(&logs, &path, "AOF worker shut down gracefully").await;
+        assert!(
+            output
+                .lines()
+                .filter(|line| line.contains(&path.display().to_string()))
+                .all(|line| !line.contains(" WARN ")),
+            "graceful worker shutdown emitted a warning:\n{output}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_channel_disconnect_remains_a_warning() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(aof_log_subscriber(Arc::clone(&logs)));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("disconnected-worker.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::No).expect("open AOF writer");
+        let sender = spawn_aof_worker(path.clone(), None, writer, FsyncPolicy::No, 1);
+
+        drop(sender);
+
+        let output =
+            wait_for_aof_log(&logs, &path, "AOF worker channel closed; worker exiting").await;
+        assert!(
+            output.lines().any(|line| {
+                line.contains(&path.display().to_string())
+                    && line.contains(" WARN ")
+                    && line.contains("AOF worker channel closed; worker exiting")
+            }),
+            "unexpected worker disconnect was not logged as a warning:\n{output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_bounds_the_acknowledgement_wait() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let runtime = runtime_without_writer(
+            dir.path().join("dump.rdb"),
+            dir.path().join("timed-out-shutdown.aof"),
+            None,
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        {
+            let mut state = runtime.aof.lock().expect("runtime state");
+            state.sender = Some(sender);
+            state.generation = 1;
+        }
+
+        let shutdown_task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                disable_aof_with_reply_timeout(&runtime, Some(Duration::from_millis(20)), true)
+                    .await
+            }
+        });
+        let AofWorkerCommand::Shutdown { reply } =
+            receiver.recv().await.expect("accepted shutdown")
+        else {
+            panic!("expected shutdown control")
+        };
+
+        let error = shutdown_task
+            .await
+            .expect("shutdown task")
+            .expect_err("missing acknowledgement must time out");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for AOF shutdown completion")
+        );
+        assert!(runtime.aof_sender().is_none());
+        drop(reply);
+    }
+
+    #[tokio::test]
+    async fn terminal_shutdown_surfaces_the_worker_fsync_error() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let runtime = runtime_without_writer(
+            dir.path().join("dump.rdb"),
+            dir.path().join("failed-shutdown.aof"),
+            None,
+        );
+        let (sender, mut receiver) = mpsc::channel(1);
+        {
+            let mut state = runtime.aof.lock().expect("runtime state");
+            state.sender = Some(sender);
+            state.generation = 1;
+        }
+
+        let shutdown_task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                disable_aof_with_reply_timeout(&runtime, Some(Duration::from_secs(1)), true).await
+            }
+        });
+        let AofWorkerCommand::Shutdown { reply } =
+            receiver.recv().await.expect("accepted shutdown")
+        else {
+            panic!("expected shutdown control")
+        };
+        reply
+            .send(Err("synthetic shutdown fsync failure".to_string()))
+            .expect("send worker failure");
+
+        let error = shutdown_task
+            .await
+            .expect("shutdown task")
+            .expect_err("worker fsync failure must be returned");
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic shutdown fsync failure")
+        );
         assert!(runtime.aof_sender().is_none());
     }
 

@@ -69,6 +69,31 @@ where
     command.output()
 }
 
+#[cfg(target_os = "macos")]
+fn run_ratatosk_with_soft_nofile_limit(
+    cwd: &Path,
+    soft_limit: usize,
+    max_clients: usize,
+) -> io::Result<Output> {
+    Command::new("/bin/sh")
+        .current_dir(cwd)
+        .env_clear()
+        .env("RATATOSK_DISABLE_CONFIG_AUTOLOAD", "true")
+        .env("RATATOSK_DIR", cwd)
+        .env("RATATOSK_MAX_CLIENTS", max_clients.to_string())
+        .env("RATATOSK_AUDIT_LOG", cwd.join("audit.log"))
+        .env("RATATOSK_AUDIT_CHAIN_STATE", cwd.join("audit.state"))
+        .args([
+            "-c",
+            "ulimit -S -n \"$1\" && shift && exec \"$@\"",
+            "ratatosk-fd-preflight-test",
+        ])
+        .arg(soft_limit.to_string())
+        .arg(ratatosk_bin()?)
+        .arg("--check-config")
+        .output()
+}
+
 #[cfg(unix)]
 struct UnixServerGuard {
     child: Child,
@@ -328,6 +353,45 @@ fn check_config_fails_for_unwritable_bound_addr_file_parent() -> io::Result<()> 
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn check_config_honors_inherited_macos_soft_nofile_limit() -> io::Result<()> {
+    const SOFT_LIMIT: usize = 256;
+    const FD_HEADROOM: usize = 128;
+
+    let passing_temp = tempfile::tempdir()?;
+    let passing_max_clients = SOFT_LIMIT - FD_HEADROOM;
+    let passing =
+        run_ratatosk_with_soft_nofile_limit(passing_temp.path(), SOFT_LIMIT, passing_max_clients)?;
+    assert!(
+        passing.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&passing.stdout),
+        stderr_text(&passing)
+    );
+    assert!(
+        String::from_utf8_lossy(&passing.stdout).contains("ratatosk configuration OK"),
+        "stdout did not report successful validation:\n{}",
+        String::from_utf8_lossy(&passing.stdout)
+    );
+
+    let failing_temp = tempfile::tempdir()?;
+    let failing_max_clients = passing_max_clients + 1;
+    let failing =
+        run_ratatosk_with_soft_nofile_limit(failing_temp.path(), SOFT_LIMIT, failing_max_clients)?;
+    assert!(!failing.status.success(), "command unexpectedly succeeded");
+    let stderr = stderr_text(&failing);
+    assert!(
+        stderr.contains(
+            "insufficient open-file limit: soft_limit=256 required_at_least=257 \
+             (max_clients=129 + headroom=128)"
+        ),
+        "stderr did not include the macOS fd headroom failure:\n{stderr}"
+    );
+
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn unixsocket_config_validation_printing_and_env_override_work() -> io::Result<()> {
@@ -417,6 +481,71 @@ fn unixsocket_is_removed_when_startup_fails_after_binding() -> io::Result<()> {
         "Unix socket file should be removed after post-bind startup failure"
     );
 
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn prometheus_endpoint_serves_command_and_memory_metrics() -> io::Result<()> {
+    // Reserve an ephemeral port for the exporter; `127.0.0.1:0` would not be
+    // discoverable from outside.
+    let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let temp = tempfile::tempdir()?;
+    let socket_path = temp.path().join("ratatosk.sock");
+    let bound_addr_file = temp.path().join("bound-addr.json");
+    let mut command = unixsocket_server_command(temp.path(), &socket_path, &bound_addr_file)?;
+    command
+        .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+        .env_remove("RATATOSK_ALLOW_NO_METRICS");
+    let mut server = UnixServerGuard {
+        child: command.spawn()?,
+    };
+    wait_for_bound_addr_file(&bound_addr_file, &mut server.child).await?;
+
+    let mut client = UnixStream::connect(&socket_path).await?;
+    client
+        .write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+        .await?;
+    let mut ok = [0_u8; 5];
+    client.read_exact(&mut ok).await?;
+    assert_eq!(&ok, b"+OK\r\n");
+
+    // The recorder used to be installed without its HTTP listener, so this
+    // endpoint never answered and histogram samples were never drained.
+    let used_memory = |body: &str| {
+        body.lines()
+            .find_map(|line| line.strip_prefix("ratatosk_memory_used_bytes "))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+    };
+    // The gauge is refreshed by the server cron, a tick after the write.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let mut http = tokio::net::TcpStream::connect(("127.0.0.1", metrics_port)).await?;
+        http.write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        http.read_to_string(&mut response).await?;
+        if used_memory(&response).is_some_and(|bytes| bytes > 0.0) || Instant::now() >= deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(
+        body.contains("ratatosk_commands_total{command=\"SET\",status=\"success\"} 1"),
+        "{body}"
+    );
+    assert!(
+        used_memory(&body).is_some_and(|bytes| bytes > 0.0),
+        "one key must register as used memory: {body}"
+    );
+    // Latency is exported as a real histogram for `histogram_quantile`.
+    assert!(
+        body.contains("ratatosk_command_duration_seconds_bucket{command=\"SET\",le=\""),
+        "{body}"
+    );
     Ok(())
 }
 

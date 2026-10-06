@@ -7,7 +7,9 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{AtomicStatsState, ServerState};
 use crate::security::next_audit_stamp;
 
-use super::{ClientState, CommandOutcome, err, parse_i64, to_uppercase_bytes, wrong_arity};
+use super::{
+    ClientState, CommandOutcome, err, parse_i64, parse_usize, to_uppercase_bytes, wrong_arity,
+};
 
 pub(super) fn cmd_config(
     args: &[Bytes],
@@ -65,6 +67,7 @@ pub(super) fn cmd_config(
 }
 
 enum ConfigSetOp {
+    Maxmemory(usize),
     Timeout(i64),
     Hz(u32),
     AppendOnly(bool),
@@ -125,6 +128,14 @@ fn cmd_config_set(
         let name = to_uppercase_bytes(&args[idx]);
         let value = &args[idx + 1];
         let (op, param) = match name.as_slice() {
+            b"MAXMEMORY" => {
+                let Some(parsed) = parse_usize(value) else {
+                    return CommandOutcome::reply(err(
+                        "ERR value is not an integer or out of range",
+                    ));
+                };
+                (ConfigSetOp::Maxmemory(parsed), "maxmemory")
+            }
             b"TIMEOUT" => {
                 let Some(parsed) = parse_i64(value) else {
                     return CommandOutcome::reply(err(
@@ -376,6 +387,7 @@ fn cmd_config_set(
             "configuration parameter changed"
         );
         match op {
+            ConfigSetOp::Maxmemory(value) => server.config.set_maxmemory(value),
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),
             ConfigSetOp::Hz(value) => server.config.set_hz(value),
             ConfigSetOp::AppendOnly(value) => server.config.set_appendonly(value),
@@ -920,9 +932,20 @@ fn rewrite_config_file(server: &ServerState) -> Result<(), String> {
     )
     .map_err(|e| format!("writing config: {e}"))?;
 
+    // Dropping a BufWriter would swallow a failed final write; flush and sync
+    // explicitly so a partial file is never renamed over the old config.
+    file.flush()
+        .map_err(|e| format!("flushing config file: {e}"))?;
+    file.get_ref()
+        .sync_all()
+        .map_err(|e| format!("syncing config file: {e}"))?;
     drop(file);
 
     std::fs::rename(&temp_path, &config_path).map_err(|e| format!("renaming config file: {e}"))?;
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(config_dir) {
+        let _ = dir.sync_all();
+    }
 
     tracing::info!(
         target = "ratatosk::config",
