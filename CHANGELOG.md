@@ -178,6 +178,8 @@ The format is based on Keep a Changelog and the versioning policy in
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
 - `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.
+- CI workflows run with read-only repository permissions, and the security scan
+  also runs weekly.
 - A command reply larger than `output-buffer-limit-bytes` is now sent instead
   of closing the connection with `ERR output buffer limit exceeded`. The command
   had already run, so a large pop removed and logged elements the client never
@@ -187,8 +189,6 @@ The format is based on Keep a Changelog and the versioning policy in
 - `client-write-timeout-sec` now bounds each write call rather than a whole
   reply, so it drops a client that makes no progress for that long instead of
   any client too slow to take a large reply within it.
-- CI workflows run with read-only repository permissions, and the security scan
-  also runs weekly.
 - **License changed from MIT to GPL-3.0-or-later.** The workspace `license`
   field, `flake.nix` metadata, and `LICENSE` file were updated together.
 - The product contract sentence now says the supported subset is tested against
