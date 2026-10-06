@@ -438,7 +438,7 @@ v1에서 구현하지 않는다. 제품 페이지에서 **숨기지 않고** 명
 
 - **A. Honest Redis compatibility** — 모든 명령이 capability tier를 노출하고, supported subset은 Redis/Valkey로 검증된다.
 - **B. Single-node durability without operational mystery** — RDB·AOF·manifest recovery gate·shutdown flush·crash drill이 릴리즈 계약의 일부.
-- **C. Small, safe, observable cache/event bus** — cache·Pub/Sub·TTL·rate limit·session·local workflow state를 위한 컴팩트 Rust 서버 (Conductor/Ironclaw/command-center/Muninn 통합).
+- **C. Small, safe, observable cache/event bus** — cache·Pub/Sub·TTL·rate limit·session·local workflow state를 위한 컴팩트 Rust 서버.
 - **D. Strict mode prevents compatibility footguns** — 미지원/`syntax_only` 명령은 거짓 성공 대신 명확히 실패한다.
 
 ---

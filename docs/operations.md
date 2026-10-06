@@ -336,7 +336,7 @@ re-evaluate the already-bound socket.
 # Ratatosk Ecosystem Integration
 
 Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Sub 이벤트 버스 역할을 맡는다.
-이 문서는 **현재 코드 상태**(2026-06-02)와 외부 프로젝트 통합 기준을 정리한다.
+이 문서는 **현재 코드 상태**(2026-06-02)와 다른 서비스와 함께 쓸 때의 통합 기준을 정리한다.
 
 ## Implementation Status (2026-06-02)
 
@@ -402,13 +402,12 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 ## Integration Matrix
 
-| Service | Role with Ratatosk | Protocol | Typical Use |
+| Workload | Role with Ratatosk | Protocol | Typical Use |
 | --- | --- | --- | --- |
-| Conductor | 실행 상태 캐시 + 실행 이벤트 fanout | RESP3 TCP | DAG node intermediate result, execution events |
-| Ironclaw | 세션 캐시 + provider rate-limit counter | RESP3 TCP | session context TTL, API quota counter |
-| command-center | TUI 상태 공유 + Pub/Sub 수신 | RESP3 TCP | live event stream, undo/clipboard cache |
-| Rustmux | 세션 메타데이터 캐시(선택) | RESP3 TCP | terminal session index/cache |
-| Muninn | 검색 결과 단기 캐시(선택) | RESP3 TCP | hot query result cache |
+| Workflow engine | 실행 상태 캐시 + 실행 이벤트 fanout | RESP3 TCP | DAG node intermediate result, execution events |
+| API gateway | 세션 캐시 + provider rate-limit counter | RESP3 TCP | session context TTL, API quota counter |
+| Interactive client (TUI 등) | 상태 공유 + Pub/Sub 수신 | RESP3 TCP | live event stream, undo/clipboard cache |
+| Search service | 검색 결과 단기 캐시(선택) | RESP3 TCP | hot query result cache |
 
 ## Deployment Baseline
 
@@ -445,7 +444,7 @@ cargo run -p ratatosk-server --bin ratatosk --release
 ./scripts/install-ratatosk-autostart-macos.sh
 ```
 
-- macOS 기본 포트: `6379` -- Kirei bridges.toml 설정과 일치.
+- macOS 기본 포트: `6379`.
 - plist 경로: `~/Library/LaunchAgents/dev.ratatosk.serve.plist`
 - 로그 경로: `~/Library/Logs/Ratatosk/`
 - 데이터/audit 경로: `<repo>/data/`
@@ -555,16 +554,15 @@ checks.
 
 ## Recommended Key Naming
 
-- Conductor: `conductor:exec:<exec_id>:node:<node_id>`
-- Ironclaw session: `ironclaw:session:<sid>`
-- Ironclaw rate-limit: `ironclaw:ratelimit:<provider>:<window>`
-- command-center session: `cc:session:<sid>:state`
-- Muninn cache: `muninn:cache:<query_hash>`
+- Workflow state: `<service>:exec:<exec_id>:node:<node_id>`
+- Session: `<service>:session:<sid>`
+- Rate limit: `<service>:ratelimit:<provider>:<window>`
+- Query cache: `<service>:cache:<query_hash>`
 
 운영 규칙:
 - 공유 키는 서비스 prefix를 강제한다.
 - 캐시 키는 TTL을 기본값으로 둔다(무기한 키 금지).
-- Pub/Sub 채널은 도메인 prefix로 분리한다(`conductor:events:*`).
+- Pub/Sub 채널은 도메인 prefix로 분리한다(`<service>:events:*`).
 
 ### Key Prefix Convention
 
@@ -573,29 +571,29 @@ Ratatosk does **not** implement built-in key-prefix enforcement — there is no
 are an operational **convention** for services that coexist on one instance,
 enforced by clients/operators rather than by the server:
 
-- `conductor:`, `ironclaw:`, `cc:`, `muninn:`, `rustmux:`
+- one short prefix per service, such as `<service>:`, with no prefix shared by two services
 
 ## Integration Playbooks
 
-### Conductor -> Ratatosk
+### Workflow engine -> Ratatosk
 
 - 중간 산출물은 TTL key로 저장하고, 완료 이벤트는 Pub/Sub으로 전파.
 - 장애 시 fallback: 프로세스 로컬 메모리 캐시 + polling 이벤트 경로.
 
-### Ironclaw -> Ratatosk
+### API gateway -> Ratatosk
 
 - active session context를 TTL key로 저장.
 - provider quota는 `INCR` + `EXPIRE` 조합으로 window counter 구현.
 
-### command-center -> Ratatosk
+### Interactive client -> Ratatosk
 
-- TUI 상태를 hash/list로 저장하고, Pub/Sub으로 실시간 이벤트 수신.
+- 클라이언트 상태를 hash/list로 저장하고, Pub/Sub으로 실시간 이벤트 수신.
 - Ratatosk 미가용 시 로컬 상태 모드로 degrade.
 
-### Muninn -> Ratatosk
+### Search service -> Ratatosk
 
 - semantic search 결과를 short TTL로 캐시.
-- 캐시 미스 시에만 Muninn 검색 경로 실행.
+- 캐시 미스 시에만 검색 서비스 경로 실행.
 
 ## Operational Notes
 
@@ -635,29 +633,11 @@ Ratatosk은 선택적 의존성으로 취급한다.
 
 ---
 
-## Part 4: Ecosystem Port Configuration
+## Part 4: Port Configuration
 
 <!-- Source: ecosystem-ports.md -->
 
-# Ecosystem Port Configuration
-
-Standard port assignments and configuration for all services in the ecosystem.
-
-## Quick Reference
-
-| Service | Port | Protocol | Purpose | Env Override |
-|---------|------|----------|---------|--------------|
-| Ratatosk | 6379 | TCP (RESP3) | Redis-compatible data store (default) | `RATATOSK_PORT` |
-| Ratatosk | 6380 | TCP (RESP3) | Recommended coexistence port | `RATATOSK_PORT` |
-| Muninn | 6333 | HTTP | REST API (axum) | `MUNINN_PORT` |
-| Muninn | 6334 | gRPC | gRPC API (tonic) | `MUNINN_GRPC_PORT` |
-| Conductor | 9100 | TCP (JSON-RPC) | Command-center bridge | `CONDUCTOR_COMMAND_CENTER_ADDR` |
-| Conductor | 8090 | HTTP | Planner (FastAPI/uvicorn) | `CONDUCTOR_PLANNER_URL` |
-| Ironclaw | 8080 | HTTP/WebSocket | Gateway | `IRONCLAW_GATEWAY_PORT` |
-
-## Ratatosk
-
-RESP3 in-memory data store serving as cache and Pub/Sub event bus.
+# Port Configuration
 
 | Property | Value |
 |----------|-------|
@@ -671,101 +651,8 @@ RESP3 in-memory data store serving as cache and Pub/Sub event bus.
 
 A startup warning is emitted when using port 6379. The systemd autostart unit defaults to 6380.
 
-## Muninn
-
-Vector database with REST and gRPC interfaces for semantic search and memory.
-
-### REST API
-
-| Property | Value |
-|----------|-------|
-| Default port | `6333` |
-| Port env var | `MUNINN_PORT` |
-| Bind address | `127.0.0.1` |
-| Bind env var | `MUNINN_HOST` |
-| Protocol | HTTP (axum) |
-| TLS | Not built-in; non-loopback bind requires `MUNINN_ALLOW_INSECURE_BIND=true` or TLS proxy |
-
-### gRPC API
-
-| Property | Value |
-|----------|-------|
-| Default port | `6334` |
-| Port env var | `MUNINN_GRPC_PORT` |
-| Bind address | `127.0.0.1` (shares `MUNINN_HOST`) |
-| Protocol | gRPC (tonic) |
-| TLS | Not built-in; same insecure-bind guard as REST |
-
-## Conductor
-
-Workflow execution engine with a JSON-RPC bridge and HTTP planner.
-
-### Command-center bridge (TCP)
-
-| Property | Value |
-|----------|-------|
-| Default address | `127.0.0.1:9100` |
-| Env var | `CONDUCTOR_COMMAND_CENTER_ADDR` (full `host:port`) |
-| Protocol | TCP line-delimited JSON-RPC |
-| TLS | Not built-in |
-
-### Platform API
-
-| Property | Value |
-|----------|-------|
-| Default address | `127.0.0.1:9150` |
-| Env var | `CONDUCTOR_PLATFORM_API_ADDR` (full `host:port`) |
-| Protocol | TCP JSON-RPC |
-| TLS | Not built-in |
-
-### Planner (HTTP)
-
-| Property | Value |
-|----------|-------|
-| Default URL | `http://127.0.0.1:8090` |
-| Env var | `CONDUCTOR_PLANNER_URL` (full URL) |
-| Protocol | HTTP (FastAPI/uvicorn) |
-| TLS | Required for non-local hosts (enforced by `PlannerEndpoint`) |
-
-## Ironclaw
-
-AI agent gateway serving HTTP and WebSocket connections.
-
-| Property | Value |
-|----------|-------|
-| Default port | `8080` |
-| Port env var | `IRONCLAW_GATEWAY_PORT` |
-| Bind address | `127.0.0.1` (loopback) |
-| Bind env var | `IRONCLAW_GATEWAY_BIND` |
-| Protocol | HTTP + WebSocket |
-| TLS | Configurable via `gateway.require_tls`; proxy-layer termination supported via `trusted_proxies` |
-
-## Standardized Naming Convention
-
-Environment variables follow a `{SERVICE}_{COMPONENT}` pattern:
-
-| Pattern | Examples |
-|---------|----------|
-| `{SERVICE}_PORT` | `RATATOSK_PORT`, `MUNINN_PORT`, `IRONCLAW_GATEWAY_PORT` |
-| `{SERVICE}_BIND` | `RATATOSK_BIND`, `MUNINN_HOST`, `IRONCLAW_GATEWAY_BIND` |
-| `{SERVICE}_ADDR` | `CONDUCTOR_COMMAND_CENTER_ADDR` (combined `host:port`) |
-| `{SERVICE}_URL` | `CONDUCTOR_PLANNER_URL` (full URL with scheme) |
-
-Conventions:
-- Separate `_PORT` / `_BIND` variables when the service uses a simple TCP/HTTP listener.
-- Combined `_ADDR` (`host:port`) when the variable configures a connection target rather than a listener.
-- Full `_URL` (with scheme) when the protocol may vary (HTTP vs HTTPS).
-- All services default to loopback (`127.0.0.1`) and require explicit opt-in for non-loopback binding.
-
-## Cross-Service Dependencies
-
-| Consumer | Dependency | Default Target | Env Override (consumer side) |
-|----------|------------|----------------|------------------------------|
-| Ironclaw | Ratatosk (cache) | `redis://127.0.0.1/` | `IRONCLAW_STORAGE_REDIS_URL` |
-| Ironclaw | Muninn (memory) | `http://127.0.0.1:8000` | `IRONCLAW_STORAGE_MUNINN_URL` |
-| Ironclaw | Conductor (bridge) | env-only, no default | `IRONCLAW_CONDUCTOR_ADDR` |
-| Conductor | Muninn | env-only | `CONDUCTOR_MUNINN_ADDR` |
-| Conductor | Ratatosk | via planner/runtime | `CONDUCTOR_PLANNER_URL` |
+Ratatosk keeps `_PORT` and `_BIND` as separate variables and defaults to loopback
+(`127.0.0.1`); a non-loopback bind requires an explicit opt-in.
 
 ---
 
@@ -842,24 +729,6 @@ Current Ratatosk mapping:
 Ratatosk persistence/health surfaces also expose:
 - `INFO persistence`: `audit_chain_dirty`, `audit_recovery_status`
 - `PING HEALTH`: `status`, `audit_chain_dirty`, `audit_recovery_status`
-
-### Muninn
-
-- **Endpoint**: `GET /health`
-- **Components**: inference (engine health), disk (space check), storage (write probe), recovery (WAL replay status)
-- **Contract version**: Field in health JSON response
-
-### Conductor
-
-- **Endpoint**: Bridge health handler (JSON-RPC `health` method)
-- **Components**: planner (HTTP ready check), sqlite (ping), memory (adapter health), cache (circuit breaker state), inference_pool (if configured)
-- **Contract version**: Field in health JSON response
-
-### Ironclaw
-
-- **Endpoint**: `health` RPC method
-- **Components**: storage (session backend), channels (per-channel connected status), memory (Muninn gateway), agent (LLM provider), mcp (server statuses)
-- **Contract version**: Field in health JSON response
 
 ## Probing
 

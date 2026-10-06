@@ -48,6 +48,5 @@ __pycache__/
 # Local-only material (agent harness, maintainer notes, private experiments)
 # is excluded through .git/info/exclude, not listed here.
 /AGENTS.md
-/.command-center/
 /settings.local.json
 /docs/ai/
