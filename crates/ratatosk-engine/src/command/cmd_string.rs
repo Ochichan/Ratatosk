@@ -27,6 +27,7 @@ pub(super) fn cmd_append(
         if new_len > PROTO_MAX_BULK_LEN {
             return (None, false);
         }
+        crate::keyspace::reserve_string_growth(buf, new_len);
         buf.extend_from_slice(append);
         (Some(new_len), true)
     }) else {
@@ -143,6 +144,7 @@ pub(super) fn cmd_setrange(
     };
     let Some(new_len) = db.mutate_string(key, |base| {
         if base.len() < required_len {
+            crate::keyspace::reserve_string_growth(base, required_len);
             base.resize(required_len, 0);
         }
         base[offset..required_len].copy_from_slice(value);

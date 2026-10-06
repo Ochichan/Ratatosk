@@ -1348,6 +1348,26 @@ pub struct DbWriteGuard<'a> {
     shard: parking_lot::RwLockWriteGuard<'a, DbShard>,
 }
 
+/// Make room for a string value to grow to `needed_len` bytes with Redis's
+/// rule (`sdsMakeRoomFor`): below 1 MiB the allocation doubles, above it it
+/// grows by 1 MiB. Repeated growth stays amortized O(1) without a large value
+/// holding twice its length, which the memory estimate (the length) would not
+/// see.
+pub(crate) fn reserve_string_growth(buf: &mut BytesMut, needed_len: usize) {
+    const MAX_PREALLOC: usize = 1024 * 1024;
+    if buf.capacity() >= needed_len {
+        return;
+    }
+    let target = if needed_len < MAX_PREALLOC {
+        needed_len.saturating_mul(2)
+    } else {
+        needed_len.saturating_add(MAX_PREALLOC)
+    };
+    let mut grown = BytesMut::with_capacity(target);
+    grown.extend_from_slice(buf);
+    *buf = grown;
+}
+
 impl<'a> DbWriteGuard<'a> {
     fn new(
         db_idx: usize,
@@ -2303,6 +2323,24 @@ mod tests {
         AtomicStatsState, Encoding, PubSubState, ServerState, SharedState, StatsState, StoredValue,
         ValueData,
     };
+
+    #[test]
+    fn string_growth_follows_redis_preallocation() {
+        let mut small = bytes::BytesMut::from(&[b'a'; 100][..]);
+        super::reserve_string_growth(&mut small, 101);
+        assert_eq!(small.capacity(), 202);
+        assert_eq!(&small[..], &[b'a'; 100][..]);
+
+        let len = 4 * 1024 * 1024;
+        let mut large = bytes::BytesMut::from(&vec![b'b'; len][..]);
+        super::reserve_string_growth(&mut large, len + 1);
+        assert_eq!(large.capacity(), len + 1 + 1024 * 1024);
+
+        // Room that already exists is reused.
+        let before = large.capacity();
+        super::reserve_string_growth(&mut large, len + 2);
+        assert_eq!(large.capacity(), before);
+    }
 
     #[test]
     fn stored_value_is_compact() {

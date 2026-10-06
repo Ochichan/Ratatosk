@@ -29,6 +29,7 @@ pub(super) fn set_bit(data: &mut BytesMut, offset: usize, value: u8) -> u8 {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
     if byte_idx >= data.len() {
+        crate::keyspace::reserve_string_growth(data, byte_idx + 1);
         data.resize(byte_idx + 1, 0);
     }
     let old = (data[byte_idx] >> bit_idx) & 1;
