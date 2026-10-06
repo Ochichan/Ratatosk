@@ -92,6 +92,7 @@ The format is based on Keep a Changelog and the versioning policy in
 - The Nix `ratatosk-nextest` check copies the gap ledger its tier test reads.
 - Capability-tier counts in the README and contract docs (75 `baseline_local`,
   64 `unsupported`); the gap-ledger check now verifies those tables.
+- `LPOP` and `RPOP` with `COUNT` on a missing key, `LMPOP` and `ZMPOP` with nothing to pop, the timeout of every blocking list, sorted-set and stream command, and `XREAD`/`XREADGROUP` with nothing new now reply a null array (`*-1`, or `_` in RESP3) as Redis does, instead of a null bulk string. `LPOP key 0` now looks up the key first and replies a null array if it is missing or `WRONGTYPE` if it is not a list.
 
 ### Added
 

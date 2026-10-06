@@ -53,26 +53,36 @@ pub(super) fn cmd_pop(
         None
     };
 
-    if matches!(count, Some(0)) {
-        return CommandOutcome::reply(RespFrame::Array(vec![]));
-    }
-
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
+    // Redis looks the key up (null reply for a missing key, WRONGTYPE for a
+    // non-list) before it takes the `count == 0` fast path.
+    let missing_reply = || {
+        if count.is_some() {
+            RespFrame::NullArray
+        } else {
+            RespFrame::BulkString(None)
+        }
+    };
+
     if !db.contains_key(key) {
-        return CommandOutcome::reply(RespFrame::BulkString(None));
+        return CommandOutcome::reply(missing_reply());
     }
 
     let mut remove_key = false;
     let response = {
         let Some(entry) = db.get_mut(key) else {
-            return CommandOutcome::reply(RespFrame::BulkString(None));
+            return CommandOutcome::reply(missing_reply());
         };
         let Some(list) = entry.as_list_mut() else {
             return wrong_type_response();
         };
+
+        if count == Some(0) {
+            return CommandOutcome::reply(RespFrame::Array(vec![]));
+        }
 
         match count {
             None => {
