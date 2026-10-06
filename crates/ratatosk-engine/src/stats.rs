@@ -497,6 +497,8 @@ impl AtomicStatsState {
     }
 
     pub fn adjust_commands_processed_by(&self, overcounted: u64) {
+        // Newer Rust renames fetch_update to try_update; MSRV 1.85 only has fetch_update.
+        #[allow(deprecated)]
         let _ = self.total_commands_processed.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
@@ -511,6 +513,8 @@ impl AtomicStatsState {
     }
 
     pub fn mark_client_disconnected(&self) {
+        // Newer Rust renames fetch_update to try_update; MSRV 1.85 only has fetch_update.
+        #[allow(deprecated)]
         let _ = self.connected_clients.fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,

@@ -1205,6 +1205,8 @@ impl DataState {
     /// Subtract `bytes` from the estimated memory for a specific database.
     pub fn sub_memory(&self, db_idx: usize, bytes: usize) {
         // Use saturating semantics to avoid underflow from drift.
+        // Newer Rust renames fetch_update to try_update; MSRV 1.85 only has fetch_update.
+        #[allow(deprecated)]
         let _ = self.db_memory_bytes[db_idx].fetch_update(
             AtomicOrdering::Relaxed,
             AtomicOrdering::Relaxed,
