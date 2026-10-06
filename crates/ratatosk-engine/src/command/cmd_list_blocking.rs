@@ -7,7 +7,7 @@ use ratatosk_resp::frame::RespFrame;
 use crate::keyspace::{ServerState, StoredValue, purge_expired_key};
 use crate::object::parse_f64;
 
-use super::cmd_list_pop::{MAX_LIST_NUMKEYS, MAX_LIST_POP_COUNT};
+use super::cmd_list_pop::MAX_LIST_NUMKEYS;
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
     wrong_type_response,
@@ -457,9 +457,6 @@ pub(super) fn cmd_lmpop_inner(
         let Ok(parsed_count) = usize::try_from(parsed_count) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        if parsed_count > MAX_LIST_POP_COUNT {
-            return CommandOutcome::reply(err("ERR count is out of range"));
-        }
         count = parsed_count;
     }
 
@@ -511,7 +508,7 @@ pub(super) fn try_lmpop_once(
                 return wrong_type_response();
             };
 
-            let mut popped = Vec::with_capacity(count);
+            let mut popped = Vec::with_capacity(count.min(list.len()));
             for _ in 0..count {
                 let value = if left {
                     list.pop_front()

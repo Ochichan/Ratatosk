@@ -12026,11 +12026,11 @@ mod tests {
 
         assert_eq!(
             run(&["LPOP", "k", "100001"], &mut server, &mut client),
-            RespFrame::error_str("ERR count is out of range")
+            RespFrame::BulkString(None)
         );
         assert_eq!(
             run(&["SPOP", "k", "100001"], &mut server, &mut client),
-            RespFrame::error_str("ERR count is out of range")
+            RespFrame::Array(vec![])
         );
         assert_eq!(
             run(&["ZMPOP", "10001", "k", "MIN"], &mut server, &mut client),
@@ -12040,6 +12040,111 @@ mod tests {
             run(&["LMPOP", "10001", "k", "LEFT"], &mut server, &mut client),
             RespFrame::error_str("ERR numkeys is out of range")
         );
+    }
+
+    #[test]
+    fn huge_positive_counts_return_whole_collection() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let huge = i64::MAX.to_string();
+
+        for count in ["100001", huge.as_str()] {
+            run(&["RPUSH", "l", "a", "b", "c"], &mut server, &mut client);
+            let RespFrame::Array(items) = run(&["LPOP", "l", count], &mut server, &mut client)
+            else {
+                panic!("LPOP with count should return array");
+            };
+            assert_eq!(items.len(), 3);
+
+            run(&["SADD", "s", "a", "b", "c"], &mut server, &mut client);
+            let RespFrame::Array(items) = run(&["SPOP", "s", count], &mut server, &mut client)
+            else {
+                panic!("SPOP with count should return array");
+            };
+            assert_eq!(items.len(), 3);
+
+            run(
+                &["ZADD", "z", "1", "a", "2", "b", "3", "c"],
+                &mut server,
+                &mut client,
+            );
+            let RespFrame::Array(items) = run(&["ZPOPMIN", "z", count], &mut server, &mut client)
+            else {
+                panic!("ZPOPMIN with count should return array");
+            };
+            assert_eq!(items.len(), 6);
+
+            run(&["RPUSH", "l", "a", "b", "c"], &mut server, &mut client);
+            let RespFrame::Array(reply) = run(
+                &["LMPOP", "1", "l", "LEFT", "COUNT", count],
+                &mut server,
+                &mut client,
+            ) else {
+                panic!("LMPOP with count should return array");
+            };
+            let RespFrame::Array(values) = &reply[1] else {
+                panic!("LMPOP reply should hold a values array");
+            };
+            assert_eq!(values.len(), 3);
+        }
+    }
+
+    #[test]
+    fn huge_positive_random_counts_return_whole_collection() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let huge = i64::MAX.to_string();
+
+        run(&["SADD", "s", "a", "b", "c"], &mut server, &mut client);
+        run(
+            &["HSET", "h", "f1", "v1", "f2", "v2", "f3", "v3"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["ZADD", "z", "1", "a", "2", "b", "3", "c"],
+            &mut server,
+            &mut client,
+        );
+
+        for count in ["100001", huge.as_str()] {
+            for cmd in ["SRANDMEMBER", "HRANDFIELD", "ZRANDMEMBER"] {
+                let key = match cmd {
+                    "SRANDMEMBER" => "s",
+                    "HRANDFIELD" => "h",
+                    _ => "z",
+                };
+                let RespFrame::Array(items) = run(&[cmd, key, count], &mut server, &mut client)
+                else {
+                    panic!("{cmd} with positive count should return array");
+                };
+                assert_eq!(items.len(), 3, "{cmd} count {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn large_negative_random_counts_still_error() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        run(&["SADD", "s", "a"], &mut server, &mut client);
+        run(&["HSET", "h", "f", "v"], &mut server, &mut client);
+        run(&["ZADD", "z", "1", "a"], &mut server, &mut client);
+
+        for (cmd, key) in [
+            ("SRANDMEMBER", "s"),
+            ("HRANDFIELD", "h"),
+            ("ZRANDMEMBER", "z"),
+        ] {
+            for count in ["-100001", "-9223372036854775808"] {
+                assert_eq!(
+                    run(&[cmd, key, count], &mut server, &mut client),
+                    RespFrame::error_str("ERR count is out of range"),
+                    "{cmd} count {count}"
+                );
+            }
+        }
     }
 
     #[test]

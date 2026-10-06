@@ -12,8 +12,7 @@ use super::{
 };
 use super::{parse_scan_cursor, parse_scan_match_count_options, scan_collect_indexes, scan_reply};
 
-const MAX_SET_POP_COUNT: usize = 100_000;
-const MAX_SET_RANDOM_COUNT: usize = 100_000;
+const MAX_SET_RANDOM_REPEAT_COUNT: usize = 100_000;
 
 pub(super) fn cmd_sadd(
     args: &[Bytes],
@@ -226,9 +225,6 @@ pub(super) fn cmd_spop(
         let Ok(parsed_count) = usize::try_from(raw_count) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        if parsed_count > MAX_SET_POP_COUNT {
-            return CommandOutcome::reply(err("ERR count is out of range"));
-        }
         Some(parsed_count)
     } else {
         None
@@ -382,9 +378,6 @@ pub(super) fn cmd_srandmember(
             let Ok(requested) = usize::try_from(raw_count) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            if requested > MAX_SET_RANDOM_COUNT {
-                return CommandOutcome::reply(err("ERR count is out of range"));
-            }
             if requested == 0 {
                 return CommandOutcome::reply(RespFrame::Array(vec![]));
             }
@@ -408,7 +401,7 @@ pub(super) fn cmd_srandmember(
             let Ok(requested) = usize::try_from(raw_count.saturating_neg()) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            if requested > MAX_SET_RANDOM_COUNT {
+            if requested > MAX_SET_RANDOM_REPEAT_COUNT {
                 return CommandOutcome::reply(err("ERR count is out of range"));
             }
 

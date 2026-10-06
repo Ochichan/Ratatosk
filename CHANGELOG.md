@@ -38,6 +38,11 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Fixed
 
+- Positive `COUNT` arguments of `LPOP`/`RPOP`, `LMPOP`/`BLMPOP`, `ZPOPMIN`/`ZPOPMAX`,
+  `ZMPOP`/`BZMPOP`, `SPOP`, `SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` no
+  longer fail above 100000, as in Redis. A count larger than the collection
+  returns the whole collection. Only the negative (repeating) count of the three
+  random commands keeps the 100000 limit.
 - **Prometheus endpoint never served, and leaked memory**: the exporter was
   installed without its HTTP listener or upkeep task, so nothing listened on
   `RATATOSK_METRICS_BIND` and every histogram sample was retained forever

@@ -12,7 +12,7 @@ use super::{
 };
 use super::{parse_scan_cursor, parse_scan_match_count_options, scan_collect_indexes, scan_reply};
 
-const MAX_ZSET_RANDOM_COUNT: usize = 100_000;
+const MAX_ZSET_RANDOM_REPEAT_COUNT: usize = 100_000;
 
 pub(super) fn cmd_zrandmember(
     args: &[Bytes],
@@ -70,9 +70,6 @@ pub(super) fn cmd_zrandmember(
             let Ok(requested) = usize::try_from(raw_count) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            if requested > MAX_ZSET_RANDOM_COUNT {
-                return CommandOutcome::reply(err("ERR count is out of range"));
-            }
             if requested == 0 {
                 return CommandOutcome::reply(RespFrame::Array(vec![]));
             }
@@ -88,7 +85,7 @@ pub(super) fn cmd_zrandmember(
             let Ok(requested) = usize::try_from(raw_count.saturating_neg()) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            if requested > MAX_ZSET_RANDOM_COUNT {
+            if requested > MAX_ZSET_RANDOM_REPEAT_COUNT {
                 return CommandOutcome::reply(err("ERR count is out of range"));
             }
             let mut out = Vec::with_capacity(if with_scores {
