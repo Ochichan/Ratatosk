@@ -447,19 +447,44 @@ async fn hostile_frames_cannot_crash_the_server_or_desync_replies() {
         .expect("connect nested client");
     let mut payload = b"*1\r\n".repeat(100_000);
     payload.extend_from_slice(&bulk("PING"));
-    nested
-        .write_all(&payload)
-        .await
-        .expect("write nested frame");
-    expect_wire(&mut nested, b"-ERR protocol error\r\n").await;
-    // Closing with unread input may surface as a reset instead of EOF.
-    let mut rest = Vec::new();
-    match timeout(Duration::from_secs(1), nested.read_to_end(&mut rest))
+    // The server answers and closes as soon as it hits the nesting limit, so
+    // the client may still be writing: a broken pipe or reset is acceptable.
+    let write_failed = match nested.write_all(&payload).await {
+        Ok(()) => false,
+        Err(error) => {
+            assert!(
+                matches!(
+                    error.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                ),
+                "unexpected nested frame write error: {error}"
+            );
+            true
+        }
+    };
+    // Whatever arrives must be the protocol error, and the connection must
+    // close. Closing with unread input may surface as a reset instead of EOF.
+    let mut received = Vec::new();
+    match timeout(Duration::from_secs(1), nested.read_to_end(&mut received))
         .await
         .expect("closed after protocol error")
     {
-        Ok(_) => assert!(rest.is_empty()),
-        Err(error) => assert_eq!(error.kind(), io::ErrorKind::ConnectionReset),
+        Ok(_) => {}
+        Err(error) => assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+            ),
+            "unexpected nested frame read error: {error}"
+        ),
+    }
+    let reply: &[u8] = b"-ERR protocol error\r\n";
+    if write_failed && received.is_empty() {
+        // The reset discarded the reply before the client could read it.
+    } else {
+        assert_eq!(received, reply);
     }
 
     // A CR/LF quoted back in an error cannot inject a second reply.
