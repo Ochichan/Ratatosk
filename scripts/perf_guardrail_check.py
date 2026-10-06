@@ -195,8 +195,11 @@ def main() -> int:
     input_mode = parser.add_mutually_exclusive_group(required=True)
     input_mode.add_argument("--log", help="Path to Criterion benchmark log file")
     input_mode.add_argument("--ipc", help="Path to ratatosk-ipc-bench JSON artifact")
-    parser.add_argument("--set-guard-us", type=float, default=110.0)
-    parser.add_argument("--ping-guard-us", type=float, default=35.0)
+    # Calibrated on GitHub's ubuntu-latest runners (2026-10-06): nine runs
+    # gave set@256 119-154us and ping@256 37-63us.
+    # The defaults sit about 1.3x above the slowest run.
+    parser.add_argument("--set-guard-us", type=float, default=200.0)
+    parser.add_argument("--ping-guard-us", type=float, default=80.0)
     parser.add_argument(
         "--ipc-p99-us-max",
         type=float,
