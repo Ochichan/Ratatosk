@@ -301,7 +301,7 @@ P0 제품경계 ──▶ P1 상태모델 ──▶ ┬─▶ P2 관측성 ─�
 
 **Exit gate:** perf-guardrail이 CI **required** · latency/throughput/memory **capacity envelope 리포트** 존재 · P1 refactor 효과 측정.
 
-- [x] perf guardrail baseline 존재 — set@256 ≤ 110µs, ping@256 ≤ 35µs (canonical PASS 2026-02-08). 유지.
+- [x] perf guardrail baseline 존재 — set@256 ≤ 200µs, ping@256 ≤ 80µs (2026-10-06 GitHub `ubuntu-latest` 9회 실측 최댓값의 약 1.3배로 재보정. 이전 110µs/35µs는 2026-02-08 로컬 기준이었다).
 - [ ] **perf gate를 CI required로** — `perf-guardrail.yml`을 branch protection required check에 포함, CI fixture 안정화.
 - [~] **capacity envelope 측정** — `scripts/capacity_envelope.sh` 신규: SET/GET/PING × pipeline depth 1·16 latency/throughput + 키 개수별 RAM(used_memory & `ratatosk_memory_used_bytes`) → markdown 리포트. bash 구문/shellcheck green; 전체 실행은 `redis-benchmark` 설치 환경 필요.
   - _검증:_ `./scripts/capacity_envelope.sh` (redis-benchmark 있는 환경) · `./scripts/bench_baseline.sh` + `python3 scripts/perf_guardrail_check.py`.

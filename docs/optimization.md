@@ -32,9 +32,14 @@ python3 scripts/perf_guardrail_check.py --log <benchmark_log>
 
 #### Guardrail Defaults
 
-- `pipeline_set_parse_execute_encode/256` upper <= `110 us`
-- `pipeline_ping_parse_execute_encode/256` upper <= `35 us`
+- `pipeline_set_parse_execute_encode/256` upper <= `200 us`
+- `pipeline_ping_parse_execute_encode/256` upper <= `80 us`
 - checker: `scripts/perf_guardrail_check.py`
+- calibration (2026-10-06): nine `perf-guardrail.yml` runs on GitHub's `ubuntu-latest`
+  gave set@256 `119-154 us` and ping@256 `37-63 us`, in two clusters around
+  `120 us` and `150 us` for set. The defaults sit about 1.3x above the slowest run. The earlier
+  `110 us` / `35 us` came from the local 2026-02-08 baselines below, which the hosted
+  runners never met.
 
 #### Reference Logs
 
