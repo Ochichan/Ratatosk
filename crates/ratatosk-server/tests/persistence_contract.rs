@@ -325,6 +325,42 @@ fn stream_metadata_survives_aof_replay_and_rewrite() -> io::Result<()> {
 }
 
 #[test]
+fn legacy_xsetid_records_now_set_the_last_id_on_replay() -> io::Result<()> {
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    client.command(&["XADD", "events", "5-1", "f", "v"])?;
+    drop(client);
+    server.stop(false)?;
+
+    // Older builds logged XSETID without applying it. Its replay now applies it.
+    let mut incr_files = std::fs::read_dir(server.dir.path())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.to_string_lossy().ends_with(".incr.aof"))
+        .collect::<Vec<_>>();
+    incr_files.sort();
+    let incr = incr_files.last().expect("AOF INCR file");
+    let record = b"*3\r\n$15\r\nRATATOSK.AOF.AT\r\n:1\r\n*3\r\n$6\r\nXSETID\r\n$6\r\nevents\r\n$4\r\n90-0\r\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(incr)?
+        .write_all(record)?;
+
+    server.start()?;
+    let mut client = server.client()?;
+    assert_eq!(
+        client.command(&["XADD", "events", "50-0", "f", "v"])?,
+        RespFrame::Error(Bytes::from_static(
+            b"ERR The ID specified in XADD is equal or smaller than the target stream top item"
+        ))
+    );
+    assert_eq!(
+        client.command(&["XADD", "events", "91-0", "f", "v"])?,
+        RespFrame::bulk_str("91-0")
+    );
+    Ok(())
+}
+
+#[test]
 fn strict_mode_restart_replays_commands_it_rejects_from_clients() -> io::Result<()> {
     let mut server = Server::new(true)?;
     let mut client = server.client()?;

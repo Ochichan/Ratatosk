@@ -945,7 +945,8 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 RDB BASE는 해시 필드의 절대 만료 시각, stream group의 마지막 전달 ID,
 consumer별 pending ID와 seen time, PEL의 소유자·전달 횟수·전달 시각을
 보존한다. 이 metadata는 Ratatosk 전용 type 128/129로 저장하며 기존
-hash/stream 인코딩은 읽기 호환을 유지한다.
+hash/stream 인코딩은 읽기 호환을 유지한다. stream의 마지막 생성 ID,
+entries added, 가장 큰 삭제 ID가 항목에서 유도되는 값과 다르면 type 130으로 저장한다.
 
 `CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다. 클라이언트·background 작업 정리 후 worker에 Shutdown을 보내 fsync 결과를 확인하고 종료한다. 성공한 명시적 종료는 INFO, 예기치 않은 채널 단절은 WARN, shutdown fsync 실패는 ERROR로 구분한다. 최종 종료의 응답 대기는 제한되지만 동기 fsync 자체를 중단하는 hard deadline은 아니다.
 

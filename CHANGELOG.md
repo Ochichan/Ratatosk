@@ -108,7 +108,9 @@ The format is based on Keep a Changelog and the versioning policy in
   rollback procedure; a binary-only downgrade after new writes is unsupported.
 - **Hash-field TTL and stream group state in RDB**: snapshots retain hash-field
   absolute deadlines (`HEXPIRE` family) and stream group / consumer / PEL state
-  using private type bytes 128 and 129. Older Ratatosk encodings stay loadable.
+  using private type bytes 128 and 129, and stream metadata (last generated ID,
+  entries added, largest deleted ID) using 130. Older Ratatosk encodings stay
+  loadable.
 - **Sidecar handoff**: `RATATOSK_PORT=0` binds an ephemeral loopback port and,
   when `RATATOSK_BOUND_ADDR_FILE` is set, writes the bound address to that file
   once the listener is ready (the path is preflight-checked at startup). The
@@ -183,10 +185,11 @@ The format is based on Keep a Changelog and the versioning policy in
   `ms-*`), `XREAD $` and `XGROUP CREATE/SETID $` follow the last generated ID
   even after its entry is deleted, `XDEL`/`XDELEX`/`XACKDEL` record the largest
   deleted ID, and `XINFO STREAM` reports real `last-generated-id`,
-  `entries-added` and `max-deleted-entry-id` values. `DUMP` emits `RATSK3`.
+  `entries-added` and `max-deleted-entry-id` values.
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
-- `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.
+- `DUMP` emits payload version `RATSK3`; `RESTORE` accepts `RATSK1`, `RATSK2`
+  and `RATSK3`.
 - CI workflows run with read-only repository permissions, and the security scan
   also runs weekly.
 - **License changed from MIT to GPL-3.0-or-later.** The workspace `license`
@@ -231,10 +234,15 @@ The format is based on Keep a Changelog and the versioning policy in
   empties the list. Run `BGREWRITEAOF` on the old build before upgrading to
   carry its dataset over exactly.
 - `RATSK2` `DUMP` payloads cannot be restored by older Ratatosk builds.
-- A stream whose metadata differs from what its entries imply (after `XSETID`,
-  or after deleting its newest entry) is saved with the private RDB type 130,
-  which older Ratatosk builds reject. Other streams keep type 129. Snapshots
-  without type 130 still load on older builds, and older snapshots load here
-  with the metadata derived from the entries as before. `RATSK3` `DUMP`
-  payloads likewise need this build.
+- A stream whose metadata differs from what its entries imply is saved with the
+  private RDB type 130, which older Ratatosk builds reject. That is any stream
+  touched by `XSETID`, `XDEL`, `XDELEX` or `XACKDEL`, or trimmed by `XTRIM`;
+  only streams that have only ever been appended to keep type 129. Older
+  snapshots load here with the metadata derived from the entries as before.
+  `RATSK3` `DUMP` payloads likewise need this build.
+- Older builds logged `XSETID` without applying it. Replaying such a record now
+  sets the stream's last ID and runs Redis's checks, so a record that set an ID
+  below an earlier `XDEL`, or one followed by an `XADD` below the ID it set,
+  stops startup with the byte offset of the failing command. Run `BGREWRITEAOF`
+  on the old build before upgrading to carry its dataset over exactly.
 

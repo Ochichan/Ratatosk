@@ -6468,6 +6468,10 @@ mod tests {
                 "ERR syntax error",
             ),
             (
+                &["XSETID", "s", "*"][..],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+            (
                 &["XSETID", "s", "9-0", "BOGUS", "1"][..],
                 "ERR syntax error",
             ),
@@ -6479,6 +6483,12 @@ mod tests {
             );
         }
 
+        // A bare millisecond value is that millisecond with sequence 0.
+        assert_eq!(
+            run(&["XSETID", "s", "7"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(info(&mut server, &mut client).0, RespFrame::bulk_str("7-0"));
         assert_eq!(
             run(
                 &[
