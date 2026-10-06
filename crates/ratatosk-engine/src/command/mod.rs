@@ -10864,7 +10864,8 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(outcome.response, RespFrame::NullArray);
+        // Parks with a null bulk; the server replies a null array at the timeout.
+        assert_eq!(outcome.response, RespFrame::BulkString(None));
         assert!(outcome.retry_blocking.is_some());
 
         let outcome = run_full(
@@ -10872,7 +10873,8 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(outcome.response, RespFrame::NullArray);
+        // Parks with a null bulk; the server replies a null array at the timeout.
+        assert_eq!(outcome.response, RespFrame::BulkString(None));
         assert!(outcome.retry_blocking.is_some());
 
         assert_eq!(
@@ -12152,13 +12154,21 @@ mod tests {
             &["BZPOPMIN", "missing", "0"],
             &["BZPOPMAX", "missing", "0"],
             &["BZMPOP", "0", "1", "missing", "MIN"],
-            &["BLMOVE", "missing", "dst", "LEFT", "RIGHT", "0.1"],
-            &["BRPOPLPUSH", "missing", "dst", "0.1"],
             &["XREAD", "BLOCK", "10", "STREAMS", "missing", "$"],
         ];
         for parts in blocking {
             let outcome = run_full(parts, &mut server, &mut client);
             assert_eq!(outcome.response, null_array, "{parts:?}");
+            assert!(outcome.retry_blocking.is_some(), "{parts:?}");
+        }
+        // BLMOVE and BRPOPLPUSH park with a null bulk, their reply inside
+        // EXEC; the server turns it into a null array at the timeout.
+        for parts in [
+            &["BLMOVE", "missing", "dst", "LEFT", "RIGHT", "0.1"][..],
+            &["BRPOPLPUSH", "missing", "dst", "0.1"][..],
+        ] {
+            let outcome = run_full(parts, &mut server, &mut client);
+            assert_eq!(outcome.response, RespFrame::BulkString(None), "{parts:?}");
             assert!(outcome.retry_blocking.is_some(), "{parts:?}");
         }
 
@@ -12208,9 +12218,18 @@ mod tests {
         run(&["MULTI"], &mut server, &mut client);
         run(&["BLPOP", "missing", "0"], &mut server, &mut client);
         run(&["BZPOPMIN", "missing", "0"], &mut server, &mut client);
+        run(
+            &["BLMOVE", "missing", "dst", "LEFT", "RIGHT", "0"],
+            &mut server,
+            &mut client,
+        );
         assert_eq!(
             run(&["EXEC"], &mut server, &mut client),
-            RespFrame::Array(vec![null_array.clone(), null_array])
+            RespFrame::Array(vec![
+                null_array.clone(),
+                null_array,
+                RespFrame::BulkString(None)
+            ])
         );
     }
 

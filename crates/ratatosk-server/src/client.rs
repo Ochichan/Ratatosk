@@ -3248,6 +3248,22 @@ mod tests {
             .await
             .expect("blpop timeout");
         assert_eq!(read_reply(&mut client).await, b"*-1\r\n");
+        // BLMOVE parks with a null bulk but times out with a null array.
+        client
+            .write_all(b"BLMOVE missing dst LEFT RIGHT 0.1\r\n")
+            .await
+            .expect("blmove timeout");
+        assert_eq!(read_reply(&mut client).await, b"*-1\r\n");
+        // Inside EXEC it cannot block and replies a null bulk, as Redis does.
+        client
+            .write_all(b"MULTI\r\nBLMOVE missing dst LEFT RIGHT 0\r\nEXEC\r\n")
+            .await
+            .expect("blmove in exec");
+        let mut reply = Vec::new();
+        while !reply.ends_with(b"*1\r\n$-1\r\n") {
+            reply.extend_from_slice(&read_reply(&mut client).await);
+        }
+        assert_eq!(reply, b"+OK\r\n+QUEUED\r\n*1\r\n$-1\r\n");
 
         // RESP3: both null-array cases are `_`.
         client

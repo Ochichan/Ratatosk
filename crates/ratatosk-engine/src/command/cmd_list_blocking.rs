@@ -310,16 +310,16 @@ pub(super) fn cmd_brpoplpush(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
     let wrapped = [source.clone(), destination.clone()];
 
+    // Like Redis, an empty source replies a null bulk where the client cannot
+    // block (inside EXEC) and a null array once a real timeout expires.
     let mut outcome = cmd_rpoplpush(&wrapped, server, client);
-    if matches!(outcome.response, RespFrame::BulkString(None)) {
-        outcome.response = RespFrame::NullArray;
-    }
-    if !matches!(outcome.response, RespFrame::NullArray) {
+    if !matches!(outcome.response, RespFrame::BulkString(None)) {
         return outcome;
     }
 
     if let Some(deadline) = deadline_ms {
         if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
+            outcome.response = RespFrame::NullArray;
             return outcome;
         }
     }
@@ -355,16 +355,16 @@ pub(super) fn cmd_blmove(
         to_raw.clone(),
     ];
 
+    // Like Redis, an empty source replies a null bulk where the client cannot
+    // block (inside EXEC) and a null array once a real timeout expires.
     let mut outcome = cmd_lmove(&wrapped, server, client);
-    if matches!(outcome.response, RespFrame::BulkString(None)) {
-        outcome.response = RespFrame::NullArray;
-    }
-    if !matches!(outcome.response, RespFrame::NullArray) {
+    if !matches!(outcome.response, RespFrame::BulkString(None)) {
         return outcome;
     }
 
     if let Some(deadline) = deadline_ms {
         if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
+            outcome.response = RespFrame::NullArray;
             return outcome;
         }
     }
