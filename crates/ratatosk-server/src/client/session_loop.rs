@@ -251,13 +251,21 @@ pub(super) async fn apply_command_outcomes<S: SessionStream>(
                 output_limit_bytes,
                 protocol_version,
             ) {
-                tracing::warn!(
+                // The command has already run, and a pop has already removed
+                // and logged what it returns, so the reply is still delivered,
+                // as Redis does for normal clients. Earlier pipelined replies
+                // go out first, and client-write-timeout-sec still drops a
+                // client that stops reading. The limit keeps bounding the
+                // pub/sub and MONITOR backlogs.
+                flush_output_buffer(stream, server_state, output, *write_timeout).await?;
+                append_encoded_frame(output, &outcome.response, usize::MAX, protocol_version);
+                tracing::debug!(
                     client_id = client_state.id(),
                     output_limit_bytes = output_limit_bytes,
-                    "disconnecting client: command response exceeded output buffer limit"
+                    reply_bytes = output.len(),
+                    "sending command reply larger than the output buffer limit"
                 );
-                write_output_limit_error(stream, *write_timeout).await?;
-                return Ok(None);
+                flush_output_buffer(stream, server_state, output, *write_timeout).await?;
             }
 
             if output.len() >= *output_buffer_flush_threshold {

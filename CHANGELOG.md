@@ -178,6 +178,11 @@ The format is based on Keep a Changelog and the versioning policy in
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
 - `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.
+- A command reply larger than `output-buffer-limit-bytes` is now sent instead
+  of closing the connection with `ERR output buffer limit exceeded`. The command
+  had already run, so a large pop removed and logged elements the client never
+  received. The limit still applies to pub/sub and MONITOR backlogs, and
+  `client-write-timeout-sec` still drops a client that stops reading.
 - CI workflows run with read-only repository permissions, and the security scan
   also runs weekly.
 - **License changed from MIT to GPL-3.0-or-later.** The workspace `license`

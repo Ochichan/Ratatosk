@@ -2377,27 +2377,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_response_disconnects_client() {
+    async fn oversized_response_is_delivered_and_keeps_the_connection() {
         let limits = ClientIoLimits {
             output_buffer_limit_bytes: 256,
             client_read_timeout_sec: 0,
         };
         let (mut client, server_task) = setup_client_server_with_limits(limits).await;
 
+        // A reply over the limit, between two small pipelined replies.
         let payload = "x".repeat(1024);
-        let command = format!("ECHO {payload}\r\n");
+        let command = format!("PING\r\nECHO {payload}\r\nPING\r\n");
         client
             .write_all(command.as_bytes())
             .await
-            .expect("write oversized echo");
+            .expect("write pipelined commands");
 
-        let reply = read_reply(&mut client).await;
-        assert_eq!(reply, b"-ERR output buffer limit exceeded\r\n");
+        let expected = format!("+PONG\r\n${}\r\n{payload}\r\n+PONG\r\n", payload.len());
+        let mut reply = vec![0u8; expected.len()];
+        timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .expect("read timeout")
+            .expect("read replies");
+        assert_eq!(reply, expected.as_bytes());
 
-        let mut eof = [0u8; 1];
-        let n = client.read(&mut eof).await.expect("read eof");
-        assert_eq!(n, 0);
-
+        drop(client);
         server_task.await.expect("server task complete");
     }
 
