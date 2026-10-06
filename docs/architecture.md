@@ -355,7 +355,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 ## Compatibility Notes
 
 - [Part 6: Redis Gap Ledger](#part-6-redis-gap-ledger) 기준 명령 카탈로그는 420개 엔트리이며, 현재 ledger는 status와 별도로 `capability_tier`를 기록한다.
-- 현재 tier summary는 `unsupported=64`, `syntax_only=6`, `baseline_local=75`, `behavioral_subset=275`, `distributed_parity=0`이다.
+- 현재 tier summary는 `unsupported=64`, `syntax_only=8`, `baseline_local=75`, `behavioral_subset=273`, `distributed_parity=0`이다.
 - 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
   - 예: 복제/클러스터 계열은 standalone 호환 응답 중심.
   - 단, `SAVE`/`BGSAVE`는 실제 RDB 스냅샷을 수행하며, `BGSAVE`는 background snapshot worker로 동작한다 (단순 timestamp 갱신이 아님).
@@ -1194,9 +1194,9 @@ From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-09-13:
 | Tier | Count | Meaning |
 |------|-------|---------|
 | `distributed_parity` | 0 | No command achieves Redis distributed semantics |
-| `behavioral_subset` | 275 | Locally correct behavior for common use cases |
+| `behavioral_subset` | 273 | Locally correct behavior for common use cases |
 | `baseline_local` | 75 | Standalone-compatible response shell |
-| `syntax_only` | 6 | Parses and responds but lacks backing subsystem |
+| `syntax_only` | 8 | Parses and responds but lacks backing subsystem |
 | `unsupported` | 64 | Returns explicit error |
 
 The runtime exposes `ratatosk_capability_tier` in `COMMAND DOCS` responses so clients can programmatically inspect implementation depth.
@@ -1263,9 +1263,9 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 현재 ledger tier summary:
 
 - `unsupported=64`
-- `syntax_only=6`
+- `syntax_only=8`
 - `baseline_local=75`
-- `behavioral_subset=275`
+- `behavioral_subset=273`
 - `distributed_parity=0`
 
 결론적으로 현재 Ratatosk는 "Redis 명령을 많이 이해하는 standalone 메모리 서버"로는 설명될 수 있지만, Redis를 대체하는 드롭인 시스템이라고 보기에는 이른 상태다. 특히 replication, failover, cluster redirection, client-side caching invalidation, scripting 생태계에 의존하는 워크로드는 그대로 이식되기 어렵다.

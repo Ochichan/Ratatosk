@@ -4755,10 +4755,10 @@
       "path": "xcfgset.json",
       "summary": "Sets the IDMP configuration parameters for a stream.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "syntax_only",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-6 stream extended deletion/config baseline implemented."
+      "notes": "Validates arguments and returns OK without changing stream state. IDMP-DURATION and IDMP-MAXSIZE are parsed and not stored."
     },
     {
       "name": "XCLAIM",
@@ -5041,10 +5041,10 @@
       "path": "xsetid.json",
       "summary": "An internal command for replicating stream values.",
       "status": "done",
-      "capability_tier": "behavioral_subset",
+      "capability_tier": "syntax_only",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution)."
+      "notes": "Validates arguments and returns OK without changing stream state. No last-ID metadata is kept, so a later XADD * can generate an ID lower than the one given."
     },
     {
       "name": "XTRIM",

@@ -32,9 +32,9 @@ carry a capability tier, visible through `COMMAND DOCS` and recorded in the
 
 | Tier | Meaning | Count |
 |---|---|---|
-| `behavioral_subset` | implemented and tested for real Redis semantics on a single node | 275 |
+| `behavioral_subset` | implemented and tested for real Redis semantics on a single node | 273 |
 | `baseline_local` | works locally with standalone semantics (for example `WAIT` answers immediately, `CLUSTER` reports one node) | 75 |
-| `syntax_only` | parsed and acknowledged, no real effect | 6 |
+| `syntax_only` | parsed and acknowledged, no real effect | 8 |
 | `unsupported` | rejected | 64 |
 | `distributed_parity` | reserved; nothing claims it | 0 |
 

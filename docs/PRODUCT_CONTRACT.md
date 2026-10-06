@@ -52,9 +52,9 @@ code↔ledger drift audited and reconciled on 2026-06-02).
 
 | tier | count | meaning |
 |---|---:|---|
-| `behavioral_subset` | 275 | Useful Redis-compatible behavior; may omit some edge / distributed semantics. The differential-tested target set. |
+| `behavioral_subset` | 273 | Useful Redis-compatible behavior; may omit some edge / distributed semantics. The differential-tested target set. |
 | `baseline_local` | 75 | Standalone single-node baseline; does not claim distributed Redis parity (e.g. `CLUSTER SLOTS` returns local-only info). |
-| `syntax_only` | 6 | Syntax/arity is accepted but there is **no Redis-equivalent operational effect**. ⚠️ silent-success risk. |
+| `syntax_only` | 8 | Syntax/arity is accepted but there is **no Redis-equivalent operational effect**. ⚠️ silent-success risk. |
 | `unsupported` | 64 | Not supported in this build (distributed / functions / commands that always error on a single node). |
 | `distributed_parity` | 0 | No distributed parity is claimed anywhere. |
 
@@ -102,7 +102,7 @@ ERR command WAIT is not supported in Ratatosk strict compatibility mode; reason=
 Representative commands blocked in strict mode: `WAIT`, `WAITAOF`,
 `CLIENT PAUSE`, `CLIENT UNBLOCK`, `CLUSTER *` (except informational
 `CLUSTER INFO/SLOTS/SHARDS/MYID/KEYSLOT/...`), `SENTINEL *`, `FUNCTION LOAD/DELETE/RESTORE`,
-`FCALL`/`FCALL_RO`, `READONLY`/`READWRITE`/`ASKING`. Commands clients need for
+`FCALL`/`FCALL_RO`, `READONLY`/`READWRITE`/`ASKING`, `XSETID`, `XCFGSET`. Commands clients need for
 discovery and operation (`GET`/`SET`, `PING`, `INFO`, `CONFIG`, `CLIENT LIST`,
 `COMMAND DOCS`, `CLUSTER INFO`) are **never** blocked.
 
@@ -150,7 +150,7 @@ operators get a cause, not just a status word. `reasons:none` when healthy.
 | Item | Risk if unmanaged | Mitigation (status) |
 |---|---|---|
 | `done=420` phrasing | read as "identical to Redis" | "surface 420, semantics vary by tier" (✅ this doc, README; CLI `--help` states the tier rule without the count) |
-| `syntax_only` (6) | client/tool reads false success | `strict` mode → ERR; `compat` mode documented (✅ implemented) |
+| `syntax_only` (8) | client/tool reads false success | `strict` mode → ERR; `compat` mode documented (✅ implemented) |
 | Cluster/Sentinel helpers | looks cluster-capable | tiered `unsupported`; strict ERR (✅) |
 | `WAIT` / `WAITAOF` | metadata read as durability | strict ERR; not replica-backed (✅) |
 | Lua / Functions | feature-gated vs ledger drift | `FUNCTION LOAD/DELETE/RESTORE` and `FCALL`/`FCALL_RO` unsupported; other `FUNCTION` subcommands `baseline_local`; `EVAL` family behind the `lua-scripting` feature and `unsupported` in the default build |
