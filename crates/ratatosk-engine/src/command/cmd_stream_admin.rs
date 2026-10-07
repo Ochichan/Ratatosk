@@ -10,8 +10,8 @@ use super::cmd_stream::parse_stream_id;
 /// bare millisecond value means sequence 0, and `-`, `+` and `*` are refused.
 fn parse_xsetid_id(raw: &Bytes) -> Option<StreamId> {
     if !raw.contains(&b'-') {
-        let ms = std::str::from_utf8(raw).ok()?.parse::<i64>().ok()?;
-        return (ms >= 0).then_some(StreamId { ms, seq: 0 });
+        let ms = std::str::from_utf8(raw).ok()?.parse::<u64>().ok()?;
+        return Some(StreamId { ms, seq: 0 });
     }
     parse_stream_id(raw)
 }

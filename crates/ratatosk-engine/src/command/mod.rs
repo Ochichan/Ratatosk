@@ -6485,8 +6485,8 @@ mod tests {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
         run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
-        let max = i64::MAX.to_string();
-        let near_end = format!("{}-{max}", i64::MAX - 1);
+        let max = u64::MAX.to_string();
+        let near_end = format!("{}-{max}", u64::MAX - 1);
 
         // `*` carries an exhausted sequence into the next millisecond.
         assert_eq!(
@@ -6583,6 +6583,48 @@ mod tests {
             crate::keyspace::StreamId { ms: 6, seq: 0 }
         );
         assert_eq!(meta("copy", &server), Some(original));
+    }
+
+    #[test]
+    fn dump_restore_roundtrips_stream_ids_across_the_u64_range() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let ids = [
+            "0-1",
+            "9223372036854775807-5",
+            "18446744073709551615-18446744073709551615",
+        ];
+        for id in ids {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let RespFrame::BulkString(Some(payload)) = run(&["DUMP", "s"], &mut server, &mut client)
+        else {
+            panic!("DUMP should return a payload");
+        };
+        assert_eq!(
+            run_bytes(
+                &[
+                    Bytes::from_static(b"RESTORE"),
+                    Bytes::from_static(b"copy"),
+                    Bytes::from_static(b"0"),
+                    payload,
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        let range = |key: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", key, "-", "+"], server, client)
+        };
+        assert_eq!(
+            range("copy", &mut server, &mut client),
+            range("s", &mut server, &mut client)
+        );
+        let RespFrame::Array(rows) = range("copy", &mut server, &mut client) else {
+            panic!("XRANGE should return an array");
+        };
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

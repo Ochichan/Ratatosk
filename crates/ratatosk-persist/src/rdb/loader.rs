@@ -261,8 +261,8 @@ impl<R: Read> RdbLoader<R> {
                     self.read_bytes(&mut ms_buf)?;
                     self.read_bytes(&mut seq_buf)?;
                     let id = StreamId {
-                        ms: i64::from_le_bytes(ms_buf),
-                        seq: i64::from_le_bytes(seq_buf),
+                        ms: u64::from_le_bytes(ms_buf),
+                        seq: u64::from_le_bytes(seq_buf),
                     };
 
                     let field_count = self.read_length()?;
@@ -356,10 +356,16 @@ impl<R: Read> RdbLoader<R> {
         Ok(i64::from_le_bytes(bytes))
     }
 
+    fn read_u64(&mut self) -> Result<u64, PersistError> {
+        let mut bytes = [0; 8];
+        self.read_bytes(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
     fn read_stream_id(&mut self) -> Result<StreamId, PersistError> {
         Ok(StreamId {
-            ms: self.read_i64()?,
-            seq: self.read_i64()?,
+            ms: self.read_u64()?,
+            seq: self.read_u64()?,
         })
     }
 
@@ -879,6 +885,47 @@ mod tests {
             RdbLoader::new(bytes.as_slice()).load_into(&mut target),
             Err(PersistError::Corrupt { .. })
         ));
+    }
+
+    #[test]
+    fn stream_ids_roundtrip_across_the_full_u64_range() {
+        let ids = [
+            StreamId { ms: 0, seq: 0 },
+            StreamId {
+                ms: 9_223_372_036_854_775_807,
+                seq: 5,
+            },
+            StreamId {
+                ms: u64::MAX,
+                seq: u64::MAX,
+            },
+        ];
+        let state = ServerState::with_default_dbs();
+        let entries = ids
+            .iter()
+            .map(|id| StreamEntry {
+                id: *id,
+                fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+            })
+            .collect::<Vec<_>>();
+        state
+            .db_mut(0)
+            .insert(Bytes::from("s"), StoredValue::stream(entries, None));
+
+        let loaded = roundtrip_state(&state);
+        let db = loaded.db(0);
+        let stream = db.get(&Bytes::from("s")).expect("stream");
+        let loaded_ids = stream
+            .as_stream_entries()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_ids, ids);
+        assert_eq!(
+            stream.as_stream_meta().copied().expect("meta").last_id,
+            ids[2]
+        );
     }
 
     #[test]

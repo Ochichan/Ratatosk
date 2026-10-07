@@ -37,8 +37,8 @@ pub type DbSnapshot = Vec<HashMap<Bytes, StoredValue>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
-    pub ms: i64,
-    pub seq: i64,
+    pub ms: u64,
+    pub seq: u64,
 }
 
 #[derive(Debug, Clone)]

@@ -21,7 +21,7 @@ fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
             return None;
         }
         Some(StreamId {
-            ms: parse_i64(raw)?,
+            ms: std::str::from_utf8(raw).ok()?.parse::<u64>().ok()?,
             seq: 0,
         })
     })

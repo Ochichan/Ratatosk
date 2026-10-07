@@ -24,11 +24,8 @@ pub(super) fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
         return None;
     }
 
-    let ms = ms_raw.parse::<i64>().ok()?;
-    let seq = seq_raw.parse::<i64>().ok()?;
-    if ms < 0 || seq < 0 {
-        return None;
-    }
+    let ms = ms_raw.parse::<u64>().ok()?;
+    let seq = seq_raw.parse::<u64>().ok()?;
 
     Some(StreamId { ms, seq })
 }
@@ -38,10 +35,7 @@ pub(super) fn parse_stream_range_bound(raw: &Bytes) -> Option<StreamId> {
         return Some(StreamId { ms: 0, seq: 0 });
     }
     if raw.as_ref() == b"+" {
-        return Some(StreamId {
-            ms: i64::MAX,
-            seq: i64::MAX,
-        });
+        return Some(MAX_STREAM_ID);
     }
 
     let id = parse_stream_id(raw)?;
@@ -50,19 +44,19 @@ pub(super) fn parse_stream_range_bound(raw: &Bytes) -> Option<StreamId> {
 
 /// The largest stream ID; a stream whose last ID is this accepts no more entries.
 const MAX_STREAM_ID: StreamId = StreamId {
-    ms: i64::MAX,
-    seq: i64::MAX,
+    ms: u64::MAX,
+    seq: u64::MAX,
 };
 
 /// The ID right after `id`, carrying into the next millisecond when the
 /// sequence is exhausted, as Redis's `streamIncrID`. `None` past the last ID.
 fn incremented_stream_id(id: StreamId) -> Option<StreamId> {
-    if id.seq < i64::MAX {
+    if id.seq < u64::MAX {
         Some(StreamId {
             ms: id.ms,
             seq: id.seq + 1,
         })
-    } else if id.ms < i64::MAX {
+    } else if id.ms < u64::MAX {
         Some(StreamId {
             ms: id.ms + 1,
             seq: 0,
@@ -75,7 +69,7 @@ fn incremented_stream_id(id: StreamId) -> Option<StreamId> {
 /// The ID `XADD *` assigns after `last_id`, the stream's last generated ID,
 /// as Redis's `streamNextID`.
 fn next_stream_id(last_id: StreamId) -> Option<StreamId> {
-    let now = now_ms();
+    let now = u64::try_from(now_ms()).unwrap_or(0);
     if now > last_id.ms {
         Some(StreamId { ms: now, seq: 0 })
     } else {
@@ -85,11 +79,11 @@ fn next_stream_id(last_id: StreamId) -> Option<StreamId> {
 
 /// The ID `XADD <ms>-*` assigns. Within the last ID's millisecond the sequence
 /// continues and, unlike `*`, never carries: an exhausted sequence is `None`.
-fn next_stream_id_for_ms(last_id: StreamId, ms: i64) -> Option<StreamId> {
+fn next_stream_id_for_ms(last_id: StreamId, ms: u64) -> Option<StreamId> {
     if ms != last_id.ms {
         return Some(StreamId { ms, seq: 0 });
     }
-    (last_id.seq < i64::MAX).then(|| StreamId {
+    (last_id.seq < u64::MAX).then(|| StreamId {
         ms,
         seq: last_id.seq + 1,
     })
@@ -156,7 +150,7 @@ pub(super) fn cmd_xadd(
     // forms while parsing its arguments).
     enum IdSpec {
         Auto,
-        AutoSeq(i64),
+        AutoSeq(u64),
         Explicit(StreamId),
     }
     let invalid_id = || {
@@ -169,8 +163,7 @@ pub(super) fn cmd_xadd(
     } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
         let Some(ms) = std::str::from_utf8(ms_raw)
             .ok()
-            .and_then(|text| text.parse::<i64>().ok())
-            .filter(|ms| *ms >= 0)
+            .and_then(|text| text.parse::<u64>().ok())
         else {
             return invalid_id();
         };

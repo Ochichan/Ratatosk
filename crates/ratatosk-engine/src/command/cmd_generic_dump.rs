@@ -287,8 +287,8 @@ fn put_optional_i64(buf: &mut Vec<u8>, value: Option<i64>) {
 }
 
 fn put_stream_id(buf: &mut Vec<u8>, id: StreamId) {
-    put_i64(buf, id.ms);
-    put_i64(buf, id.seq);
+    buf.extend_from_slice(&id.ms.to_le_bytes());
+    buf.extend_from_slice(&id.seq.to_le_bytes());
 }
 
 fn take_optional_i64(raw: &[u8], idx: &mut usize) -> Option<Option<i64>> {
@@ -302,9 +302,9 @@ fn take_optional_i64(raw: &[u8], idx: &mut usize) -> Option<Option<i64>> {
 }
 
 fn take_stream_id(raw: &[u8], idx: &mut usize) -> Option<StreamId> {
-    let ms = take_i64(raw, idx)?;
-    let seq = take_i64(raw, idx)?;
-    (ms >= 0 && seq >= 0).then_some(StreamId { ms, seq })
+    let ms = take_i64(raw, idx)? as u64;
+    let seq = take_i64(raw, idx)? as u64;
+    Some(StreamId { ms, seq })
 }
 
 /// Reads an element count; RESTORE refuses empty lists, sets, hashes and
