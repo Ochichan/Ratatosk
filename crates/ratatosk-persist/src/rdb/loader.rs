@@ -252,7 +252,10 @@ impl<R: Read> RdbLoader<R> {
                 }
                 StoredValue::sorted_set(zset, expire_ms)
             }
-            RDB_TYPE_STREAM | RDB_TYPE_RATATOSK_STREAM_GROUPS | RDB_TYPE_RATATOSK_STREAM_META => {
+            RDB_TYPE_STREAM
+            | RDB_TYPE_RATATOSK_STREAM_GROUPS
+            | RDB_TYPE_RATATOSK_STREAM_META
+            | RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ => {
                 let entry_count = self.read_length()?;
                 let mut entries = Vec::with_capacity(prealloc(entry_count, MAX_PREALLOC));
                 for _ in 0..entry_count {
@@ -281,6 +284,16 @@ impl<R: Read> RdbLoader<R> {
                     for _ in 0..group_count {
                         let name = self.read_string()?;
                         let last_delivered_id = self.read_stream_id()?;
+                        let entries_read = if type_byte == RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ {
+                            match self.read_i64()? {
+                                -1 => None,
+                                read => Some(u64::try_from(read).map_err(|_| {
+                                    PersistError::corrupt("negative stream entries-read counter")
+                                })?),
+                            }
+                        } else {
+                            None
+                        };
                         let mut consumers = HashMap::new();
                         let consumer_count = self.read_length()?;
                         for _ in 0..consumer_count {
@@ -316,13 +329,16 @@ impl<R: Read> RdbLoader<R> {
                             name,
                             StreamGroup {
                                 last_delivered_id,
+                                entries_read,
                                 consumers,
                                 pending,
                             },
                         );
                     }
                 }
-                if type_byte == RDB_TYPE_RATATOSK_STREAM_META {
+                if type_byte == RDB_TYPE_RATATOSK_STREAM_META
+                    || type_byte == RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ
+                {
                     let last_id = self.read_stream_id()?;
                     let entries_added = self.read_i64()? as u64;
                     let max_deleted_id = self.read_stream_id()?;
@@ -335,6 +351,20 @@ impl<R: Read> RdbLoader<R> {
                     if !meta.is_valid_for(entries) {
                         return Err(PersistError::corrupt(
                             "stream metadata is behind its entries",
+                        ));
+                    }
+                    if value
+                        .as_stream_groups()
+                        .expect("stream value")
+                        .values()
+                        .any(|group| {
+                            group
+                                .entries_read
+                                .is_some_and(|read| read > meta.entries_added)
+                        })
+                    {
+                        return Err(PersistError::corrupt(
+                            "stream entries-read counter is past the entries added",
                         ));
                     }
                     *value.as_stream_meta_mut().expect("stream value") = meta;
@@ -633,6 +663,7 @@ mod tests {
             Bytes::from("group"),
             StreamGroup {
                 last_delivered_id: id,
+                entries_read: None,
                 consumers: HashMap::from_iter([
                     (
                         Bytes::from("consumer"),
@@ -926,6 +957,72 @@ mod tests {
             stream.as_stream_meta().copied().expect("meta").last_id,
             ids[2]
         );
+    }
+
+    #[test]
+    fn stream_group_entries_read_roundtrips_and_old_types_still_load() {
+        // The type byte comes right before the key "s" (length 1).
+        let has_type =
+            |bytes: &[u8], type_byte: u8| bytes.windows(3).any(|w| w == [type_byte, 1, b's']);
+        let group = |entries_read| StreamGroup {
+            last_delivered_id: StreamId { ms: 2, seq: 0 },
+            entries_read,
+            consumers: HashMap::new(),
+            pending: HashMap::new(),
+        };
+        let entries = vec![
+            StreamEntry {
+                id: StreamId { ms: 1, seq: 0 },
+                fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+            },
+            StreamEntry {
+                id: StreamId { ms: 2, seq: 0 },
+                fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+            },
+        ];
+
+        // With a known counter the private type 131 is written and read back.
+        let state = ServerState::with_default_dbs();
+        let mut stream = StoredValue::stream(entries.clone(), None);
+        {
+            let groups = stream.as_stream_groups_mut().expect("groups");
+            groups.insert(Bytes::from("known"), group(Some(2)));
+            groups.insert(Bytes::from("unknown"), group(None));
+        }
+        state.db_mut(0).insert(Bytes::from("s"), stream);
+        let mut bytes = Vec::new();
+        RdbSaver::new(&mut bytes).save_state(&state).expect("save");
+        assert!(has_type(&bytes, RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ));
+        let loaded = roundtrip_state(&state);
+        let db = loaded.db(0);
+        let groups = db
+            .get(&Bytes::from("s"))
+            .and_then(|value| value.as_stream_groups())
+            .expect("groups");
+        assert_eq!(groups[&Bytes::from("known")].entries_read, Some(2));
+        assert_eq!(groups[&Bytes::from("unknown")].entries_read, None);
+
+        // Without a known counter the older type 129 is still written, so
+        // builds that predate entries-read keep reading these snapshots, and
+        // type 129 and 130 data loads with no counter.
+        let plain = ServerState::with_default_dbs();
+        let mut stream = StoredValue::stream(entries, None);
+        stream
+            .as_stream_groups_mut()
+            .expect("groups")
+            .insert(Bytes::from("g"), group(None));
+        plain.db_mut(0).insert(Bytes::from("s"), stream);
+        let mut bytes = Vec::new();
+        RdbSaver::new(&mut bytes).save_state(&plain).expect("save");
+        assert!(has_type(&bytes, RDB_TYPE_RATATOSK_STREAM_GROUPS));
+        assert!(!has_type(&bytes, RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ));
+        let loaded = roundtrip_state(&plain);
+        let db = loaded.db(0);
+        let groups = db
+            .get(&Bytes::from("s"))
+            .and_then(|value| value.as_stream_groups())
+            .expect("groups");
+        assert_eq!(groups[&Bytes::from("g")].entries_read, None);
     }
 
     #[test]

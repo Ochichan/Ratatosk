@@ -161,6 +161,75 @@ impl StreamMeta {
             && self.entries_added >= entries.len() as u64
             && self.max_deleted_id <= self.last_id
     }
+
+    /// Redis's `streamRangeHasTombstones` for a range that runs from `start` to
+    /// the end of the ID space: whether an entry deleted in that range may
+    /// have left a gap, which makes a read counter unreliable.
+    pub fn range_has_tombstones(&self, entries: &[StreamEntry], start: StreamId) -> bool {
+        if entries.is_empty() || self.max_deleted_id == (StreamId { ms: 0, seq: 0 }) {
+            return false;
+        }
+        start <= self.max_deleted_id
+    }
+
+    /// Redis's `streamEstimateDistanceFromFirstEverEntry`: the logical read
+    /// counter of `id`, that is how many entries were ever added up to it, or
+    /// `None` when deletions or a future ID make that unknowable.
+    pub fn estimate_distance_from_first_entry(
+        &self,
+        entries: &[StreamEntry],
+        id: StreamId,
+    ) -> Option<u64> {
+        let zero = StreamId { ms: 0, seq: 0 };
+        if self.entries_added == 0 {
+            return Some(0);
+        }
+        if entries.is_empty() && id <= self.last_id {
+            return Some(self.entries_added);
+        }
+        // There are gaps between `id` and the last generated ID.
+        if id != zero && id < self.max_deleted_id {
+            return None;
+        }
+        if id == self.last_id {
+            return Some(self.entries_added);
+        }
+        if id > self.last_id {
+            return None;
+        }
+
+        let first_id = entries.first().map_or(zero, |entry| entry.id);
+        let length = entries.len() as u64;
+        if self.max_deleted_id == zero || self.max_deleted_id < first_id {
+            // No gap lies ahead.
+            if id < first_id {
+                return Some(self.entries_added - length);
+            }
+            if id == first_id {
+                return Some(self.entries_added - length + 1);
+            }
+        }
+        None
+    }
+
+    /// Redis's `streamReplyWithCGLag`: the entries a group has yet to be
+    /// delivered, or `None` when fragmentation makes that unknowable.
+    pub fn group_lag(&self, entries: &[StreamEntry], group: &StreamGroup) -> Option<u64> {
+        let length = entries.len() as u64;
+        if self.entries_added == 0 || entries.is_empty() {
+            return Some(0);
+        }
+        let first_id = entries[0].id;
+        if group.last_delivered_id < first_id && self.max_deleted_id < first_id {
+            // Everything left in the stream is undelivered.
+            return Some(length);
+        }
+        let read = match group.entries_read {
+            Some(read) if !self.range_has_tombstones(entries, group.last_delivered_id) => read,
+            _ => self.estimate_distance_from_first_entry(entries, group.last_delivered_id)?,
+        };
+        Some(self.entries_added.saturating_sub(read))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -179,6 +248,9 @@ pub struct StreamConsumer {
 #[derive(Debug, Clone)]
 pub struct StreamGroup {
     pub last_delivered_id: StreamId,
+    /// The logical read counter of `last_delivered_id` (Redis's
+    /// `entries_read`), `None` while unknown.
+    pub entries_read: Option<u64>,
     pub consumers: HashMap<Bytes, StreamConsumer>,
     pub pending: HashMap<StreamId, StreamPendingEntry>,
 }
@@ -1051,6 +1123,25 @@ impl StoredValue {
     ) -> Option<(&mut StreamEntries, &mut StreamMeta)> {
         match &mut *self.data {
             ValueData::Stream { entries, meta, .. } => Some((entries, meta)),
+            _ => None,
+        }
+    }
+
+    /// The entries and metadata for reading and the groups for changing, for
+    /// commands that update a group from the stream's shape.
+    pub fn as_stream_parts_mut(
+        &mut self,
+    ) -> Option<(
+        &StreamEntries,
+        &mut HashMap<Bytes, StreamGroup>,
+        &StreamMeta,
+    )> {
+        match &mut *self.data {
+            ValueData::Stream {
+                entries,
+                groups,
+                meta,
+            } => Some((&**entries, groups, &**meta)),
             _ => None,
         }
     }

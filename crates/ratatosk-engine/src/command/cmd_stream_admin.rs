@@ -89,11 +89,22 @@ pub(super) fn cmd_xsetid(
     }
 
     meta.last_id = new_id;
+    let mut lowered_to = None;
     if let Some(added) = entries_added {
+        if added < meta.entries_added {
+            lowered_to = Some(added);
+        }
         meta.entries_added = added;
     }
     if max_deleted_id != (StreamId { ms: 0, seq: 0 }) {
         meta.max_deleted_id = max_deleted_id;
+    }
+    // Lowering entries_added must not leave a group's read counter past it,
+    // or its lag would go negative; Redis clamps the counters.
+    if let (Some(added), Some(groups)) = (lowered_to, entry.as_stream_groups_mut()) {
+        for group in groups.values_mut() {
+            group.entries_read = group.entries_read.map(|read| read.min(added));
+        }
     }
     CommandOutcome::reply(RespFrame::ok())
 }

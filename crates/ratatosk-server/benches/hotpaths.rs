@@ -182,6 +182,7 @@ fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState,
             group_name,
             StreamGroup {
                 last_delivered_id,
+                entries_read: None,
                 consumers,
                 pending,
             },
