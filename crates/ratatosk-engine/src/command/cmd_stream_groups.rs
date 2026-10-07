@@ -439,6 +439,22 @@ pub(super) fn cmd_xreadgroup(
 
             if id_raw.as_ref() == b">" {
                 if !noack {
+                    // An ID still pending for another consumer (after XGROUP SETID
+                    // rewound the group) moves to this one, so it leaves the old
+                    // owner's list, and its delivery count restarts at 1, as in
+                    // Redis.
+                    for id in &selected_ids {
+                        let previous = group
+                            .pending
+                            .get(id)
+                            .filter(|pending| pending.consumer != consumer_name)
+                            .map(|pending| pending.consumer.clone());
+                        if let Some(previous) = previous {
+                            if let Some(owner) = group.consumers.get_mut(&previous) {
+                                owner.pending.remove(id);
+                            }
+                        }
+                    }
                     let consumer_state = group
                         .consumers
                         .entry(consumer_name.clone())
@@ -454,7 +470,7 @@ pub(super) fn cmd_xreadgroup(
                             .entry(*id)
                             .and_modify(|pending| {
                                 pending.consumer = consumer_name.clone();
-                                pending.deliveries = pending.deliveries.saturating_add(1);
+                                pending.deliveries = 1;
                                 pending.last_delivered_ms = now;
                             })
                             .or_insert_with(|| StreamPendingEntry {

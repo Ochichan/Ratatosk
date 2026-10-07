@@ -20,8 +20,10 @@ fn stream_contains_id(stream: &[StreamEntry], id: StreamId) -> bool {
     stream.binary_search_by_key(&id, |entry| entry.id).is_ok()
 }
 
-/// Drops removed IDs from every group's pending lists. The cost follows the
-/// number of removed IDs, not the size of the lists.
+/// Drops removed IDs from every group's pending lists. For each group the
+/// cheaper side is walked: the removed IDs (hash lookups) when they are fewer
+/// than the group's pending entries, otherwise the pending IDs (binary
+/// searches in the sorted removed IDs).
 pub(super) fn prune_stream_removed_ids(entry: &mut StoredValue, removed_ids: &[StreamId]) {
     if removed_ids.is_empty() {
         return;
@@ -29,15 +31,38 @@ pub(super) fn prune_stream_removed_ids(entry: &mut StoredValue, removed_ids: &[S
     let Some(groups) = entry.as_stream_groups_mut() else {
         return;
     };
+    let sorted;
+    let removed = if removed_ids.is_sorted() {
+        removed_ids
+    } else {
+        let mut copy = removed_ids.to_vec();
+        copy.sort_unstable();
+        sorted = copy;
+        &sorted
+    };
 
     for group in groups.values_mut() {
         if group.pending.is_empty() {
             continue;
         }
-        for id in removed_ids {
-            if let Some(pending) = group.pending.remove(id) {
+        let doomed = if removed.len() <= group.pending.len() {
+            removed
+                .iter()
+                .copied()
+                .filter(|id| group.pending.contains_key(id))
+                .collect::<Vec<_>>()
+        } else {
+            group
+                .pending
+                .keys()
+                .copied()
+                .filter(|id| removed.binary_search(id).is_ok())
+                .collect::<Vec<_>>()
+        };
+        for id in doomed {
+            if let Some(pending) = group.pending.remove(&id) {
                 if let Some(consumer) = group.consumers.get_mut(&pending.consumer) {
-                    consumer.pending.remove(id);
+                    consumer.pending.remove(&id);
                 }
             }
         }

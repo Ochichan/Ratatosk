@@ -7667,6 +7667,91 @@ mod tests {
     }
 
     #[test]
+    fn xreadgroup_reassigning_a_pending_id_moves_it_between_consumers() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "a", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        // Rewinding the group delivers the same IDs to another consumer.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending = |server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(rows) = run(&["XINFO", "CONSUMERS", "s", "g"], server, client)
+            else {
+                panic!("XINFO CONSUMERS should return an array");
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let RespFrame::Array(fields) = row else {
+                        panic!("a consumer should be an array");
+                    };
+                    (fields[1].clone(), fields[3].clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(3)),
+            ]
+        );
+        // The delivery count restarts at 1 whether or not the owner changed.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(rows) = run(
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XPENDING should return an array");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let RespFrame::Array(fields) = row else {
+                panic!("a pending entry should be an array");
+            };
+            assert_eq!(fields[1], RespFrame::bulk_str("b"));
+            assert_eq!(fields[3], RespFrame::Integer(1));
+        }
+
+        // Trimming everything leaves no pending entry on either consumer.
+        run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(0)),
+            ]
+        );
+    }
+
+    #[test]
     fn dump_restore_roundtrips_stream_ids_across_the_u64_range() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
