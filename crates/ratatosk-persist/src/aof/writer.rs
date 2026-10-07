@@ -291,6 +291,7 @@ impl AofWriter {
             self.write_resp_array_bytes(args).map_err(|e| {
                 io::Error::new(e.kind(), format!("appending AOF transaction command: {e}"))
             })?;
+            self.spill_if_over_cap()?;
         }
 
         self.write_timed_command(&[Bytes::from_static(b"EXEC")], timestamp_ms)
@@ -298,6 +299,29 @@ impl AofWriter {
         self.maybe_fsync()?;
 
         Ok(())
+    }
+
+    /// Enforce the buffer cap while a large transaction is still being
+    /// encoded.  Writing a prefix of MULTI ... EXEC to the fd is safe: order is
+    /// kept, the rest follows, and recovery already discards a MULTI that never
+    /// reached its EXEC.  With an fsync in flight this write may block on it,
+    /// like the other forced writes, and is counted as a delayed fsync.
+    fn spill_if_over_cap(&mut self) -> Result<(), PersistError> {
+        if self.buf.len() < self.max_pending {
+            return Ok(());
+        }
+        self.note_delayed_fsync();
+        self.write_pending_ctx()
+    }
+
+    /// Count a forced write behind a running fsync, once per fsync.
+    fn note_delayed_fsync(&mut self) {
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            if !in_flight.counted_delayed {
+                in_flight.counted_delayed = true;
+                self.delayed_fsync += 1;
+            }
+        }
     }
 
     fn write_timed_command(&mut self, args: &[Bytes], timestamp_ms: i64) -> io::Result<()> {
@@ -432,9 +456,10 @@ impl AofWriter {
             if self.try_reap() {
                 self.write_pending_ctx()?;
             } else {
-                let (held, counted) = self.in_flight.as_ref().map_or((Duration::ZERO, true), |f| {
-                    (f.started.elapsed(), f.counted_delayed)
-                });
+                let held = self
+                    .in_flight
+                    .as_ref()
+                    .map_or(Duration::ZERO, |f| f.started.elapsed());
                 let over_size = self.buf.len() >= self.max_pending;
                 let over_time = held >= self.max_hold;
                 // Stop holding back: bounded memory and bounded delay win over
@@ -442,12 +467,7 @@ impl AofWriter {
                 // bound every call writes, so no record waits longer than
                 // `max_hold` however small and frequent the appends are.
                 if over_size || over_time {
-                    if !counted {
-                        self.delayed_fsync += 1;
-                        if let Some(in_flight) = self.in_flight.as_mut() {
-                            in_flight.counted_delayed = true;
-                        }
-                    }
+                    self.note_delayed_fsync();
                     self.write_pending_ctx()?;
                 }
                 return Ok(());
@@ -1171,6 +1191,57 @@ mod tests {
         assert!(writer.buf.is_empty());
         gate.release();
         writer.force_fsync().expect("drain");
+    }
+
+    #[test]
+    fn large_transaction_during_blocked_fsync_respects_the_cap_and_order() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let gate = Gate::new(true, false);
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        writer.fsync_hook = Some(gate.hook());
+        writer.max_pending = 4096;
+        writer.append_command(0, &set_cmd("ka")).expect("a");
+        make_due(&mut writer);
+        writer
+            .append_command(0, &set_cmd("kb"))
+            .expect("b starts fsync");
+        assert!(writer.fsync_in_flight());
+
+        // ~200 KiB transaction against a 4 KiB cap, with the fsync blocked.
+        let commands: Vec<(usize, Vec<Bytes>)> = (0..200)
+            .map(|i| {
+                (
+                    0,
+                    vec![
+                        Bytes::from("SET"),
+                        Bytes::from(format!("tx{i}")),
+                        Bytes::from(vec![b'x'; 1000]),
+                    ],
+                )
+            })
+            .collect();
+        writer.append_transaction(&commands).expect("transaction");
+        let peak = writer.buf.len();
+        assert!(
+            peak < 4096 + 2048,
+            "buffer must stay near the cap, was {peak}"
+        );
+        assert_eq!(writer.delayed_fsync_count(), 1);
+
+        gate.release();
+        writer.append_command(0, &set_cmd("kc")).expect("c");
+        writer.force_fsync().expect("drain");
+
+        let mut loaded = ratatosk_engine::keyspace::ServerState::with_default_dbs();
+        crate::aof::AofRecovery::replay_file(&path, &mut loaded).expect("replay");
+        for i in 0..200 {
+            assert!(loaded.db(0).contains_key(format!("tx{i}").as_bytes()));
+        }
+        assert_eq!(key_order(&path), ["ka", "kb", "kc"]);
+        let text = String::from_utf8_lossy(&fs::read(&path).expect("read")).into_owned();
+        assert!(text.find("tx0").unwrap() < text.find("tx199").unwrap());
+        assert!(text.find("tx199").unwrap() < text.rfind("kc").unwrap());
     }
 
     #[test]

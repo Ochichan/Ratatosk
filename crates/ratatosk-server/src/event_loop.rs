@@ -836,8 +836,10 @@ async fn flush_everysec_persistence(
         }
     }
     if let Err((generation, error)) = tick_aof_everysec(persistence).await {
-        // A tick that raced with CONFIG SET appendonly no/yes belongs to a
-        // writer that is gone; its failure must not latch the new one.
+        // Take `meta` first, then check the generation under it: a CONFIG SET
+        // appendonly no/yes between a check and the lock could otherwise latch
+        // this stale failure on the new, healthy writer.
+        let mut state = server_state.meta.lock().await;
         if !persistence.aof_generation_is_current(generation) {
             tracing::warn!(
                 target = "ratatosk::aof",
@@ -847,7 +849,6 @@ async fn flush_everysec_persistence(
             return;
         }
         let detail = format!("periodic AOF fsync failed: {error}");
-        let mut state = server_state.meta.lock().await;
         state.set_aof_last_error(detail.clone());
         crate::metrics::set_aof_write_latched(true);
         tracing::error!(target = "ratatosk::aof", error = %detail, "AOF writes latched");
