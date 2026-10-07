@@ -140,7 +140,7 @@ pub fn estimate_object_memory(key: &Bytes, value: &StoredValue) -> usize {
         }
         ValueData::SetInt(s) => s.len() * std::mem::size_of::<i64>(),
         ValueData::SortedSet(z) => {
-            // BTreeMap + HashMap dual indexing
+            // OrderedIndex (B+ tree) + HashMap dual indexing
             let per_entry = 128;
             let member_payload = z
                 .by_member

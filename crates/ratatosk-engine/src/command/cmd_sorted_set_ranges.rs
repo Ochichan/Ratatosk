@@ -858,10 +858,7 @@ pub(super) fn cmd_zremrangebyrank(
     }
 
     let to_remove: Vec<Bytes> = zset
-        .by_score
-        .iter()
-        .skip(start)
-        .take(stop - start + 1)
+        .range_by_rank(start, stop - start + 1)
         .map(|entry| entry.member.clone())
         .collect();
 

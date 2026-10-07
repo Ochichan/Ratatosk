@@ -11,7 +11,7 @@ pub use crate::replication::{
 };
 pub use crate::stats::{AtomicStatsState, HotStatsSnapshot, SlowlogEntry, StatsState};
 pub use crate::tracking::ClientTrackingState;
-use crate::zset_index::OrderedIndex;
+use crate::zset_index::{OrderLead, OrderedIndex};
 use ratatosk_core::time::now_ms as unix_ms_now;
 use std::{
     cmp::Ordering,
@@ -112,6 +112,16 @@ impl SortedSetScore {
     pub fn value(self) -> f64 {
         self.0
     }
+
+    /// Unsigned integer whose order matches `total_cmp` on the score.
+    fn order_key(self) -> u64 {
+        let bits = self.0.to_bits();
+        if bits >> 63 == 1 {
+            !bits
+        } else {
+            bits | (1 << 63)
+        }
+    }
 }
 
 impl PartialEq for SortedSetScore {
@@ -138,6 +148,12 @@ impl Ord for SortedSetScore {
 pub struct SortedSetEntry {
     pub score: SortedSetScore,
     pub member: Bytes,
+}
+
+impl OrderLead for SortedSetEntry {
+    fn lead(&self) -> u64 {
+        self.score.order_key()
+    }
 }
 
 impl PartialOrd for SortedSetEntry {
@@ -3445,6 +3461,7 @@ mod sorted_set_rank_tests {
     ];
 
     fn assert_matches(zset: &SortedSet, reference: &BTreeMap<SortedSetEntry, ()>) {
+        zset.by_score.assert_invariants();
         assert_eq!(zset.len(), reference.len());
         assert_eq!(zset.by_score.len(), reference.len());
         assert!(zset.by_score.iter().eq(reference.keys()));

@@ -225,7 +225,7 @@ pub struct StoredValue {
 - `List(VecDeque<Bytes>)`
 - `Set(HashSet<Bytes>)`
 - `SetInt(Vec<i64>)` — 멤버가 모두 i64인 작은 Set (Phase 4B compact encoding)
-- `SortedSet(SortedSet)` — `{ by_score: BTreeMap, by_member: HashMap }`
+- `SortedSet(SortedSet)` — `{ by_score: OrderedIndex, by_member: HashMap }` (`OrderedIndex` is an order-statistic B+ tree in `zset_index.rs`, so rank and by-index access are O(log n))
 - `Stream { entries, groups }`
 
 ### ConfigState 확장
