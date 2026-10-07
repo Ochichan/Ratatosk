@@ -323,14 +323,13 @@ fn redis_call_impl(
 
     // Redis checks this per nested command (scriptVerifyWriteCommandAllow), not
     // for the EVAL itself, so read-only scripts keep running under the latch.
-    if server.aof_enabled()
-        && super::is_write_command(&cmd_args)
-        && let Some(detail) = server.aof_last_error()
-    {
-        let message = format!(
-            "MISCONF writes are blocked because AOF persistence is in an error state; last_error={detail}"
-        );
-        return reject_script_call(lua, protected, &message);
+    if server.aof_enabled() && super::is_write_command(&cmd_args) {
+        if let Some(detail) = server.aof_last_error() {
+            let message = format!(
+                "MISCONF writes are blocked because AOF persistence is in an error state; last_error={detail}"
+            );
+            return reject_script_call(lua, protected, &message);
+        }
     }
 
     // Build a RespFrame::Array for execute()
