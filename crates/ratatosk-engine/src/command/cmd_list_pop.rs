@@ -8,7 +8,6 @@ use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, wrong_arity, wrong_type_response,
 };
 
-pub(super) const MAX_LIST_POP_COUNT: usize = 100_000;
 pub(super) const MAX_LIST_NUMKEYS: usize = 10_000;
 
 pub(super) fn cmd_lpop(
@@ -49,9 +48,6 @@ pub(super) fn cmd_pop(
         let Ok(parsed_count) = usize::try_from(raw_count) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        if parsed_count > MAX_LIST_POP_COUNT {
-            return CommandOutcome::reply(err("ERR count is out of range"));
-        }
         Some(parsed_count)
     } else {
         None
@@ -91,7 +87,7 @@ pub(super) fn cmd_pop(
                 CommandOutcome::reply(RespFrame::BulkString(popped))
             }
             Some(count) => {
-                let mut items = Vec::with_capacity(count);
+                let mut items = Vec::with_capacity(count.min(list.len()));
                 for _ in 0..count {
                     let popped = if left {
                         list.pop_front()

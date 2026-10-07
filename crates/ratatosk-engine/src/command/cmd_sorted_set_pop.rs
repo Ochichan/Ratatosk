@@ -12,8 +12,6 @@ use super::{
     wrong_type_response,
 };
 
-const MAX_ZSET_POP_COUNT: usize = 100_000;
-
 fn blocking_watch_keys(client: &ClientState, keys: &[Bytes]) -> Vec<(usize, Bytes)> {
     keys.iter()
         .cloned()
@@ -70,9 +68,6 @@ fn zpop_impl(
         let Ok(parsed_count) = usize::try_from(raw_count) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        if parsed_count > MAX_ZSET_POP_COUNT {
-            return CommandOutcome::reply(err("ERR count is out of range"));
-        }
         parsed_count
     } else {
         1
@@ -207,9 +202,6 @@ fn zmpop_inner(
         let Ok(parsed_count) = usize::try_from(parsed_count) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        if parsed_count > MAX_ZSET_POP_COUNT {
-            return CommandOutcome::reply(err("ERR count is out of range"));
-        }
         count = parsed_count;
     }
 
