@@ -258,7 +258,6 @@ def _infer_capability_tier(status: str, name: str, notes: str) -> str:
         "ACL DRYRUN",
         "LOLWUT",
         "TRIMSLOTS",
-        "XSETID",
         "XCFGSET",
     }
     baseline_local_commands = {

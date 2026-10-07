@@ -1484,7 +1484,7 @@ const EXTRA_COMMAND_SPECS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "XSETID",
-        arity: 3,
+        arity: -3,
         flags: &["write", "fast"],
         first_key: 1,
         last_key: 1,
@@ -4619,9 +4619,9 @@ fn capture_durability_effects(
         // a successful CONFIG reply as if it were data.
         b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SELECT" | b"CONFIG"
         | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF" | b"PUBLISH" | b"SPUBLISH" => None,
-        // XSETID/XCFGSET reply OK without changing stream state, and strict
-        // mode rejects them, so logging them would only make replay fragile.
-        b"XSETID" | b"XCFGSET" => None,
+        // XCFGSET replies OK without storing its options, and strict mode
+        // rejects it, so logging it would only make replay fragile.
+        b"XCFGSET" => None,
         _ if is_write_command(argv) && raw_command_changed_state(command, response) => {
             Some(argv.to_vec())
         }
@@ -6296,19 +6296,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_mode_rejects_stream_admin_commands_that_change_no_state() {
+    fn strict_mode_rejects_xcfgset_and_allows_xsetid() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
-
-        // Compat mode keeps today's behaviour: both validate and reply OK.
         run(
             &["XADD", "mystream", "5-1", "a", "b"],
             &mut server,
             &mut client,
-        );
-        assert_eq!(
-            run(&["XSETID", "mystream", "5-1"], &mut server, &mut client),
-            RespFrame::ok()
         );
         assert_eq!(
             run(
@@ -6322,26 +6316,23 @@ mod tests {
         server
             .config
             .set_compatibility_mode(Bytes::from_static(b"strict"));
-        for (name, parts) in [
-            ("XSETID", vec!["XSETID", "mystream", "0-0"]),
-            (
-                "XCFGSET",
-                vec!["XCFGSET", "mystream", "IDMP-DURATION", "10"],
-            ),
-        ] {
-            let frame = run(&parts, &mut server, &mut client);
-            assert_strict_blocked(&frame, &parts.join(" "));
-            assert_eq!(
-                frame,
-                RespFrame::Error(Bytes::from(format!(
-                    "ERR command {name} is not supported in Ratatosk strict compatibility mode; reason=command is only accepted syntactically and has no Redis-equivalent operational effect"
-                )))
-            );
-        }
+        let parts = ["XCFGSET", "mystream", "IDMP-DURATION", "10"];
+        let frame = run(&parts, &mut server, &mut client);
+        assert_strict_blocked(&frame, &parts.join(" "));
+        assert_eq!(
+            frame,
+            RespFrame::error_str(
+                "ERR command XCFGSET is not supported in Ratatosk strict compatibility mode; reason=command is only accepted syntactically and has no Redis-equivalent operational effect"
+            )
+        );
+        assert_eq!(
+            run(&["XSETID", "mystream", "9-0"], &mut server, &mut client),
+            RespFrame::ok()
+        );
     }
 
     #[test]
-    fn stream_admin_commands_that_change_no_state_are_not_logged() {
+    fn xsetid_is_logged_and_xcfgset_is_not() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
         client.set_durability_capture_enabled(true);
@@ -6353,10 +6344,20 @@ mod tests {
         );
         assert!(client.take_durability_effects().is_some());
         assert_eq!(
-            run(&["XSETID", "mystream", "9-0"], &mut server, &mut client),
+            run(
+                &["XSETID", "mystream", "9-0", "ENTRIESADDED", "7"],
+                &mut server,
+                &mut client
+            ),
             RespFrame::ok()
         );
-        assert!(client.take_durability_effects().is_none());
+        let effects = client.take_durability_effects().expect("XSETID effects");
+        assert_eq!(
+            effects.commands[0].argv,
+            ["XSETID", "mystream", "9-0", "ENTRIESADDED", "7"]
+                .map(|part| Bytes::from(part.as_bytes().to_vec()))
+                .to_vec()
+        );
         assert_eq!(
             run(
                 &["XCFGSET", "mystream", "IDMP-DURATION", "10"],
@@ -6366,6 +6367,210 @@ mod tests {
             RespFrame::ok()
         );
         assert!(client.take_durability_effects().is_none());
+    }
+
+    #[test]
+    fn dump_restore_keeps_stream_metadata() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["XADD", "s", "5-1", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "s", "6-0", "f", "v"], &mut server, &mut client);
+        run(&["XDEL", "s", "6-0"], &mut server, &mut client);
+        run(
+            &["XSETID", "s", "9-9", "ENTRIESADDED", "12"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::BulkString(Some(payload)) = run(&["DUMP", "s"], &mut server, &mut client)
+        else {
+            panic!("DUMP should return a payload");
+        };
+        assert!(payload.starts_with(b"RATSK3"));
+        let restored = run_bytes(
+            &[
+                Bytes::from_static(b"RESTORE"),
+                Bytes::from_static(b"copy"),
+                Bytes::from_static(b"0"),
+                payload,
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(restored, RespFrame::ok());
+
+        let meta = |key: &str, server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from(key.to_owned()))
+                .and_then(|value| value.as_stream_meta().copied())
+        };
+        let original = meta("s", &server).expect("stream meta");
+        assert_eq!(
+            original.last_id,
+            crate::keyspace::StreamId { ms: 9, seq: 9 }
+        );
+        assert_eq!(original.entries_added, 12);
+        assert_eq!(
+            original.max_deleted_id,
+            crate::keyspace::StreamId { ms: 6, seq: 0 }
+        );
+        assert_eq!(meta("copy", &server), Some(original));
+    }
+
+    #[test]
+    fn xsetid_moves_the_last_id_that_xadd_and_dollar_follow() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let info = |server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(items) = run(&["XINFO", "STREAM", "s"], server, client) else {
+                panic!("XINFO STREAM should return an array");
+            };
+            let field = |name: &str| {
+                let at = items
+                    .iter()
+                    .position(|item| *item == RespFrame::bulk_str(name))
+                    .unwrap_or_else(|| panic!("XINFO STREAM has no {name}"));
+                items[at + 1].clone()
+            };
+            (
+                field("last-generated-id"),
+                field("entries-added"),
+                field("max-deleted-entry-id"),
+            )
+        };
+
+        assert_eq!(
+            run(&["XSETID", "missing", "1-0"], &mut server, &mut client),
+            RespFrame::error_str("ERR no such key")
+        );
+        run(&["XADD", "s", "5-1", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "s", "6-0", "f", "v"], &mut server, &mut client);
+
+        for (parts, expected) in [
+            (
+                &["XSETID", "s", "5-9"][..],
+                "ERR The ID specified in XSETID is smaller than the target stream top item",
+            ),
+            (
+                &["XSETID", "s", "9-0", "ENTRIESADDED", "1"][..],
+                "ERR The entries_added specified in XSETID is smaller than the target stream length",
+            ),
+            (
+                &["XSETID", "s", "9-0", "ENTRIESADDED", "-1"][..],
+                "ERR entries_added must be positive",
+            ),
+            (
+                &["XSETID", "s", "9-0", "MAXDELETEDID", "10-0"][..],
+                "ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id",
+            ),
+            (
+                &["XSETID", "s", "9-0", "ENTRIESADDED"][..],
+                "ERR syntax error",
+            ),
+            (
+                &["XSETID", "s", "*"][..],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+            (
+                &["XSETID", "s", "9-0", "BOGUS", "1"][..],
+                "ERR syntax error",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+
+        // A bare millisecond value is that millisecond with sequence 0.
+        assert_eq!(
+            run(&["XSETID", "s", "7"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(info(&mut server, &mut client).0, RespFrame::bulk_str("7-0"));
+        assert_eq!(
+            run(
+                &[
+                    "XSETID",
+                    "s",
+                    "100-5",
+                    "ENTRIESADDED",
+                    "40",
+                    "MAXDELETEDID",
+                    "3-0"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            info(&mut server, &mut client),
+            (
+                RespFrame::bulk_str("100-5"),
+                RespFrame::Integer(40),
+                RespFrame::bulk_str("3-0")
+            )
+        );
+
+        // XADD must stay above the last generated ID, not just the top entry.
+        assert_eq!(
+            run(&["XADD", "s", "50-0", "f", "v"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+            )
+        );
+        assert_eq!(
+            run(&["XADD", "s", "100-*", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("100-6")
+        );
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "s", "g", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "s"], &mut server, &mut client)
+        else {
+            panic!("XINFO GROUPS should return an array");
+        };
+        let RespFrame::Array(group) = &groups[0] else {
+            panic!("XINFO GROUPS entry should be an array");
+        };
+        let at = group
+            .iter()
+            .position(|item| *item == RespFrame::bulk_str("last-delivered-id"))
+            .expect("last-delivered-id");
+        assert_eq!(group[at + 1], RespFrame::bulk_str("100-6"));
+
+        // Deleting entries keeps the last ID and records the largest deletion.
+        assert_eq!(
+            run(&["XDEL", "s", "100-6", "6-0"], &mut server, &mut client),
+            RespFrame::Integer(2)
+        );
+        assert_eq!(
+            info(&mut server, &mut client),
+            (
+                RespFrame::bulk_str("100-6"),
+                RespFrame::Integer(41),
+                RespFrame::bulk_str("100-6")
+            )
+        );
+        assert_eq!(
+            run(&["XSETID", "s", "100-5"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The ID specified in XSETID is smaller than current max_deleted_entry_id"
+            )
+        );
+        assert_eq!(
+            run(&["XADD", "s", "100-6", "f", "v"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+            )
+        );
     }
 
     #[test]
@@ -8869,8 +9074,19 @@ mod tests {
             run(&["XLEN", "mystream"], &mut server, &mut client),
             RespFrame::Integer(0)
         );
+        // As in Redis, XSETID cannot go below an ID that XDEL already removed.
         assert_eq!(
             run(&["XSETID", "mystream", "0-0"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The ID specified in XSETID is smaller than current max_deleted_entry_id"
+            )
+        );
+        assert_eq!(
+            run(
+                &["XSETID", "mystream", delivered_id2_text.as_str()],
+                &mut server,
+                &mut client
+            ),
             RespFrame::ok()
         );
 

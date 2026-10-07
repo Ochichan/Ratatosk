@@ -21,6 +21,10 @@ pub const RDB_TYPE_STREAM: u8 = 19;
 // Older Ratatosk readers reject these rather than silently dropping metadata.
 pub const RDB_TYPE_RATATOSK_HASH_TTL: u8 = 128;
 pub const RDB_TYPE_RATATOSK_STREAM_GROUPS: u8 = 129;
+/// Type 129 followed by the stream metadata. Written only when the metadata
+/// differs from what the entries imply, so other streams stay readable by
+/// builds that predate it.
+pub const RDB_TYPE_RATATOSK_STREAM_META: u8 = 130;
 
 // ---------------------------------------------------------------------------
 // RDB opcodes

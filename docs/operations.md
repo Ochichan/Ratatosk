@@ -129,7 +129,7 @@ Backup / restore / rollback is reproducible via `scripts/backup_restore_drill.sh
 
 - New writes use `REDIS-AOF-002` with a timestamped RESP envelope. Replay executes each command/transaction at its recorded wall clock, then normal reads and expiry resume at the real clock. This preserves relative expiries and mutations made before an earlier deadline.
 - Readers accept version 1 and version 2 AOF files. Opening a version 1 or legacy RESP file for append atomically upgrades its header while preserving its existing command bytes; it needs temporary free space approximately equal to that file's size. Old commands have no execution timestamps, so upgrading cannot reconstruct already-lost history or correct every historical TTL decision; materialize a verified current dataset with `BGREWRITEAOF` before relying on the new guarantee.
-- RDB snapshots retain hash-field absolute deadlines and stream group/consumer/PEL state using private type bytes 128 and 129. Older Ratatosk encodings remain readable. Ratatosk RDB and DUMP formats are not a promise of Redis binary-file interchange.
+- RDB snapshots retain hash-field absolute deadlines and stream group/consumer/PEL state using private type bytes 128 and 129, and stream metadata (last generated ID, entries added, largest deleted ID) using 130. Type 130 is written only for a stream whose metadata differs from what its entries imply. Older Ratatosk encodings remain readable. Ratatosk RDB and DUMP formats are not a promise of Redis binary-file interchange.
 - Before upgrading a populated instance, stop writes, take an offline copy of the complete data directory (manifest, BASE, all INCRs and independent RDB), and verify the copy with the old binary. Start the new binary against a copy first; compare database contents, expiry deadlines, stream groups and pending messages, then restart it and repeat the comparison before switching clients.
 - A binary-only downgrade after new writes is unsupported. Roll back by stopping the new instance and restoring the complete pre-upgrade directory with the old binary; writes made after cutover require a separately planned export. Keep the backup and orphaned old AOF files until the verification period ends. No cleanup of old lineage files is automatic.
 
@@ -344,7 +344,7 @@ Ratatosk은 RESP3 기반 인메모리 데이터 스토어이며, 캐시 + Pub/Su
 
 - 명령 카탈로그: `420` entries
 - status summary: `done=420`
-- capability tier summary: `unsupported=64`, `syntax_only=8`, `baseline_local=75`, `behavioral_subset=273`, `distributed_parity=0`
+- capability tier summary: `unsupported=64`, `syntax_only=7`, `baseline_local=75`, `behavioral_subset=274`, `distributed_parity=0`
 - 즉, "명령 이름 존재"와 "Redis 행동 parity"는 같은 뜻이 아니다.
 
 ### 인프라 구현 상태
@@ -1148,9 +1148,9 @@ gap-ledger 기준:
 
 - total commands: 420
 - `unsupported`: 64
-- `syntax_only`: 8
+- `syntax_only`: 7
 - `baseline_local`: 75
-- `behavioral_subset`: 273
+- `behavioral_subset`: 274
 - `distributed_parity`: 0
 
 근거: [gap-ledger summary](./redis-gap-ledger.md#L11-L30)

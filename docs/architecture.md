@@ -355,7 +355,7 @@ subscribed/tracking client의 이벤트 루프는 `WaitResult` enum으로 통합
 ## Compatibility Notes
 
 - [Part 6: Redis Gap Ledger](#part-6-redis-gap-ledger) 기준 명령 카탈로그는 420개 엔트리이며, 현재 ledger는 status와 별도로 `capability_tier`를 기록한다.
-- 현재 tier summary는 `unsupported=64`, `syntax_only=8`, `baseline_local=75`, `behavioral_subset=273`, `distributed_parity=0`이다.
+- 현재 tier summary는 `unsupported=64`, `syntax_only=7`, `baseline_local=75`, `behavioral_subset=274`, `distributed_parity=0`이다.
 - 일부 서버/복제/운영 명령은 "standalone baseline semantics"(ack/no-op 포함)으로 구현되어 있다.
   - 예: 복제/클러스터 계열은 standalone 호환 응답 중심.
   - 단, `SAVE`/`BGSAVE`는 실제 RDB 스냅샷을 수행하며, `BGSAVE`는 background snapshot worker로 동작한다 (단순 timestamp 갱신이 아님).
@@ -945,7 +945,8 @@ let replayed = AofRecovery::replay_file(&path, &mut state)?;
 RDB BASE는 해시 필드의 절대 만료 시각, stream group의 마지막 전달 ID,
 consumer별 pending ID와 seen time, PEL의 소유자·전달 횟수·전달 시각을
 보존한다. 이 metadata는 Ratatosk 전용 type 128/129로 저장하며 기존
-hash/stream 인코딩은 읽기 호환을 유지한다.
+hash/stream 인코딩은 읽기 호환을 유지한다. stream의 마지막 생성 ID,
+entries added, 가장 큰 삭제 ID가 항목에서 유도되는 값과 다르면 type 130으로 저장한다.
 
 `CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다. 클라이언트·background 작업 정리 후 worker에 Shutdown을 보내 fsync 결과를 확인하고 종료한다. 성공한 명시적 종료는 INFO, 예기치 않은 채널 단절은 WARN, shutdown fsync 실패는 ERROR로 구분한다. 최종 종료의 응답 대기는 제한되지만 동기 fsync 자체를 중단하는 hard deadline은 아니다.
 
@@ -1194,9 +1195,9 @@ From the command ledger (`docs/redis-gap-ledger.json`), as of 2026-09-13:
 | Tier | Count | Meaning |
 |------|-------|---------|
 | `distributed_parity` | 0 | No command achieves Redis distributed semantics |
-| `behavioral_subset` | 273 | Locally correct behavior for common use cases |
+| `behavioral_subset` | 274 | Locally correct behavior for common use cases |
 | `baseline_local` | 75 | Standalone-compatible response shell |
-| `syntax_only` | 8 | Parses and responds but lacks backing subsystem |
+| `syntax_only` | 7 | Parses and responds but lacks backing subsystem |
 | `unsupported` | 64 | Returns explicit error |
 
 The runtime exposes `ratatosk_capability_tier` in `COMMAND DOCS` responses so clients can programmatically inspect implementation depth.
@@ -1263,9 +1264,9 @@ Ratatosk는 이미 다음 영역에서는 꽤 많이 진척되어 있다.
 현재 ledger tier summary:
 
 - `unsupported=64`
-- `syntax_only=8`
+- `syntax_only=7`
 - `baseline_local=75`
-- `behavioral_subset=273`
+- `behavioral_subset=274`
 - `distributed_parity=0`
 
 결론적으로 현재 Ratatosk는 "Redis 명령을 많이 이해하는 standalone 메모리 서버"로는 설명될 수 있지만, Redis를 대체하는 드롭인 시스템이라고 보기에는 이른 상태다. 특히 replication, failover, cluster redirection, client-side caching invalidation, scripting 생태계에 의존하는 워크로드는 그대로 이식되기 어렵다.
@@ -1855,9 +1856,9 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | Tier | Value |
 | --- | ---: |
 | unsupported | 64 |
-| syntax_only | 8 |
+| syntax_only | 7 |
 | baseline_local | 75 |
-| behavioral_subset | 273 |
+| behavioral_subset | 274 |
 | distributed_parity | 0 |
 
 ## Group Progress
@@ -1900,7 +1901,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | server | 0 | 34 | 41 | 1 | 7 | 83 |
 | set | 0 | 17 | 0 | 0 | 0 | 17 |
 | sorted_set | 0 | 35 | 0 | 0 | 0 | 35 |
-| stream | 0 | 26 | 0 | 2 | 0 | 28 |
+| stream | 0 | 27 | 0 | 1 | 0 | 28 |
 | string | 0 | 25 | 0 | 0 | 0 | 25 |
 | transactions | 0 | 5 | 0 | 0 | 0 | 5 |
 
@@ -2294,7 +2295,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). |
 | `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). |
 | `XREVRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (reverse inclusive range + COUNT option). |
-| `XSETID` | stream | 5.0.0 | done | syntax_only | m3-events | Validates arguments and returns OK without changing stream state. No last-ID metadata is kept, so a later XADD * can generate an ID lower than the one given. |
+| `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Sets the last generated ID, ENTRIESADDED and MAXDELETEDID with Redis's checks. XADD, XREAD $ and XGROUP $ follow the stored last ID, which RDB (private type 130) and DUMP (RATSK3) persist. |
 | `XTRIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `ZADD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
 | `ZCARD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
