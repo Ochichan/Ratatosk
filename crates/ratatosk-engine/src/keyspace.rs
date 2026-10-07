@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
@@ -552,6 +552,26 @@ pub struct StoredValue {
 const LRU_BITS: u32 = 28;
 const LRU_MASK: u32 = (1 << LRU_BITS) - 1;
 
+/// Longest byte string that can hold an `i64` ("-9223372036854775808").
+const MAX_INT_STRING_LEN: usize = 20;
+
+/// Returns the integer a string value is stored as under the `Int` encoding.
+///
+/// Rejects leading zeros ("007"), "+0", "-0", empty and whitespace. Values
+/// longer than an `i64` can print are never integers, so large values skip the
+/// UTF-8 scan entirely.
+fn parse_int_string(bytes: &[u8]) -> Option<i64> {
+    if bytes.is_empty() || bytes.len() > MAX_INT_STRING_LEN {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    let dominated_by_leading_zero = s.len() > 1 && s.starts_with('0');
+    if s.starts_with('+') || dominated_by_leading_zero || s.starts_with("-0") {
+        return None;
+    }
+    s.parse::<i64>().ok()
+}
+
 impl StoredValue {
     // -- constructors --------------------------------------------------------
 
@@ -566,18 +586,8 @@ impl StoredValue {
 
     pub fn string(value: Bytes, expire_at_ms: Option<i64>) -> Self {
         // Try integer encoding: saves 24 bytes (Bytes overhead) per key.
-        if let Ok(s) = std::str::from_utf8(&value) {
-            // Reject leading zeros ("007"), "+0", empty, or whitespace.
-            let dominated_by_leading_zero = s.len() > 1 && s.starts_with('0');
-            if !s.is_empty()
-                && !s.starts_with('+')
-                && !dominated_by_leading_zero
-                && !s.starts_with("-0")
-            {
-                if let Ok(n) = s.parse::<i64>() {
-                    return Self::new(ValueData::StringInt(n), expire_at_ms, Encoding::Int);
-                }
-            }
+        if let Some(n) = parse_int_string(&value) {
+            return Self::new(ValueData::StringInt(n), expire_at_ms, Encoding::Int);
         }
         Self::new(ValueData::String(value), expire_at_ms, Encoding::Raw)
     }
@@ -1403,6 +1413,26 @@ pub struct DbWriteGuard<'a> {
     shard: parking_lot::RwLockWriteGuard<'a, DbShard>,
 }
 
+/// Make room for a string value to grow to `needed_len` bytes with Redis's
+/// rule (`sdsMakeRoomFor`): below 1 MiB the allocation doubles, above it it
+/// grows by 1 MiB. Repeated growth stays amortized O(1) without a large value
+/// holding twice its length, which the memory estimate (the length) would not
+/// see.
+pub(crate) fn reserve_string_growth(buf: &mut BytesMut, needed_len: usize) {
+    const MAX_PREALLOC: usize = 1024 * 1024;
+    if buf.capacity() >= needed_len {
+        return;
+    }
+    let target = if needed_len < MAX_PREALLOC {
+        needed_len.saturating_mul(2)
+    } else {
+        needed_len.saturating_add(MAX_PREALLOC)
+    };
+    let mut grown = BytesMut::with_capacity(target);
+    grown.extend_from_slice(buf);
+    *buf = grown;
+}
+
 impl<'a> DbWriteGuard<'a> {
     fn new(
         db_idx: usize,
@@ -1436,6 +1466,83 @@ impl<'a> DbWriteGuard<'a> {
         }
 
         old
+    }
+
+    /// Mutate the string stored at `key` in place.
+    ///
+    /// `f` receives the value bytes and returns `(result, modified)`. When the
+    /// buffer is uniquely owned it is edited without copying; when a reply,
+    /// snapshot or other clone still shares it, the bytes are copied first so
+    /// that clone never changes. A missing key gives `f` an empty buffer and
+    /// the key is created only if `f` reports a modification. Returns `None`
+    /// when the key holds a non-string.
+    ///
+    /// After a modification the value gets the encoding `StoredValue::string`
+    /// would assign, the LRU clock resets to zero as for a freshly built
+    /// value, the TTL is kept, and the memory estimate moves by the exact
+    /// size change. `f` must leave the buffer untouched when it returns
+    /// `false`.
+    pub fn mutate_string<R>(
+        &mut self,
+        key: &Bytes,
+        f: impl FnOnce(&mut BytesMut) -> (R, bool),
+    ) -> Option<R> {
+        let Some(entry) = self.shard.data.get_mut(key) else {
+            let mut buf = BytesMut::new();
+            let (result, modified) = f(&mut buf);
+            if modified {
+                self.insert(key.clone(), StoredValue::string(buf.freeze(), None));
+            }
+            return Some(result);
+        };
+        if !entry.is_string() {
+            return None;
+        }
+
+        let old_mem = crate::eviction::estimate_object_memory(key, entry);
+        // `original` is kept only when the buffer cannot be edited in place
+        // so an unmodified call can put the stored value back untouched.
+        let (mut buf, original) =
+            match std::mem::replace(entry.data_mut(), ValueData::String(Bytes::new())) {
+                ValueData::String(bytes) => match bytes.try_into_mut() {
+                    Ok(buf) => (buf, None),
+                    Err(bytes) => (BytesMut::from(&bytes[..]), Some(ValueData::String(bytes))),
+                },
+                ValueData::StringInt(n) => {
+                    let mut itoa_buf = itoa::Buffer::new();
+                    (
+                        BytesMut::from(itoa_buf.format(n).as_bytes()),
+                        Some(ValueData::StringInt(n)),
+                    )
+                }
+                _ => unreachable!("is_string() checked above"),
+            };
+
+        let (result, modified) = f(&mut buf);
+        if !modified {
+            *entry.data_mut() = original.unwrap_or_else(|| ValueData::String(buf.freeze()));
+            return Some(result);
+        }
+
+        match parse_int_string(&buf) {
+            Some(n) => {
+                *entry.data_mut() = ValueData::StringInt(n);
+                entry.set_encoding(Encoding::Int);
+            }
+            None => {
+                *entry.data_mut() = ValueData::String(buf.freeze());
+                entry.set_encoding(Encoding::Raw);
+            }
+        }
+        entry.set_lru_clock(0);
+
+        let new_mem = crate::eviction::estimate_object_memory(key, entry);
+        if new_mem >= old_mem {
+            self.data_state.add_memory(self.db_idx, new_mem - old_mem);
+        } else {
+            self.data_state.sub_memory(self.db_idx, old_mem - new_mem);
+        }
+        Some(result)
     }
 
     /// Remove a top-level key while keeping the expires side-index and
@@ -2281,6 +2388,24 @@ mod tests {
         AtomicStatsState, Encoding, PubSubState, ServerState, SharedState, StatsState, StoredValue,
         ValueData,
     };
+
+    #[test]
+    fn string_growth_follows_redis_preallocation() {
+        let mut small = bytes::BytesMut::from(&[b'a'; 100][..]);
+        super::reserve_string_growth(&mut small, 101);
+        assert_eq!(small.capacity(), 202);
+        assert_eq!(&small[..], &[b'a'; 100][..]);
+
+        let len = 4 * 1024 * 1024;
+        let mut large = bytes::BytesMut::from(&vec![b'b'; len][..]);
+        super::reserve_string_growth(&mut large, len + 1);
+        assert_eq!(large.capacity(), len + 1 + 1024 * 1024);
+
+        // Room that already exists is reused.
+        let before = large.capacity();
+        super::reserve_string_growth(&mut large, len + 2);
+        assert_eq!(large.capacity(), before);
+    }
 
     #[test]
     fn stored_value_is_compact() {

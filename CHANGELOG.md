@@ -220,6 +220,7 @@ The format is based on Keep a Changelog and the versioning policy in
   field, `flake.nix` metadata, and `LICENSE` file were updated together.
 - The product contract sentence now says the supported subset is tested against
   Redis; the interop suite and CI never exercised Valkey.
+- `APPEND`, `SETRANGE`, `SETBIT` and `BITFIELD` writes edit a uniquely owned string value in place instead of copying it and re-validating UTF-8, which cuts the cost on a 64 MiB value from about 2.3 ms to under 1 microsecond. Replies, encodings, TTLs and memory accounting are unchanged.
 - README rewritten around the problem Ratatosk solves and the capability-tier
   contract; maintainer-only planning and harness files are no longer tracked.
 - README and CLI `--help` now state the single-node / capability-tier product

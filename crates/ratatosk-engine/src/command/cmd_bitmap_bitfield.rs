@@ -1,8 +1,8 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::{ServerState, StoredValue, purge_expired_key};
+use crate::keyspace::{ServerState, purge_expired_key};
 
 use super::{
     ClientState, CommandOutcome,
@@ -101,7 +101,7 @@ fn read_bits(data: &[u8], bit_offset: usize, bits: u8, signed: bool) -> i64 {
     value as i64
 }
 
-fn write_bits(data: &mut Vec<u8>, bit_offset: usize, bits: u8, value: i64) {
+fn write_bits(data: &mut BytesMut, bit_offset: usize, bits: u8, value: i64) {
     let raw = value as u64;
     for i in 0..bits as usize {
         let bit_pos = bits as usize - 1 - i;
@@ -309,66 +309,55 @@ pub(super) fn cmd_bitfield(
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
-    let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string_bytes() else {
-            return wrong_type_response();
-        };
-        (s.to_vec(), existing.expire_at_ms())
-    } else {
-        (Vec::new(), None)
-    };
+    let Some(results) = db.mutate_string(key, |data| {
+        let mut results: Vec<RespFrame> = Vec::with_capacity(ops.len());
+        let mut modified = false;
 
-    let mut results: Vec<RespFrame> = Vec::with_capacity(ops.len());
-    let mut modified = false;
-
-    for (op, overflow) in &ops {
-        match op {
-            BitfieldOp::Get { encoding, offset } => {
-                let val = read_bits(&data, *offset, encoding.bits, encoding.signed);
-                results.push(RespFrame::Integer(val));
-            }
-            BitfieldOp::Set {
-                encoding,
-                offset,
-                value,
-            } => {
-                let old_val = read_bits(&data, *offset, encoding.bits, encoding.signed);
-                let clamped = apply_overflow(*value, *encoding, *overflow);
-                match clamped {
-                    Some(new_val) => {
-                        write_bits(&mut data, *offset, encoding.bits, new_val);
-                        modified = true;
-                        results.push(RespFrame::Integer(old_val));
-                    }
-                    None => results.push(RespFrame::BulkString(None)),
+        for (op, overflow) in &ops {
+            match op {
+                BitfieldOp::Get { encoding, offset } => {
+                    let val = read_bits(data, *offset, encoding.bits, encoding.signed);
+                    results.push(RespFrame::Integer(val));
                 }
-            }
-            BitfieldOp::IncrBy {
-                encoding,
-                offset,
-                increment,
-            } => {
-                let current = read_bits(&data, *offset, encoding.bits, encoding.signed);
-                let new_raw = current.wrapping_add(*increment);
-                let clamped = apply_overflow(new_raw, *encoding, *overflow);
-                match clamped {
-                    Some(new_val) => {
-                        write_bits(&mut data, *offset, encoding.bits, new_val);
-                        modified = true;
-                        results.push(RespFrame::Integer(new_val));
+                BitfieldOp::Set {
+                    encoding,
+                    offset,
+                    value,
+                } => {
+                    let old_val = read_bits(data, *offset, encoding.bits, encoding.signed);
+                    let clamped = apply_overflow(*value, *encoding, *overflow);
+                    match clamped {
+                        Some(new_val) => {
+                            write_bits(data, *offset, encoding.bits, new_val);
+                            modified = true;
+                            results.push(RespFrame::Integer(old_val));
+                        }
+                        None => results.push(RespFrame::BulkString(None)),
                     }
-                    None => results.push(RespFrame::BulkString(None)),
+                }
+                BitfieldOp::IncrBy {
+                    encoding,
+                    offset,
+                    increment,
+                } => {
+                    let current = read_bits(data, *offset, encoding.bits, encoding.signed);
+                    let new_raw = current.wrapping_add(*increment);
+                    let clamped = apply_overflow(new_raw, *encoding, *overflow);
+                    match clamped {
+                        Some(new_val) => {
+                            write_bits(data, *offset, encoding.bits, new_val);
+                            modified = true;
+                            results.push(RespFrame::Integer(new_val));
+                        }
+                        None => results.push(RespFrame::BulkString(None)),
+                    }
                 }
             }
         }
-    }
-
-    if modified {
-        db.insert(
-            key.clone(),
-            StoredValue::string(Bytes::from(data), expire_at_ms),
-        );
-    }
+        (results, modified)
+    }) else {
+        return wrong_type_response();
+    };
 
     CommandOutcome::reply(RespFrame::Array(results))
 }

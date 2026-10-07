@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use ratatosk_resp::frame::RespFrame;
 
@@ -25,10 +25,11 @@ pub(super) fn get_bit(data: &[u8], offset: usize) -> u8 {
     }
 }
 
-pub(super) fn set_bit(data: &mut Vec<u8>, offset: usize, value: u8) -> u8 {
+pub(super) fn set_bit(data: &mut BytesMut, offset: usize, value: u8) -> u8 {
     let byte_idx = offset / 8;
     let bit_idx = 7 - (offset % 8);
     if byte_idx >= data.len() {
+        crate::keyspace::reserve_string_growth(data, byte_idx + 1);
         data.resize(byte_idx + 1, 0);
     }
     let old = (data[byte_idx] >> bit_idx) & 1;
@@ -82,20 +83,10 @@ pub(super) fn cmd_setbit(
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
-    let (mut data, expire_at_ms) = if let Some(existing) = db.get(key) {
-        let Some(s) = existing.as_string_bytes() else {
-            return wrong_type_response();
-        };
-        (s.to_vec(), existing.expire_at_ms())
-    } else {
-        (Vec::new(), None)
+    let Some(old) = db.mutate_string(key, |data| (set_bit(data, offset, bit_value as u8), true))
+    else {
+        return wrong_type_response();
     };
-
-    let old = set_bit(&mut data, offset, bit_value as u8);
-    db.insert(
-        key.clone(),
-        StoredValue::string(Bytes::from(data), expire_at_ms),
-    );
 
     CommandOutcome::reply(RespFrame::Integer(old as i64))
 }
