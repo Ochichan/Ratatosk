@@ -213,7 +213,12 @@ pub(super) fn cmd_acl(
                         user.passwords.insert(hash);
                         user.nopass = false;
                     } else if rule.starts_with(b"<") {
-                        user.remove_password(&rule[1..]);
+                        if !user.remove_password(&rule[1..]) {
+                            return CommandOutcome::reply(setuser_modifier_error(
+                                rule,
+                                "The password you are trying to remove from the user does not exist",
+                            ));
+                        }
                     } else if rule.eq_ignore_ascii_case(b"reset") {
                         user.enabled = false;
                         user.nopass = false;
@@ -232,13 +237,31 @@ pub(super) fn cmd_acl(
                     } else if let Some(category) = parse_acl_category_rule(rule, b'+') {
                         user.allowed_categories.insert(category);
                     } else if let Some(category) = parse_acl_category_rule(rule, b'-') {
+                        // A command is checked against `fast` only when it has
+                        // no other category, so removing `fast` would still
+                        // allow fast reads and writes that Redis denies.
+                        // Refuse it rather than grant more than asked.
+                        if category.as_ref() == b"fast" {
+                            return CommandOutcome::reply(unsupported_acl_rule(rule));
+                        }
+                        if user.allow_all_commands {
+                            // `+@all -@cat` means every category but `cat`.
+                            user.allow_all_commands = false;
+                            user.allowed_categories = ACL_CATEGORIES
+                                .iter()
+                                .map(|known| Bytes::from_static(known))
+                                .collect();
+                        }
                         user.allowed_categories.remove(&category);
                     } else if rule.starts_with(b"+@") || rule.starts_with(b"-@") {
-                        return CommandOutcome::reply(err("ERR syntax error"));
+                        return CommandOutcome::reply(setuser_modifier_error(
+                            rule,
+                            "Unknown command or category name in ACL",
+                        ));
                     } else if is_accepted_non_category_rule(rule) {
                         return CommandOutcome::reply(unsupported_acl_rule(rule));
                     } else {
-                        return CommandOutcome::reply(err("ERR syntax error"));
+                        return CommandOutcome::reply(setuser_modifier_error(rule, "Syntax error"));
                     }
                 }
             }
@@ -386,15 +409,35 @@ pub(super) fn cmd_acl(
             if args.len() < 3 {
                 return wrong_arity("acl");
             }
+            // Same checks and replies as Redis 7.2: a denied command is
+            // reported as a bulk string, not an error.
             let username = &args[1];
+            if server.acl.get_user(username).is_none() {
+                return CommandOutcome::reply(err(&format!(
+                    "ERR User '{}' not found",
+                    String::from_utf8_lossy(username)
+                )));
+            }
             let Some(spec) = super::find_command_spec(&args[2]) else {
-                return CommandOutcome::reply(err("ERR unknown command"));
+                return CommandOutcome::reply(err(&format!(
+                    "ERR Command '{}' not found",
+                    String::from_utf8_lossy(&args[2])
+                )));
             };
+            let command_name = spec.name.to_ascii_lowercase();
+            if !super::cmd_command_metadata::command_arity_matches(spec.arity, args.len() - 2) {
+                return CommandOutcome::reply(err(&format!(
+                    "ERR wrong number of arguments for '{command_name}' command"
+                )));
+            }
             let categories = acl_required_categories(spec);
             if server.acl.command_allowed(username, &categories) {
                 CommandOutcome::reply(RespFrame::ok())
             } else {
-                CommandOutcome::reply(err("NOPERM ACL DRYRUN denied command"))
+                CommandOutcome::reply(RespFrame::bulk_str(&format!(
+                    "User {} has no permissions to run the '{command_name}' command",
+                    String::from_utf8_lossy(username)
+                )))
             }
         }
         _ => CommandOutcome::reply(err(
@@ -418,13 +461,28 @@ fn parse_acl_category_rule(rule: &Bytes, prefix: u8) -> Option<Bytes> {
     }
 }
 
+/// Every category this build checks commands against, in lowercase.
+const ACL_CATEGORIES: [&[u8]; 6] = [
+    b"admin",
+    b"read",
+    b"write",
+    b"pubsub",
+    b"connection",
+    b"fast",
+];
+
 fn is_valid_acl_category(category: &Bytes) -> bool {
-    category.eq_ignore_ascii_case(b"admin")
-        || category.eq_ignore_ascii_case(b"read")
-        || category.eq_ignore_ascii_case(b"write")
-        || category.eq_ignore_ascii_case(b"pubsub")
-        || category.eq_ignore_ascii_case(b"connection")
-        || category.eq_ignore_ascii_case(b"fast")
+    ACL_CATEGORIES
+        .iter()
+        .any(|known| category.eq_ignore_ascii_case(known))
+}
+
+/// Redis's ACL SETUSER error: "Error in ACL SETUSER modifier '<rule>': <reason>".
+fn setuser_modifier_error(rule: &Bytes, reason: &str) -> RespFrame {
+    let rule_text = String::from_utf8_lossy(rule);
+    err(&format!(
+        "ERR Error in ACL SETUSER modifier '{rule_text}': {reason}"
+    ))
 }
 
 fn is_accepted_non_category_rule(rule: &Bytes) -> bool {
@@ -562,6 +620,80 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_category_from_all_commands_denies_it() {
+        let mut server = ServerState::new(16);
+        assert_eq!(
+            setuser(&mut server, &["w", "on", "nopass", "+@all", "-@write"]),
+            RespFrame::ok()
+        );
+        let w = Bytes::from_static(b"w");
+        assert!(!server.acl.command_allowed_mask(&w, 1 << 1));
+        assert!(!server.acl.command_allowed(&w, &[b"write"]));
+        assert!(server.acl.command_allowed_mask(&w, 1 << 2));
+        assert!(server.acl.command_allowed(&w, &[b"read"]));
+        assert!(server.acl.command_allowed(&w, &[b"admin"]));
+
+        // `fast` is only checked for commands with no other category, so
+        // removing it cannot be enforced and is refused.
+        assert_eq!(
+            setuser(&mut server, &["w", "-@fast"]),
+            RespFrame::error_str("ERR ACL rule '-@fast' is not supported in this build")
+        );
+        assert!(server.acl.command_allowed(&w, &[b"read"]));
+    }
+
+    #[test]
+    fn dryrun_replies_like_redis() {
+        let mut server = ServerState::new(16);
+        assert_eq!(
+            setuser(&mut server, &["r", "on", "nopass", "+@read"]),
+            RespFrame::ok()
+        );
+        let client = ClientState::new(11);
+        let dryrun = |server: &mut ServerState, args: &[&str]| {
+            let mut argv = vec![Bytes::from_static(b"DRYRUN")];
+            argv.extend(
+                args.iter()
+                    .map(|arg| Bytes::copy_from_slice(arg.as_bytes())),
+            );
+            cmd_acl(&argv, server, &client).response
+        };
+        assert_eq!(dryrun(&mut server, &["r", "GET", "k"]), RespFrame::ok());
+        assert_eq!(
+            dryrun(&mut server, &["r", "SET", "k", "v"]),
+            RespFrame::bulk_str("User r has no permissions to run the 'set' command")
+        );
+        assert_eq!(
+            dryrun(&mut server, &["nobody", "GET", "k"]),
+            RespFrame::error_str("ERR User 'nobody' not found")
+        );
+        assert_eq!(
+            dryrun(&mut server, &["r", "NOPE"]),
+            RespFrame::error_str("ERR Command 'NOPE' not found")
+        );
+        assert_eq!(
+            dryrun(&mut server, &["r", "GET"]),
+            RespFrame::error_str("ERR wrong number of arguments for 'get' command")
+        );
+    }
+
+    #[test]
+    fn setuser_errors_use_redis_text() {
+        let mut server = ServerState::new(16);
+        assert_eq!(
+            setuser(&mut server, &["x", "+@bogus"]),
+            RespFrame::error_str(
+                "ERR Error in ACL SETUSER modifier '+@bogus': Unknown command or category name in ACL"
+            )
+        );
+        assert_eq!(
+            setuser(&mut server, &["x", "whatever"]),
+            RespFrame::error_str("ERR Error in ACL SETUSER modifier 'whatever': Syntax error")
+        );
+        assert!(server.acl.get_user(&Bytes::from_static(b"x")).is_none());
+    }
+
+    #[test]
     fn setuser_password_rules_apply_in_order() {
         let mut server = ServerState::new(16);
         assert_eq!(
@@ -571,12 +703,16 @@ mod tests {
         assert!(!auth(&server, "bob", "one"));
         assert!(auth(&server, "bob", "two"));
 
-        // Removing before adding keeps the added password.
+        // Removing a password the user does not have fails the whole
+        // command, as in Redis, so the `>three` after it is not applied.
         assert_eq!(
             setuser(&mut server, &["bob", "<three", ">three"]),
-            RespFrame::ok()
+            RespFrame::error_str(
+                "ERR Error in ACL SETUSER modifier '<three': The password you are trying to remove from the user does not exist"
+            )
         );
-        assert!(auth(&server, "bob", "three"));
+        assert!(!auth(&server, "bob", "three"));
+        assert!(auth(&server, "bob", "two"));
 
         // nopass forgets every password, as in Redis.
         assert_eq!(setuser(&mut server, &["bob", "nopass"]), RespFrame::ok());

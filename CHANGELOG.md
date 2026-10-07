@@ -15,6 +15,17 @@ The format is based on Keep a Changelog and the versioning policy in
   update could leave an existing user half changed. Like Redis, `SETUSER` now
   applies all of its rules or none, and creates no user when it fails. `<pass`
   removals now apply in rule order, and `nopass` forgets every password.
+- `ACL SETUSER u +@all -@write` was accepted but left `u` able to run write
+  commands. Removing a category from a user with all commands now leaves every
+  other category. `-@fast` cannot be enforced by this build's category model,
+  so it is refused instead of granting more than asked.
+- Removing a password the user does not have (`<pass`) now fails like Redis,
+  so a typo while revoking a leaked password is no longer reported as success.
+  ACL files from older builds that stored passwords next to `nopass` load
+  without those passwords.
+- `ACL SETUSER` errors use Redis's `Error in ACL SETUSER modifier '<rule>':
+  <reason>` text. `ACL DRYRUN` checks the user, the command and its arity like
+  Redis, and reports a denied command as a bulk string.
 - **RESP parser stack exhaustion**: a few kilobytes of nested arrays (`*1\r\n`
   repeated) overflowed the parser's stack and aborted the whole process before
   authentication. Aggregates may now nest at most 128 levels; deeper input is a
