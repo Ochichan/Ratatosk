@@ -2,10 +2,10 @@ use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::{ServerState, purge_expired_keys};
+use crate::keyspace::ServerState;
 use crate::object::now_us;
 
-use super::{ClientState, CommandOutcome, now_ms, wrong_arity};
+use super::{ClientState, CommandOutcome, wrong_arity};
 
 pub(super) fn cmd_dbsize(
     args: &[Bytes],
@@ -16,9 +16,8 @@ pub(super) fn cmd_dbsize(
         return wrong_arity("dbsize");
     }
 
-    let now = now_ms();
-    let mut db = server.db_mut(client.selected_db);
-    purge_expired_keys(&mut db, now);
+    // Like Redis, DBSIZE counts expired keys that are not yet reclaimed.
+    let db = server.db(client.selected_db);
     CommandOutcome::reply(RespFrame::Integer(db.len() as i64))
 }
 

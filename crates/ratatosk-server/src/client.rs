@@ -583,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn lock_free_fast_path_handles_dbsize_and_purges_expired_keys() {
+    fn lock_free_fast_path_dbsize_counts_unreclaimed_expired_keys() {
         let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
         {
             let mut db = shared.data.write_db(0);
@@ -598,10 +598,28 @@ mod tests {
         }
 
         let mut client = ClientState::new(11);
-        let argv = vec![Bytes::from_static(b"DBSIZE")];
-        let outcome = try_execute_lock_free_fast_command(&argv, &shared, &mut client)
+        let dbsize = vec![Bytes::from_static(b"DBSIZE")];
+        let outcome = try_execute_lock_free_fast_command(&dbsize, &shared, &mut client)
             .expect("lock-free DBSIZE should be handled");
 
+        // Redis semantics: DBSIZE counts expired keys that were not reclaimed yet.
+        assert_eq!(outcome.response, RespFrame::Integer(2));
+        assert!(
+            shared
+                .data
+                .read_db(0)
+                .data
+                .contains_key(b"expired" as &[u8])
+        );
+
+        // Touching the key reclaims it, after which DBSIZE drops.
+        let get = vec![Bytes::from_static(b"GET"), Bytes::from_static(b"expired")];
+        let outcome = try_execute_lock_free_fast_command(&get, &shared, &mut client)
+            .expect("lock-free GET should be handled");
+        assert_eq!(outcome.response, RespFrame::BulkString(None));
+
+        let outcome = try_execute_lock_free_fast_command(&dbsize, &shared, &mut client)
+            .expect("lock-free DBSIZE should be handled");
         assert_eq!(outcome.response, RespFrame::Integer(1));
         let db = shared.data.read_db(0);
         assert!(!db.data.contains_key(b"expired" as &[u8]));
