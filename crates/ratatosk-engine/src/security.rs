@@ -222,17 +222,13 @@ fn default_audit_file(name: &str) -> PathBuf {
         .map_or_else(|| fallback_audit_dir().join(name), |dir| dir.join(name))
 }
 
-#[cfg(not(test))]
+/// Audit files when no data directory was set. Only the server binary sets
+/// one (from its `dir`); tests and embedders do not. Every such process gets
+/// its own directory: a shared `/tmp` file made parallel processes race on the
+/// chain checkpoint, which marked the chain dirty and turned `health_status`
+/// degraded at random.
 fn fallback_audit_dir() -> PathBuf {
-    PathBuf::from("/tmp")
-}
-
-/// Unit tests never set a data directory. Sharing `/tmp`'s audit files with
-/// every other test process on the host made checkpoint writes race, which
-/// marked the chain dirty and turned `health_status` degraded at random.
-#[cfg(test)]
-fn fallback_audit_dir() -> PathBuf {
-    let dir = env::temp_dir().join(format!("ratatosk-audit-test-{}", std::process::id()));
+    let dir = env::temp_dir().join(format!("ratatosk-audit-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
