@@ -9,6 +9,12 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Security
 
+- `ACL SETUSER` applied its rules one by one and stopped at the first invalid
+  one, keeping the rules before it. `ACL SETUSER ghost on nopass ~* +@all`
+  replied with an error yet created an enabled password-less user, and a failed
+  update could leave an existing user half changed. Like Redis, `SETUSER` now
+  applies all of its rules or none, and creates no user when it fails. `<pass`
+  removals now apply in rule order, and `nopass` forgets every password.
 - **RESP parser stack exhaustion**: a few kilobytes of nested arrays (`*1\r\n`
   repeated) overflowed the parser's stack and aborted the whole process before
   authentication. Aggregates may now nest at most 128 levels; deeper input is a

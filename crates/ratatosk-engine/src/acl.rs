@@ -61,6 +61,14 @@ impl AclUser {
         }
     }
 
+    /// Remove every stored hash that matches `raw_password`.
+    pub fn remove_password(&mut self, raw_password: &[u8]) -> bool {
+        let before = self.passwords.len();
+        self.passwords
+            .retain(|stored| !verify_password_hash(stored, raw_password));
+        self.passwords.len() != before
+    }
+
     pub fn category_allowed(&self, category: &[u8]) -> bool {
         self.allow_all_commands || self.allowed_categories.contains(category)
     }
@@ -102,6 +110,11 @@ impl AclState {
 
     pub fn get_user(&self, username: &Bytes) -> Option<&AclUser> {
         self.users.get(username)
+    }
+
+    /// Store `user` under `username`, replacing any previous definition.
+    pub fn put_user(&mut self, username: Bytes, user: AclUser) {
+        self.users.insert(username, user);
     }
 
     pub fn get_or_create_user_mut(&mut self, username: &Bytes) -> &mut AclUser {
@@ -212,16 +225,7 @@ impl AclState {
         let Some(user) = self.users.get_mut(username) else {
             return false;
         };
-
-        let mut removed = false;
-        let current = user.passwords.iter().cloned().collect::<Vec<_>>();
-        for stored in current {
-            if verify_password_hash(&stored, raw_password) && user.passwords.remove(&stored) {
-                removed = true;
-            }
-        }
-
-        removed
+        user.remove_password(raw_password)
     }
 
     pub fn push_log(&mut self, line: Bytes) {

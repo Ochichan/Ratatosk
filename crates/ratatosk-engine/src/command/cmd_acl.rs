@@ -184,15 +184,24 @@ pub(super) fn cmd_acl(
                 return wrong_arity("acl");
             }
             let username = args[1].clone();
-            let mut remove_passwords = Vec::new();
+            // Rules apply to a copy that replaces the stored user only when
+            // every rule is valid, so a rejected SETUSER changes nothing and
+            // creates no user (Redis applies SETUSER all or nothing).
+            let mut user: AclUser = server
+                .acl
+                .get_user(&username)
+                .cloned()
+                .unwrap_or_else(AclUser::new_disabled);
             {
-                let user: &mut AclUser = server.acl.get_or_create_user_mut(&username);
+                let user = &mut user;
                 for rule in &args[2..] {
                     if rule.eq_ignore_ascii_case(b"on") {
                         user.enabled = true;
                     } else if rule.eq_ignore_ascii_case(b"off") {
                         user.enabled = false;
                     } else if rule.eq_ignore_ascii_case(b"nopass") {
+                        // Like Redis, nopass also forgets every password.
+                        user.passwords.clear();
                         user.nopass = true;
                     } else if rule.eq_ignore_ascii_case(b"resetpass") {
                         user.passwords.clear();
@@ -204,7 +213,7 @@ pub(super) fn cmd_acl(
                         user.passwords.insert(hash);
                         user.nopass = false;
                     } else if rule.starts_with(b"<") {
-                        remove_passwords.push(Bytes::copy_from_slice(&rule[1..]));
+                        user.remove_password(&rule[1..]);
                     } else if rule.eq_ignore_ascii_case(b"reset") {
                         user.enabled = false;
                         user.nopass = false;
@@ -233,9 +242,7 @@ pub(super) fn cmd_acl(
                     }
                 }
             }
-            for password in remove_passwords {
-                let _ = server.acl.remove_password(&username, &password);
-            }
+            server.acl.put_user(username.clone(), user);
             let rule_count = args.len().saturating_sub(2);
             server.acl.push_log(Bytes::from(format!(
                 "SETUSER {} rules={} OK",
@@ -492,6 +499,95 @@ mod tests {
 
         // Verify client is not authenticated
         assert!(!client.authenticated);
+    }
+
+    fn setuser(server: &mut ServerState, args: &[&str]) -> RespFrame {
+        let client = ClientState::new(9);
+        let mut argv = vec![Bytes::from_static(b"SETUSER")];
+        argv.extend(
+            args.iter()
+                .map(|arg| Bytes::copy_from_slice(arg.as_bytes())),
+        );
+        cmd_acl(&argv, server, &client).response
+    }
+
+    fn auth(server: &ServerState, user: &str, password: &str) -> bool {
+        let mut client = ClientState::new(10);
+        let outcome = cmd_auth(
+            &[
+                Bytes::copy_from_slice(user.as_bytes()),
+                Bytes::copy_from_slice(password.as_bytes()),
+            ],
+            server,
+            &mut client,
+        );
+        matches!(outcome.response, RespFrame::SimpleString(_)) && client.authenticated
+    }
+
+    #[test]
+    fn rejected_setuser_creates_and_changes_nothing() {
+        let mut server = ServerState::new(16);
+
+        // A bad rule after `on nopass` must not leave a usable user behind.
+        assert!(matches!(
+            setuser(&mut server, &["ghost", "on", "nopass", "~*", "+@all"]),
+            RespFrame::Error(_)
+        ));
+        assert!(server.acl.get_user(&Bytes::from_static(b"ghost")).is_none());
+        assert!(!auth(&server, "ghost", "anything"));
+
+        assert!(matches!(
+            setuser(&mut server, &["u3", "on", "nopass", "+@all", "-exec"]),
+            RespFrame::Error(_)
+        ));
+        assert!(server.acl.get_user(&Bytes::from_static(b"u3")).is_none());
+
+        // An existing user keeps every field when a later rule fails.
+        assert_eq!(
+            setuser(&mut server, &["alice", "on", ">secret", "+@read"]),
+            RespFrame::ok()
+        );
+        assert!(matches!(
+            setuser(&mut server, &["alice", "nopass", "+@all", "+@bogus"]),
+            RespFrame::Error(_)
+        ));
+        let alice = server
+            .acl
+            .get_user(&Bytes::from_static(b"alice"))
+            .expect("alice exists");
+        assert!(alice.enabled && !alice.nopass && !alice.allow_all_commands);
+        assert!(alice.category_allowed(b"read") && !alice.category_allowed(b"write"));
+        assert!(auth(&server, "alice", "secret"));
+        assert!(!auth(&server, "alice", "other"));
+    }
+
+    #[test]
+    fn setuser_password_rules_apply_in_order() {
+        let mut server = ServerState::new(16);
+        assert_eq!(
+            setuser(&mut server, &["bob", "on", ">one", "<one", ">two"]),
+            RespFrame::ok()
+        );
+        assert!(!auth(&server, "bob", "one"));
+        assert!(auth(&server, "bob", "two"));
+
+        // Removing before adding keeps the added password.
+        assert_eq!(
+            setuser(&mut server, &["bob", "<three", ">three"]),
+            RespFrame::ok()
+        );
+        assert!(auth(&server, "bob", "three"));
+
+        // nopass forgets every password, as in Redis.
+        assert_eq!(setuser(&mut server, &["bob", "nopass"]), RespFrame::ok());
+        let bob = server
+            .acl
+            .get_user(&Bytes::from_static(b"bob"))
+            .expect("bob exists");
+        assert!(bob.nopass && bob.passwords.is_empty());
+        assert_eq!(setuser(&mut server, &["bob", ">four"]), RespFrame::ok());
+        assert!(!auth(&server, "bob", "two"));
+        assert!(auth(&server, "bob", "four"));
     }
 
     #[test]
