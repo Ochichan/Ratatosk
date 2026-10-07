@@ -6370,6 +6370,136 @@ mod tests {
     }
 
     #[test]
+    fn rejected_stream_creation_leaves_no_key() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for (parts, expected) in [
+            (
+                &["XADD", "s", "0-0", "f", "v"][..],
+                "ERR The ID specified in XADD must be greater than 0-0",
+            ),
+            (
+                &["XADD", "s", "bad", "f", "v"][..],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+            (
+                &["XGROUP", "CREATE", "s", "g", "bad", "MKSTREAM"][..],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+            assert_eq!(
+                run(&["EXISTS", "s"], &mut server, &mut client),
+                RespFrame::Integer(0),
+                "{parts:?} left a key behind"
+            );
+        }
+        // Without MKSTREAM the missing key is reported before the ID.
+        let RespFrame::Error(message) = run(
+            &["XGROUP", "CREATE", "s", "g", "bad"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XGROUP CREATE on a missing key should fail");
+        };
+        assert!(message.starts_with(b"ERR The XGROUP subcommand requires the key to exist"));
+
+        // A bad XADD ID is reported before WRONGTYPE; XGROUP checks the type first.
+        run(&["SET", "k", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(&["XADD", "k", "bad", "f", "v"], &mut server, &mut client),
+            RespFrame::error_str("ERR Invalid stream ID specified as stream command argument")
+        );
+        let RespFrame::Error(message) = run(
+            &["XGROUP", "CREATE", "k", "g", "bad", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XGROUP CREATE on a string key should fail");
+        };
+        assert!(message.starts_with(b"WRONGTYPE"));
+
+        // `$ MKSTREAM` on a missing key creates the stream and the group.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "m", "g", "$", "MKSTREAM"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::simple_str("OK")
+        );
+        let RespFrame::Error(message) = run(
+            &["XGROUP", "CREATE", "m", "g", "$", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("a second XGROUP CREATE should fail");
+        };
+        assert!(message.starts_with(b"BUSYGROUP"));
+    }
+
+    #[test]
+    fn xadd_ids_carry_and_exhaust_like_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        let max = i64::MAX.to_string();
+        let near_end = format!("{}-{max}", i64::MAX - 1);
+
+        // `*` carries an exhausted sequence into the next millisecond.
+        assert_eq!(
+            run(&["XSETID", "s", &near_end], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["XADD", "s", "*", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str(&format!("{max}-0"))
+        );
+        // `<ms>-*` never carries: an exhausted sequence is rejected.
+        assert_eq!(
+            run(
+                &["XSETID", "s", &format!("{max}-{max}")],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        for id in ["*", &format!("{max}-*"), "5-*"] {
+            assert_eq!(
+                run(&["XADD", "s", id, "f", "v"], &mut server, &mut client),
+                RespFrame::error_str(
+                    "ERR The stream has exhausted the last possible ID, unable to add more items"
+                ),
+                "{id}"
+            );
+        }
+
+        run(&["XADD", "t", "7-1", "f", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(
+                &["XSETID", "t", &format!("7-{max}")],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["XADD", "t", "7-*", "f", "v"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The ID specified in XADD is equal or smaller than the target stream top item"
+            )
+        );
+        assert_eq!(
+            run(&["XADD", "t", "8-*", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("8-0")
+        );
+    }
+
+    #[test]
     fn dump_restore_keeps_stream_metadata() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();

@@ -63,6 +63,12 @@ The format is based on Keep a Changelog and the versioning policy in
 - `LRANGE`, `LTRIM`, and `ZRANGE` returned an element for a range whose end
   stays negative (`0 -100`); `GETRANGE`, `BITCOUNT`, and `BITPOS` now clamp such
   ranges the way Redis does. The lock-free read path agrees with the engine.
+- A rejected `XADD` (for example ID `0-0`) or `XGROUP CREATE ... MKSTREAM` with
+  an invalid ID left an empty stream that was never logged, so a later logged
+  command on that key could stop AOF replay. Both now validate before creating
+  the stream. `XADD *` now carries an exhausted sequence into the next
+  millisecond, and a stream whose last ID is the largest possible ID replies
+  Redis's "exhausted the last possible ID" error.
 - `ZADD`/`ZINCRBY` silently dropped `+inf`/`-inf` scores. Score ranges treat
   `±inf` as inclusive bounds and reject NaN; `ZUNION`, `ZINTER`, `ZDIFF` and
   their `STORE`/`CARD` forms accept plain sets, turn NaN into 0, and check every

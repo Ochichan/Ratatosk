@@ -84,27 +84,26 @@ pub(super) fn cmd_xgroup(
             let mut db = server.db_mut(client.selected_db);
             purge_expired_key(&mut db, key, now);
 
-            if !db.contains_key(key) && mkstream {
-                db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
-            }
-
-            let Some(entry) = db.get_mut(key) else {
-                return CommandOutcome::reply(err(
-                    "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.",
-                ));
+            // Same order as Redis: key and type first, then the ID, and
+            // MKSTREAM only once the command can no longer fail, so a
+            // rejected command leaves no empty stream behind.
+            let existing_last_id = match db.get(key) {
+                Some(entry) => {
+                    let Some(meta) = entry.as_stream_meta() else {
+                        return wrong_type_response();
+                    };
+                    Some(meta.last_id)
+                }
+                None if mkstream => None,
+                None => {
+                    return CommandOutcome::reply(err(
+                        "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.",
+                    ));
+                }
             };
-            // `$` is the stream's last generated ID.
-            let last_id = entry.as_stream_meta().map(|meta| meta.last_id);
-            let Some(groups) = entry.as_stream_groups_mut() else {
-                return wrong_type_response();
-            };
-
-            if groups.contains_key(group_name) {
-                return CommandOutcome::reply(err("BUSYGROUP Consumer Group name already exists"));
-            }
-
             let id = if id_raw.as_ref() == b"$" {
-                last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
+                // `$` is the stream's last generated ID.
+                existing_last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
                 let Some(parsed) = parse_stream_id(id_raw) else {
                     return CommandOutcome::reply(err(
@@ -113,6 +112,20 @@ pub(super) fn cmd_xgroup(
                 };
                 parsed
             };
+
+            if existing_last_id.is_none() {
+                db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
+            }
+            let Some(groups) = db
+                .get_mut(key)
+                .and_then(|entry| entry.as_stream_groups_mut())
+            else {
+                return CommandOutcome::reply(err("ERR internal error"));
+            };
+
+            if groups.contains_key(group_name) {
+                return CommandOutcome::reply(err("BUSYGROUP Consumer Group name already exists"));
+            }
 
             groups.insert(
                 group_name.clone(),
