@@ -10,20 +10,29 @@
 //! touches a few cache lines instead of one line per 40-byte key, and fall
 //! back to full comparisons only inside a run of equal prefixes.
 //!
-//! Cost per operation, with `n` items:
+//! Cost per operation, with `n` items (leaf size 32, node fan-out 128):
 //!
-//! - `insert` / `remove`: one root-to-leaf descent, one memmove inside a leaf
-//!   of at most `LEAF_MAX` items, and one counter update per level. A split
-//!   or merge touches one node and its parent, never the whole structure.
+//! - `insert`: one root-to-leaf descent (a binary search per level over the
+//!   dense `leads` arrays), one memmove inside one leaf, one counter update
+//!   per level. A full leaf shifts items into a sibling or splits; a full
+//!   node splits. A split touches one node and its parent. O(log n).
+//! - `remove`: the same descent and memmove. A leaf left under `LEAF_MIN`
+//!   items merges with or borrows from an adjacent sibling, and a node left
+//!   under `NODE_MIN` children does the same one level up, to the root,
+//!   which collapses when it has one child. Each step touches at most two
+//!   nodes per level, so a removal is O(log n) and never walks the tree.
 //! - `rank_of` / `get`: one descent, summing child counts along the way.
+//!   O(log n).
 //! - `range` / `iter_ranks`: one or two descents, then O(1) per item.
 //!
-//! Removals do not rebalance internal nodes. Instead the tree is rebuilt
-//! from an in-order walk when it holds far more memory than its items need
-//! (mostly empty leaves, many nodes, or arenas full of freed slots), so
-//! memory follows the current size rather than the history of the set.
-//! Vectors start small and grow on demand, so a one-member set is a few
-//! hundred bytes.
+//! Every non-root node keeps at least `NODE_MIN` children, and every leaf
+//! except the first and last keeps at least `LEAF_MIN` items. The first and
+//! last leaf may be sparse because sequential fills pack the leaves behind
+//! them. Vectors start small and grow on demand, so a one-member set is a
+//! few hundred bytes. Freed arena slots drop their buffers at once, trailing
+//! free slots are popped, and the arenas shrink when mostly empty. A freed
+//! slot below a live one still costs its slot struct (56 or 72 bytes, about
+//! 2 to 4 bytes per member of the peak size) until it is reused.
 //!
 //! The nodes sit in two arenas of `Vec`s addressed by `u32` ids, so the code
 //! is safe Rust. The state is behind one `Box` to keep the index a single
@@ -33,22 +42,25 @@ use std::ops::{Bound, RangeBounds};
 
 /// Maximum items in a leaf. A full leaf splits in two before an insert.
 const LEAF_MAX: usize = 32;
-/// A leaf that shrinks below this tries to merge with a sibling.
+/// A leaf that shrinks below this merges with or borrows from a sibling.
 const LEAF_MIN: usize = 8;
 /// Siblings merge only when the result stays at or below this size.
 const LEAF_MERGE_MAX: usize = 24;
 /// A full leaf shifts items into its next sibling only if that sibling has
 /// at least this many free slots.
 const LEAF_SHIFT_SLACK: usize = 8;
-/// A rebuilt tree packs this many items into each leaf.
-const REBUILD_LEAF: usize = 24;
-/// A rebuilt tree packs this many children into each internal node.
-const REBUILD_NODE: usize = 96;
 /// Maximum children of an internal node.
 const NODE_MAX: usize = 128;
+/// A non-root node that drops below this many children is merged into or
+/// rebalanced with a sibling.
+const NODE_MIN: usize = 32;
+/// Sibling nodes merge only when the result stays at or below this size.
+const NODE_MERGE_MAX: usize = 96;
 /// Deeper than any tree this index can build (32^10 items).
 const MAX_DEPTH: usize = 10;
 const NIL: u32 = u32::MAX;
+/// Marks a freed leaf slot in `Leaf::prev` (a freed node has no children).
+const DEAD: u32 = u32::MAX - 1;
 
 /// Where an insert lands relative to the whole index.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +151,13 @@ fn grow_to<U>(v: &mut Vec<U>, new_len: usize, max: usize) {
     }
 }
 
+/// Return arena memory once the arena holds a quarter of its capacity.
+fn shrink_arena<U>(arena: &mut Vec<U>) {
+    if arena.capacity() > 4 * arena.len() + 64 {
+        arena.shrink_to(arena.len() * 2 + 16);
+    }
+}
+
 /// Index of the first entry that is not before `target`, or of the first
 /// entry after `target` when `after` is set. `leads` mirrors `items`.
 fn cut<T: OrderLead>(items: &[T], leads: &[u64], target: &T, lead: u64, after: bool) -> usize {
@@ -177,142 +196,89 @@ impl<T: OrderLead> Inner<T> {
             prev,
             next,
         };
-        if let Some(id) = self.free_leaves.pop() {
-            self.leaves[id as usize] = leaf;
-            id
-        } else {
-            self.leaves.push(leaf);
-            (self.leaves.len() - 1) as u32
+        // Free lists may hold stale ids (a slot truncated, or reused through
+        // a duplicate entry); only a slot that is still dead can be reused.
+        while let Some(id) = self.free_leaves.pop() {
+            if self
+                .leaves
+                .get(id as usize)
+                .is_some_and(|slot| slot.prev == DEAD)
+            {
+                self.leaves[id as usize] = leaf;
+                return id;
+            }
         }
+        self.leaves.push(leaf);
+        (self.leaves.len() - 1) as u32
     }
 
     fn alloc_node(&mut self, node: Node<T>) -> u32 {
-        if let Some(id) = self.free_nodes.pop() {
-            self.nodes[id as usize] = node;
-            id
-        } else {
-            self.nodes.push(node);
-            (self.nodes.len() - 1) as u32
+        while let Some(id) = self.free_nodes.pop() {
+            if self
+                .nodes
+                .get(id as usize)
+                .is_some_and(|slot| slot.kids.is_empty())
+            {
+                self.nodes[id as usize] = node;
+                return id;
+            }
         }
+        self.nodes.push(node);
+        (self.nodes.len() - 1) as u32
     }
 
+    /// Free a leaf slot: its buffers are dropped at once, so a dead slot
+    /// costs only the slot struct. Trailing dead slots are popped and the
+    /// arena shrinks once it is mostly empty.
     fn free_leaf(&mut self, id: u32) {
-        let leaf = &mut self.leaves[id as usize];
-        leaf.items = Vec::new();
-        leaf.leads = Vec::new();
-        self.free_leaves.push(id);
+        self.leaves[id as usize] = Leaf {
+            items: Vec::new(),
+            leads: Vec::new(),
+            prev: DEAD,
+            next: NIL,
+        };
+        if id as usize + 1 == self.leaves.len() {
+            while self.leaves.last().is_some_and(|slot| slot.prev == DEAD) {
+                self.leaves.pop();
+            }
+        } else {
+            self.free_leaves.push(id);
+        }
+        shrink_arena(&mut self.leaves);
+        if self.free_leaves.len() > 2 * self.leaves.len() + 64 {
+            let leaves = &self.leaves;
+            self.free_leaves.retain(|&id| {
+                leaves
+                    .get(id as usize)
+                    .is_some_and(|slot| slot.prev == DEAD)
+            });
+            self.free_leaves.shrink_to_fit();
+        }
     }
 
     fn free_node(&mut self, id: u32) {
-        let node = &mut self.nodes[id as usize];
-        node.keys = Vec::new();
-        node.leads = Vec::new();
-        node.kids = Vec::new();
-        self.free_nodes.push(id);
-    }
-
-    /// Build a tree holding `items` (sorted, unique), packed to about
-    /// `REBUILD_LEAF` per leaf and `REBUILD_NODE` per node, with exact-size
-    /// vectors and arenas.
-    fn from_sorted(items: Vec<T>) -> Self {
-        let n = items.len();
-        let mut inner = Inner {
-            leaves: Vec::new(),
-            nodes: Vec::new(),
-            free_leaves: Vec::new(),
-            free_nodes: Vec::new(),
-            root: NIL,
-            height: 0,
-            len: n,
-            head: NIL,
-            tail: NIL,
+        self.nodes[id as usize] = Node {
+            keys: Vec::new(),
+            leads: Vec::new(),
+            kids: Vec::new(),
         };
-        if n == 0 {
-            return inner;
-        }
-        let leaf_count = if n <= LEAF_MAX {
-            1
+        if id as usize + 1 == self.nodes.len() {
+            while self.nodes.last().is_some_and(|slot| slot.kids.is_empty()) {
+                self.nodes.pop();
+            }
         } else {
-            n.div_ceil(REBUILD_LEAF)
-        };
-        inner.leaves.reserve_exact(leaf_count);
-        // One entry per subtree on the current level: (id, count, maximum).
-        let mut level: Vec<(u32, usize, T)> = Vec::with_capacity(leaf_count);
-        let mut source = items.into_iter();
-        let mut prev = NIL;
-        for i in 0..leaf_count {
-            let size = n / leaf_count + usize::from(i < n % leaf_count);
-            let chunk: Vec<T> = source.by_ref().take(size).collect();
-            let leads: Vec<u64> = chunk.iter().map(OrderLead::lead).collect();
-            let max = chunk.last().cloned().expect("chunks are non-empty");
-            let id = inner.alloc_leaf(chunk, leads, prev, NIL);
-            if prev == NIL {
-                inner.head = id;
-            } else {
-                inner.leaves[prev as usize].next = id;
-            }
-            prev = id;
-            level.push((id, size, max));
+            self.free_nodes.push(id);
         }
-        inner.tail = prev;
-        while level.len() > 1 {
-            let groups = level.len().div_ceil(REBUILD_NODE);
-            let total = level.len();
-            inner.nodes.reserve_exact(groups);
-            let mut upper: Vec<(u32, usize, T)> = Vec::with_capacity(groups);
-            let mut children = level.into_iter();
-            for g in 0..groups {
-                let size = total / groups + usize::from(g < total % groups);
-                let mut node = Node {
-                    keys: Vec::with_capacity(size),
-                    leads: Vec::with_capacity(size),
-                    kids: Vec::with_capacity(size),
-                };
-                let mut count = 0;
-                let mut max = None;
-                for (id, c, key) in children.by_ref().take(size) {
-                    node.leads.push(key.lead());
-                    node.kids.push(Kid { count: c, id });
-                    count += c;
-                    if node.keys.len() + 1 == size {
-                        max = Some(key.clone());
-                    }
-                    node.keys.push(key);
-                }
-                let id = inner.alloc_node(node);
-                upper.push((id, count, max.expect("groups are non-empty")));
-            }
-            level = upper;
-            inner.height += 1;
+        shrink_arena(&mut self.nodes);
+        if self.free_nodes.len() > 2 * self.nodes.len() + 64 {
+            let nodes = &self.nodes;
+            self.free_nodes.retain(|&id| {
+                nodes
+                    .get(id as usize)
+                    .is_some_and(|slot| slot.kids.is_empty())
+            });
+            self.free_nodes.shrink_to_fit();
         }
-        inner.root = level[0].0;
-        inner
-    }
-
-    /// Rebuild the tree when it holds far more memory than its items need:
-    /// leaves mostly empty, many internal nodes, or arenas dominated by freed
-    /// slots. Deletions never rebalance internal nodes, so this bounds memory
-    /// by the current size rather than by the history of the set. Each
-    /// rebuild is O(n) and needs the set to shrink by a constant factor first,
-    /// so removals stay O(1) amortized extra.
-    fn compact_if_sparse(&mut self) {
-        let live_leaves = self.leaves.len() - self.free_leaves.len();
-        let live_nodes = self.nodes.len() - self.free_nodes.len();
-        let sparse_leaves = live_leaves * LEAF_MAX > 4 * self.len + 4 * LEAF_MAX;
-        let sparse_nodes = live_nodes * 24 > live_leaves + 96;
-        let slack_leaves = self.leaves.len() > 2 * live_leaves + 16;
-        let slack_nodes = self.nodes.len() > 2 * live_nodes + 16;
-        if !(sparse_leaves || sparse_nodes || slack_leaves || slack_nodes) {
-            return;
-        }
-        let mut items = Vec::with_capacity(self.len);
-        let mut id = self.head;
-        while id != NIL {
-            let leaf = &mut self.leaves[id as usize];
-            items.append(&mut leaf.items);
-            id = leaf.next;
-        }
-        *self = Self::from_sorted(items);
     }
 
     fn first_item(&self) -> Option<&T> {
@@ -378,10 +344,22 @@ impl<T: OrderLead> Inner<T> {
             Edge::Inside => len / 2,
         };
         let leaf = &mut self.leaves[id as usize];
-        let mut items = Vec::with_capacity(LEAF_MAX);
-        let mut leads = Vec::with_capacity(LEAF_MAX);
+        // In a small set, memory per member matters more than the realloc a
+        // growing leaf would cost, so halves are sized to fit. Otherwise a
+        // sequential fill goes on appending to the new leaf and gets full
+        // capacity up front, and other halves grow on demand.
+        let small = self.len <= 4 * LEAF_MAX;
+        let (mut items, mut leads) = if edge == Edge::Above && !small {
+            (Vec::with_capacity(LEAF_MAX), Vec::with_capacity(LEAF_MAX))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         items.extend(leaf.items.drain(mid..));
         leads.extend(leaf.leads.drain(mid..));
+        if small {
+            leaf.items.shrink_to_fit();
+            leaf.leads.shrink_to_fit();
+        }
         let next = leaf.next;
         let new = self.alloc_leaf(items, leads, id, next);
         self.leaves[id as usize].next = new;
@@ -515,36 +493,6 @@ impl<T: OrderLead> Inner<T> {
         self.split_child(new_root, 0, root_is_leaf, edge);
     }
 
-    /// Remove child `ci` of `parent` (a node whose children are leaves when
-    /// `child_is_leaf`). Returns whether it was the last child.
-    fn detach_child(&mut self, parent: u32, ci: usize, child_is_leaf: bool) -> bool {
-        let node = &mut self.nodes[parent as usize];
-        let was_last = ci + 1 == node.kids.len();
-        node.keys.remove(ci);
-        node.leads.remove(ci);
-        let child = node.kids.remove(ci).id;
-        if child_is_leaf {
-            let (prev, next) = {
-                let leaf = self.leaf(child);
-                (leaf.prev, leaf.next)
-            };
-            if prev == NIL {
-                self.head = next;
-            } else {
-                self.leaves[prev as usize].next = next;
-            }
-            if next == NIL {
-                self.tail = prev;
-            } else {
-                self.leaves[next as usize].prev = prev;
-            }
-            self.free_leaf(child);
-        } else {
-            self.free_node(child);
-        }
-        was_last
-    }
-
     /// Record `key` as the maximum of the subtree at `path[upto]` and of
     /// every ancestor for which that subtree is the last child.
     fn fix_max(&mut self, path: &[(u32, usize)], upto: usize, key: &T) {
@@ -568,44 +516,173 @@ impl<T: OrderLead> Inner<T> {
         }
     }
 
-    /// Merge the small leaf `ci` of `parent` into a neighbour under the same
-    /// parent when the result is small enough.
-    fn try_merge_leaf(&mut self, parent: u32, ci: usize) {
+    /// Rebalance the leaf that is child `path[lvl].1` of node `path[lvl].0`
+    /// after a removal left it below `LEAF_MIN` items (possibly empty). It
+    /// merges with an adjacent sibling when the result fits `LEAF_MERGE_MAX`,
+    /// and otherwise evens the two out. Every non-root node has at least two
+    /// children, so a sibling always exists.
+    fn rebalance_leaf(&mut self, path: &[(u32, usize)], lvl: usize) {
+        let (parent, ci) = path[lvl];
+        let n = self.node(parent).kids.len();
+        let left = if ci + 1 < n { ci } else { ci - 1 };
+        let right_is_last = left + 2 == n;
         let node = self.node(parent);
-        let len = self.leaf(node.kids[ci].id).items.len();
-        let fits =
-            |other: usize| len + self.leaf(node.kids[other].id).items.len() <= LEAF_MERGE_MAX;
-        let left = if ci + 1 < node.kids.len() && fits(ci + 1) {
-            ci
-        } else if ci > 0 && fits(ci - 1) {
-            ci - 1
-        } else {
-            return;
-        };
         let (l, r) = (node.kids[left].id, node.kids[left + 1].id);
-        let moved_items = std::mem::take(&mut self.leaves[r as usize].items);
-        let moved_leads = std::mem::take(&mut self.leaves[r as usize].leads);
-        let next = self.leaf(r).next;
-        let target = &mut self.leaves[l as usize];
-        let new_len = target.items.len() + moved_items.len();
-        grow_to(&mut target.items, new_len, LEAF_MAX);
-        grow_to(&mut target.leads, new_len, LEAF_MAX);
-        target.items.extend(moved_items);
-        target.leads.extend(moved_leads);
-        target.next = next;
-        if next == NIL {
-            self.tail = l;
+        let (ll, rl) = (self.leaf(l).items.len(), self.leaf(r).items.len());
+        if ll + rl <= LEAF_MERGE_MAX {
+            let items = std::mem::take(&mut self.leaves[r as usize].items);
+            let leads = std::mem::take(&mut self.leaves[r as usize].leads);
+            let next = self.leaf(r).next;
+            let target = &mut self.leaves[l as usize];
+            grow_to(&mut target.items, ll + rl, LEAF_MAX);
+            grow_to(&mut target.leads, ll + rl, LEAF_MAX);
+            target.items.extend(items);
+            target.leads.extend(leads);
+            target.next = next;
+            let max = target.items.last().cloned().expect("a merge keeps items");
+            if next == NIL {
+                self.tail = l;
+            } else {
+                self.leaves[next as usize].prev = l;
+            }
+            self.free_leaf(r);
+            let node = &mut self.nodes[parent as usize];
+            node.keys.remove(left + 1);
+            node.leads.remove(left + 1);
+            let merged = node.kids.remove(left + 1);
+            node.leads[left] = max.lead();
+            node.keys[left] = max;
+            node.kids[left].count += merged.count;
         } else {
-            self.leaves[next as usize].prev = l;
+            let total = ll + rl;
+            let new_left = total / 2;
+            if ll < new_left {
+                let k = new_left - ll;
+                let src = &mut self.leaves[r as usize];
+                let items: Vec<T> = src.items.drain(..k).collect();
+                let leads: Vec<u64> = src.leads.drain(..k).collect();
+                let dst = &mut self.leaves[l as usize];
+                grow_to(&mut dst.items, new_left, LEAF_MAX);
+                grow_to(&mut dst.leads, new_left, LEAF_MAX);
+                dst.items.extend(items);
+                dst.leads.extend(leads);
+            } else {
+                let k = ll - new_left;
+                let src = &mut self.leaves[l as usize];
+                let items = src.items.split_off(new_left);
+                let leads = src.leads.split_off(new_left);
+                let dst = &mut self.leaves[r as usize];
+                grow_to(&mut dst.items, rl + k, LEAF_MAX);
+                grow_to(&mut dst.leads, rl + k, LEAF_MAX);
+                dst.items.splice(0..0, items);
+                dst.leads.splice(0..0, leads);
+            }
+            let lmax = self.leaf(l).items.last().cloned().expect("balanced");
+            let rmax = self.leaf(r).items.last().cloned().expect("balanced");
+            let node = &mut self.nodes[parent as usize];
+            node.leads[left] = lmax.lead();
+            node.keys[left] = lmax;
+            node.leads[left + 1] = rmax.lead();
+            node.keys[left + 1] = rmax;
+            node.kids[left].count = new_left;
+            node.kids[left + 1].count = total - new_left;
         }
-        self.free_leaf(r);
-        let node = &mut self.nodes[parent as usize];
-        let key = node.keys.remove(left + 1);
-        let lead = node.leads.remove(left + 1);
-        node.keys[left] = key;
-        node.leads[left] = lead;
-        let merged = node.kids.remove(left + 1);
-        node.kids[left].count += merged.count;
+        if right_is_last {
+            self.refresh_parent_max(path, lvl);
+        }
+    }
+
+    /// Rebalance the internal node that is child `path[lvl].1` of
+    /// `path[lvl].0` after it fell below `NODE_MIN` children: merge with a
+    /// sibling when the result fits `NODE_MERGE_MAX`, otherwise even out.
+    fn rebalance_node(&mut self, path: &[(u32, usize)], lvl: usize) {
+        let (parent, ci) = path[lvl];
+        let n = self.node(parent).kids.len();
+        let left = if ci + 1 < n { ci } else { ci - 1 };
+        let right_is_last = left + 2 == n;
+        let (l, r) = {
+            let node = self.node(parent);
+            (node.kids[left].id, node.kids[left + 1].id)
+        };
+        let (ll, rl) = (self.node(l).kids.len(), self.node(r).kids.len());
+        if ll + rl <= NODE_MERGE_MAX {
+            let right = &mut self.nodes[r as usize];
+            let keys = std::mem::take(&mut right.keys);
+            let leads = std::mem::take(&mut right.leads);
+            let kids = std::mem::take(&mut right.kids);
+            let target = &mut self.nodes[l as usize];
+            grow_to(&mut target.keys, ll + rl, NODE_MAX);
+            grow_to(&mut target.leads, ll + rl, NODE_MAX);
+            grow_to(&mut target.kids, ll + rl, NODE_MAX);
+            target.keys.extend(keys);
+            target.leads.extend(leads);
+            target.kids.extend(kids);
+            let max = target.keys.last().cloned().expect("a merge keeps kids");
+            self.free_node(r);
+            let node = &mut self.nodes[parent as usize];
+            node.keys.remove(left + 1);
+            node.leads.remove(left + 1);
+            let merged = node.kids.remove(left + 1);
+            node.leads[left] = max.lead();
+            node.keys[left] = max;
+            node.kids[left].count += merged.count;
+        } else {
+            let total = ll + rl;
+            let new_left = total / 2;
+            if ll < new_left {
+                let k = new_left - ll;
+                let src = &mut self.nodes[r as usize];
+                let keys: Vec<T> = src.keys.drain(..k).collect();
+                let leads: Vec<u64> = src.leads.drain(..k).collect();
+                let kids: Vec<Kid> = src.kids.drain(..k).collect();
+                let dst = &mut self.nodes[l as usize];
+                grow_to(&mut dst.keys, new_left, NODE_MAX);
+                grow_to(&mut dst.leads, new_left, NODE_MAX);
+                grow_to(&mut dst.kids, new_left, NODE_MAX);
+                dst.keys.extend(keys);
+                dst.leads.extend(leads);
+                dst.kids.extend(kids);
+            } else {
+                let k = ll - new_left;
+                let src = &mut self.nodes[l as usize];
+                let keys = src.keys.split_off(new_left);
+                let leads = src.leads.split_off(new_left);
+                let kids = src.kids.split_off(new_left);
+                let dst = &mut self.nodes[r as usize];
+                grow_to(&mut dst.keys, rl + k, NODE_MAX);
+                grow_to(&mut dst.leads, rl + k, NODE_MAX);
+                grow_to(&mut dst.kids, rl + k, NODE_MAX);
+                dst.keys.splice(0..0, keys);
+                dst.leads.splice(0..0, leads);
+                dst.kids.splice(0..0, kids);
+            }
+            let left_count: usize = self.node(l).kids.iter().map(|k| k.count).sum();
+            let right_count: usize = self.node(r).kids.iter().map(|k| k.count).sum();
+            let lmax = self.node(l).keys.last().cloned().expect("balanced");
+            let rmax = self.node(r).keys.last().cloned().expect("balanced");
+            let node = &mut self.nodes[parent as usize];
+            node.leads[left] = lmax.lead();
+            node.keys[left] = lmax;
+            node.leads[left + 1] = rmax.lead();
+            node.keys[left + 1] = rmax;
+            node.kids[left].count = left_count;
+            node.kids[left + 1].count = right_count;
+        }
+        if right_is_last {
+            self.refresh_parent_max(path, lvl);
+        }
+    }
+
+    /// After the last child of `path[lvl].0` changed, copy that node's
+    /// maximum into its ancestors for as long as it is their last child.
+    fn refresh_parent_max(&mut self, path: &[(u32, usize)], lvl: usize) {
+        if lvl == 0 {
+            return;
+        }
+        let key = self.node(path[lvl].0).keys.last().cloned();
+        if let Some(key) = key {
+            self.fix_max(path, lvl - 1, &key);
+        }
     }
 }
 
@@ -712,14 +789,6 @@ impl<T: OrderLead> OrderedIndex<T> {
 
     /// Remove `item`. Returns whether it was present.
     pub fn remove(&mut self, item: &T) -> bool {
-        let removed = self.remove_item(item);
-        if removed {
-            self.inner.compact_if_sparse();
-        }
-        removed
-    }
-
-    fn remove_item(&mut self, item: &T) -> bool {
         let inner = &mut *self.inner;
         if inner.root == NIL {
             return false;
@@ -747,57 +816,31 @@ impl<T: OrderLead> OrderedIndex<T> {
         for &(nid, ci) in &path[..height] {
             inner.nodes[nid as usize].kids[ci].count -= 1;
         }
-
         let leaf_len = inner.leaf(cur).items.len();
-        if leaf_len == 0 {
-            if height == 0 {
+        if height == 0 {
+            if leaf_len == 0 {
                 inner.free_leaf(cur);
                 inner.root = NIL;
                 inner.head = NIL;
                 inner.tail = NIL;
-                return true;
             }
-            // Detach the empty leaf, then any ancestors left without children.
-            let mut lvl = height;
-            loop {
-                lvl -= 1;
-                let (nid, ci) = path[lvl];
-                let was_last = inner.detach_child(nid, ci, lvl + 1 == height);
-                if !inner.node(nid).kids.is_empty() {
-                    if was_last && lvl > 0 {
-                        let key = inner.node(nid).keys.last().cloned();
-                        if let Some(key) = key {
-                            inner.fix_max(&path, lvl - 1, &key);
-                        }
-                    }
-                    break;
-                }
-                if lvl == 0 {
-                    // Unreachable while len > 0, kept for a consistent state.
-                    inner.free_node(nid);
-                    inner.root = NIL;
-                    inner.head = NIL;
-                    inner.tail = NIL;
-                    inner.height = 0;
-                    return true;
-                }
-            }
-            inner.collapse_root();
             return true;
         }
-
-        if height > 0 {
-            if idx == leaf_len {
-                let key = inner.leaf(cur).items.last().cloned();
-                if let Some(key) = key {
-                    inner.fix_max(&path, height - 1, &key);
-                }
+        if idx == leaf_len && leaf_len > 0 {
+            let key = inner.leaf(cur).items.last().cloned();
+            if let Some(key) = key {
+                inner.fix_max(&path, height - 1, &key);
             }
-            if leaf_len < LEAF_MIN {
-                let (nid, ci) = path[height - 1];
-                inner.try_merge_leaf(nid, ci);
-                inner.collapse_root();
+        }
+        if leaf_len < LEAF_MIN {
+            // Fix the leaf, then each ancestor that lost children, bottom up.
+            let mut lvl = height - 1;
+            inner.rebalance_leaf(&path, lvl);
+            while lvl > 0 && inner.node(path[lvl].0).kids.len() < NODE_MIN {
+                inner.rebalance_node(&path, lvl - 1);
+                lvl -= 1;
             }
+            inner.collapse_root();
         }
         true
     }
@@ -933,16 +976,27 @@ impl<T: OrderLead> OrderedIndex<T> {
             assert_eq!(inner.len, 0);
             assert_eq!(inner.head, NIL);
             assert_eq!(inner.tail, NIL);
-            assert_eq!(inner.leaves.len(), inner.free_leaves.len());
-            assert_eq!(inner.nodes.len(), inner.free_nodes.len());
+            assert!(
+                inner.leaves.is_empty(),
+                "an empty index holds no leaf slots"
+            );
+            assert!(inner.nodes.is_empty(), "an empty index holds no node slots");
             return;
         }
         let mut census = Census::default();
         let (count, _) = Self::check_subtree(inner, inner.root, inner.height, &mut census);
         assert_eq!(count, inner.len);
         let order = census.order;
-        assert_eq!(census.leaves + inner.free_leaves.len(), inner.leaves.len());
-        assert_eq!(census.nodes + inner.free_nodes.len(), inner.nodes.len());
+        let dead_leaves = inner.leaves.iter().filter(|l| l.prev == DEAD).count();
+        let dead_nodes = inner.nodes.iter().filter(|n| n.kids.is_empty()).count();
+        assert_eq!(census.leaves + dead_leaves, inner.leaves.len());
+        assert_eq!(census.nodes + dead_nodes, inner.nodes.len());
+        // Trailing dead slots are popped, and dead slots hold no buffers.
+        assert!(inner.leaves.last().is_some_and(|l| l.prev != DEAD));
+        assert!(inner.nodes.is_empty() || inner.nodes.last().is_some_and(|n| !n.kids.is_empty()));
+        for leaf in inner.leaves.iter().filter(|l| l.prev == DEAD) {
+            assert_eq!(leaf.items.capacity() + leaf.leads.capacity(), 0);
+        }
         // Leaves reachable through the tree match the chain.
         assert_eq!(order.first().copied(), Some(inner.head));
         assert_eq!(order.last().copied(), Some(inner.tail));
@@ -970,6 +1024,11 @@ impl<T: OrderLead> OrderedIndex<T> {
             let leaf = inner.leaf(id);
             assert!(!leaf.items.is_empty(), "leaves are never empty");
             assert!(leaf.items.len() <= LEAF_MAX);
+            // Only the first and last leaf may be sparse (sequential fills
+            // leave one there); deletions rebalance every other leaf.
+            if id != inner.head && id != inner.tail {
+                assert!(leaf.items.len() >= LEAF_MIN, "sparse inner leaf");
+            }
             assert_eq!(leaf.leads.len(), leaf.items.len());
             for (item, &lead) in leaf.items.iter().zip(&leaf.leads) {
                 assert_eq!(item.lead(), lead, "leaf lead mirrors its item");
@@ -980,6 +1039,11 @@ impl<T: OrderLead> OrderedIndex<T> {
         let node = inner.node(id);
         let n = node.kids.len();
         assert!(n > 0 && n <= NODE_MAX);
+        if id == inner.root {
+            assert!(n >= 2, "an internal root has at least two children");
+        } else {
+            assert!(n >= NODE_MIN, "underfull internal node");
+        }
         assert_eq!(node.keys.len(), n);
         assert_eq!(node.leads.len(), n);
         let mut total = 0;
@@ -1392,12 +1456,13 @@ mod tests {
         assert_eq!(index.inner.height, 0);
     }
 
-    /// Memory is bounded by the current size, not by the history that led to
-    /// it: a few multiples of the bytes the items themselves need, plus a
-    /// small constant.
-    fn assert_memory_bounded(index: &OrderedIndex<(i64, u32)>, context: &str) {
+    /// Memory follows the current size: a few multiples of the bytes the items
+    /// need, plus a small constant, plus a few bytes per member of the peak
+    /// size (a freed arena slot that cannot be popped still costs its slot
+    /// struct, about 56 bytes per 20-32 items).
+    fn assert_memory_bounded(index: &OrderedIndex<(i64, u32)>, peak: usize, context: &str) {
         let per_item = std::mem::size_of::<(i64, u32)>() + 8;
-        let bound = 6 * per_item * index.len() + 4_096;
+        let bound = 6 * per_item * index.len() + 8 * peak + 4_096;
         assert!(
             index.heap_bytes() <= bound,
             "{context}: {} bytes for {} items (bound {bound})",
@@ -1418,7 +1483,7 @@ mod tests {
                 index.insert(pair(n * 3));
             }
             index.assert_invariants();
-            assert_memory_bounded(&index, &format!("{count} items"));
+            assert_memory_bounded(&index, count as usize, &format!("{count} items"));
         }
         let mut one = OrderedIndex::new();
         one.insert(pair(1));
@@ -1433,7 +1498,7 @@ mod tests {
         for i in 0..N {
             index.insert(pair(scatter(i)));
         }
-        assert_memory_bounded(&index, "full");
+        assert_memory_bounded(&index, N as usize, "full");
         for i in 0..N {
             if i % 1_000 != 0 {
                 assert!(index.remove(&pair(scatter(i))));
@@ -1441,7 +1506,7 @@ mod tests {
         }
         index.assert_invariants();
         assert_eq!(index.len(), 1_001);
-        assert_memory_bounded(&index, "1M scattered down to 1k");
+        assert_memory_bounded(&index, N as usize, "1M scattered down to 1k");
     }
 
     #[test]
@@ -1456,11 +1521,11 @@ mod tests {
                 assert!(index.remove(&pair(n)));
             }
             if n % 100_000 == 0 {
-                assert_memory_bounded(&index, "sequential shrink");
+                assert_memory_bounded(&index, N as usize, "sequential shrink");
             }
         }
         index.assert_invariants();
-        assert_memory_bounded(&index, "sequential fill, keep every 1984th");
+        assert_memory_bounded(&index, N as usize, "sequential fill, keep every 1984th");
     }
 
     #[test]
@@ -1482,11 +1547,123 @@ mod tests {
                 }
             }
             peak = peak.max(index.heap_bytes());
-            assert_memory_bounded(&index, &format!("round {round}"));
+            assert_memory_bounded(
+                &index,
+                FILL as usize + index.len(),
+                &format!("round {round}"),
+            );
         }
         index.assert_invariants();
         assert_eq!(index.len(), (ROUNDS * FILL / 4_000) as usize);
-        assert!(peak < 12_000_000, "peak {peak}");
+        assert!(peak < 3_000_000, "peak {peak}");
+    }
+
+    fn assert_same(index: &OrderedIndex<(i64, u32)>, reference: &BTreeSet<(i64, u32)>) {
+        index.assert_invariants();
+        assert_eq!(index.len(), reference.len());
+        assert!(index.iter().eq(reference.iter()));
+        for (rank, item) in reference.iter().enumerate().step_by(7) {
+            assert_eq!(index.rank_of(item), Some(rank));
+            assert_eq!(index.get(rank), Some(item));
+        }
+    }
+
+    /// Removal-heavy shapes that force leaf and node rebalancing at every
+    /// level, checked against a reference with the full invariant checker.
+    #[test]
+    fn rebalancing_phases_match_reference() {
+        let mut rng = Rng(0x5EED_0000_1234_5678);
+        let mut index = OrderedIndex::new();
+        let mut reference = BTreeSet::new();
+
+        // Sawtooth: grow to 60k, shrink to 2k by removing random members.
+        for _ in 0..4 {
+            while reference.len() < 60_000 {
+                let item = ((rng.next() % 400_000) as i64, (rng.next() % 4) as u32);
+                assert_eq!(index.insert(item), reference.insert(item));
+            }
+            assert_same(&index, &reference);
+            while reference.len() > 2_000 {
+                let rank = (rng.next() % reference.len() as u64) as usize;
+                let item = *index.get(rank).unwrap();
+                assert!(index.remove(&item));
+                assert!(reference.remove(&item));
+                if reference.len() % 9_000 == 0 {
+                    index.assert_invariants();
+                }
+            }
+            assert_same(&index, &reference);
+        }
+
+        // Keep every k-th member of a sequential fill, removing in random order.
+        for k in [2u32, 3, 7, 50, 1_984] {
+            let mut index = OrderedIndex::new();
+            let mut reference = BTreeSet::new();
+            let mut doomed: Vec<u32> = (0..30_000).filter(|n| n % k != 0).collect();
+            for n in 0..30_000u32 {
+                index.insert(pair(n));
+                reference.insert(pair(n));
+            }
+            for i in (1..doomed.len()).rev() {
+                doomed.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+            }
+            for (done, n) in doomed.into_iter().enumerate() {
+                assert!(index.remove(&pair(n)));
+                reference.remove(&pair(n));
+                if done % 5_000 == 0 {
+                    index.assert_invariants();
+                }
+            }
+            assert_same(&index, &reference);
+        }
+
+        // Rank-window removal: repeatedly delete a window of 200 consecutive
+        // ranks (the pattern of ZREMRANGEBYRANK), then refill a little.
+        let mut index = OrderedIndex::new();
+        let mut reference = BTreeSet::new();
+        for n in 0..50_000u32 {
+            index.insert(pair(n * 2));
+            reference.insert(pair(n * 2));
+        }
+        let mut window = 0;
+        while reference.len() > 400 {
+            let start = (rng.next() % reference.len() as u64) as usize;
+            for _ in 0..200.min(reference.len() - start) {
+                let item = *index.get(start).unwrap();
+                assert!(index.remove(&item));
+                assert!(reference.remove(&item));
+            }
+            for _ in 0..20 {
+                let item = pair((rng.next() % 200_000) as u32 * 2 + 1);
+                assert_eq!(index.insert(item), reference.insert(item));
+            }
+            window += 1;
+            if window % 40 == 0 {
+                index.assert_invariants();
+            }
+        }
+        assert_same(&index, &reference);
+
+        // Drain from the front and from the back, as ZPOPMIN and ZPOPMAX do.
+        for from_front in [true, false] {
+            let mut index = OrderedIndex::new();
+            for n in 0..40_000u32 {
+                index.insert(pair(n));
+            }
+            let mut step = 0;
+            while let Some(&item) = if from_front {
+                index.first()
+            } else {
+                index.last()
+            } {
+                assert!(index.remove(&item));
+                step += 1;
+                if step % 8_000 == 0 {
+                    index.assert_invariants();
+                }
+            }
+            index.assert_invariants();
+        }
     }
 
     #[test]
