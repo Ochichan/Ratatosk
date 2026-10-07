@@ -2453,11 +2453,11 @@ mod tests {
             24,
             "StoredValue grew beyond 24 bytes — check Box<ValueData> / field packing"
         );
-        // ValueData enum size must not regress.
-        assert_eq!(
-            std::mem::size_of::<ValueData>(),
-            72,
-            "ValueData size changed — new variant may have increased the enum"
+        // ValueData enum size must not regress (shrinking is fine).
+        let value_data_size = std::mem::size_of::<ValueData>();
+        assert!(
+            value_data_size <= 72,
+            "ValueData grew to {value_data_size} bytes — a new variant may have widened the enum"
         );
     }
 
