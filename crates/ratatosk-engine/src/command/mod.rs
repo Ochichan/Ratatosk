@@ -3703,6 +3703,32 @@ impl ClientState {
         }
     }
 
+    /// Reject a command before it runs, as Redis `rejectCommand` does.
+    ///
+    /// EXEC discards the transaction, drops its watches and replies
+    /// `EXECABORT Transaction discarded because of: <error>`. Any other
+    /// command queued inside MULTI flags the transaction so EXEC aborts.
+    /// Pass `data` when the caller can reach the keyspace so watches are
+    /// released; a client that is not authenticated holds none.
+    pub fn reject_command(
+        &mut self,
+        is_exec: bool,
+        response: RespFrame,
+        data: Option<&DataState>,
+    ) -> RespFrame {
+        if is_exec {
+            self.tx_state = TransactionState::default();
+            if let Some(data) = data {
+                self.release_watches(data);
+            }
+            return execabort_reply(&response);
+        }
+        if let TransactionState::InTransaction { has_error, .. } = &mut self.tx_state {
+            *has_error = true;
+        }
+        response
+    }
+
     pub fn has_queued_writes(&self) -> bool {
         match &self.tx_state {
             TransactionState::InTransaction { queue, .. } => {
@@ -4031,6 +4057,18 @@ impl Default for ClientState {
     }
 }
 
+/// Build the reply for an EXEC refused before its queue ran.
+pub fn execabort_reply(error: &RespFrame) -> RespFrame {
+    match error {
+        RespFrame::Error(message) => {
+            let mut text = b"EXECABORT Transaction discarded because of: ".to_vec();
+            text.extend_from_slice(message);
+            RespFrame::Error(Bytes::from(text))
+        }
+        other => other.clone(),
+    }
+}
+
 pub enum ExecuteArgvPrecheck {
     Continue,
     Reject(CommandOutcome),
@@ -4060,9 +4098,12 @@ pub fn precheck_execute_argv_with_default_acl(
 
     let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
     if !client.is_authenticated() && !allow_without_auth {
-        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(err(
-            "NOAUTH Authentication required.",
-        )));
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            err("NOAUTH Authentication required."),
+            None,
+        );
+        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(response));
     }
 
     ExecuteArgvPrecheck::Continue
@@ -4111,7 +4152,12 @@ fn execute_argv_inner(
     let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
 
     if !client.is_authenticated() && !allow_without_auth {
-        return CommandOutcome::reply(err("NOAUTH Authentication required."));
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            err("NOAUTH Authentication required."),
+            None,
+        );
+        return CommandOutcome::reply(response);
     }
 
     if client.is_authenticated()
@@ -4125,9 +4171,12 @@ fn execute_argv_inner(
                 .acl
                 .command_allowed_mask(client.acl_user(), required_mask)
             {
-                return CommandOutcome::reply(err(
-                    "NOPERM this user has no permissions to run the command",
-                ));
+                let response = client.reject_command(
+                    command.as_slice() == b"EXEC",
+                    err("NOPERM this user has no permissions to run the command"),
+                    Some(&access.meta.data),
+                );
+                return CommandOutcome::reply(response);
             }
         }
     }
@@ -4191,7 +4240,12 @@ fn execute_argv_inner(
         })
         && should_reject_for_maxmemory(argv, spec, server, client)
     {
-        return CommandOutcome::reply(maxmemory_oom_error());
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            maxmemory_oom_error(),
+            Some(&server.data),
+        );
+        return CommandOutcome::reply(response);
     }
 
     let args = &argv[1..];
@@ -5627,6 +5681,40 @@ mod tests {
     }
 
     #[test]
+    fn rejected_exec_aborts_the_transaction_and_releases_watches() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["WATCH", "w"], &mut server, &mut client);
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "a", "1"], &mut server, &mut client);
+        let reply = client.reject_command(
+            true,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(
+            reply,
+            RespFrame::error_str("EXECABORT Transaction discarded because of: NOPERM nope")
+        );
+        assert!(!client.in_multi());
+        assert!(client.watched.is_empty());
+
+        // A command refused while queued flags the transaction instead.
+        run(&["MULTI"], &mut server, &mut client);
+        let reply = client.reject_command(
+            false,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(reply, RespFrame::error_str("NOPERM nope"));
+        assert!(client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("EXECABORT Transaction discarded because of previous errors.")
+        );
+    }
+
+    #[test]
     fn noeviction_admits_one_overshoot_then_allows_reads_and_freeing() {
         let mut server = ServerState::with_default_dbs();
         server.config.set_maxmemory(1);
@@ -5835,7 +5923,13 @@ mod tests {
             run(&["SET", "other", &large], &mut server, &mut concurrent),
             RespFrame::ok()
         );
-        assert_oom(run(&["EXEC"], &mut server, &mut transaction));
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut transaction),
+            RespFrame::error_str(
+                "EXECABORT Transaction discarded because of: OOM command not allowed when used memory > 'maxmemory'"
+            )
+        );
+        assert!(!transaction.in_multi());
         assert_eq!(
             run(&["GET", "queued"], &mut server, &mut transaction),
             RespFrame::BulkString(None)

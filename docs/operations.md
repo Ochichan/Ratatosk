@@ -533,7 +533,10 @@ nothing, and writes made before a script error are still logged (even though the
 client gets an error reply) because they already changed the dataset. RESET is
 refused inside scripts like AUTH and HELLO. While the AOF is latched after a write
 error, EVAL and EVALSHA, including one queued for EXEC, are refused with MISCONF
-like any write, because a script may write. This repo has no `no-writes` script
+like any write, because a script may write. As in Redis, a refused EXEC (latch, OOM, NOAUTH, NOPERM) discards the transaction,
+drops its watches and replies `EXECABORT Transaction discarded because of: <error>`;
+a write refused while queueing flags the transaction so EXEC replies with the
+"previous errors" EXECABORT. This repo has no `no-writes` script
 flags, so no EVAL variant that can write is exempt. EVAL_RO and EVALSHA_RO never log. SCRIPT LOAD and the
 script cache are not persisted, so after a restart EVALSHA returns NOSCRIPT until
 the script is loaded again, as in Redis.

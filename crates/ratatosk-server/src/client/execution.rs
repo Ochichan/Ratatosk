@@ -395,7 +395,11 @@ pub(super) async fn run_with_blocking_retry<S: SessionStream>(
                 let mut outcome = if let Some(aof_error) = aof_latched_error {
                     metrics::record_aof_write_rejected("latched");
                     CommandOutcome {
-                        response: aof_write_latch_error(&aof_error),
+                        response: client_state.reject_command(
+                            command_name == "EXEC",
+                            aof_write_latch_error(&aof_error),
+                            Some(&server.data),
+                        ),
                         close: false,
                         retry_blocking: None,
                         delay_ms: None,
@@ -462,7 +466,11 @@ pub(super) async fn run_with_blocking_retry<S: SessionStream>(
         let mut outcome = if let Some(aof_error) = aof_latched_error {
             metrics::record_aof_write_rejected("latched");
             CommandOutcome {
-                response: aof_write_latch_error(&aof_error),
+                response: client_state.reject_command(
+                    command_name == "EXEC",
+                    aof_write_latch_error(&aof_error),
+                    Some(&server.data),
+                ),
                 close: false,
                 retry_blocking: None,
                 delay_ms: None,

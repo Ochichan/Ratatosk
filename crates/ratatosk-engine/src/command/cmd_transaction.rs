@@ -6,7 +6,7 @@ use crate::keyspace::{AtomicStatsState, ServerState, purge_expired_key};
 
 use super::{
     ClientState, CommandOutcome, DurabilityEffects, DurableCommand, ServerAccess, TransactionState,
-    WatchedKey, command_may_grow_memory, err, execute, maxmemory_limit_exceeded,
+    WatchedKey, command_may_grow_memory, err, execabort_reply, execute, maxmemory_limit_exceeded,
     maxmemory_oom_error, now_ms, registry::find_command_spec, wrong_arity,
 };
 
@@ -77,7 +77,7 @@ pub(super) fn cmd_exec(
             .any(|argv| command_may_grow_memory(argv, argv.first().and_then(find_command_spec)))
         && maxmemory_limit_exceeded(server)
     {
-        return CommandOutcome::reply(maxmemory_oom_error());
+        return CommandOutcome::reply(execabort_reply(&maxmemory_oom_error()));
     }
 
     let mut replies = Vec::with_capacity(queued.len());
