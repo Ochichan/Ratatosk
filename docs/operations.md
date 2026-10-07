@@ -531,13 +531,17 @@ single MULTI/EXEC transaction, and inside a client MULTI they join the EXEC
 transaction. A script that wrote nothing, or whose writes all failed, logs
 nothing, and writes made before a script error are still logged (even though the
 client gets an error reply) because they already changed the dataset. RESET is
-refused inside scripts like AUTH and HELLO. While the AOF is latched after a write
-error, EVAL and EVALSHA, including one queued for EXEC, are refused with MISCONF
-like any write, because a script may write. As in Redis, a refused EXEC (latch, OOM, NOAUTH, NOPERM) discards the transaction,
-drops its watches and replies `EXECABORT Transaction discarded because of: <error>`;
-a write refused while queueing flags the transaction so EXEC replies with the
-"previous errors" EXECABORT. This repo has no `no-writes` script
-flags, so no EVAL variant that can write is exempt. EVAL_RO and EVALSHA_RO never log. SCRIPT LOAD and the
+refused inside scripts like AUTH and HELLO. Scripts have no shebang flags, so all
+run in Redis compat mode. While the AOF is latched after a write error, EVAL and
+EVALSHA still start, and a nested write command inside the script fails with
+MISCONF (`redis.call` raises it, `redis.pcall` returns it), as Redis does in
+`scriptVerifyWriteCommandAllow`. Read-only scripts keep running under the latch,
+including from MULTI/EXEC. EVAL_RO and EVALSHA_RO never log. As in Redis, a
+refused EXEC (latch, OOM, NOAUTH, NOPERM, or extra arguments) discards the
+transaction, drops its watches and replies
+`EXECABORT Transaction discarded because of: <error>`. A write refused while
+queueing flags the transaction so EXEC replies with the "previous errors"
+EXECABORT. SCRIPT LOAD and the
 script cache are not persisted, so after a restart EVALSHA returns NOSCRIPT until
 the script is loaded again, as in Redis.
 

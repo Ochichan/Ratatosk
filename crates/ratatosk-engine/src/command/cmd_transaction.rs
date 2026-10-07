@@ -33,7 +33,14 @@ pub(super) fn cmd_exec(
     atomic_stats: Option<&AtomicStatsState>,
 ) -> CommandOutcome {
     if !args.is_empty() {
-        return wrong_arity("exec");
+        // Redis refuses EXEC with extra arguments through rejectCommand, which
+        // discards the transaction.
+        let response = client.reject_command(
+            true,
+            err("wrong number of arguments for 'exec' command"),
+            Some(&server.data),
+        );
+        return CommandOutcome::reply(response);
     }
 
     if !client.tx_state.in_multi() {

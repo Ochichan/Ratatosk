@@ -938,22 +938,48 @@ mod tests {
         assert_error_contains(&reply, "not allowed from script");
     }
 
+    #[cfg(feature = "lua-scripting")]
     #[test]
-    fn may_write_command_counts_eval_but_not_ro_variants() {
-        for (name, expected) in [
-            ("EVAL", true),
-            ("evalsha", true),
-            ("SET", true),
-            ("EVAL_RO", false),
-            ("EVALSHA_RO", false),
-            ("GET", false),
-        ] {
-            assert_eq!(
-                crate::command::may_write_command(&[Bytes::copy_from_slice(name.as_bytes())]),
-                expected,
-                "{name}"
-            );
-        }
+    fn latched_aof_refuses_nested_writes_but_not_reads() {
+        let mut server = ServerState::with_default_dbs();
+        server.set_aof_enabled(true);
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SET", "k", "v"]);
+        server.set_aof_last_error("disk gone");
+
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('GET','k')", "0"],
+        );
+        assert_eq!(reply, RespFrame::bulk_str("v"));
+        assert!(effects.is_none());
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','k','x')", "0"],
+        );
+        assert_error_contains(&reply, "MISCONF writes are blocked");
+        assert_error_contains(&reply, "disk gone");
+        assert!(effects.is_none());
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.pcall('DEL','k')['err']", "0"],
+        );
+        assert!(matches!(reply, RespFrame::BulkString(Some(_))), "{reply:?}");
+        let (reply, _) = run_argv(&mut server, &mut client, &["GET", "k"]);
+        assert_eq!(reply, RespFrame::bulk_str("v"));
+
+        // With the AOF off there is nothing to latch.
+        server.set_aof_enabled(false);
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','k','x')", "0"],
+        );
+        assert!(!matches!(reply, RespFrame::Error(_)));
     }
 
     #[cfg(feature = "lua-scripting")]

@@ -3732,7 +3732,7 @@ impl ClientState {
     pub fn has_queued_writes(&self) -> bool {
         match &self.tx_state {
             TransactionState::InTransaction { queue, .. } => {
-                queue.iter().any(|argv| may_write_command(argv))
+                queue.iter().any(|argv| is_write_command(argv))
             }
             TransactionState::Normal => false,
         }
@@ -5160,19 +5160,6 @@ pub fn command_name(argv: &[Bytes]) -> Option<Bytes> {
     ))
 }
 
-/// Return whether a command can change the dataset, counting EVAL and
-/// EVALSHA. Their own flags are only `noscript`, but a script may write, and
-/// Redis refuses scripts without `no-writes` when writes are blocked. The
-/// `_RO` variants cannot write.
-pub fn may_write_command(argv: &[Bytes]) -> bool {
-    if is_write_command(argv) {
-        return true;
-    }
-    argv.first().is_some_and(|name| {
-        name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA")
-    })
-}
-
 pub fn is_write_command(argv: &[Bytes]) -> bool {
     let Some(name) = command_name(argv) else {
         return false;
@@ -5678,6 +5665,29 @@ mod tests {
             ),
             other => panic!("expected OOM error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exec_with_extra_arguments_aborts_the_transaction() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "k", "1"], &mut server, &mut client);
+        assert_eq!(
+            run(&["EXEC", "extra"], &mut server, &mut client),
+            RespFrame::error_str(
+                "EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command"
+            )
+        );
+        assert!(!client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("ERR EXEC without MULTI")
+        );
+        assert_eq!(
+            run(&["GET", "k"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
     }
 
     #[test]

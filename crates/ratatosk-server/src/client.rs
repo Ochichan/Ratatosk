@@ -5,7 +5,7 @@ use ratatosk_engine::{
     command::{
         ClientState, CommandOutcome, DurabilityEffects, ExecuteArgvPrecheck, ServerAccess,
         apply_post_execute_side_effects, execute, execute_argv, is_write_command,
-        may_write_command, post_execute_tracking_flags, precheck_execute_argv_with_default_acl,
+        post_execute_tracking_flags, precheck_execute_argv_with_default_acl,
     },
     keyspace::{PubSubMessage, ServerState, SharedState},
     object::normalize_range,
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[cfg(feature = "lua-scripting")]
     #[tokio::test]
-    async fn aof_latch_refuses_scripts_that_may_write_but_not_ro_scripts() {
+    async fn aof_latch_refuses_script_writes_but_runs_read_only_scripts() {
         let (mut client, shared, server_task) =
             setup_client_server_with_shared(ClientIoLimits::default()).await;
         {
@@ -1634,21 +1634,13 @@ mod tests {
             server.set_aof_last_error("injected disk error");
         }
 
-        for (name, parts) in [
-            ("plain SET", vec!["SET", "k", "v"]),
-            ("EVAL", vec!["EVAL", "redis.call('SET','k','v')", "0"]),
-        ] {
-            let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
-            for part in &parts {
-                frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
-            }
-            client.write_all(&frame).await.expect("write");
-            let reply = read_reply(&mut client).await;
-            assert!(reply.starts_with(b"-MISCONF"), "{name}: {reply:?}");
-        }
-        // An EVAL queued before the latch makes EXEC a write operation too.
-        // Redis aborts the transaction instead of leaving the client in MULTI.
-        shared.meta.lock().await.clear_aof_last_error();
+        let frame = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+        client.write_all(&frame).await.expect("write");
+        let reply = read_reply(&mut client).await;
+        assert!(reply.starts_with(b"-MISCONF"), "plain SET: {reply:?}");
+
+        // Redis (compat-mode scripts) lets EVAL start and refuses the nested
+        // write inside the script instead.
         async fn send(client: &mut TcpStream, parts: &[&str]) -> Vec<u8> {
             let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
             for part in parts {
@@ -1657,12 +1649,39 @@ mod tests {
             client.write_all(&frame).await.expect("write");
             read_reply(client).await
         }
-        assert_eq!(send(&mut client, &["WATCH", "w"]).await, b"+OK\r\n");
+        let reply = send(&mut client, &["EVAL", "redis.call('SET','k','v')", "0"]).await;
+        assert!(
+            String::from_utf8_lossy(&reply).contains("MISCONF writes are blocked"),
+            "EVAL write: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        let reply = send(
+            &mut client,
+            &["EVAL", "return redis.pcall('SET','k','v')['err']", "0"],
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&reply).contains("MISCONF writes are blocked"),
+            "EVAL pcall write: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(
+            send(&mut client, &["EVAL", "return redis.call('GET','k')", "0"]).await,
+            b"$-1\r\n"
+        );
+        // A read-only script queued in MULTI runs under the latch.
         assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
         assert_eq!(
-            send(&mut client, &["EVAL", "redis.call('SET','k','v')", "0"]).await,
+            send(&mut client, &["EVAL", "return 5", "0"]).await,
             b"+QUEUED\r\n"
         );
+        assert_eq!(send(&mut client, &["EXEC"]).await, b"*1\r\n:5\r\n");
+        // A write queued before the latch makes EXEC a write operation too.
+        // Redis aborts the transaction instead of leaving the client in MULTI.
+        shared.meta.lock().await.clear_aof_last_error();
+        assert_eq!(send(&mut client, &["WATCH", "w"]).await, b"+OK\r\n");
+        assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert_eq!(send(&mut client, &["SET", "k", "v"]).await, b"+QUEUED\r\n");
         shared
             .meta
             .lock()
