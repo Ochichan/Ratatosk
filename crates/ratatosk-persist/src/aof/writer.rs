@@ -438,8 +438,10 @@ impl AofWriter {
                 let over_size = self.buf.len() >= self.max_pending;
                 let over_time = held >= self.max_hold;
                 // Stop holding back: bounded memory and bounded delay win over
-                // the risk that this write blocks on the fsync.
-                if over_size || (over_time && (flush_tail || self.buf.len() >= WRITE_BATCH)) {
+                // the risk that this write blocks on the fsync.  Past the time
+                // bound every call writes, so no record waits longer than
+                // `max_hold` however small and frequent the appends are.
+                if over_size || over_time {
                     if !counted {
                         self.delayed_fsync += 1;
                         if let Some(in_flight) = self.in_flight.as_mut() {
@@ -1141,6 +1143,32 @@ mod tests {
         assert_eq!(writer.delayed_fsync_count(), 1);
         writer.poll_background();
         assert_eq!(writer.delayed_fsync_count(), 1, "counted once per fsync");
+        gate.release();
+        writer.force_fsync().expect("drain");
+    }
+
+    #[test]
+    fn time_bound_holds_for_a_steady_trickle_of_small_appends() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let gate = Gate::new(true, false);
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        writer.fsync_hook = Some(gate.hook());
+        writer.max_hold = Duration::from_millis(40);
+        writer.append_command(0, &set_cmd("ka")).expect("a");
+        make_due(&mut writer);
+        writer
+            .append_command(0, &set_cmd("kb"))
+            .expect("b starts fsync");
+        writer
+            .append_command(0, &set_cmd("kc"))
+            .expect("c held back");
+        assert_eq!(key_order(&path), ["ka", "kb"]);
+        thread::sleep(Duration::from_millis(60));
+        // A small append (far below 8 KiB) past the bound must flush the tail.
+        writer.append_command(0, &set_cmd("kd")).expect("d");
+        assert_eq!(key_order(&path), ["ka", "kb", "kc", "kd"]);
+        assert!(writer.buf.is_empty());
         gate.release();
         writer.force_fsync().expect("drain");
     }

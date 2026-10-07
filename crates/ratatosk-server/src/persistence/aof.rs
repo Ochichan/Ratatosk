@@ -1199,6 +1199,16 @@ mod tests {
             .finish()
     }
 
+    /// Install `logs` as this thread's subscriber. Rebuilding the callsite
+    /// interest cache makes log statements that already registered while no
+    /// subscriber was installed (by tests in other threads) become enabled
+    /// again, so log-asserting tests do not depend on test order.
+    fn install_log_subscriber(logs: Arc<Mutex<Vec<u8>>>) -> tracing::subscriber::DefaultGuard {
+        let guard = tracing::subscriber::set_default(aof_log_subscriber(logs));
+        tracing::callsite::rebuild_interest_cache();
+        guard
+    }
+
     async fn wait_for_aof_log(logs: &Arc<Mutex<Vec<u8>>>, path: &Path, message: &str) -> String {
         let path = path.display().to_string();
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1965,7 +1975,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn explicit_worker_shutdown_is_graceful_without_a_warning() {
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let _subscriber = tracing::subscriber::set_default(aof_log_subscriber(Arc::clone(&logs)));
+        let _subscriber = install_log_subscriber(Arc::clone(&logs));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("graceful-worker.aof");
         let writer = AofWriter::open(&path, FsyncPolicy::No).expect("open AOF writer");
@@ -2029,8 +2039,7 @@ mod tests {
     async fn everysec_worker_keeps_order_across_background_fsync_and_drains_on_controls() {
         // Own subscriber so worker log callsites register as enabled; without
         // one they can cache "disabled" and starve the log-asserting tests.
-        let _subscriber =
-            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let _subscriber = install_log_subscriber(Arc::new(Mutex::new(Vec::new())));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("everysec-worker.aof");
         let writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open AOF writer");
@@ -2150,8 +2159,7 @@ mod tests {
     async fn config_set_does_not_swallow_a_background_fsync_failure() {
         // Own subscriber so worker log callsites register as enabled; without
         // one they can cache "disabled" and starve the log-asserting tests.
-        let _subscriber =
-            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let _subscriber = install_log_subscriber(Arc::new(Mutex::new(Vec::new())));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("bg-fail-policy.aof");
         let sender = worker_with_failed_background_fsync(&path).await;
@@ -2186,8 +2194,7 @@ mod tests {
     async fn rewrite_reports_a_background_fsync_failure_and_keeps_it_for_the_latch() {
         // Own subscriber so worker log callsites register as enabled; without
         // one they can cache "disabled" and starve the log-asserting tests.
-        let _subscriber =
-            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let _subscriber = install_log_subscriber(Arc::new(Mutex::new(Vec::new())));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("bg-fail-rewrite.aof");
         let sender = worker_with_failed_background_fsync(&path).await;
@@ -2222,8 +2229,7 @@ mod tests {
     async fn shutdown_reports_a_background_fsync_failure_after_fsyncing() {
         // Own subscriber so worker log callsites register as enabled; without
         // one they can cache "disabled" and starve the log-asserting tests.
-        let _subscriber =
-            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let _subscriber = install_log_subscriber(Arc::new(Mutex::new(Vec::new())));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("bg-fail-shutdown.aof");
         let sender = worker_with_failed_background_fsync(&path).await;
@@ -2250,7 +2256,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn worker_channel_disconnect_remains_a_warning() {
         let logs = Arc::new(Mutex::new(Vec::new()));
-        let _subscriber = tracing::subscriber::set_default(aof_log_subscriber(Arc::clone(&logs)));
+        let _subscriber = install_log_subscriber(Arc::clone(&logs));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("disconnected-worker.aof");
         let writer = AofWriter::open(&path, FsyncPolicy::No).expect("open AOF writer");
