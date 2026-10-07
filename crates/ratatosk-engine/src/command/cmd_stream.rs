@@ -48,33 +48,51 @@ pub(super) fn parse_stream_range_bound(raw: &Bytes) -> Option<StreamId> {
     Some(id)
 }
 
-/// The ID `XADD *` assigns after `last_id`, the stream's last generated ID.
-pub(super) fn next_stream_id(last_id: StreamId) -> StreamId {
-    let now = now_ms();
-    if now > last_id.ms {
-        StreamId { ms: now, seq: 0 }
+/// The largest stream ID; a stream whose last ID is this accepts no more entries.
+const MAX_STREAM_ID: StreamId = StreamId {
+    ms: i64::MAX,
+    seq: i64::MAX,
+};
+
+/// The ID right after `id`, carrying into the next millisecond when the
+/// sequence is exhausted, as Redis's `streamIncrID`. `None` past the last ID.
+fn incremented_stream_id(id: StreamId) -> Option<StreamId> {
+    if id.seq < i64::MAX {
+        Some(StreamId {
+            ms: id.ms,
+            seq: id.seq + 1,
+        })
+    } else if id.ms < i64::MAX {
+        Some(StreamId {
+            ms: id.ms + 1,
+            seq: 0,
+        })
     } else {
-        StreamId {
-            ms: last_id.ms,
-            seq: last_id.seq.saturating_add(1),
-        }
+        None
     }
 }
 
-fn next_stream_id_for_ms(last_id: StreamId, ms: i64) -> StreamId {
-    if ms > last_id.ms {
-        StreamId { ms, seq: 0 }
-    } else if ms == last_id.ms {
-        StreamId {
-            ms,
-            seq: last_id.seq.saturating_add(1),
-        }
+/// The ID `XADD *` assigns after `last_id`, the stream's last generated ID,
+/// as Redis's `streamNextID`.
+fn next_stream_id(last_id: StreamId) -> Option<StreamId> {
+    let now = now_ms();
+    if now > last_id.ms {
+        Some(StreamId { ms: now, seq: 0 })
     } else {
-        // The ordinary monotonicity check below reports the compatibility
-        // error.  Keeping the candidate at the requested millisecond avoids
-        // manufacturing a new, unrelated ID for an invalid request.
-        StreamId { ms, seq: 0 }
+        incremented_stream_id(last_id)
     }
+}
+
+/// The ID `XADD <ms>-*` assigns. Within the last ID's millisecond the sequence
+/// continues and, unlike `*`, never carries: an exhausted sequence is `None`.
+fn next_stream_id_for_ms(last_id: StreamId, ms: i64) -> Option<StreamId> {
+    if ms != last_id.ms {
+        return Some(StreamId { ms, seq: 0 });
+    }
+    (last_id.seq < i64::MAX).then(|| StreamId {
+        ms,
+        seq: last_id.seq + 1,
+    })
 }
 
 pub(super) fn stream_entry_frame(entry: &StreamEntry) -> RespFrame {
@@ -133,55 +151,72 @@ pub(super) fn cmd_xadd(
     let key = &args[0];
     let id_raw = &args[1];
 
+    // How the ID is chosen, validated before the key is touched so that a
+    // rejected XADD never leaves an empty stream behind (Redis rejects these
+    // forms while parsing its arguments).
+    enum IdSpec {
+        Auto,
+        AutoSeq(i64),
+        Explicit(StreamId),
+    }
+    let invalid_id = || {
+        CommandOutcome::reply(err(
+            "ERR Invalid stream ID specified as stream command argument",
+        ))
+    };
+    let spec = if id_raw.as_ref() == b"*" {
+        IdSpec::Auto
+    } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
+        let Some(ms) = std::str::from_utf8(ms_raw)
+            .ok()
+            .and_then(|text| text.parse::<i64>().ok())
+            .filter(|ms| *ms >= 0)
+        else {
+            return invalid_id();
+        };
+        IdSpec::AutoSeq(ms)
+    } else {
+        let Some(parsed) = parse_stream_id(id_raw) else {
+            return invalid_id();
+        };
+        if parsed == (StreamId { ms: 0, seq: 0 }) {
+            return CommandOutcome::reply(err(
+                "ERR The ID specified in XADD must be greater than 0-0",
+            ));
+        }
+        IdSpec::Explicit(parsed)
+    };
+
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
 
-    if !db.contains_key(key) {
-        db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
+    let last_id = match db.get(key) {
+        Some(entry) => {
+            let Some(meta) = entry.as_stream_meta() else {
+                return wrong_type_response();
+            };
+            meta.last_id
+        }
+        None => StreamId { ms: 0, seq: 0 },
+    };
+    if last_id == MAX_STREAM_ID {
+        return CommandOutcome::reply(err(
+            "ERR The stream has exhausted the last possible ID, unable to add more items",
+        ));
     }
-
-    let Some(entry) = db.get_mut(key) else {
-        return CommandOutcome::reply(err("ERR internal error"));
+    let id = match spec {
+        IdSpec::Auto => next_stream_id(last_id),
+        IdSpec::AutoSeq(ms) => next_stream_id_for_ms(last_id, ms),
+        IdSpec::Explicit(id) => Some(id),
     };
-    let Some((stream, meta)) = entry.as_stream_entries_and_meta_mut() else {
-        return wrong_type_response();
-    };
-
-    let id = if id_raw.as_ref() == b"*" {
-        next_stream_id(meta.last_id)
-    } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
-        let Some(ms_text) = std::str::from_utf8(ms_raw).ok() else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        let Some(ms) = ms_text.parse::<i64>().ok().filter(|ms| *ms >= 0) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        next_stream_id_for_ms(meta.last_id, ms)
-    } else {
-        let Some(parsed) = parse_stream_id(id_raw) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        parsed
-    };
-
-    if id.ms == 0 && id.seq == 0 {
-        return CommandOutcome::reply(err("ERR The ID specified in XADD must be greater than 0-0"));
-    }
-
     // Compared with the last generated ID, not the top entry, so deleting
     // entries never lets an older ID back in.
-    if id <= meta.last_id {
+    let Some(id) = id.filter(|id| *id > last_id) else {
         return CommandOutcome::reply(err(
             "ERR The ID specified in XADD is equal or smaller than the target stream top item",
         ));
-    }
+    };
 
     let mut fields = Vec::with_capacity((args.len() - 2) / 2);
     let mut idx = 2usize;
@@ -190,6 +225,15 @@ pub(super) fn cmd_xadd(
         idx += 2;
     }
 
+    if !db.contains_key(key) {
+        db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
+    }
+    let Some((stream, meta)) = db
+        .get_mut(key)
+        .and_then(|entry| entry.as_stream_entries_and_meta_mut())
+    else {
+        return CommandOutcome::reply(err("ERR internal error"));
+    };
     stream.push(StreamEntry { id, fields });
     meta.last_id = id;
     meta.entries_added = meta.entries_added.saturating_add(1);
