@@ -6407,6 +6407,39 @@ mod tests {
             panic!("XGROUP CREATE on a missing key should fail");
         };
         assert!(message.starts_with(b"ERR The XGROUP subcommand requires the key to exist"));
+
+        // A bad XADD ID is reported before WRONGTYPE; XGROUP checks the type first.
+        run(&["SET", "k", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(&["XADD", "k", "bad", "f", "v"], &mut server, &mut client),
+            RespFrame::error_str("ERR Invalid stream ID specified as stream command argument")
+        );
+        let RespFrame::Error(message) = run(
+            &["XGROUP", "CREATE", "k", "g", "bad", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XGROUP CREATE on a string key should fail");
+        };
+        assert!(message.starts_with(b"WRONGTYPE"));
+
+        // `$ MKSTREAM` on a missing key creates the stream and the group.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "m", "g", "$", "MKSTREAM"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::simple_str("OK")
+        );
+        let RespFrame::Error(message) = run(
+            &["XGROUP", "CREATE", "m", "g", "$", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("a second XGROUP CREATE should fail");
+        };
+        assert!(message.starts_with(b"BUSYGROUP"));
     }
 
     #[test]
