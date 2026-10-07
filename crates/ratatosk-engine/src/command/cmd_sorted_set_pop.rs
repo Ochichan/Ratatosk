@@ -91,9 +91,9 @@ fn zpop_impl(
     let mut popped = Vec::with_capacity(count.min(zset.len()));
     for _ in 0..count {
         let entry_opt = if pop_min {
-            zset.by_score.keys().next().cloned()
+            zset.by_score.first().cloned()
         } else {
-            zset.by_score.keys().next_back().cloned()
+            zset.by_score.last().cloned()
         };
         let Some(entry) = entry_opt else {
             break;
@@ -260,9 +260,9 @@ fn try_zmpop_once(
             let mut items = Vec::with_capacity(count.min(zset.len()));
             for _ in 0..count {
                 let entry_opt = if pop_min {
-                    zset.by_score.keys().next().cloned()
+                    zset.by_score.first().cloned()
                 } else {
-                    zset.by_score.keys().next_back().cloned()
+                    zset.by_score.last().cloned()
                 };
                 let Some(entry) = entry_opt else {
                     break;
@@ -384,9 +384,9 @@ fn try_bzpop_once(
             };
 
             let entry_opt = if pop_min {
-                zset.by_score.keys().next().cloned()
+                zset.by_score.first().cloned()
             } else {
-                zset.by_score.keys().next_back().cloned()
+                zset.by_score.last().cloned()
             };
 
             let Some(entry) = entry_opt else {

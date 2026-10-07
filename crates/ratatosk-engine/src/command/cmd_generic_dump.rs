@@ -221,7 +221,7 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
         ValueData::SortedSet(zset) => {
             out.push(b'z');
             put_u32(&mut out, zset.len());
-            for entry in zset.by_score.keys() {
+            for entry in zset.by_score.iter() {
                 put_bytes(&mut out, &entry.member);
                 put_i64(&mut out, entry.score.0.to_bits() as i64);
             }

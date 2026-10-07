@@ -274,10 +274,7 @@ impl DirectDb<'_> {
         }
 
         let take_len = (stop_idx - start_idx + 1).min(limit);
-        zset.by_score
-            .keys()
-            .skip(start_idx)
-            .take(take_len)
+        zset.range_by_rank(start_idx, take_len)
             .map(|e| (e.member.clone(), e.score.value()))
             .collect()
     }
@@ -334,11 +331,7 @@ impl DirectDb<'_> {
 
         let take_len = (stop_idx - start_idx + 1).min(limit);
 
-        zset.by_score
-            .keys()
-            .rev()
-            .skip(start_idx)
-            .take(take_len)
+        zset.rev_range_by_rank(start_idx, take_len)
             .map(|e| (e.member.clone(), e.score.value()))
             .collect()
     }

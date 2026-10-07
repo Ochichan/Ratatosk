@@ -11,10 +11,11 @@ pub use crate::replication::{
 };
 pub use crate::stats::{AtomicStatsState, HotStatsSnapshot, SlowlogEntry, StatsState};
 pub use crate::tracking::ClientTrackingState;
+use crate::zset_index::OrderedIndex;
 use ratatosk_core::time::now_ms as unix_ms_now;
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc,
@@ -155,7 +156,7 @@ impl Ord for SortedSetEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct SortedSet {
-    pub by_score: BTreeMap<SortedSetEntry, ()>,
+    pub by_score: OrderedIndex<SortedSetEntry>,
     pub by_member: HashMap<Bytes, SortedSetScore>,
 }
 
@@ -192,26 +193,20 @@ impl SortedSet {
                     score: old_score,
                     member: occ.key().clone(),
                 });
-                self.by_score.insert(
-                    SortedSetEntry {
-                        score: new_score,
-                        member: occ.key().clone(),
-                    },
-                    (),
-                );
+                self.by_score.insert(SortedSetEntry {
+                    score: new_score,
+                    member: occ.key().clone(),
+                });
                 *occ.get_mut() = new_score;
                 false
             }
             hashbrown::hash_map::Entry::Vacant(vac) => {
                 let member_clone = vac.key().clone();
                 vac.insert(new_score);
-                self.by_score.insert(
-                    SortedSetEntry {
-                        score: new_score,
-                        member: member_clone,
-                    },
-                    (),
-                );
+                self.by_score.insert(SortedSetEntry {
+                    score: new_score,
+                    member: member_clone,
+                });
                 true
             }
         }
@@ -244,12 +239,36 @@ impl SortedSet {
             score: *score,
             member: member.clone(),
         };
-        Some(self.by_score.range(..&entry).count())
+        self.by_score.rank_of(&entry)
     }
 
     pub fn rev_rank(&self, member: &Bytes) -> Option<usize> {
         self.rank(member)
             .map(|r| self.len().saturating_sub(1).saturating_sub(r))
+    }
+
+    /// `take` members starting at ascending rank `start`, in ascending order.
+    ///
+    /// O(log n) to seek, then O(1) per member.
+    pub fn range_by_rank(
+        &self,
+        start: usize,
+        take: usize,
+    ) -> impl DoubleEndedIterator<Item = &SortedSetEntry> + '_ {
+        self.by_score.iter_ranks(start, start.saturating_add(take))
+    }
+
+    /// `take` members starting at descending rank `start` (rank 0 is the
+    /// highest member), yielded from high to low.
+    pub fn rev_range_by_rank(
+        &self,
+        start: usize,
+        take: usize,
+    ) -> impl DoubleEndedIterator<Item = &SortedSetEntry> + '_ {
+        let len = self.by_score.len();
+        let end = len.saturating_sub(start);
+        let begin = end.saturating_sub(take);
+        self.by_score.iter_ranks(begin, end).rev()
     }
 
     /// Members whose score lies within `[min, max]`, in ascending order.
@@ -282,22 +301,15 @@ impl SortedSet {
         } else {
             Bound::Excluded(probe(next_score_up(high)))
         };
-        // An inverted range would make `BTreeMap::range` panic.
-        let empty = matches!((&lower, &upper), (Bound::Included(a), Bound::Excluded(b)) if a >= b);
-        let range = if empty {
-            self.by_score.range(probe(0.0)..probe(0.0))
-        } else {
-            self.by_score.range((lower, upper))
-        };
-        range
-            .map(|(entry, ())| entry)
+        self.by_score
+            .range((lower, upper))
             .filter(move |entry| score_in_range(entry.score.value(), min, max))
     }
 
     /// Remove all members whose score is in `[min, max]` (inclusive).
     ///
-    /// Uses `BTreeMap::range` to seek to `min` in O(log n), avoiding a full
-    /// linear scan of all entries.  Returns the number of removed members.
+    /// Seeks to `min` in O(log n), avoiding a full linear scan of all
+    /// entries.  Returns the number of removed members.
     pub fn remove_range_by_score(&mut self, min: f64, max: f64) -> usize {
         let min_bound = SortedSetEntry {
             score: SortedSetScore(min),
@@ -306,8 +318,8 @@ impl SortedSet {
         let members: SmallVec<[Bytes; 16]> = self
             .by_score
             .range(min_bound..)
-            .take_while(|(e, _)| e.score.value() <= max)
-            .map(|(e, _)| e.member.clone()) // Bytes clone = ref-count incr
+            .take_while(|e| e.score.value() <= max)
+            .map(|e| e.member.clone()) // Bytes clone = ref-count incr
             .collect();
         let count = members.len();
         for member in &members {
@@ -3400,5 +3412,157 @@ mod tests {
             db1_before + estimate
         );
         assert_eq!(server.data.estimated_memory(), total_before);
+    }
+}
+
+#[cfg(test)]
+mod sorted_set_rank_tests {
+    use super::{ScoreBound, SortedSet, SortedSetEntry, SortedSetScore};
+    use bytes::Bytes;
+    use std::collections::BTreeMap;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    const SCORES: [f64; 9] = [
+        f64::NEG_INFINITY,
+        -2.5,
+        -0.0,
+        0.0,
+        1.0,
+        1.5,
+        7.0,
+        1e300,
+        f64::INFINITY,
+    ];
+
+    fn assert_matches(zset: &SortedSet, reference: &BTreeMap<SortedSetEntry, ()>) {
+        assert_eq!(zset.len(), reference.len());
+        assert_eq!(zset.by_score.len(), reference.len());
+        assert!(zset.by_score.iter().eq(reference.keys()));
+        assert!(zset.by_score.iter().rev().eq(reference.keys().rev()));
+        assert_eq!(zset.by_score.first(), reference.keys().next());
+        assert_eq!(zset.by_score.last(), reference.keys().next_back());
+        for (rank, entry) in reference.keys().enumerate() {
+            assert_eq!(zset.rank(&entry.member), Some(rank));
+            assert_eq!(
+                zset.rev_rank(&entry.member),
+                Some(reference.len() - 1 - rank)
+            );
+            assert_eq!(zset.by_score.get(rank), Some(entry));
+        }
+    }
+
+    #[test]
+    fn random_ops_match_btreemap_reference() {
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let mut zset = SortedSet::default();
+        let mut reference: BTreeMap<SortedSetEntry, ()> = BTreeMap::new();
+        let mut scores: BTreeMap<Bytes, SortedSetScore> = BTreeMap::new();
+
+        for step in 0..20_000 {
+            let member = Bytes::from(format!("m{}", rng.next() % 3000));
+            if rng.next() % 4 == 0 {
+                let removed = zset.remove(&member);
+                let old = scores.remove(&member);
+                assert_eq!(removed, old.is_some());
+                if let Some(score) = old {
+                    reference.remove(&SortedSetEntry { score, member });
+                }
+            } else {
+                let score = if rng.next() % 2 == 0 {
+                    SCORES[(rng.next() % SCORES.len() as u64) as usize]
+                } else {
+                    (rng.next() % 200) as f64 / 4.0 - 10.0
+                };
+                zset.insert(member.clone(), score);
+                let score = SortedSetScore(score);
+                if let Some(old) = scores.insert(member.clone(), score) {
+                    reference.remove(&SortedSetEntry {
+                        score: old,
+                        member: member.clone(),
+                    });
+                }
+                reference.insert(SortedSetEntry { score, member }, ());
+            }
+            if step % 4_000 == 0 {
+                assert_matches(&zset, &reference);
+            }
+        }
+        assert_matches(&zset, &reference);
+        assert!(zset.len() > 1024, "test must span several chunks");
+
+        // Rank-window helpers, forward and reverse.
+        let all: Vec<&SortedSetEntry> = reference.keys().collect();
+        let len = all.len();
+        for (start, take) in [(0, 10), (5, 0), (len - 3, 10), (len, 4), (700, 1500)] {
+            let fwd: Vec<_> = zset.range_by_rank(start, take).collect();
+            let want: Vec<_> = all.iter().copied().skip(start).take(take).collect();
+            assert_eq!(fwd, want);
+            let rev: Vec<_> = zset.rev_range_by_rank(start, take).collect();
+            let want: Vec<_> = all.iter().rev().copied().skip(start).take(take).collect();
+            assert_eq!(rev, want);
+        }
+
+        // Score ranges, including the -0.0 / 0.0 boundary and infinities.
+        let bound = |v: f64, exclusive: bool| {
+            if exclusive {
+                ScoreBound::Exclusive(v)
+            } else {
+                ScoreBound::Inclusive(v)
+            }
+        };
+        for _ in 0..300 {
+            let lo = SCORES[(rng.next() % 9) as usize];
+            let hi = SCORES[(rng.next() % 9) as usize];
+            let min = bound(lo, rng.next() % 2 == 0);
+            let max = bound(hi, rng.next() % 2 == 0);
+            let want: Vec<_> = all
+                .iter()
+                .copied()
+                .filter(|e| super::score_in_range(e.score.value(), min, max))
+                .collect();
+            let got: Vec<_> = zset.range_by_score(min, max).collect();
+            assert_eq!(got, want);
+            let got_rev: Vec<_> = zset.range_by_score(min, max).rev().collect();
+            let want_rev: Vec<_> = want.iter().rev().copied().collect();
+            assert_eq!(got_rev, want_rev);
+        }
+    }
+
+    /// Timing check for ZRANK at 1M members; run with
+    /// `cargo test -p ratatosk-engine --release -- --ignored --nocapture zrank_timing`.
+    #[test]
+    #[ignore = "timing measurement"]
+    fn zrank_timing_at_one_million_members() {
+        let mut zset = SortedSet::default();
+        for i in 0..1_000_000u32 {
+            zset.insert(Bytes::from(format!("member:{i}")), f64::from(i));
+        }
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let probes: Vec<Bytes> = (0..10_000)
+            .map(|_| Bytes::from(format!("member:{}", rng.next() % 1_000_000)))
+            .collect();
+        let start = std::time::Instant::now();
+        let mut sum = 0usize;
+        for member in &probes {
+            sum += zset.rank(member).expect("member exists");
+        }
+        let per_op = start.elapsed() / probes.len() as u32;
+        println!("ZRANK at 1M members: {per_op:?} per op (checksum {sum})");
+
+        let start = std::time::Instant::now();
+        let window: usize = zset.range_by_rank(500_000, 100).count();
+        println!("range_by_rank(500000, 100): {:?}", start.elapsed());
+        assert_eq!(window, 100);
+        assert!(per_op < std::time::Duration::from_micros(500));
     }
 }

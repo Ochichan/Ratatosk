@@ -85,18 +85,11 @@ fn zrange_collect(
                 Some((start, stop)) => {
                     let take_len = stop - start + 1;
                     if rev {
-                        zset.by_score
-                            .keys()
-                            .rev()
-                            .skip(start)
-                            .take(take_len)
+                        zset.rev_range_by_rank(start, take_len)
                             .map(|entry| (entry.member.clone(), entry.score.value()))
                             .collect()
                     } else {
-                        zset.by_score
-                            .keys()
-                            .skip(start)
-                            .take(take_len)
+                        zset.range_by_rank(start, take_len)
                             .map(|entry| (entry.member.clone(), entry.score.value()))
                             .collect()
                     }
@@ -157,14 +150,14 @@ fn zrange_collect(
 
             if rev {
                 zset.by_score
-                    .keys()
+                    .iter()
                     .rev()
                     .filter(|entry| member_in_lex_range(&entry.member, &lmin, &lmax))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             } else {
                 zset.by_score
-                    .keys()
+                    .iter()
                     .filter(|entry| member_in_lex_range(&entry.member, &lmin, &lmax))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
@@ -762,7 +755,7 @@ pub(super) fn cmd_zlexcount(
 
     let count = zset
         .by_score
-        .keys()
+        .iter()
         .filter(|entry| member_in_lex_range(&entry.member, &lmin, &lmax))
         .count();
 
@@ -866,7 +859,7 @@ pub(super) fn cmd_zremrangebyrank(
 
     let to_remove: Vec<Bytes> = zset
         .by_score
-        .keys()
+        .iter()
         .skip(start)
         .take(stop - start + 1)
         .map(|entry| entry.member.clone())
@@ -957,7 +950,7 @@ pub(super) fn cmd_zremrangebylex(
 
     let to_remove: Vec<Bytes> = zset
         .by_score
-        .keys()
+        .iter()
         .filter(|entry| member_in_lex_range(&entry.member, &lmin, &lmax))
         .map(|entry| entry.member.clone())
         .collect();

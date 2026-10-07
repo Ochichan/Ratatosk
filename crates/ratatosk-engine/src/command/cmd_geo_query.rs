@@ -225,7 +225,7 @@ pub(super) fn geosearch_execute(
 
     let mut results = Vec::new();
 
-    for entry in zset.by_score.keys() {
+    for entry in zset.by_score.iter() {
         let (lon, lat) = geohash_decode(entry.score.value());
         let dist = haversine_distance(center_lon, center_lat, lon, lat);
 

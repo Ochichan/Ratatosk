@@ -342,18 +342,11 @@ fn collect_lock_free_zrange_entries(
                 Some((start, stop)) => {
                     let take_len = stop - start + 1;
                     if rev {
-                        zset.by_score
-                            .keys()
-                            .rev()
-                            .skip(start)
-                            .take(take_len)
+                        zset.rev_range_by_rank(start, take_len)
                             .map(|entry| (entry.member.clone(), entry.score.value()))
                             .collect()
                     } else {
-                        zset.by_score
-                            .keys()
-                            .skip(start)
-                            .take(take_len)
+                        zset.range_by_rank(start, take_len)
                             .map(|entry| (entry.member.clone(), entry.score.value()))
                             .collect()
                     }
@@ -420,14 +413,14 @@ fn collect_lock_free_zrange_entries(
 
             if rev {
                 zset.by_score
-                    .keys()
+                    .iter()
                     .rev()
                     .filter(|entry| member_in_lex_range(&entry.member, &min, &max))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
             } else {
                 zset.by_score
-                    .keys()
+                    .iter()
                     .filter(|entry| member_in_lex_range(&entry.member, &min, &max))
                     .map(|entry| (entry.member.clone(), entry.score.value()))
                     .collect()
@@ -1381,7 +1374,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                         Some(zset) => RespFrame::Integer(
                             i64::try_from(
                                 zset.by_score
-                                    .keys()
+                                    .iter()
                                     .filter(|member| {
                                         member_in_lex_range(&member.member, &min, &max)
                                     })

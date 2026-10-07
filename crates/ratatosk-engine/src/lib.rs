@@ -33,3 +33,4 @@ pub mod security;
 pub mod slot;
 pub mod stats;
 pub mod tracking;
+pub mod zset_index;

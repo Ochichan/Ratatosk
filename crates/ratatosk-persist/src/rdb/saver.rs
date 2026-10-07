@@ -210,7 +210,7 @@ impl<W: Write> RdbSaver<W> {
                 self.write_bytes(&[RDB_TYPE_ZSET])?;
                 self.write_string(key)?;
                 self.write_length(zset.len() as u64)?;
-                for entry in zset.by_score.keys() {
+                for entry in zset.by_score.iter() {
                     self.write_string(&entry.member)?;
                     let score_bytes = entry.score.0.to_bits().to_le_bytes();
                     self.write_bytes(&score_bytes)?;
