@@ -8,7 +8,8 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    parse_stream_id, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
+    AddTrimArgs, IntervalEdge, TrimStrategy, parse_add_or_trim_args, parse_interval_id,
+    parse_strict_stream_id, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
 };
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
@@ -19,20 +20,51 @@ fn stream_contains_id(stream: &[StreamEntry], id: StreamId) -> bool {
     stream.binary_search_by_key(&id, |entry| entry.id).is_ok()
 }
 
+/// Drops removed IDs from every group's pending lists. For each group the
+/// cheaper side is walked: the removed IDs (hash lookups) when they are fewer
+/// than the group's pending entries, otherwise the pending IDs (binary
+/// searches in the sorted removed IDs).
 pub(super) fn prune_stream_removed_ids(entry: &mut StoredValue, removed_ids: &[StreamId]) {
     if removed_ids.is_empty() {
         return;
     }
-
-    let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
     let Some(groups) = entry.as_stream_groups_mut() else {
         return;
     };
+    let sorted;
+    let removed = if removed_ids.is_sorted() {
+        removed_ids
+    } else {
+        let mut copy = removed_ids.to_vec();
+        copy.sort_unstable();
+        sorted = copy;
+        &sorted
+    };
 
     for group in groups.values_mut() {
-        group.pending.retain(|id, _| !removed.contains(id));
-        for consumer in group.consumers.values_mut() {
-            consumer.pending.retain(|id| !removed.contains(id));
+        if group.pending.is_empty() {
+            continue;
+        }
+        let doomed = if removed.len() <= group.pending.len() {
+            removed
+                .iter()
+                .copied()
+                .filter(|id| group.pending.contains_key(id))
+                .collect::<Vec<_>>()
+        } else {
+            group
+                .pending
+                .keys()
+                .copied()
+                .filter(|id| removed.binary_search(id).is_ok())
+                .collect::<Vec<_>>()
+        };
+        for id in doomed {
+            if let Some(pending) = group.pending.remove(&id) {
+                if let Some(consumer) = group.consumers.get_mut(&pending.consumer) {
+                    consumer.pending.remove(&id);
+                }
+            }
         }
     }
 }
@@ -113,7 +145,7 @@ pub(super) fn parse_stream_ids_block(
 
     let mut ids = Vec::with_capacity(num_ids);
     for raw_id in &args[start..end] {
-        let Some(id) = parse_stream_id(raw_id) else {
+        let Some(id) = parse_strict_stream_id(raw_id) else {
             return Err(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -140,6 +172,99 @@ pub(super) fn purge_stream_pending_id(groups: &mut HashMap<Bytes, StreamGroup>, 
     }
 }
 
+/// Entries per radix node in Redis (`stream-node-max-entries` default).
+const APPROX_TRIM_NODE_ENTRIES: usize = 100;
+
+/// What a `~` trim without `LIMIT` may remove at most, Redis's default of 100
+/// nodes.
+const APPROX_TRIM_DEFAULT_LIMIT: usize = 100 * APPROX_TRIM_NODE_ENTRIES;
+
+/// How many entries a `~` trim removes, modelling Redis's `streamTrim` on
+/// nodes of [`APPROX_TRIM_NODE_ENTRIES`] entries counted from the front (the
+/// last node may be partial, and is the whole stream when it is short). Whole
+/// leading nodes go while removing one keeps the stream at or above MAXLEN, or
+/// for MINID while the node's last ID is below it, and the trim stops before a
+/// node that would take the total past `limit` (`None` is no cap).
+fn approx_trim_count(
+    entries: &[StreamEntry],
+    strategy: TrimStrategy,
+    limit: Option<usize>,
+) -> usize {
+    let length = entries.len();
+    let mut removed = 0usize;
+    while removed < length {
+        let node = APPROX_TRIM_NODE_ENTRIES.min(length - removed);
+        let eligible = match strategy {
+            TrimStrategy::MaxLen(max_len) => {
+                let max_len = usize::try_from(max_len).unwrap_or(usize::MAX);
+                if length - removed <= max_len {
+                    break;
+                }
+                length - removed - node >= max_len
+            }
+            TrimStrategy::MinId(min_id) => entries[removed + node - 1].id < min_id,
+        };
+        if limit.is_some_and(|cap| removed + node > cap) || !eligible {
+            break;
+        }
+        removed += node;
+    }
+    removed
+}
+
+/// Trims the stream at `entry` as `options` ask and returns how many entries
+/// went.
+///
+/// An exact trim removes everything past the threshold, up to `LIMIT` when
+/// one is given (`LIMIT 0` is no cap). A `~` trim removes whole nodes as
+/// [`approx_trim_count`] describes, with `LIMIT` defaulting to
+/// [`APPROX_TRIM_DEFAULT_LIMIT`]. The logged form of the command is the
+/// exact result, so replay stays deterministic. Under AOF replay `~` is exact
+/// and `LIMIT` is the plain cap older versions applied. Like Redis, trimming
+/// leaves `max_deleted_id` alone. Group pending lists drop the removed IDs.
+pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usize {
+    let Some(strategy) = options.strategy else {
+        return 0;
+    };
+    let Some(stream) = entry.as_stream_entries_mut() else {
+        return 0;
+    };
+    let replay = super::cmd_stream::replay_mode();
+
+    let cap = if replay {
+        options.limit
+    } else {
+        match options.limit {
+            Some(0) => None,
+            Some(cap) => Some(cap),
+            None if options.approx => Some(APPROX_TRIM_DEFAULT_LIMIT),
+            None => None,
+        }
+    };
+    let mut remove_count = if options.approx && !replay {
+        approx_trim_count(stream, strategy, cap)
+    } else {
+        let mut count = match strategy {
+            TrimStrategy::MaxLen(max_len) => stream
+                .len()
+                .saturating_sub(usize::try_from(max_len).unwrap_or(usize::MAX)),
+            TrimStrategy::MinId(min_id) => stream.partition_point(|item| item.id < min_id),
+        };
+        if let Some(cap) = cap {
+            count = count.min(cap);
+        }
+        count
+    };
+    remove_count = remove_count.min(stream.len());
+    if remove_count == 0 {
+        return 0;
+    }
+
+    let removed_ids = stream.remove_front(remove_count);
+    prune_stream_removed_ids(entry, &removed_ids);
+    removed_ids.len()
+}
+
 pub(super) fn cmd_xtrim(
     args: &[Bytes],
     server: &mut ServerState,
@@ -150,52 +275,10 @@ pub(super) fn cmd_xtrim(
     }
 
     let key = &args[0];
-    let strategy = &args[1];
-
-    let mut idx = 2usize;
-    if idx < args.len() && (args[idx].as_ref() == b"=" || args[idx].as_ref() == b"~") {
-        idx += 1;
-    }
-    if idx >= args.len() {
-        return CommandOutcome::reply(err("ERR syntax error"));
-    }
-
-    enum TrimStrategy {
-        MaxLen(usize),
-        MinId(StreamId),
-    }
-
-    let mode = if strategy.eq_ignore_ascii_case(b"MAXLEN") {
-        let Some(parsed) = parse_usize(&args[idx]) else {
-            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-        };
-        TrimStrategy::MaxLen(parsed)
-    } else if strategy.eq_ignore_ascii_case(b"MINID") {
-        let Some(parsed) = parse_stream_id(&args[idx]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        TrimStrategy::MinId(parsed)
-    } else {
-        return CommandOutcome::reply(err("ERR syntax error"));
+    let options = match parse_add_or_trim_args(args, false) {
+        Ok(options) => options,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
-    idx += 1;
-
-    let mut limit = None;
-    while idx < args.len() {
-        if !args[idx].eq_ignore_ascii_case(b"LIMIT") {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        }
-        let Some(raw_limit) = args.get(idx + 1) else {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        };
-        let Some(parsed_limit) = parse_usize(raw_limit) else {
-            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-        };
-        limit = Some(parsed_limit);
-        idx += 2;
-    }
 
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
@@ -204,30 +287,12 @@ pub(super) fn cmd_xtrim(
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(stream) = entry.as_stream_entries_mut() else {
+    if !entry.is_stream() {
         return wrong_type_response();
-    };
-
-    let mut remove_count = match mode {
-        TrimStrategy::MaxLen(max_len) => stream.len().saturating_sub(max_len),
-        TrimStrategy::MinId(min_id) => stream.iter().take_while(|item| item.id < min_id).count(),
-    };
-
-    if let Some(max_remove) = limit {
-        remove_count = remove_count.min(max_remove);
     }
 
-    if remove_count == 0 {
-        return CommandOutcome::reply(RespFrame::Integer(0));
-    }
-
-    let removed_ids = stream
-        .drain(0..remove_count)
-        .map(|entry| entry.id)
-        .collect::<Vec<_>>();
-    prune_stream_removed_ids(entry, &removed_ids);
-
-    CommandOutcome::reply(RespFrame::Integer(removed_ids.len() as i64))
+    let removed = apply_trim(entry, &options);
+    CommandOutcome::reply(RespFrame::Integer(removed as i64))
 }
 
 pub(super) fn cmd_xdel(
@@ -244,7 +309,7 @@ pub(super) fn cmd_xdel(
 
     let mut id_set = HashSet::new();
     for raw_id in ids {
-        let Some(id) = parse_stream_id(raw_id) else {
+        let Some(id) = parse_strict_stream_id(raw_id) else {
             return CommandOutcome::reply(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -318,7 +383,7 @@ pub(super) fn cmd_xclaim(
             continue;
         }
 
-        let Some(parsed_id) = parse_stream_id(&args[idx]) else {
+        let Some(parsed_id) = parse_strict_stream_id(&args[idx]) else {
             return CommandOutcome::reply(err("ERR syntax error"));
         };
         ids.push(parsed_id);
@@ -421,10 +486,11 @@ pub(super) fn cmd_xautoclaim(
         return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
     }
 
-    let Some(start) = parse_stream_id(&args[4]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
+    // The start is an interval bound, as in Redis: `-`, `+`, a bare
+    // millisecond value and the `(` exclusive prefix are accepted.
+    let start = match parse_interval_id(&args[4], IntervalEdge::Start) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
 
     let mut count = 100usize;

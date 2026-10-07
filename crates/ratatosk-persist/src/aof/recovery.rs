@@ -90,6 +90,7 @@ impl AofRecovery {
         state: &mut ServerState,
     ) -> Result<ReplayResult, PersistError> {
         let mut client = ClientState::new(0);
+        client.set_aof_replay(true);
         let mut commands_replayed = 0usize;
         let mut corruption_positions = Vec::new();
 
@@ -263,6 +264,94 @@ mod tests {
     use super::*;
     use crate::aof::writer::{AofWriter, FsyncPolicy};
     use bytes::Bytes;
+
+    fn encode_aof(commands: &[&[&str]]) -> Vec<u8> {
+        let mut out = b"REDIS-AOF-001\n".to_vec();
+        for command in commands {
+            out.extend_from_slice(format!("*{}\r\n", command.len()).as_bytes());
+            for part in *command {
+                out.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+        }
+        out
+    }
+
+    fn stream_ids(state: &ServerState, key: &str) -> Vec<(u64, u64)> {
+        state
+            .db(0)
+            .get(key.as_bytes())
+            .and_then(|value| value.as_stream_entries().map(|entries| entries.to_vec()))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| (entry.id.ms, entry.id.seq))
+            .collect()
+    }
+
+    /// Records an earlier version logged raw must still replay, or the server
+    /// cannot start: a LIMIT without `~`, `~` trims, and a zero-padded ID
+    /// longer than the 127 bytes a client may send.
+    #[test]
+    fn replay_accepts_raw_stream_records_from_earlier_versions() {
+        let padded_id = format!("{}2-0", "0".repeat(130));
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        for (key, count) in [
+            ("a", 6),
+            ("b", 6),
+            ("c", 6),
+            ("d", 6),
+            ("e", 6),
+            ("f", 6),
+            ("g", 6),
+        ] {
+            for ms in 1..=count {
+                commands.push(
+                    ["XADD", key, &format!("{ms}-0"), "f", "v"]
+                        .map(str::to_owned)
+                        .to_vec(),
+                );
+            }
+        }
+        for raw in [
+            &["XTRIM", "a", "MAXLEN", "3", "LIMIT", "2"][..],
+            &["XTRIM", "b", "MAXLEN", "=", "3", "LIMIT", "2"],
+            &["XTRIM", "c", "MINID", "4", "LIMIT", "0"],
+            &["XTRIM", "d", "MAXLEN", "~", "3"],
+            // Earlier versions parsed these as unsigned numbers of any size.
+            &["XTRIM", "f", "MAXLEN", "0", "LIMIT", "18446744073709551615"],
+            &["XTRIM", "g", "MAXLEN", "18446744073709551615"],
+        ] {
+            commands.push(raw.iter().map(|part| (*part).to_owned()).collect());
+        }
+        commands.push(
+            ["XDEL", "e", padded_id.as_str()]
+                .map(str::to_owned)
+                .to_vec(),
+        );
+
+        let refs: Vec<Vec<&str>> = commands
+            .iter()
+            .map(|command| command.iter().map(String::as_str).collect())
+            .collect();
+        let slices: Vec<&[&str]> = refs.iter().map(Vec::as_slice).collect();
+        let mut state = ServerState::with_default_dbs();
+        let result = AofRecovery::replay_reader(encode_aof(&slices).as_slice(), &mut state)
+            .expect("records an earlier version logged must replay");
+        assert!(!result.corruption_detected);
+
+        let ids = |ms: &[u64]| ms.iter().map(|ms| (*ms, 0)).collect::<Vec<_>>();
+        // LIMIT 2 caps an exact trim: 6 entries with MAXLEN 3 leave 4.
+        assert_eq!(stream_ids(&state, "a"), ids(&[3, 4, 5, 6]));
+        assert_eq!(stream_ids(&state, "b"), ids(&[3, 4, 5, 6]));
+        // LIMIT 0 removed nothing in those versions.
+        assert_eq!(stream_ids(&state, "c"), ids(&[1, 2, 3, 4, 5, 6]));
+        // `~` trimmed exactly, with no node rounding or default cap.
+        assert_eq!(stream_ids(&state, "d"), ids(&[4, 5, 6]));
+        // A LIMIT past i64::MAX caps nothing, and a MAXLEN past it keeps all.
+        assert_eq!(stream_ids(&state, "f"), ids(&[]));
+        assert_eq!(stream_ids(&state, "g"), ids(&[1, 2, 3, 4, 5, 6]));
+        // The long padded ID is 2-0.
+        assert_eq!(stream_ids(&state, "e"), ids(&[1, 3, 4, 5, 6]));
+    }
 
     #[test]
     fn legacy_exec_preserves_successful_siblings_of_a_runtime_error() {

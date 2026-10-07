@@ -8,24 +8,11 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame,
-    parse_stream_id as parse_full_stream_id, parse_stream_range_bound, stream_entry_frame,
-    stream_id_to_bytes, stream_nogroup_error, xreadgroup_nogroup_error,
+    IntervalEdge, blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame,
+    invalid_stream_id, parse_interval_id, parse_stream_id_generic, parse_strict_stream_id,
+    stream_entry_frame, stream_id_to_bytes, stream_nogroup_error, xreadgroup_nogroup_error,
 };
 
-// Group cursors accept a millisecond-only ID (notably the common `0`),
-// with an omitted sequence interpreted as zero.
-fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
-    parse_full_stream_id(raw).or_else(|| {
-        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        Some(StreamId {
-            ms: parse_i64(raw)?,
-            seq: 0,
-        })
-    })
-}
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
     wrong_arity, wrong_type_response,
@@ -105,10 +92,8 @@ pub(super) fn cmd_xgroup(
                 // `$` is the stream's last generated ID.
                 existing_last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_strict_stream_id(id_raw) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
                 parsed
             };
@@ -188,10 +173,8 @@ pub(super) fn cmd_xgroup(
             group.last_delivered_id = if id_raw.as_ref() == b"$" {
                 last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_stream_id_generic(id_raw, 0, false) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
                 parsed
             };
@@ -409,10 +392,8 @@ pub(super) fn cmd_xreadgroup(
                         .collect::<Vec<_>>()
                 }
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_strict_stream_id(id_raw) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
 
                 if let Some(limit) = count {
@@ -458,6 +439,22 @@ pub(super) fn cmd_xreadgroup(
 
             if id_raw.as_ref() == b">" {
                 if !noack {
+                    // An ID still pending for another consumer (after XGROUP SETID
+                    // rewound the group) moves to this one, so it leaves the old
+                    // owner's list, and its delivery count restarts at 1, as in
+                    // Redis.
+                    for id in &selected_ids {
+                        let previous = group
+                            .pending
+                            .get(id)
+                            .filter(|pending| pending.consumer != consumer_name)
+                            .map(|pending| pending.consumer.clone());
+                        if let Some(previous) = previous {
+                            if let Some(owner) = group.consumers.get_mut(&previous) {
+                                owner.pending.remove(id);
+                            }
+                        }
+                    }
                     let consumer_state = group
                         .consumers
                         .entry(consumer_name.clone())
@@ -473,7 +470,7 @@ pub(super) fn cmd_xreadgroup(
                             .entry(*id)
                             .and_modify(|pending| {
                                 pending.consumer = consumer_name.clone();
-                                pending.deliveries = pending.deliveries.saturating_add(1);
+                                pending.deliveries = 1;
                                 pending.last_delivered_ms = now;
                             })
                             .or_insert_with(|| StreamPendingEntry {
@@ -580,7 +577,7 @@ pub(super) fn cmd_xack(
 
     let mut removed = 0i64;
     for id_raw in ids {
-        let Some(id) = parse_stream_id(id_raw) else {
+        let Some(id) = parse_strict_stream_id(id_raw) else {
             return CommandOutcome::reply(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -668,15 +665,13 @@ pub(super) fn cmd_xpending(
         return wrong_arity("xpending");
     }
 
-    let Some(start) = parse_stream_range_bound(&args[2]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
+    let start = match parse_interval_id(&args[2], IntervalEdge::Start) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
-    let Some(end) = parse_stream_range_bound(&args[3]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
+    let end = match parse_interval_id(&args[3], IntervalEdge::End) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
     let Some(count) = parse_usize(&args[4]) else {
         return CommandOutcome::reply(err("ERR value is not an integer or out of range"));

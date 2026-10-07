@@ -128,7 +128,7 @@ fn estimate_value_memory_usage(key: &Bytes, value: &StoredValue) -> i64 {
             entries, groups, ..
         } => {
             total = total.saturating_add(64);
-            for entry in entries {
+            for entry in entries.iter() {
                 total = total.saturating_add(32);
                 for (k, v) in &entry.fields {
                     total = total

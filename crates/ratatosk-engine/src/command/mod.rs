@@ -3617,6 +3617,9 @@ pub struct ClientState {
     unix_socket: bool,
     monitor_mode: bool,
     durability_capture_enabled: bool,
+    /// Set by AOF recovery. Stream commands then accept what an earlier
+    /// version logged raw (see `cmd_stream::replay_mode`).
+    replaying_aof: bool,
     durability_effects: Option<DurabilityEffects>,
     /// Nested EXEC/EVAL dispatches are admitted as one atomic command unit.
     memory_admission_bypass_depth: usize,
@@ -3738,6 +3741,13 @@ impl ClientState {
         if !enabled {
             self.durability_effects = None;
         }
+    }
+
+    /// Marks this client as the one AOF recovery replays commands through.
+    /// Like Redis's must-obey clients, it is trusted to carry commands the
+    /// server logged itself, including ones an older version logged raw.
+    pub fn set_aof_replay(&mut self, replaying: bool) {
+        self.replaying_aof = replaying;
     }
 
     fn set_durability_effects(&mut self, effects: Option<DurabilityEffects>) {
@@ -3959,6 +3969,7 @@ impl ClientState {
             unix_socket: false,
             monitor_mode: false,
             durability_capture_enabled: false,
+            replaying_aof: false,
             durability_effects: None,
             memory_admission_bypass_depth: 0,
         }
@@ -4046,6 +4057,7 @@ pub fn execute_argv(
     access: &mut ServerAccess<'_>,
     client: &mut ClientState,
 ) -> CommandOutcome {
+    let _replay = cmd_stream::ReplayScope::enter(client.replaying_aof);
     if client.durability_capture_enabled {
         // All relative expiries and lazy expiry decisions in this operation
         // use the same clock that recovery will use, including nested EXEC.
@@ -4594,7 +4606,13 @@ fn capture_durability_effects(
         // XADD resolves `*` (and the supported partial auto-ID form) while it
         // mutates the stream.  Replay the returned concrete ID, never the
         // caller's generator token.
-        b"XADD" => canonical_xadd(argv, response),
+        b"XADD" => canonical_xadd(argv, server, db_index, response),
+        // Like Redis, only a trim that removed entries is propagated, and a
+        // `~` trim is rewritten to the exact trim it turned out to be.
+        b"XTRIM" if matches!(response, RespFrame::Integer(removed) if *removed > 0) => {
+            canonical_xtrim(argv, server, db_index)
+        }
+        b"XTRIM" => None,
         b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
         // These commands are administrative/session actions, not keyspace
         // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
@@ -4739,14 +4757,80 @@ fn canonical_expiry_state(
     }
 }
 
-fn canonical_xadd(argv: &[Bytes], response: &RespFrame) -> Option<Vec<Bytes>> {
+/// Rewrites an XADD for the log: the ID becomes the one the server picked, and
+/// a `~` trim becomes the exact trim it turned out to be.
+fn canonical_xadd(
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<Vec<Bytes>> {
     let RespFrame::BulkString(Some(id)) = response else {
         return None;
     };
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, true).ok()?;
+    let (id_idx, _) = options.id?;
     let mut canonical = argv.to_vec();
-    let id_slot = canonical.get_mut(2)?;
-    *id_slot = id.clone();
-    Some(canonical)
+    *canonical.get_mut(id_idx + 1)? = id.clone();
+    canonical_trim_arguments(canonical, &options, server, db_index)
+}
+
+fn canonical_xtrim(argv: &[Bytes], server: &ServerState, db_index: usize) -> Option<Vec<Bytes>> {
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, false).ok()?;
+    canonical_trim_arguments(argv.to_vec(), &options, server, db_index)
+}
+
+/// As Redis's `streamRewriteApproxSpecifier` and `streamRewriteTrimArgument`:
+/// `~` becomes `=` and the threshold becomes what the stream now holds, so the
+/// replayed trim removes exactly the same entries. `LIMIT` goes too, since an
+/// exact trim has no use for it and would reject it. An exact trim is already
+/// deterministic and is logged as sent.
+fn canonical_trim_arguments(
+    mut canonical: Vec<Bytes>,
+    options: &cmd_stream::AddTrimArgs,
+    server: &ServerState,
+    db_index: usize,
+) -> Option<Vec<Bytes>> {
+    if !options.approx {
+        return Some(canonical);
+    }
+    let strategy = options.strategy?;
+    let key = canonical.get(1)?;
+    let db = server.db(db_index);
+    let value = db.get(key)?;
+    let entries = value.as_stream_entries()?;
+    let threshold = match strategy {
+        cmd_stream::TrimStrategy::MaxLen(_) => Bytes::from(entries.len().to_string()),
+        cmd_stream::TrimStrategy::MinId(_) => {
+            // The first remaining ID. A trim that emptied the stream keeps
+            // only IDs past the last one.
+            let last_id = value.as_stream_meta()?.last_id;
+            let first = entries
+                .first()
+                .map(|entry| entry.id)
+                .or_else(|| cmd_stream::incremented_stream_id(last_id))
+                .unwrap_or(last_id);
+            cmd_stream::stream_id_to_bytes(first)
+        }
+    };
+
+    // Positions in `options` skip the command name.
+    let threshold_idx = options.strategy_arg_idx + 1;
+    *canonical.get_mut(threshold_idx - 1)? = Bytes::from_static(b"=");
+    *canonical.get_mut(threshold_idx)? = threshold;
+    let dropped = options
+        .limit_positions
+        .iter()
+        .flat_map(|at| [at + 1, at + 2])
+        .collect::<Vec<_>>();
+    Some(
+        canonical
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| !dropped.contains(at))
+            .map(|(_, arg)| arg)
+            .collect(),
+    )
 }
 
 fn raw_command_changed_state(command: &[u8], response: &RespFrame) -> bool {
@@ -5189,7 +5273,8 @@ fn maybe_track_write_version(
 
     let integer_zero = matches!(response, RespFrame::Integer(0));
     let should_mark = match command {
-        b"SET" => !matches!(response, RespFrame::BulkString(None)),
+        // XADD NOMKSTREAM on a missing key replies null and changes nothing.
+        b"SET" | b"XADD" => !matches!(response, RespFrame::BulkString(None)),
         b"GETEX" => argv.len() > 2,
         b"LMOVE" | b"BLMOVE" | b"RPOPLPUSH" | b"BRPOPLPUSH" | b"LMPOP" | b"BLMPOP" => {
             !matches!(response, RespFrame::BulkString(None) | RespFrame::NullArray)
@@ -6485,8 +6570,8 @@ mod tests {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
         run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
-        let max = i64::MAX.to_string();
-        let near_end = format!("{}-{max}", i64::MAX - 1);
+        let max = u64::MAX.to_string();
+        let near_end = format!("{}-{max}", u64::MAX - 1);
 
         // `*` carries an exhausted sequence into the next millisecond.
         assert_eq!(
@@ -6583,6 +6668,1129 @@ mod tests {
             crate::keyspace::StreamId { ms: 6, seq: 0 }
         );
         assert_eq!(meta("copy", &server), Some(original));
+    }
+
+    fn invalid_id_error() -> RespFrame {
+        RespFrame::error_str("ERR Invalid stream ID specified as stream command argument")
+    }
+
+    fn stream_ids(frame: RespFrame) -> Vec<String> {
+        let RespFrame::Array(rows) = frame else {
+            panic!("expected an array of entries, got {frame:?}");
+        };
+        rows.into_iter()
+            .map(|row| {
+                let RespFrame::Array(parts) = row else {
+                    panic!("entry should be an array");
+                };
+                let Some(RespFrame::BulkString(Some(id))) = parts.first() else {
+                    panic!("entry should start with its ID");
+                };
+                String::from_utf8_lossy(id).into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_stream_commands_take_bare_ms_and_refuse_dash_and_plus() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // XADD takes a bare millisecond value as `<ms>-0`.
+        assert_eq!(
+            run(&["XADD", "s", "5", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("5-0")
+        );
+        for bad in ["-", "+", "5-", "-5", "5-6-7", "x", "5-+"] {
+            assert_eq!(
+                run(&["XADD", "s", bad, "f", "v"], &mut server, &mut client),
+                invalid_id_error(),
+                "XADD {bad}"
+            );
+        }
+        // A leading plus sign and whitespace parse like Redis's strtoull.
+        assert_eq!(
+            run(&["XADD", "s", "+7-+1", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("7-1")
+        );
+        assert_eq!(
+            run(&["XADD", "s", " 8", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("8-0")
+        );
+        // Overflow is an invalid ID.
+        assert_eq!(
+            run(
+                &["XADD", "s", "18446744073709551616", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        // More than 127 bytes is an invalid ID.
+        let long = format!("{}9", "0".repeat(127));
+        assert_eq!(
+            run(&["XADD", "s", &long, "f", "v"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XDEL.
+        assert_eq!(
+            run(&["XDEL", "s", "5"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XDEL", "s", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XDEL {bad}"
+            );
+        }
+
+        // XREAD: bare ms, `$` and `+`; `-` is refused.
+        run(&["XADD", "r", "10-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "20-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "30-0", "f", "v"], &mut server, &mut client);
+        let read = |id: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XREAD", "STREAMS", "r", id], server, client)
+        };
+        let read_ids = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(streams) = frame else {
+                return Vec::new();
+            };
+            let RespFrame::Array(stream) = &streams[0] else {
+                panic!("stream reply should be an array");
+            };
+            stream_ids(stream[1].clone())
+        };
+        assert_eq!(
+            read_ids(read("10", &mut server, &mut client)),
+            ["20-0", "30-0"]
+        );
+        assert_eq!(read_ids(read("+", &mut server, &mut client)), ["30-0"]);
+        assert_eq!(read("$", &mut server, &mut client), RespFrame::NullArray);
+        assert_eq!(read("-", &mut server, &mut client), invalid_id_error());
+        // `+` on a missing stream reads nothing.
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "none", "+"], &mut server, &mut client),
+            RespFrame::NullArray
+        );
+
+        // XTRIM MINID takes a bare ms and refuses `-`.
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "20"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "-"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XSETID.
+        assert_eq!(
+            run(&["XSETID", "r", "40"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XSETID", "r", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XSETID {bad}"
+            );
+        }
+
+        // XGROUP CREATE: bare ms and `$` are accepted, `-` and `+` are not.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g2", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(
+                    &["XGROUP", "CREATE", "r", "g3", bad],
+                    &mut server,
+                    &mut client
+                ),
+                invalid_id_error(),
+                "XGROUP CREATE {bad}"
+            );
+        }
+
+        // XGROUP SETID is not strict: `-`, `+` and a bare ms all parse.
+        for (id, expected) in [
+            ("-", "0-0"),
+            ("+", "18446744073709551615-18446744073709551615"),
+            ("25", "25-0"),
+        ] {
+            assert_eq!(
+                run(&["XGROUP", "SETID", "r", "g", id], &mut server, &mut client),
+                RespFrame::ok(),
+                "XGROUP SETID {id}"
+            );
+            let last = server
+                .db(0)
+                .get(&Bytes::from_static(b"r"))
+                .and_then(|value| value.as_stream_groups())
+                .and_then(|groups| groups.get(&Bytes::from_static(b"g")))
+                .map(|group| group.last_delivered_id)
+                .expect("group");
+            assert_eq!(format!("{}-{}", last.ms, last.seq), expected);
+        }
+        assert_eq!(
+            run(
+                &["XGROUP", "SETID", "r", "g", "x"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+
+        // XREADGROUP, XACK and XCLAIM take strict IDs.
+        run(
+            &["XGROUP", "SETID", "r", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(&["XADD", "r", "50-0", "f", "v"], &mut server, &mut client);
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "r", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            stream_ids(run(
+                &["XCLAIM", "r", "g", "c2", "0", "50"],
+                &mut server,
+                &mut client
+            )),
+            ["50-0"]
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "r", "-"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "+"], &mut server, &mut client),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "50"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn interval_stream_commands_follow_redis_bounds() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for id in ["1-0", "1-5", "2-0", "2-7", "3-0"] {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let range = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+        let rev = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XREVRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+
+        // An incomplete start has sequence 0 and an incomplete end the maximum.
+        assert_eq!(
+            stream_ids(range(&["1", "2"], &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["2", "1"], &mut server, &mut client)),
+            ["2-7", "2-0", "1-5", "1-0"]
+        );
+        assert_eq!(
+            stream_ids(range(&["-", "+"], &mut server, &mut client)).len(),
+            5
+        );
+        // `(` excludes the bound; an incomplete exclusive start skips the
+        // whole `<ms>-0` and an incomplete exclusive end excludes `<ms>-MAX`.
+        assert_eq!(
+            stream_ids(range(&["(1-5", "(3-0"], &mut server, &mut client)),
+            ["2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(range(&["(1", "(3"], &mut server, &mut client)),
+            ["1-5", "2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["(3-0", "(1-5"], &mut server, &mut client)),
+            ["2-7", "2-0"]
+        );
+        // Edge errors.
+        assert_eq!(
+            range(
+                &["(18446744073709551615-18446744073709551615", "+"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            range(&["-", "(0-0"], &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        for bad in ["(-", "(+", "(", "x", "1-"] {
+            assert_eq!(
+                range(&[bad, "+"], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE {bad}"
+            );
+            assert_eq!(
+                range(&["-", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE end {bad}"
+            );
+        }
+        // The IDs are checked before COUNT, as in Redis.
+        assert_eq!(
+            range(&["x", "+", "COUNT", "y"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XPENDING and XAUTOCLAIM use the same interval bounds.
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending =
+            |start: &str, end: &str, server: &mut ServerState, client: &mut ClientState| {
+                run(&["XPENDING", "s", "g", start, end, "10"], server, client)
+            };
+        assert_eq!(
+            stream_ids(pending("1", "2", &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(pending("(1-5", "(3", &mut server, &mut client)),
+            ["2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            pending(
+                "(18446744073709551615-18446744073709551615",
+                "+",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            pending("-", "(0-0", &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        assert_eq!(
+            pending("(-", "+", &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        let claim = |start: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(
+                &["XAUTOCLAIM", "s", "g", "c2", "0", start, "JUSTID"],
+                server,
+                client,
+            )
+        };
+        // The JUSTID reply lists bare IDs, so read them directly.
+        let bare = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(parts) = frame else {
+                panic!("XAUTOCLAIM should return an array, got {frame:?}");
+            };
+            let RespFrame::Array(ids) = &parts[1] else {
+                panic!("claimed IDs should be an array");
+            };
+            ids.iter()
+                .map(|id| match id {
+                    RespFrame::BulkString(Some(raw)) => String::from_utf8_lossy(raw).into_owned(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(bare(claim("(2", &mut server, &mut client)), ["2-7", "3-0"]);
+        assert_eq!(
+            claim(
+                "(18446744073709551615-18446744073709551615",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(claim("(-", &mut server, &mut client), invalid_id_error());
+        assert_eq!(
+            bare(claim("+", &mut server, &mut client)),
+            Vec::<String>::new()
+        );
+    }
+
+    fn stream_len(key: &str, server: &mut ServerState, client: &mut ClientState) -> i64 {
+        match run(&["XLEN", key], server, client) {
+            RespFrame::Integer(len) => len,
+            other => panic!("XLEN should reply an integer, got {other:?}"),
+        }
+    }
+
+    fn fill_stream(key: &str, count: u64, server: &mut ServerState, client: &mut ClientState) {
+        for ms in 1..=count {
+            let id = format!("{ms}-0");
+            run(&["XADD", key, &id, "f", "v"], server, client);
+        }
+    }
+
+    #[test]
+    fn xadd_and_xtrim_option_errors_match_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let syntax = |text: &str| RespFrame::error_str(&format!("ERR {text}"));
+        let arity = RespFrame::error_str("ERR wrong number of arguments for 'xadd' command");
+
+        for (parts, expected) in [
+            (
+                &["XADD", "s", "MAXLEN", "-1", "*", "f", "v"][..],
+                RespFrame::error_str("ERR The MAXLEN argument must be >= 0."),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "abc", "*", "f", "v"][..],
+                RespFrame::error_str("ERR value is not an integer or out of range"),
+            ),
+            (
+                &[
+                    "XADD", "s", "MAXLEN", "~", "5", "LIMIT", "-1", "*", "f", "v",
+                ][..],
+                RespFrame::error_str("ERR The LIMIT argument must be >= 0."),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "5", "LIMIT", "2", "*", "f", "v"][..],
+                syntax("syntax error, LIMIT cannot be used without the special ~ option"),
+            ),
+            (
+                &["XADD", "s", "LIMIT", "2", "*", "f", "v"][..],
+                syntax("syntax error, LIMIT cannot be used without specifying a trimming strategy"),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "5", "MINID", "1", "*", "f", "v"][..],
+                syntax(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ),
+            ),
+            (
+                &["XADD", "s", "MINID", "-", "*", "f", "v"][..],
+                invalid_id_error(),
+            ),
+            // The ID is parsed before the field count is checked.
+            (&["XADD", "s", "badid", "f", "v"][..], invalid_id_error()),
+            (
+                &["XADD", "s", "badid", "f", "v", "g"][..],
+                invalid_id_error(),
+            ),
+            (&["XADD", "s", "1-1", "f", "v", "g"][..], arity.clone()),
+            // Redis's arity check (at least five words) runs first.
+            (&["XADD", "s", "badid", "f"][..], arity.clone()),
+            (&["XADD", "s", "1-1", "f"][..], arity.clone()),
+            (&["XADD", "s", "MAXLEN", "5", "*", "f"][..], arity.clone()),
+            (&["XADD", "s", "MAXLEN", "5"][..], arity),
+            // With no ID, the field name is read as the ID.
+            (
+                &["XADD", "s", "NOMKSTREAM", "MAXLEN", "5", "f"][..],
+                invalid_id_error(),
+            ),
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), expected, "{parts:?}");
+            assert_eq!(
+                run(&["EXISTS", "s"], &mut server, &mut client),
+                RespFrame::Integer(0),
+                "{parts:?} must not create the stream"
+            );
+        }
+
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        for (parts, expected) in [
+            (
+                &["XTRIM", "s", "MAXLEN", "-1"][..],
+                RespFrame::error_str("ERR The MAXLEN argument must be >= 0."),
+            ),
+            (
+                &["XTRIM", "s", "MAXLEN", "5", "LIMIT", "2"][..],
+                syntax("syntax error, LIMIT cannot be used without the special ~ option"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "2", "MAXLEN", "~", "5", "MINID", "1"][..],
+                syntax(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "2", "~"][..],
+                syntax("syntax error"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "0"][..],
+                syntax("syntax error, XTRIM must be called with a trimming strategy"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "3"][..],
+                syntax("syntax error, LIMIT cannot be used without specifying a trimming strategy"),
+            ),
+            (
+                &["XTRIM", "s", "NOMKSTREAM", "MAXLEN", "1"][..],
+                syntax("syntax error"),
+            ),
+            (&["XTRIM", "s", "MINID", "+"][..], invalid_id_error()),
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), expected, "{parts:?}");
+        }
+        assert_eq!(stream_len("s", &mut server, &mut client), 1);
+    }
+
+    #[test]
+    fn xadd_nomkstream_replies_null_without_creating() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        assert_eq!(
+            run(
+                &["XADD", "s", "NOMKSTREAM", "*", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(
+            run(
+                &[
+                    "XADD",
+                    "s",
+                    "NOMKSTREAM",
+                    "MAXLEN",
+                    "~",
+                    "1",
+                    "1-1",
+                    "f",
+                    "v"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(
+            run(&["EXISTS", "s"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+
+        // On an existing stream it adds like plain XADD.
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(
+                &["XADD", "s", "nomkstream", "2-1", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("2-1")
+        );
+        // A wrong-type key still reports WRONGTYPE.
+        run(&["SET", "str", "x"], &mut server, &mut client);
+        assert!(matches!(
+            run(
+                &["XADD", "str", "NOMKSTREAM", "*", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(_)
+        ));
+    }
+
+    #[test]
+    fn xadd_trims_after_appending_and_keeps_max_deleted_id() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 5, &mut server, &mut client);
+        let meta = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_meta().copied())
+                .expect("stream meta")
+        };
+        let before = meta(&server);
+
+        // MAXLEN counts the new entry.
+        assert_eq!(
+            run(
+                &["XADD", "s", "MAXLEN", "3", "6-0", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("6-0")
+        );
+        assert_eq!(
+            stream_ids(run(&["XRANGE", "s", "-", "+"], &mut server, &mut client)),
+            ["4-0", "5-0", "6-0"]
+        );
+        // Trimming does not move max_deleted_id, and entries_added counts the add.
+        let after = meta(&server);
+        assert_eq!(after.max_deleted_id, before.max_deleted_id);
+        assert_eq!(after.entries_added, before.entries_added + 1);
+        assert_eq!(after.last_id, crate::keyspace::StreamId { ms: 6, seq: 0 });
+
+        // MINID, with `=`, and a bare millisecond threshold.
+        assert_eq!(
+            run(
+                &["XADD", "s", "MINID", "=", "5", "7-0", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("7-0")
+        );
+        assert_eq!(
+            stream_ids(run(&["XRANGE", "s", "-", "+"], &mut server, &mut client)),
+            ["5-0", "6-0", "7-0"]
+        );
+
+        // `~` removes whole nodes of 100 entries from the front, and stops
+        // before a node that would take it past LIMIT: 301 entries with
+        // MAXLEN 2 could lose three nodes, LIMIT 150 allows one.
+        run(&["DEL", "s"], &mut server, &mut client);
+        fill_stream("s", 300, &mut server, &mut client);
+        run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "301-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 201);
+        // A LIMIT smaller than a node removes nothing.
+        run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "5", "302-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 202);
+        // Without LIMIT both leading nodes go, and the short last node stays
+        // since removing it would leave the stream under MAXLEN.
+        run(
+            &["XADD", "s", "MAXLEN", "~", "2", "303-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 3);
+        // A stream shorter than a node is one partial node: it goes whole
+        // when MAXLEN allows, otherwise it stays.
+        run(
+            &["XADD", "s", "MAXLEN", "~", "2", "304-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 4);
+        run(
+            &["XADD", "s", "MAXLEN", "~", "0", "305-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 0);
+
+        // LIMIT 0 means no cap.
+        fill_stream("t", 600, &mut server, &mut client);
+        run(
+            &[
+                "XADD", "t", "MAXLEN", "~", "1", "LIMIT", "0", "601-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("t", &mut server, &mut client), 1);
+
+        // Without LIMIT, `~` removes at most 100 nodes (10000 entries).
+        fill_stream("u", 20_000, &mut server, &mut client);
+        run(
+            &["XADD", "u", "MAXLEN", "~", "1", "20001-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("u", &mut server, &mut client), 10_001);
+    }
+
+    #[test]
+    fn xtrim_uses_the_shared_options() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 1000, &mut server, &mut client);
+
+        // Nodes of 100 go while the total stays within LIMIT: one of them.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "~", "8", "LIMIT", "150"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(100)
+        );
+        // The options may come in any order.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "LIMIT", "250", "MAXLEN", "~", "4"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 700);
+        // Exact trims ignore the node size.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "=", "500"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        // A node that would take the stream under MAXLEN stays.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "~", "450"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(0)
+        );
+        // Two nodes end below ID 800.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "minid", "~", "800"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        assert_eq!(
+            run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client),
+            RespFrame::Integer(300)
+        );
+        // An emptied stream stays, and a missing key trims zero entries.
+        assert_eq!(
+            run(&["EXISTS", "s"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["XTRIM", "none", "MAXLEN", "1"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+    }
+
+    fn logged_argv(client: &mut ClientState) -> Option<Vec<String>> {
+        client.take_durability_effects().map(|effects| {
+            assert_eq!(effects.commands.len(), 1);
+            effects.commands[0]
+                .argv
+                .iter()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn aof_capture_rewrites_approximate_trims_to_exact_ones() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let argv = |parts: &[&str]| {
+            Some(
+                parts
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        fill_stream("s", 300, &mut server, &mut client);
+        client.take_durability_effects();
+
+        // `~` becomes `=`, the threshold the resulting length, LIMIT goes,
+        // and `*` becomes the generated ID. 301 entries lose one node of 100
+        // within LIMIT 150.
+        let RespFrame::BulkString(Some(id)) = run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "*", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XADD should reply with an ID");
+        };
+        let id = String::from_utf8_lossy(&id).into_owned();
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "s", "MAXLEN", "=", "201", &id, "f", "v"])
+        );
+
+        // A LIMIT that stops the trim early is reflected in the length.
+        fill_stream("t", 1000, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &[
+                "XADD", "t", "MAXLEN", "~", "2", "LIMIT", "300", "1001-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "t", "MAXLEN", "=", "701", "1001-0", "f", "v"])
+        );
+
+        // MINID logs the first remaining ID, and options before the ID may
+        // come in any order (the ID is not at a fixed position). 599 entries
+        // are below 900, which rounds down to 500, and LIMIT 200 stops there.
+        run(
+            &[
+                "XADD",
+                "t",
+                "NOMKSTREAM",
+                "LIMIT",
+                "200",
+                "MINID",
+                "~",
+                "900",
+                "1002-0",
+                "f",
+                "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&[
+                "XADD",
+                "t",
+                "NOMKSTREAM",
+                "MINID",
+                "=",
+                "501-0",
+                "1002-0",
+                "f",
+                "v"
+            ])
+        );
+
+        // An exact trim is logged as sent, with only the ID resolved.
+        run(
+            &["XADD", "t", "MAXLEN", "5", "1003-*", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "t", "MAXLEN", "5", "1003-0", "f", "v"])
+        );
+
+        // NOMKSTREAM on a missing key logs nothing.
+        assert_eq!(
+            run(
+                &[
+                    "XADD",
+                    "gone",
+                    "NOMKSTREAM",
+                    "MAXLEN",
+                    "~",
+                    "1",
+                    "*",
+                    "f",
+                    "v"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(logged_argv(&mut client), None);
+
+        // XTRIM: `~` is rewritten and a trim that removed nothing is not logged.
+        fill_stream("w", 400, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &["XTRIM", "w", "MAXLEN", "~", "3", "LIMIT", "150"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MAXLEN", "=", "300"])
+        );
+        run(
+            &["XTRIM", "w", "MINID", "~", "250"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MINID", "=", "201-0"])
+        );
+        run(
+            &["XTRIM", "w", "MAXLEN", "~", "250"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(logged_argv(&mut client), None);
+        run(&["XTRIM", "w", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MAXLEN", "0"])
+        );
+        run(&["XTRIM", "w", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(logged_argv(&mut client), None);
+
+        // A MINID trim that empties the stream logs the ID after the last one.
+        fill_stream("x", 100, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &["XTRIM", "x", "MINID", "~", "1000"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "x", "MINID", "=", "100-1"])
+        );
+    }
+
+    #[test]
+    fn replaying_the_logged_trims_reproduces_the_stream() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        let mut record = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        };
+        for ms in 1..=300 {
+            let id = format!("{ms}-0");
+            record(&["XADD", "s", &id, "f", "v"], &mut server, &mut client);
+        }
+        record(
+            &[
+                "XADD", "s", "MAXLEN", "~", "3", "LIMIT", "100", "*", "g", "w",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &[
+                "XADD",
+                "s",
+                "MINID",
+                "~",
+                "250",
+                "1000000000000000-*",
+                "h",
+                "x",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XTRIM", "s", "MAXLEN", "~", "2", "LIMIT", "150"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XADD", "s", "NOMKSTREAM", "MAXLEN", "0", "*", "z", "z"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XADD", "s", "MAXLEN", "~", "1", "*", "y", "y"],
+            &mut server,
+            &mut client,
+        );
+        assert!(
+            log.iter()
+                .any(|argv| argv.iter().any(|arg| arg.as_ref() == b"=")),
+            "the approximate trims should have been logged as exact ones"
+        );
+
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        let range = |server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", "s", "-", "+"], server, client)
+        };
+        assert_eq!(
+            range(&mut replayed, &mut replay_client),
+            range(&mut server, &mut client)
+        );
+        let meta = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_meta().copied())
+        };
+        assert_eq!(meta(&replayed), meta(&server));
+    }
+
+    #[test]
+    fn xreadgroup_reassigning_a_pending_id_moves_it_between_consumers() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "a", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        // Rewinding the group delivers the same IDs to another consumer.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending = |server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(rows) = run(&["XINFO", "CONSUMERS", "s", "g"], server, client)
+            else {
+                panic!("XINFO CONSUMERS should return an array");
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let RespFrame::Array(fields) = row else {
+                        panic!("a consumer should be an array");
+                    };
+                    (fields[1].clone(), fields[3].clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(3)),
+            ]
+        );
+        // The delivery count restarts at 1 whether or not the owner changed.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(rows) = run(
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XPENDING should return an array");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let RespFrame::Array(fields) = row else {
+                panic!("a pending entry should be an array");
+            };
+            assert_eq!(fields[1], RespFrame::bulk_str("b"));
+            assert_eq!(fields[3], RespFrame::Integer(1));
+        }
+
+        // Trimming everything leaves no pending entry on either consumer.
+        run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn dump_restore_roundtrips_stream_ids_across_the_u64_range() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let ids = [
+            "0-1",
+            "9223372036854775807-5",
+            "18446744073709551615-18446744073709551615",
+        ];
+        for id in ids {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let RespFrame::BulkString(Some(payload)) = run(&["DUMP", "s"], &mut server, &mut client)
+        else {
+            panic!("DUMP should return a payload");
+        };
+        assert_eq!(
+            run_bytes(
+                &[
+                    Bytes::from_static(b"RESTORE"),
+                    Bytes::from_static(b"copy"),
+                    Bytes::from_static(b"0"),
+                    payload,
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        let range = |key: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", key, "-", "+"], server, client)
+        };
+        assert_eq!(
+            range("copy", &mut server, &mut client),
+            range("s", &mut server, &mut client)
+        );
+        let RespFrame::Array(rows) = range("copy", &mut server, &mut client) else {
+            panic!("XRANGE should return an array");
+        };
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]

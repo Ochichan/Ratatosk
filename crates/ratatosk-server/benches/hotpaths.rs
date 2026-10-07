@@ -114,7 +114,7 @@ fn build_stream_entries(entry_count: usize) -> Vec<StreamEntry> {
         entries.push(StreamEntry {
             id: StreamId {
                 ms: 1,
-                seq: seq as i64,
+                seq: seq as u64,
             },
             fields: vec![(bs(b"f"), bs(b"v"))],
         });
@@ -137,7 +137,7 @@ fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState,
     for seq in 0..pending_len {
         let id = StreamId {
             ms: 1,
-            seq: seq as i64,
+            seq: seq as u64,
         };
         consumer_pending.insert(id);
         pending.insert(
@@ -164,7 +164,7 @@ fn setup_stream_state(entry_count: usize, pending_count: usize) -> (ServerState,
     } else {
         StreamId {
             ms: 1,
-            seq: pending_len as i64 - 1,
+            seq: pending_len as u64 - 1,
         }
     };
 

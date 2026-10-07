@@ -4732,7 +4732,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Auto-ID, explicit ID and millisecond-* ID forms; AOF records the resolved ID. Other Redis XADD option variants remain outside this baseline."
+      "notes": "Auto-ID, explicit ID and millisecond-* ID forms with Redis's ID parser (a bare millisecond value is <ms>-0; - and + are refused; IDs span the full unsigned 64-bit range). NOMKSTREAM, MAXLEN and MINID with = or ~, and LIMIT, with Redis's option errors; the ID is parsed before the field count is checked. A ~ trim models Redis's streamTrim on nodes of 100 entries (stream-node-max-entries default) counted from the front, the last node possibly partial: whole leading nodes go while the stream stays at or above MAXLEN (MINID: while the node's last ID is below it), and the trim stops before a node that would take the total past LIMIT, which defaults to 10000 entries (LIMIT 0 is no cap). Redis's real nodes also depend on the history of XADD and XDEL, so the counts can differ. Trimming leaves max_deleted_id unchanged, as in Redis. Unlike Redis, trimmed IDs are also dropped from group pending lists, because XREADGROUP history, XCLAIM, XAUTOCLAIM and XPENDING do not handle pending IDs whose entry is gone (Redis keeps them); the cost follows the number of removed IDs. KEEPREF, DELREF, ACKED and IDMP (newer than Redis 7.x) are out of scope. AOF records the resolved ID, rewrites a ~ trim to = with the exact resulting length or first remaining ID, drops LIMIT, and logs nothing for NOMKSTREAM on a missing key. AOF replay accepts the raw forms an earlier version logged (LIMIT without ~ still caps the trim, ~ trims exactly, IDs over 127 bytes)."
     },
     {
       "name": "XAUTOCLAIM",
@@ -4745,7 +4745,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution)."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The start is an interval bound like Redis: - and +, a bare millisecond value, and the ( exclusive prefix with Redis's invalid start ID error."
     },
     {
       "name": "XCFGSET",
@@ -4784,7 +4784,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution)."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). IDs use Redis's strict parser: a bare millisecond value is <ms>-0, and - and + are refused."
     },
     {
       "name": "XDELEX",
@@ -4810,7 +4810,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. Group cursors accept omitted sequence zero, including the common cursor 0."
+      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. CREATE takes a strict ID (a bare millisecond value is <ms>-0, - and + are refused) or $; SETID takes any ID including - and +. ENTRIESREAD and entries_read are not supported."
     },
     {
       "name": "XGROUP CREATE",
@@ -4823,7 +4823,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (MKSTREAM + BUSYGROUP + id/$ support)."
+      "notes": "M3 stream group baseline implemented (MKSTREAM + BUSYGROUP + strict ID or $; a bare millisecond value is <ms>-0, - and + are refused). ENTRIESREAD is not supported."
     },
     {
       "name": "XGROUP CREATECONSUMER",
@@ -4888,7 +4888,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented."
+      "notes": "M3 stream group baseline implemented. The ID is parsed non-strictly like Redis: a bare millisecond value, - and +, or $. ENTRIESREAD is not supported."
     },
     {
       "name": "XINFO",
@@ -4979,7 +4979,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (summary + range forms)."
+      "notes": "M3 stream group baseline implemented (summary + range forms). The range bounds use Redis's interval parser (- and +, incomplete IDs, and the ( exclusive prefix with Redis's invalid start/end ID errors). The IDLE option is not supported."
     },
     {
       "name": "XRANGE",
@@ -4992,7 +4992,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (inclusive range + COUNT option)."
+      "notes": "Inclusive range, COUNT, and Redis's interval parser: - and +, an incomplete start means sequence 0 and an incomplete end the maximum, and the ( prefix excludes a bound with Redis's invalid start/end ID errors. A negative COUNT is an error here (Redis treats it as 0)."
     },
     {
       "name": "XREAD",
@@ -5005,7 +5005,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback)."
+      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). IDs use Redis's strict parser (a bare millisecond value is <ms>-0, - is refused), and $ and + are accepted; + reads the last entry."
     },
     {
       "name": "XREADGROUP",
@@ -5031,7 +5031,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (reverse inclusive range + COUNT option)."
+      "notes": "Reverse inclusive range, COUNT, and Redis's interval parser: - and +, an incomplete start means sequence 0 and an incomplete end the maximum, and the ( prefix excludes a bound with Redis's invalid start/end ID errors. A negative COUNT is an error here (Redis treats it as 0)."
     },
     {
       "name": "XSETID",
@@ -5057,7 +5057,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution)."
+      "notes": "MAXLEN and MINID with = or ~, and LIMIT, parsed by the same code as XADD with Redis's option errors. A ~ trim models Redis's streamTrim on nodes of 100 entries (stream-node-max-entries default) counted from the front, the last node possibly partial: whole leading nodes go while the stream stays at or above MAXLEN (MINID: while the node's last ID is below it), and the trim stops before a node that would take the total past LIMIT, which defaults to 10000 entries (LIMIT 0 is no cap). Redis's real nodes also depend on the history of XADD and XDEL, so the counts can differ. Trimming leaves max_deleted_id unchanged, as in Redis. Unlike Redis, trimmed IDs are also dropped from group pending lists, because XREADGROUP history, XCLAIM, XAUTOCLAIM and XPENDING do not handle pending IDs whose entry is gone (Redis keeps them); the cost follows the number of removed IDs. KEEPREF, DELREF, ACKED and IDMP (newer than Redis 7.x) are out of scope. AOF logs only a trim that removed entries, with ~ rewritten to = and the exact threshold, and LIMIT dropped. AOF replay accepts the raw forms an earlier version logged."
     },
     {
       "name": "ZADD",
