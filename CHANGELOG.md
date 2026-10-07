@@ -175,6 +175,9 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
+- `XSETID` and `XCFGSET` are now `syntax_only`, so `compatibility-mode strict`
+  rejects them. They validate arguments and reply OK without changing stream
+  state.
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
 - `DUMP` emits payload version `RATSK2`; `RESTORE` still accepts `RATSK1`.

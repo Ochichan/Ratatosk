@@ -14,6 +14,7 @@ struct Server {
     dir: tempfile::TempDir,
     port: u16,
     appendonly: bool,
+    compatibility_mode: &'static str,
 }
 
 impl Server {
@@ -23,6 +24,7 @@ impl Server {
             dir: tempfile::tempdir()?,
             port: reserve_port()?,
             appendonly,
+            compatibility_mode: "compat",
         };
         server.start()?;
         Ok(server)
@@ -42,6 +44,7 @@ impl Server {
             .env("RATATOSK_PORT", self.port.to_string())
             .env("RATATOSK_DIR", self.dir.path())
             .env("RATATOSK_APPENDONLY", self.appendonly.to_string())
+            .env("RATATOSK_COMPATIBILITY_MODE", self.compatibility_mode)
             .env("RATATOSK_APPENDFSYNC", "always")
             .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
             .env("RATATOSK_ALLOW_NO_METRICS", "true")
@@ -249,6 +252,45 @@ fn aof_replays_absolute_ttl_and_resolved_stream_id() -> io::Result<()> {
                 RespFrame::bulk_str("value")
             ]),
         ])])
+    );
+    Ok(())
+}
+
+#[test]
+fn strict_mode_restart_replays_commands_it_rejects_from_clients() -> io::Result<()> {
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    assert_eq!(
+        client.command(&["XADD", "events", "5-1", "field", "value"])?,
+        RespFrame::bulk_str("5-1")
+    );
+    drop(client);
+    server.stop(false)?;
+
+    // Older builds logged XSETID. Append such a record to the newest INCR file.
+    let mut incr_files = std::fs::read_dir(server.dir.path())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.to_string_lossy().ends_with(".incr.aof"))
+        .collect::<Vec<_>>();
+    incr_files.sort();
+    let incr = incr_files.last().expect("AOF INCR file");
+    let record = b"*3\r\n$15\r\nRATATOSK.AOF.AT\r\n:1\r\n*3\r\n$6\r\nXSETID\r\n$6\r\nevents\r\n$3\r\n9-0\r\n";
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(incr)?
+        .write_all(record)?;
+
+    server.compatibility_mode = "strict";
+    server.start()?;
+    let mut client = server.client()?;
+    assert_eq!(client.command(&["XLEN", "events"])?, RespFrame::Integer(1));
+    let RespFrame::Error(message) = client.command(&["XSETID", "events", "9-0"])? else {
+        panic!("strict mode should reject XSETID from a client");
+    };
+    assert!(
+        message.starts_with(b"ERR command XSETID is not supported in Ratatosk strict"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&message)
     );
     Ok(())
 }

@@ -4619,6 +4619,9 @@ fn capture_durability_effects(
         // a successful CONFIG reply as if it were data.
         b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"SELECT" | b"CONFIG"
         | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF" | b"PUBLISH" | b"SPUBLISH" => None,
+        // XSETID/XCFGSET reply OK without changing stream state, and strict
+        // mode rejects them, so logging them would only make replay fragile.
+        b"XSETID" | b"XCFGSET" => None,
         _ if is_write_command(argv) && raw_command_changed_state(command, response) => {
             Some(argv.to_vec())
         }
@@ -6290,6 +6293,79 @@ mod tests {
             blocked_total >= 50,
             "expected strict mode to block a substantial set, got {blocked_total}"
         );
+    }
+
+    #[test]
+    fn strict_mode_rejects_stream_admin_commands_that_change_no_state() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // Compat mode keeps today's behaviour: both validate and reply OK.
+        run(
+            &["XADD", "mystream", "5-1", "a", "b"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(&["XSETID", "mystream", "5-1"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["XCFGSET", "mystream", "IDMP-DURATION", "10"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+
+        server
+            .config
+            .set_compatibility_mode(Bytes::from_static(b"strict"));
+        for (name, parts) in [
+            ("XSETID", vec!["XSETID", "mystream", "0-0"]),
+            (
+                "XCFGSET",
+                vec!["XCFGSET", "mystream", "IDMP-DURATION", "10"],
+            ),
+        ] {
+            let frame = run(&parts, &mut server, &mut client);
+            assert_strict_blocked(&frame, &parts.join(" "));
+            assert_eq!(
+                frame,
+                RespFrame::Error(Bytes::from(format!(
+                    "ERR command {name} is not supported in Ratatosk strict compatibility mode; reason=command is only accepted syntactically and has no Redis-equivalent operational effect"
+                )))
+            );
+        }
+    }
+
+    #[test]
+    fn stream_admin_commands_that_change_no_state_are_not_logged() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+
+        run(
+            &["XADD", "mystream", "5-1", "a", "b"],
+            &mut server,
+            &mut client,
+        );
+        assert!(client.take_durability_effects().is_some());
+        assert_eq!(
+            run(&["XSETID", "mystream", "9-0"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert!(client.take_durability_effects().is_none());
+        assert_eq!(
+            run(
+                &["XCFGSET", "mystream", "IDMP-DURATION", "10"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert!(client.take_durability_effects().is_none());
     }
 
     #[test]
