@@ -5668,63 +5668,6 @@ mod tests {
     }
 
     #[test]
-    fn exec_with_extra_arguments_aborts_the_transaction() {
-        let mut server = ServerState::with_default_dbs();
-        let mut client = ClientState::default();
-        run(&["MULTI"], &mut server, &mut client);
-        run(&["SET", "k", "1"], &mut server, &mut client);
-        assert_eq!(
-            run(&["EXEC", "extra"], &mut server, &mut client),
-            RespFrame::error_str(
-                "EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command"
-            )
-        );
-        assert!(!client.in_multi());
-        assert_eq!(
-            run(&["EXEC"], &mut server, &mut client),
-            RespFrame::error_str("ERR EXEC without MULTI")
-        );
-        assert_eq!(
-            run(&["GET", "k"], &mut server, &mut client),
-            RespFrame::BulkString(None)
-        );
-    }
-
-    #[test]
-    fn rejected_exec_aborts_the_transaction_and_releases_watches() {
-        let mut server = ServerState::with_default_dbs();
-        let mut client = ClientState::default();
-        run(&["WATCH", "w"], &mut server, &mut client);
-        run(&["MULTI"], &mut server, &mut client);
-        run(&["SET", "a", "1"], &mut server, &mut client);
-        let reply = client.reject_command(
-            true,
-            RespFrame::error_str("NOPERM nope"),
-            Some(&server.data),
-        );
-        assert_eq!(
-            reply,
-            RespFrame::error_str("EXECABORT Transaction discarded because of: NOPERM nope")
-        );
-        assert!(!client.in_multi());
-        assert!(client.watched.is_empty());
-
-        // A command refused while queued flags the transaction instead.
-        run(&["MULTI"], &mut server, &mut client);
-        let reply = client.reject_command(
-            false,
-            RespFrame::error_str("NOPERM nope"),
-            Some(&server.data),
-        );
-        assert_eq!(reply, RespFrame::error_str("NOPERM nope"));
-        assert!(client.in_multi());
-        assert_eq!(
-            run(&["EXEC"], &mut server, &mut client),
-            RespFrame::error_str("EXECABORT Transaction discarded because of previous errors.")
-        );
-    }
-
-    #[test]
     fn noeviction_admits_one_overshoot_then_allows_reads_and_freeing() {
         let mut server = ServerState::with_default_dbs();
         server.config.set_maxmemory(1);
@@ -5888,6 +5831,63 @@ mod tests {
             &mut server,
             &mut client,
         ));
+    }
+
+    #[test]
+    fn exec_with_extra_arguments_aborts_the_transaction() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "k", "1"], &mut server, &mut client);
+        assert_eq!(
+            run(&["EXEC", "extra"], &mut server, &mut client),
+            RespFrame::error_str(
+                "EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command"
+            )
+        );
+        assert!(!client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("ERR EXEC without MULTI")
+        );
+        assert_eq!(
+            run(&["GET", "k"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+    }
+
+    #[test]
+    fn rejected_exec_aborts_the_transaction_and_releases_watches() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["WATCH", "w"], &mut server, &mut client);
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "a", "1"], &mut server, &mut client);
+        let reply = client.reject_command(
+            true,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(
+            reply,
+            RespFrame::error_str("EXECABORT Transaction discarded because of: NOPERM nope")
+        );
+        assert!(!client.in_multi());
+        assert!(client.watched.is_empty());
+
+        // A command refused while queued flags the transaction instead.
+        run(&["MULTI"], &mut server, &mut client);
+        let reply = client.reject_command(
+            false,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(reply, RespFrame::error_str("NOPERM nope"));
+        assert!(client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("EXECABORT Transaction discarded because of previous errors.")
+        );
     }
 
     #[test]
