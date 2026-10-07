@@ -3525,7 +3525,7 @@ mod sorted_set_rank_tests {
             }
         }
         assert_matches(&zset, &reference);
-        assert!(zset.len() > 1024, "test must span several chunks");
+        assert!(zset.len() > 1024, "test must span several leaves");
 
         // Rank-window helpers, forward and reverse.
         let all: Vec<&SortedSetEntry> = reference.keys().collect();

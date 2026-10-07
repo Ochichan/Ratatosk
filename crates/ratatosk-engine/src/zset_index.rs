@@ -18,6 +18,13 @@
 //! - `rank_of` / `get`: one descent, summing child counts along the way.
 //! - `range` / `iter_ranks`: one or two descents, then O(1) per item.
 //!
+//! Removals do not rebalance internal nodes. Instead the tree is rebuilt
+//! from an in-order walk when it holds far more memory than its items need
+//! (mostly empty leaves, many nodes, or arenas full of freed slots), so
+//! memory follows the current size rather than the history of the set.
+//! Vectors start small and grow on demand, so a one-member set is a few
+//! hundred bytes.
+//!
 //! The nodes sit in two arenas of `Vec`s addressed by `u32` ids, so the code
 //! is safe Rust. The state is behind one `Box` to keep the index a single
 //! pointer wide.
@@ -33,11 +40,23 @@ const LEAF_MERGE_MAX: usize = 24;
 /// A full leaf shifts items into its next sibling only if that sibling has
 /// at least this many free slots.
 const LEAF_SHIFT_SLACK: usize = 8;
+/// A rebuilt tree packs this many items into each leaf.
+const REBUILD_LEAF: usize = 24;
+/// A rebuilt tree packs this many children into each internal node.
+const REBUILD_NODE: usize = 96;
 /// Maximum children of an internal node.
 const NODE_MAX: usize = 128;
 /// Deeper than any tree this index can build (32^10 items).
 const MAX_DEPTH: usize = 10;
 const NIL: u32 = u32::MAX;
+
+/// Where an insert lands relative to the whole index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Below,
+    Above,
+    Inside,
+}
 
 /// Items the index can order. `lead` is an order-preserving prefix:
 /// `a <= b` must imply `a.lead() <= b.lead()`. Items with equal leads are
@@ -107,6 +126,16 @@ impl<T> Default for OrderedIndex<T> {
                 tail: NIL,
             }),
         }
+    }
+}
+
+/// Make room for `new_len` entries without letting `Vec` double past `max`:
+/// capacity grows 4, 8, 16, ... up to `max`, so small sets stay small and a
+/// full node is never larger than `max` entries.
+fn grow_to<U>(v: &mut Vec<U>, new_len: usize, max: usize) {
+    if new_len > v.capacity() {
+        let target = (v.capacity() * 2).clamp(4, max).max(new_len);
+        v.reserve_exact(target - v.len());
     }
 }
 
@@ -182,6 +211,110 @@ impl<T: OrderLead> Inner<T> {
         self.free_nodes.push(id);
     }
 
+    /// Build a tree holding `items` (sorted, unique), packed to about
+    /// `REBUILD_LEAF` per leaf and `REBUILD_NODE` per node, with exact-size
+    /// vectors and arenas.
+    fn from_sorted(items: Vec<T>) -> Self {
+        let n = items.len();
+        let mut inner = Inner {
+            leaves: Vec::new(),
+            nodes: Vec::new(),
+            free_leaves: Vec::new(),
+            free_nodes: Vec::new(),
+            root: NIL,
+            height: 0,
+            len: n,
+            head: NIL,
+            tail: NIL,
+        };
+        if n == 0 {
+            return inner;
+        }
+        let leaf_count = if n <= LEAF_MAX {
+            1
+        } else {
+            n.div_ceil(REBUILD_LEAF)
+        };
+        inner.leaves.reserve_exact(leaf_count);
+        // One entry per subtree on the current level: (id, count, maximum).
+        let mut level: Vec<(u32, usize, T)> = Vec::with_capacity(leaf_count);
+        let mut source = items.into_iter();
+        let mut prev = NIL;
+        for i in 0..leaf_count {
+            let size = n / leaf_count + usize::from(i < n % leaf_count);
+            let chunk: Vec<T> = source.by_ref().take(size).collect();
+            let leads: Vec<u64> = chunk.iter().map(OrderLead::lead).collect();
+            let max = chunk.last().cloned().expect("chunks are non-empty");
+            let id = inner.alloc_leaf(chunk, leads, prev, NIL);
+            if prev == NIL {
+                inner.head = id;
+            } else {
+                inner.leaves[prev as usize].next = id;
+            }
+            prev = id;
+            level.push((id, size, max));
+        }
+        inner.tail = prev;
+        while level.len() > 1 {
+            let groups = level.len().div_ceil(REBUILD_NODE);
+            let total = level.len();
+            inner.nodes.reserve_exact(groups);
+            let mut upper: Vec<(u32, usize, T)> = Vec::with_capacity(groups);
+            let mut children = level.into_iter();
+            for g in 0..groups {
+                let size = total / groups + usize::from(g < total % groups);
+                let mut node = Node {
+                    keys: Vec::with_capacity(size),
+                    leads: Vec::with_capacity(size),
+                    kids: Vec::with_capacity(size),
+                };
+                let mut count = 0;
+                let mut max = None;
+                for (id, c, key) in children.by_ref().take(size) {
+                    node.leads.push(key.lead());
+                    node.kids.push(Kid { count: c, id });
+                    count += c;
+                    if node.keys.len() + 1 == size {
+                        max = Some(key.clone());
+                    }
+                    node.keys.push(key);
+                }
+                let id = inner.alloc_node(node);
+                upper.push((id, count, max.expect("groups are non-empty")));
+            }
+            level = upper;
+            inner.height += 1;
+        }
+        inner.root = level[0].0;
+        inner
+    }
+
+    /// Rebuild the tree when it holds far more memory than its items need:
+    /// leaves mostly empty, many internal nodes, or arenas dominated by freed
+    /// slots. Deletions never rebalance internal nodes, so this bounds memory
+    /// by the current size rather than by the history of the set. Each
+    /// rebuild is O(n) and needs the set to shrink by a constant factor first,
+    /// so removals stay O(1) amortized extra.
+    fn compact_if_sparse(&mut self) {
+        let live_leaves = self.leaves.len() - self.free_leaves.len();
+        let live_nodes = self.nodes.len() - self.free_nodes.len();
+        let sparse_leaves = live_leaves * LEAF_MAX > 4 * self.len + 4 * LEAF_MAX;
+        let sparse_nodes = live_nodes * 24 > live_leaves + 96;
+        let slack_leaves = self.leaves.len() > 2 * live_leaves + 16;
+        let slack_nodes = self.nodes.len() > 2 * live_nodes + 16;
+        if !(sparse_leaves || sparse_nodes || slack_leaves || slack_nodes) {
+            return;
+        }
+        let mut items = Vec::with_capacity(self.len);
+        let mut id = self.head;
+        while id != NIL {
+            let leaf = &mut self.leaves[id as usize];
+            items.append(&mut leaf.items);
+            id = leaf.next;
+        }
+        *self = Self::from_sorted(items);
+    }
+
     fn first_item(&self) -> Option<&T> {
         self.leaves.get(self.head as usize)?.items.first()
     }
@@ -232,18 +365,17 @@ impl<T: OrderLead> Inner<T> {
         }
     }
 
-    /// Split the full leaf `id`, leaving `at` items in place. `at` is chosen
-    /// from where `incoming` will land: an append keeps the old leaf nearly
-    /// full and a prepend gives it nearly all items to the new leaf, so
-    /// sequential fills pack leaves instead of leaving them half empty.
-    fn split_leaf(&mut self, id: u32, incoming: &T) -> u32 {
-        let items = &self.leaf(id).items;
-        let mid = if *incoming > items[items.len() - 1] {
-            items.len() - 1
-        } else if *incoming < items[0] {
-            1
-        } else {
-            items.len() / 2
+    /// Split the full leaf `id`. An insert beyond the whole index's maximum
+    /// keeps the old leaf nearly full and a prepend gives nearly all items to
+    /// the new leaf, so sequential fills pack leaves instead of leaving them
+    /// half empty. Every other insert splits evenly, including one that
+    /// lands in a gap between leaves.
+    fn split_leaf(&mut self, id: u32, edge: Edge) -> u32 {
+        let len = self.leaf(id).items.len();
+        let mid = match edge {
+            Edge::Above => len - 1,
+            Edge::Below => 1,
+            Edge::Inside => len / 2,
         };
         let leaf = &mut self.leaves[id as usize];
         let mut items = Vec::with_capacity(LEAF_MAX);
@@ -265,9 +397,9 @@ impl<T: OrderLead> Inner<T> {
         let mid = self.node(id).kids.len() / 2;
         let node = &mut self.nodes[id as usize];
         let mut upper = Node {
-            keys: Vec::with_capacity(NODE_MAX),
-            leads: Vec::with_capacity(NODE_MAX),
-            kids: Vec::with_capacity(NODE_MAX),
+            keys: Vec::new(),
+            leads: Vec::new(),
+            kids: Vec::new(),
         };
         upper.keys.extend(node.keys.drain(mid..));
         upper.leads.extend(node.leads.drain(mid..));
@@ -277,11 +409,11 @@ impl<T: OrderLead> Inner<T> {
 
     /// Make room in the full leaf child `ci` of `parent` by moving its upper
     /// items into the next sibling, when that sibling has slack and the
-    /// incoming item lands inside the leaf (appends and prepends split
-    /// instead, which packs sequential fills). Returns whether it shifted.
-    /// Sharing load this way keeps random fills about 80% full instead of
-    /// 69%, which saves memory.
-    fn try_shift_right(&mut self, parent: u32, ci: usize, incoming: &T) -> bool {
+    /// insert is not a sequential append or prepend (those split instead,
+    /// which packs sequential fills). Returns whether it shifted. Sharing
+    /// load this way raises the fill of randomly built leaves, which saves
+    /// memory.
+    fn try_shift_right(&mut self, parent: u32, ci: usize, edge: Edge) -> bool {
         let node = self.node(parent);
         if ci + 1 >= node.kids.len() {
             return false;
@@ -289,10 +421,7 @@ impl<T: OrderLead> Inner<T> {
         let (src, dst) = (node.kids[ci].id, node.kids[ci + 1].id);
         let items = &self.leaf(src).items;
         let dst_len = self.leaf(dst).items.len();
-        if *incoming > items[items.len() - 1]
-            || *incoming < items[0]
-            || dst_len + LEAF_SHIFT_SLACK > LEAF_MAX
-        {
+        if edge != Edge::Inside || dst_len + LEAF_SHIFT_SLACK > LEAF_MAX {
             return false;
         }
         let moved = (items.len() - dst_len) / 2;
@@ -302,6 +431,9 @@ impl<T: OrderLead> Inner<T> {
         let moved_leads = src_leaf.leads.split_off(at);
         let new_max = src_leaf.items.last().cloned().expect("shift keeps items");
         let dst_leaf = &mut self.leaves[dst as usize];
+        let new_len = dst_leaf.items.len() + moved_items.len();
+        grow_to(&mut dst_leaf.items, new_len, LEAF_MAX);
+        grow_to(&mut dst_leaf.leads, new_len, LEAF_MAX);
         dst_leaf.items.splice(0..0, moved_items);
         dst_leaf.leads.splice(0..0, moved_leads);
         let node = &mut self.nodes[parent as usize];
@@ -313,10 +445,10 @@ impl<T: OrderLead> Inner<T> {
     }
 
     /// Split the full child `ci` of `parent` and record both halves.
-    fn split_child(&mut self, parent: u32, ci: usize, child_is_leaf: bool, incoming: &T) {
+    fn split_child(&mut self, parent: u32, ci: usize, child_is_leaf: bool, edge: Edge) {
         let child = self.node(parent).kids[ci].id;
         let (new_id, lk, lc, rk, rc) = if child_is_leaf {
-            let new = self.split_leaf(child, incoming);
+            let new = self.split_leaf(child, edge);
             let l = &self.leaf(child).items;
             let r = &self.leaf(new).items;
             (
@@ -343,6 +475,10 @@ impl<T: OrderLead> Inner<T> {
         p.keys[ci] = lk;
         p.leads[ci] = ll;
         p.kids[ci].count = lc;
+        let new_len = p.keys.len() + 1;
+        grow_to(&mut p.keys, new_len, NODE_MAX);
+        grow_to(&mut p.leads, new_len, NODE_MAX);
+        grow_to(&mut p.kids, new_len, NODE_MAX);
         p.keys.insert(ci + 1, rk);
         p.leads.insert(ci + 1, rl);
         p.kids.insert(
@@ -354,7 +490,7 @@ impl<T: OrderLead> Inner<T> {
         );
     }
 
-    fn split_root(&mut self, incoming: &T) {
+    fn split_root(&mut self, edge: Edge) {
         let root_is_leaf = self.height == 0;
         let max = if root_is_leaf {
             self.leaf(self.root).items.last().cloned()
@@ -363,9 +499,9 @@ impl<T: OrderLead> Inner<T> {
         }
         .expect("a full root is non-empty");
         let mut node = Node {
-            keys: Vec::with_capacity(NODE_MAX),
-            leads: Vec::with_capacity(NODE_MAX),
-            kids: Vec::with_capacity(NODE_MAX),
+            keys: Vec::new(),
+            leads: Vec::new(),
+            kids: Vec::new(),
         };
         node.leads.push(max.lead());
         node.keys.push(max);
@@ -376,7 +512,7 @@ impl<T: OrderLead> Inner<T> {
         let new_root = self.alloc_node(node);
         self.root = new_root;
         self.height += 1;
-        self.split_child(new_root, 0, root_is_leaf, incoming);
+        self.split_child(new_root, 0, root_is_leaf, edge);
     }
 
     /// Remove child `ci` of `parent` (a node whose children are leaves when
@@ -451,6 +587,9 @@ impl<T: OrderLead> Inner<T> {
         let moved_leads = std::mem::take(&mut self.leaves[r as usize].leads);
         let next = self.leaf(r).next;
         let target = &mut self.leaves[l as usize];
+        let new_len = target.items.len() + moved_items.len();
+        grow_to(&mut target.items, new_len, LEAF_MAX);
+        grow_to(&mut target.leads, new_len, LEAF_MAX);
         target.items.extend(moved_items);
         target.leads.extend(moved_leads);
         target.next = next;
@@ -489,8 +628,8 @@ impl<T: OrderLead> OrderedIndex<T> {
         let inner = &mut *self.inner;
         let lead = item.lead();
         if inner.root == NIL {
-            let mut items = Vec::with_capacity(LEAF_MAX);
-            let mut leads = Vec::with_capacity(LEAF_MAX);
+            let mut items = Vec::new();
+            let mut leads = Vec::new();
             items.push(item);
             leads.push(lead);
             let id = inner.alloc_leaf(items, leads, NIL, NIL);
@@ -500,14 +639,20 @@ impl<T: OrderLead> OrderedIndex<T> {
             inner.len = 1;
             return true;
         }
-        if inner.is_full(inner.root, inner.height == 0) {
-            inner.split_root(&item);
-        }
-
         // Sequential fills (monotonic scores) insert below the minimum or above
         // the maximum; those skip every search on the way down.
         let below_all = inner.first_item().is_some_and(|first| item < *first);
         let above_all = !below_all && inner.last_item().is_some_and(|last| item > *last);
+        let edge = if below_all {
+            Edge::Below
+        } else if above_all {
+            Edge::Above
+        } else {
+            Edge::Inside
+        };
+        if inner.is_full(inner.root, inner.height == 0) {
+            inner.split_root(edge);
+        }
 
         // Descend, splitting any full child first so its parent always has
         // room for the new sibling.
@@ -526,8 +671,8 @@ impl<T: OrderLead> OrderedIndex<T> {
             };
             let child_is_leaf = lvl + 1 == inner.height;
             if inner.is_full(node.kids[ci].id, child_is_leaf) {
-                if !(child_is_leaf && inner.try_shift_right(cur, ci, &item)) {
-                    inner.split_child(cur, ci, child_is_leaf, &item);
+                if !(child_is_leaf && inner.try_shift_right(cur, ci, edge)) {
+                    inner.split_child(cur, ci, child_is_leaf, edge);
                 }
                 if inner.node(cur).keys[ci] < item {
                     ci += 1;
@@ -553,6 +698,9 @@ impl<T: OrderLead> OrderedIndex<T> {
             inner.fix_max(&path, inner.height - 1, &item);
         }
         let leaf = &mut inner.leaves[cur as usize];
+        let new_len = leaf.items.len() + 1;
+        grow_to(&mut leaf.items, new_len, LEAF_MAX);
+        grow_to(&mut leaf.leads, new_len, LEAF_MAX);
         leaf.items.insert(idx, item);
         leaf.leads.insert(idx, lead);
         for &(nid, ci) in &path[..inner.height] {
@@ -564,6 +712,14 @@ impl<T: OrderLead> OrderedIndex<T> {
 
     /// Remove `item`. Returns whether it was present.
     pub fn remove(&mut self, item: &T) -> bool {
+        let removed = self.remove_item(item);
+        if removed {
+            self.inner.compact_if_sparse();
+        }
+        removed
+    }
+
+    fn remove_item(&mut self, item: &T) -> bool {
         let inner = &mut *self.inner;
         if inner.root == NIL {
             return false;
@@ -739,6 +895,34 @@ impl<T: OrderLead> OrderedIndex<T> {
     /// `item` is present.
     pub fn count_before(&self, item: &T) -> usize {
         self.inner.cut_rank(item, false)
+    }
+
+    /// Heap bytes held by the arenas and every node vector, by capacity.
+    /// Test-only.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let i = &*self.inner;
+        let leaves: usize = i
+            .leaves
+            .iter()
+            .map(|l| l.items.capacity() * size_of::<T>() + l.leads.capacity() * 8)
+            .sum();
+        let nodes: usize = i
+            .nodes
+            .iter()
+            .map(|n| {
+                n.keys.capacity() * size_of::<T>()
+                    + n.leads.capacity() * 8
+                    + n.kids.capacity() * size_of::<Kid>()
+            })
+            .sum();
+        size_of::<Inner<T>>()
+            + i.leaves.capacity() * size_of::<Leaf<T>>()
+            + i.nodes.capacity() * size_of::<Node<T>>()
+            + (i.free_leaves.capacity() + i.free_nodes.capacity()) * 4
+            + leaves
+            + nodes
     }
 
     /// Check every structural invariant. Test-only.
@@ -1206,6 +1390,103 @@ mod tests {
         }
         index.assert_invariants();
         assert_eq!(index.inner.height, 0);
+    }
+
+    /// Memory is bounded by the current size, not by the history that led to
+    /// it: a few multiples of the bytes the items themselves need, plus a
+    /// small constant.
+    fn assert_memory_bounded(index: &OrderedIndex<(i64, u32)>, context: &str) {
+        let per_item = std::mem::size_of::<(i64, u32)>() + 8;
+        let bound = 6 * per_item * index.len() + 4_096;
+        assert!(
+            index.heap_bytes() <= bound,
+            "{context}: {} bytes for {} items (bound {bound})",
+            index.heap_bytes(),
+            index.len()
+        );
+    }
+
+    fn pair(n: u32) -> (i64, u32) {
+        (i64::from(n), 0)
+    }
+
+    #[test]
+    fn small_sets_stay_small() {
+        for count in [0u32, 1, 2, 4, 8, 33, 100, 128, 300] {
+            let mut index = OrderedIndex::new();
+            for n in 0..count {
+                index.insert(pair(n * 3));
+            }
+            index.assert_invariants();
+            assert_memory_bounded(&index, &format!("{count} items"));
+        }
+        let mut one = OrderedIndex::new();
+        one.insert(pair(1));
+        assert!(one.heap_bytes() < 1_024, "{}", one.heap_bytes());
+    }
+
+    #[test]
+    fn memory_after_scattered_mass_removal() {
+        const N: u32 = 1_000_003;
+        let scatter = |i: u32| (u64::from(i) * 7_919 % u64::from(N)) as u32;
+        let mut index = OrderedIndex::new();
+        for i in 0..N {
+            index.insert(pair(scatter(i)));
+        }
+        assert_memory_bounded(&index, "full");
+        for i in 0..N {
+            if i % 1_000 != 0 {
+                assert!(index.remove(&pair(scatter(i))));
+            }
+        }
+        index.assert_invariants();
+        assert_eq!(index.len(), 1_001);
+        assert_memory_bounded(&index, "1M scattered down to 1k");
+    }
+
+    #[test]
+    fn memory_after_sequential_fill_and_sparse_keep() {
+        const N: u32 = 1_000_000;
+        let mut index = OrderedIndex::new();
+        for n in 0..N {
+            index.insert(pair(n));
+        }
+        for n in 0..N {
+            if n % 1_984 != 0 {
+                assert!(index.remove(&pair(n)));
+            }
+            if n % 100_000 == 0 {
+                assert_memory_bounded(&index, "sequential shrink");
+            }
+        }
+        index.assert_invariants();
+        assert_memory_bounded(&index, "sequential fill, keep every 1984th");
+    }
+
+    #[test]
+    fn memory_across_repeated_fill_and_purge_rounds() {
+        const ROUNDS: u32 = 40;
+        const FILL: u32 = 200_000;
+        let mut index = OrderedIndex::new();
+        let mut peak = 0;
+        for round in 0..ROUNDS {
+            let base = round * FILL;
+            let scatter = |i: u32| base + (u64::from(i) * 7_919 % u64::from(FILL)) as u32;
+            for i in 0..FILL {
+                index.insert(pair(scatter(i)));
+            }
+            for i in 0..FILL {
+                let n = scatter(i);
+                if n % 4_000 != 0 {
+                    assert!(index.remove(&pair(n)));
+                }
+            }
+            peak = peak.max(index.heap_bytes());
+            assert_memory_bounded(&index, &format!("round {round}"));
+        }
+        index.assert_invariants();
+        assert_eq!(index.len(), (ROUNDS * FILL / 4_000) as usize);
+        assert!(peak < 12_000_000, "peak {peak}");
     }
 
     #[test]
