@@ -229,7 +229,7 @@ impl<W: Write> RdbSaver<W> {
                 }])?;
                 self.write_string(key)?;
                 self.write_length(entries.len() as u64)?;
-                for entry in entries {
+                for entry in entries.iter() {
                     // Stream ID: ms + seq
                     self.write_bytes(&entry.id.ms.to_le_bytes())?;
                     self.write_bytes(&entry.id.seq.to_le_bytes())?;

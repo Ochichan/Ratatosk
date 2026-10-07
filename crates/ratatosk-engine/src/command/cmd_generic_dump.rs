@@ -233,7 +233,7 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
         } => {
             out.push(b'r');
             put_u32(&mut out, entries.len());
-            for item in entries {
+            for item in entries.iter() {
                 put_stream_id(&mut out, item.id);
                 put_u32(&mut out, item.fields.len());
                 for (field, value) in &item.fields {

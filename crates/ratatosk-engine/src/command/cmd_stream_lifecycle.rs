@@ -260,10 +260,7 @@ pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usiz
         return 0;
     }
 
-    let removed_ids = stream
-        .drain(0..remove_count)
-        .map(|entry| entry.id)
-        .collect::<Vec<_>>();
+    let removed_ids = stream.remove_front(remove_count);
     prune_stream_removed_ids(entry, &removed_ids);
     removed_ids.len()
 }

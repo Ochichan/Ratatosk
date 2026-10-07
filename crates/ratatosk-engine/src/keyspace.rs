@@ -47,6 +47,89 @@ pub struct StreamEntry {
     pub fields: Vec<(Bytes, Bytes)>,
 }
 
+/// A stream's entries in ID order. They deref to a slice, so lookups and
+/// binary searches are as for a vector, and removing from the front costs
+/// time in the number of entries removed: the removed slots stay behind as a
+/// dead prefix, emptied, until it outweighs the live entries and is dropped
+/// in one pass.
+#[derive(Debug, Clone, Default)]
+pub struct StreamEntries {
+    items: Vec<StreamEntry>,
+    head: usize,
+}
+
+impl StreamEntries {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, entry: StreamEntry) {
+        self.items.push(entry);
+    }
+
+    /// Removes the first `count` entries and returns their IDs.
+    pub fn remove_front(&mut self, count: usize) -> Vec<StreamId> {
+        let count = count.min(self.len());
+        let start = self.head;
+        let mut ids = Vec::with_capacity(count);
+        for slot in &mut self.items[start..start + count] {
+            ids.push(slot.id);
+            // Free the fields now rather than when the prefix is dropped.
+            slot.fields = Vec::new();
+        }
+        self.head += count;
+        if self.head == self.items.len() {
+            self.items.clear();
+            self.head = 0;
+        } else if self.head > self.items.len() / 2 {
+            self.compact();
+        }
+        ids
+    }
+
+    /// Keeps the entries `keep` returns true for.
+    pub fn retain(&mut self, keep: impl FnMut(&StreamEntry) -> bool) {
+        self.compact();
+        self.items.retain(keep);
+    }
+
+    fn compact(&mut self) {
+        if self.head > 0 {
+            self.items.drain(..self.head);
+            self.head = 0;
+        }
+    }
+}
+
+impl std::ops::Deref for StreamEntries {
+    type Target = [StreamEntry];
+
+    fn deref(&self) -> &[StreamEntry] {
+        &self.items[self.head..]
+    }
+}
+
+impl std::ops::DerefMut for StreamEntries {
+    fn deref_mut(&mut self) -> &mut [StreamEntry] {
+        &mut self.items[self.head..]
+    }
+}
+
+impl<'a> IntoIterator for &'a StreamEntries {
+    type Item = &'a StreamEntry;
+    type IntoIter = std::slice::Iter<'a, StreamEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl From<Vec<StreamEntry>> for StreamEntries {
+    fn from(items: Vec<StreamEntry>) -> Self {
+        Self { items, head: 0 }
+    }
+}
+
 /// Stream state that the entries alone do not record, as in Redis.
 ///
 /// `last_id` only moves forward: XADD advances it and XSETID can raise it, but
@@ -529,7 +612,8 @@ pub enum ValueData {
     SetInt(Vec<i64>),
     SortedSet(SortedSet),
     Stream {
-        entries: Vec<StreamEntry>,
+        /// Boxed so the dead-prefix offset does not widen every value.
+        entries: Box<StreamEntries>,
         groups: HashMap<Bytes, StreamGroup>,
         /// Boxed so streams do not widen every other value.
         meta: Box<StreamMeta>,
@@ -630,7 +714,7 @@ impl StoredValue {
         let meta = Box::new(StreamMeta::derived_from(&entries));
         Self::new(
             ValueData::Stream {
-                entries,
+                entries: Box::new(entries.into()),
                 groups: HashMap::new(),
                 meta,
             },
@@ -927,7 +1011,7 @@ impl StoredValue {
         }
     }
 
-    pub fn as_stream(&self) -> Option<(&Vec<StreamEntry>, &HashMap<Bytes, StreamGroup>)> {
+    pub fn as_stream(&self) -> Option<(&StreamEntries, &HashMap<Bytes, StreamGroup>)> {
         match &*self.data {
             ValueData::Stream {
                 entries, groups, ..
@@ -938,7 +1022,7 @@ impl StoredValue {
 
     pub fn as_stream_mut(
         &mut self,
-    ) -> Option<(&mut Vec<StreamEntry>, &mut HashMap<Bytes, StreamGroup>)> {
+    ) -> Option<(&mut StreamEntries, &mut HashMap<Bytes, StreamGroup>)> {
         match &mut *self.data {
             ValueData::Stream {
                 entries, groups, ..
@@ -964,21 +1048,21 @@ impl StoredValue {
     /// Entries and metadata together, for commands that change both.
     pub fn as_stream_entries_and_meta_mut(
         &mut self,
-    ) -> Option<(&mut Vec<StreamEntry>, &mut StreamMeta)> {
+    ) -> Option<(&mut StreamEntries, &mut StreamMeta)> {
         match &mut *self.data {
             ValueData::Stream { entries, meta, .. } => Some((entries, meta)),
             _ => None,
         }
     }
 
-    pub fn as_stream_entries(&self) -> Option<&Vec<StreamEntry>> {
+    pub fn as_stream_entries(&self) -> Option<&StreamEntries> {
         match &*self.data {
             ValueData::Stream { entries, .. } => Some(entries),
             _ => None,
         }
     }
 
-    pub fn as_stream_entries_mut(&mut self) -> Option<&mut Vec<StreamEntry>> {
+    pub fn as_stream_entries_mut(&mut self) -> Option<&mut StreamEntries> {
         match &mut *self.data {
             ValueData::Stream { entries, .. } => Some(entries),
             _ => None,
@@ -2405,6 +2489,44 @@ mod tests {
         let before = large.capacity();
         super::reserve_string_growth(&mut large, len + 2);
         assert_eq!(large.capacity(), before);
+    }
+
+    #[test]
+    fn stream_entries_remove_from_the_front_without_moving_the_rest() {
+        let entry = |ms: u64| super::StreamEntry {
+            id: super::StreamId { ms, seq: 0 },
+            fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+        };
+        let mut entries = super::StreamEntries::from((1..=10).map(entry).collect::<Vec<_>>());
+        // A short prefix stays as a dead one and the live view skips it.
+        let removed = entries.remove_front(3);
+        assert_eq!(
+            removed.iter().map(|id| id.ms).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(entries.len(), 7);
+        assert_eq!(entries[0].id.ms, 4);
+        assert_eq!(entries.last().map(|entry| entry.id.ms), Some(10));
+        assert!(
+            entries
+                .binary_search_by_key(&super::StreamId { ms: 7, seq: 0 }, |entry| entry.id)
+                .is_ok()
+        );
+        // Pushing and retaining work on the live entries only.
+        entries.push(entry(11));
+        entries.retain(|entry| entry.id.ms % 2 == 0);
+        assert_eq!(
+            entries.iter().map(|entry| entry.id.ms).collect::<Vec<_>>(),
+            [4, 6, 8, 10]
+        );
+        // Removing more than half compacts, and removing everything resets.
+        assert_eq!(entries.remove_front(3).len(), 3);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id.ms, 10);
+        assert_eq!(entries.remove_front(5).len(), 1);
+        assert!(entries.is_empty());
+        entries.push(entry(12));
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
