@@ -1,6 +1,7 @@
 use std::{
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
+    path::Path,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -13,6 +14,7 @@ struct Server {
     child: Option<Child>,
     dir: tempfile::TempDir,
     port: u16,
+    starts: u32,
     appendonly: bool,
     compatibility_mode: &'static str,
 }
@@ -22,7 +24,8 @@ impl Server {
         let mut server = Self {
             child: None,
             dir: tempfile::tempdir()?,
-            port: reserve_port()?,
+            port: 0,
+            starts: 0,
             appendonly,
             compatibility_mode: "compat",
         };
@@ -31,7 +34,11 @@ impl Server {
     }
 
     fn start(&mut self) -> io::Result<()> {
-        let metrics_port = reserve_port()?;
+        // Let the OS pick the ports and read the one bound from the handoff
+        // file. Reserving a port and releasing it raced with parallel tests,
+        // which could then connect to another test's server.
+        self.starts += 1;
+        let bound_addr_file = self.dir.path().join(format!("bound-{}.json", self.starts));
         let bin = std::env::var_os("CARGO_BIN_EXE_ratatosk").ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -41,12 +48,13 @@ impl Server {
         let child = Command::new(bin)
             .arg("--no-config-autoload")
             .env("RATATOSK_BIND", "127.0.0.1")
-            .env("RATATOSK_PORT", self.port.to_string())
+            .env("RATATOSK_PORT", "0")
+            .env("RATATOSK_BOUND_ADDR_FILE", &bound_addr_file)
             .env("RATATOSK_DIR", self.dir.path())
             .env("RATATOSK_APPENDONLY", self.appendonly.to_string())
             .env("RATATOSK_COMPATIBILITY_MODE", self.compatibility_mode)
             .env("RATATOSK_APPENDFSYNC", "always")
-            .env("RATATOSK_METRICS_BIND", format!("127.0.0.1:{metrics_port}"))
+            .env("RATATOSK_METRICS_BIND", "127.0.0.1:0")
             .env("RATATOSK_ALLOW_NO_METRICS", "true")
             .env("RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS", "100000")
             .env("RATATOSK_SHUTDOWN_GRACE_MS", "1000")
@@ -54,7 +62,8 @@ impl Server {
             .stderr(Stdio::null())
             .spawn()?;
         self.child = Some(child);
-        wait_for_listener(self.port, self.child.as_mut().expect("spawned child"))
+        self.port = wait_for_bound_port(&bound_addr_file, self.child.as_mut().expect("child"))?;
+        Ok(())
     }
 
     fn restart(&mut self, kill: bool) -> io::Result<()> {
@@ -120,12 +129,7 @@ impl Client {
     }
 }
 
-fn reserve_port() -> io::Result<u16> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
-}
-
-fn wait_for_listener(port: u16, child: &mut Child) -> io::Result<()> {
+fn wait_for_bound_port(path: &Path, child: &mut Child) -> io::Result<u16> {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait()? {
@@ -133,14 +137,27 @@ fn wait_for_listener(port: u16, child: &mut Child) -> io::Result<()> {
                 "ratatosk exited before accepting persistence test connections: {status}"
             )));
         }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Ok(());
+        match std::fs::read(path) {
+            Ok(contents) => {
+                let handoff: serde_json::Value = serde_json::from_slice(&contents)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let address: std::net::SocketAddr = handoff["bound_addr"]
+                    .as_str()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "missing bound_addr")
+                    })?
+                    .parse()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                return Ok(address.port());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         thread::sleep(Duration::from_millis(20));
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        "timed out waiting for ratatosk listener",
+        "timed out waiting for the bound address handoff",
     ))
 }
 
