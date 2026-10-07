@@ -340,7 +340,9 @@ impl<R: Read> RdbLoader<R> {
                     || type_byte == RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ
                 {
                     let last_id = self.read_stream_id()?;
-                    let entries_added = self.read_i64()? as u64;
+                    let entries_added = u64::try_from(self.read_i64()?).map_err(|_| {
+                        PersistError::corrupt("negative stream entries-added counter")
+                    })?;
                     let max_deleted_id = self.read_stream_id()?;
                     let meta = StreamMeta {
                         last_id,
@@ -1023,6 +1025,29 @@ mod tests {
             .and_then(|value| value.as_stream_groups())
             .expect("groups");
         assert_eq!(groups[&Bytes::from("g")].entries_read, None);
+    }
+
+    #[test]
+    fn a_negative_entries_added_counter_is_corrupt() {
+        // entries_added is stored as 8 raw bytes, so a value past i64::MAX
+        // reads back negative and must not turn into a huge counter.
+        let state = ServerState::with_default_dbs();
+        let mut stream = StoredValue::stream(
+            vec![StreamEntry {
+                id: StreamId { ms: 1, seq: 0 },
+                fields: vec![(Bytes::from("f"), Bytes::from("v"))],
+            }],
+            None,
+        );
+        stream.as_stream_meta_mut().expect("meta").entries_added = u64::MAX;
+        state.db_mut(0).insert(Bytes::from("s"), stream);
+        let mut bytes = Vec::new();
+        RdbSaver::new(&mut bytes).save_state(&state).expect("save");
+        let mut target = ServerState::with_default_dbs();
+        assert!(matches!(
+            RdbLoader::new(bytes.as_slice()).load_into(&mut target),
+            Err(PersistError::Corrupt { .. })
+        ));
     }
 
     #[test]

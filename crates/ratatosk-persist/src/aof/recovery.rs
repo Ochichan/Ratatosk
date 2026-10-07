@@ -353,6 +353,78 @@ mod tests {
         assert_eq!(stream_ids(&state, "e"), ids(&[1, 3, 4, 5, 6]));
     }
 
+    /// XCLAIM and XAUTOCLAIM records an earlier version logged as sent must
+    /// replay with the semantics they were written with: options among the
+    /// IDs, COUNT 0 or above LONG_MAX/16, a delivery added even with JUSTID,
+    /// and no consumer created by a claim that found nothing.
+    #[test]
+    fn replay_runs_earlier_claim_records_as_they_were_written() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["XADD", "s", "1-0", "f", "v"],
+            vec!["XADD", "s", "2-0", "f", "v"],
+            vec!["XADD", "s", "3-0", "f", "v"],
+            vec!["XGROUP", "CREATE", "s", "g", "0"],
+            vec!["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            vec!["XCLAIM", "s", "g", "c2", "0", "JUSTID", "1-0"],
+            vec!["XCLAIM", "s", "g", "ghost", "3600000", "2-0"],
+            vec![
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c3",
+                "0",
+                "0",
+                "COUNT",
+                "0",
+                "JUSTID",
+            ],
+            vec![
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c4",
+                "0",
+                "3-0",
+                "COUNT",
+                "576460752303423488",
+            ],
+        ];
+        let slices: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
+        let mut state = ServerState::with_default_dbs();
+        let result = AofRecovery::replay_reader(encode_aof(&slices).as_slice(), &mut state)
+            .expect("records an earlier version logged must replay");
+        assert!(!result.corruption_detected);
+
+        let db = state.db(0);
+        let group = db
+            .get(b"s".as_slice())
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(b"g".as_slice()))
+            .expect("group");
+        let owner_and_count = |ms: u64| {
+            let pending = group
+                .pending
+                .get(&ratatosk_engine::keyspace::StreamId { ms, seq: 0 })
+                .expect("pending entry");
+            (
+                String::from_utf8_lossy(&pending.consumer).into_owned(),
+                pending.deliveries,
+            )
+        };
+        // 1-0: read, claimed with JUSTID (still a delivery), claimed again by
+        // COUNT 0, which claims one entry.
+        assert_eq!(owner_and_count(1), ("c3".to_owned(), 3));
+        assert_eq!(owner_and_count(2), ("c".to_owned(), 1));
+        assert_eq!(owner_and_count(3), ("c4".to_owned(), 2));
+        let mut consumers = group
+            .consumers
+            .keys()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect::<Vec<_>>();
+        consumers.sort();
+        assert_eq!(consumers, ["c", "c2", "c3", "c4"]);
+    }
+
     #[test]
     fn legacy_exec_preserves_successful_siblings_of_a_runtime_error() {
         let mut state = ServerState::with_default_dbs();

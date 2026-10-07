@@ -8,8 +8,7 @@ use crate::keyspace::{ServerState, StoredValue, StreamEntry, StreamId, purge_exp
 
 use super::cmd_stream_lifecycle::apply_trim;
 use super::{
-    ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
-    wrong_type_response,
+    ClientState, CommandOutcome, err, now_ms, parse_i64, wrong_arity, wrong_type_response,
 };
 
 pub(super) fn stream_id_to_bytes(id: StreamId) -> Bytes {
@@ -698,10 +697,11 @@ pub(super) fn cmd_xread(
             let Some(raw) = args.get(idx + 1) else {
                 return CommandOutcome::reply(err("ERR syntax error"));
             };
-            let Some(parsed) = parse_usize(raw) else {
+            let Some(parsed) = parse_i64(raw) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            count = Some(parsed);
+            // As Redis: a negative COUNT is 0, and 0 is no limit.
+            count = usize::try_from(parsed).ok().filter(|count| *count > 0);
             idx += 2;
             continue;
         }

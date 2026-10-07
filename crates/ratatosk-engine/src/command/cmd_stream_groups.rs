@@ -14,8 +14,8 @@ use super::cmd_stream::{
 };
 
 use super::{
-    ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
-    wrong_arity, wrong_type_response,
+    ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
+    wrong_type_response,
 };
 
 /// Parses the options after the ID of XGROUP CREATE (MKSTREAM, ENTRIESREAD)
@@ -328,10 +328,11 @@ pub(super) fn cmd_xreadgroup(
             let Some(raw) = args.get(idx + 1) else {
                 return CommandOutcome::reply(err("ERR syntax error"));
             };
-            let Some(parsed) = parse_usize(raw) else {
+            let Some(parsed) = parse_i64(raw) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            count = Some(parsed);
+            // As Redis: a negative COUNT is 0, and 0 is no limit.
+            count = usize::try_from(parsed).ok().filter(|count| *count > 0);
             idx += 2;
             continue;
         }
@@ -573,7 +574,7 @@ pub(super) fn cmd_xreadgroup(
                                     group.last_delivered_id,
                                 ) =>
                         {
-                            Some(read + 1)
+                            Some(read.saturating_add(1))
                         }
                         _ if meta.entries_added > 0 => {
                             meta.estimate_distance_from_first_entry(&entries[..], *id)
@@ -905,12 +906,14 @@ pub(super) fn cmd_xinfo(
                     let Some(raw) = args.get(idx + 1) else {
                         return CommandOutcome::reply(err("ERR syntax error"));
                     };
-                    let Some(parsed) = parse_usize(raw) else {
+                    let Some(parsed) = parse_i64(raw) else {
                         return CommandOutcome::reply(err(
                             "ERR value is not an integer or out of range",
                         ));
                     };
-                    count = Some(parsed);
+                    // A negative COUNT is the default 10, as in Redis, and 0
+                    // lists everything.
+                    count = Some(usize::try_from(parsed).unwrap_or(10));
                     idx += 2;
                     continue;
                 }

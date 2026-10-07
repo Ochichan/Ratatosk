@@ -441,6 +441,150 @@ fn claimed_reply(entries: &[StreamEntry], id: StreamId, justid: bool) -> Option<
         .map(|at| stream_entry_frame(&entries[at]))
 }
 
+/// Whether an XCLAIM replayed from the AOF is a record an earlier version
+/// logged as sent. Those versions had none of the options below, and this
+/// version logs only commands that carry one, so a record without them keeps
+/// the semantics it was written with.
+fn is_earlier_xclaim_record(args: &[Bytes]) -> bool {
+    super::cmd_stream::replay_mode()
+        && !args[4..].iter().any(|arg| {
+            [&b"TIME"[..], b"RETRYCOUNT", b"FORCE", b"LASTID", b"IDLE"]
+                .iter()
+                .any(|option| arg.eq_ignore_ascii_case(option))
+        })
+}
+
+/// Replays an XCLAIM as earlier versions ran it: JUSTID anywhere among the
+/// IDs, every claim adds a delivery (JUSTID included), nothing checks that the
+/// stream entry exists, and the consumer only appears when it claims.
+fn replay_earlier_xclaim(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
+    let key = &args[0];
+    let group_name = &args[1];
+    let consumer_name = &args[2];
+    let Some(min_idle) = parse_i64(&args[3]) else {
+        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+    };
+    let mut ids = Vec::new();
+    for arg in &args[4..] {
+        if arg.eq_ignore_ascii_case(b"JUSTID") {
+            continue;
+        }
+        let Some(id) = parse_strict_stream_id(arg) else {
+            return CommandOutcome::reply(err("ERR syntax error"));
+        };
+        ids.push(id);
+    }
+
+    let now = now_ms();
+    if let Some(reply) = require_group(server, client, key, group_name, now) {
+        return reply;
+    }
+    let mut db = server.db_mut(client.selected_db);
+    let Some(group) = db
+        .get_mut(key)
+        .and_then(|entry| entry.as_stream_groups_mut())
+        .and_then(|groups| groups.get_mut(group_name))
+    else {
+        return stream_nogroup_error(key, group_name);
+    };
+    for id in ids {
+        let Some(pending) = group.pending.get(&id) else {
+            continue;
+        };
+        if now.saturating_sub(pending.last_delivered_ms) < min_idle {
+            continue;
+        }
+        let terms = ClaimTerms {
+            delivery_ms: now,
+            retry_count: None,
+            justid: false,
+            base: pending.deliveries,
+        };
+        assign_pending_id(group, consumer_name, id, &terms);
+        touch_consumer(group, consumer_name, now);
+    }
+    CommandOutcome::reply(RespFrame::Array(vec![]))
+}
+
+/// Replays an XAUTOCLAIM as earlier versions ran it: any COUNT (0 claims one
+/// entry), no cap on the entries looked at, every claim adds a delivery, and
+/// the consumer only appears when it claims.
+fn replay_earlier_xautoclaim(
+    args: &[Bytes],
+    server: &mut ServerState,
+    client: &ClientState,
+) -> CommandOutcome {
+    let key = &args[0];
+    let group_name = &args[1];
+    let consumer_name = &args[2];
+    let Some(min_idle) = parse_i64(&args[3]) else {
+        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+    };
+    let start = match parse_interval_id(&args[4], IntervalEdge::Start) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
+    };
+    let mut count = 100usize;
+    let mut idx = 5usize;
+    while idx < args.len() {
+        if args[idx].eq_ignore_ascii_case(b"COUNT") {
+            let Some(parsed) = args.get(idx + 1).and_then(parse_usize) else {
+                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+            };
+            count = parsed;
+            idx += 2;
+        } else if args[idx].eq_ignore_ascii_case(b"JUSTID") {
+            idx += 1;
+        } else {
+            return CommandOutcome::reply(err("ERR syntax error"));
+        }
+    }
+
+    let now = now_ms();
+    if let Some(reply) = require_group(server, client, key, group_name, now) {
+        return reply;
+    }
+    let mut db = server.db_mut(client.selected_db);
+    let Some(group) = db
+        .get_mut(key)
+        .and_then(|entry| entry.as_stream_groups_mut())
+        .and_then(|groups| groups.get_mut(group_name))
+    else {
+        return stream_nogroup_error(key, group_name);
+    };
+    let mut pending_ids = group.pending.keys().copied().collect::<Vec<_>>();
+    pending_ids.sort_unstable();
+    let mut claimed = 0usize;
+    for id in pending_ids {
+        if id < start {
+            continue;
+        }
+        let Some(pending) = group.pending.get(&id) else {
+            continue;
+        };
+        if now.saturating_sub(pending.last_delivered_ms) < min_idle {
+            continue;
+        }
+        let terms = ClaimTerms {
+            delivery_ms: now,
+            retry_count: None,
+            justid: false,
+            base: pending.deliveries,
+        };
+        assign_pending_id(group, consumer_name, id, &terms);
+        touch_consumer(group, consumer_name, now);
+        claimed += 1;
+        if claimed >= count {
+            break;
+        }
+    }
+    CommandOutcome::reply(RespFrame::Array(vec![]))
+}
+
 pub(super) fn cmd_xclaim(
     args: &[Bytes],
     server: &mut ServerState,
@@ -448,6 +592,9 @@ pub(super) fn cmd_xclaim(
 ) -> CommandOutcome {
     if args.len() < 5 {
         return wrong_arity("xclaim");
+    }
+    if is_earlier_xclaim_record(args) {
+        return replay_earlier_xclaim(args, server, client);
     }
 
     let key = &args[0];
@@ -591,6 +738,11 @@ pub(super) fn cmd_xautoclaim(
 ) -> CommandOutcome {
     if args.len() < 5 {
         return wrong_arity("xautoclaim");
+    }
+    // This version never logs XAUTOCLAIM as sent, so under replay it is an
+    // earlier record.
+    if super::cmd_stream::replay_mode() {
+        return replay_earlier_xautoclaim(args, server, client);
     }
 
     let key = &args[0];

@@ -4654,8 +4654,10 @@ fn claimed_reply_ids(items: &[RespFrame]) -> Vec<Bytes> {
 /// claimed entry that names the new owner, delivery time and count, forces
 /// the entry into the pending list and carries the group's last delivered
 /// ID, so replay reproduces the same pending list whatever the clock says.
-/// Entries XAUTOCLAIM found deleted leave the list through XACK. A command
-/// that claimed nothing is logged as sent, which still creates the consumer.
+/// Pending entries whose stream entry is gone leave the list through XACK.
+/// When nothing was claimed, an XCLAIM that only carries LASTID stands for
+/// the consumer the command still created. Records without these options are
+/// what earlier versions logged as sent, and replay runs them as they were.
 fn claim_durability_effects(
     command: &[u8],
     argv: &[Bytes],
@@ -4663,7 +4665,7 @@ fn claim_durability_effects(
     db_index: usize,
     response: &RespFrame,
 ) -> Option<DurabilityEffects> {
-    let (claimed, deleted) = match response {
+    let (claimed, mut gone) = match response {
         RespFrame::Array(items) if command == b"XCLAIM" => (claimed_reply_ids(items), Vec::new()),
         RespFrame::Array(parts) if command == b"XAUTOCLAIM" && parts.len() == 3 => {
             let ids = |frame: &RespFrame| match frame {
@@ -4674,16 +4676,49 @@ fn claim_durability_effects(
         }
         _ => return None,
     };
-    if claimed.is_empty() && deleted.is_empty() {
-        return Some(DurabilityEffects::single(db_index, argv.to_vec()));
-    }
 
     let key = argv.get(1)?;
     let group_name = argv.get(2)?;
+    let consumer_name = argv.get(3)?;
     let db = server.db(db_index);
-    let group = db.get(key)?.as_stream_groups()?.get(group_name)?;
+    let value = db.get(key)?;
+    let group = value.as_stream_groups()?.get(group_name)?;
+    let entries = value.as_stream_entries()?;
+
+    // XCLAIM drops the requested IDs that were pending for an entry that no
+    // longer exists; they are in neither the reply nor the pending list.
+    if command == b"XCLAIM" {
+        for raw in argv.iter().skip(5) {
+            let Some(id) = cmd_stream::parse_strict_stream_id(raw) else {
+                break;
+            };
+            let exists = entries.binary_search_by_key(&id, |entry| entry.id).is_ok();
+            if !exists
+                && !group.pending.contains_key(&id)
+                && !gone.contains(raw)
+                && !claimed.contains(raw)
+            {
+                gone.push(raw.clone());
+            }
+        }
+    }
+
     let last_id = cmd_stream::stream_id_to_bytes(group.last_delivered_id);
-    let mut commands = Vec::with_capacity(claimed.len() + deleted.len());
+    let mut commands = Vec::with_capacity(claimed.len() + gone.len() + 1);
+    if claimed.is_empty() {
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XCLAIM"),
+                key.clone(),
+                group_name.clone(),
+                consumer_name.clone(),
+                Bytes::from_static(b"0"),
+                Bytes::from_static(b"LASTID"),
+                last_id.clone(),
+            ],
+        });
+    }
     for id in claimed {
         let pending = group
             .pending
@@ -4708,7 +4743,7 @@ fn claim_durability_effects(
             ],
         });
     }
-    for id in deleted {
+    for id in gone {
         commands.push(DurableCommand {
             db_index,
             argv: vec![
@@ -9088,7 +9123,8 @@ mod tests {
             &mut client,
             &mut log,
         );
-        // A claim that finds nothing is logged as sent.
+        // A claim that finds nothing is logged as an XCLAIM that only carries
+        // LASTID, which stands for the consumer it created.
         let before = log.len();
         record(
             &["XCLAIM", "s", "g", "c4", "3600000", "3-0"],
@@ -9098,8 +9134,8 @@ mod tests {
         );
         assert_eq!(log.len(), before + 1);
         assert_eq!(shape(&log[before])[0], "XCLAIM");
-        assert_eq!(shape(&log[before])[5], "3-0");
-        assert_eq!(log[before].len(), 6);
+        assert_eq!(shape(&log[before])[5], "LASTID");
+        assert_eq!(log[before].len(), 7);
 
         // Replay later, so that the clock differs; the delivery times and
         // counts still match because they are logged.
@@ -9201,6 +9237,422 @@ mod tests {
                 (RespFrame::bulk_str("b"), RespFrame::Integer(0)),
             ]
         );
+    }
+
+    fn consumers_of(server: &ServerState, group: &str) -> Vec<String> {
+        let mut names = server
+            .db(0)
+            .get(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(&Bytes::from(group.to_owned())))
+            .map(|group| {
+                group
+                    .consumers
+                    .keys()
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Stream `s` with 1-0 and 2-0 read by c1, plus a pending entry for the
+    /// missing 9-0, which a RESTORE or RDB payload can carry.
+    fn dangling_claim_setup() -> (ServerState, ClientState) {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let mut db = server.db_mut(0);
+        let group = db
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups_mut())
+            .and_then(|groups| groups.get_mut(&Bytes::from_static(b"g")))
+            .expect("group");
+        let id = crate::keyspace::StreamId { ms: 9, seq: 0 };
+        group.pending.insert(
+            id,
+            crate::keyspace::StreamPendingEntry {
+                consumer: Bytes::from_static(b"c1"),
+                deliveries: 1,
+                last_delivered_ms: 1,
+            },
+        );
+        group
+            .consumers
+            .get_mut(&Bytes::from_static(b"c1"))
+            .expect("c1")
+            .pending
+            .insert(id);
+        drop(db);
+        (server, client)
+    }
+
+    fn replay_claim_log(log: &[Vec<Bytes>]) -> ServerState {
+        let (mut replayed, _) = dangling_claim_setup();
+        let mut client = ClientState::default();
+        for argv in log {
+            let reply = run_bytes(argv, &mut replayed, &mut client);
+            assert!(
+                !matches!(reply, RespFrame::Error(_)),
+                "{argv:?} -> {reply:?}"
+            );
+        }
+        replayed
+    }
+
+    #[test]
+    fn claims_that_drop_dangling_entries_are_logged_so_replay_matches() {
+        // XCLAIM of a pending ID whose entry is gone, next to a real claim.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "9-0", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        let log = effects
+            .commands
+            .into_iter()
+            .map(|command| command.argv)
+            .collect::<Vec<_>>();
+        assert!(
+            log.iter()
+                .any(|argv| argv[0].as_ref() == b"XACK" && argv[3].as_ref() == b"9-0")
+        );
+        let replayed = replay_claim_log(&log);
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
+        assert_eq!(consumers_of(&replayed, "g"), consumers_of(&server, "g"));
+        assert!(!pending_of(&replayed, "g").iter().any(|row| row.0 == "9-0"));
+
+        // XAUTOCLAIM that only finds the dangling entry still created its
+        // consumer, which the log carries next to the XACK.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XAUTOCLAIM", "s", "g", "c2", "0", "3-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        let log = effects
+            .commands
+            .into_iter()
+            .map(|command| command.argv)
+            .collect::<Vec<_>>();
+        assert!(log.iter().any(|argv| argv[0].as_ref() == b"XACK"));
+        let replayed = replay_claim_log(&log);
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
+        assert_eq!(consumers_of(&server, "g"), ["c1", "c2"]);
+        assert_eq!(consumers_of(&replayed, "g"), ["c1", "c2"]);
+
+        // A claim that found nothing is logged as a LASTID-only XCLAIM that
+        // stands for the consumer.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XCLAIM", "s", "g", "ghost", "3600000", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        assert_eq!(effects.commands.len(), 1);
+        let shape = effects.commands[0]
+            .argv
+            .iter()
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(shape[..6], ["XCLAIM", "s", "g", "ghost", "0", "LASTID"]);
+        let log = vec![effects.commands[0].argv.clone()];
+        assert_eq!(consumers_of(&replay_claim_log(&log), "g"), ["c1", "ghost"]);
+    }
+
+    #[test]
+    fn xread_and_xreadgroup_count_zero_means_no_limit() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        let read_len = |frame: RespFrame| -> usize {
+            let RespFrame::Array(streams) = frame else {
+                return 0;
+            };
+            let RespFrame::Array(stream) = &streams[0] else {
+                panic!("stream reply should be an array");
+            };
+            let RespFrame::Array(rows) = &stream[1] else {
+                panic!("entries should be an array");
+            };
+            rows.len()
+        };
+        for count in ["0", "-3"] {
+            assert_eq!(
+                read_len(run(
+                    &["XREAD", "COUNT", count, "STREAMS", "s", "0"],
+                    &mut server,
+                    &mut client
+                )),
+                3,
+                "XREAD COUNT {count}"
+            );
+        }
+        assert_eq!(
+            read_len(run(
+                &[
+                    "XREADGROUP",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "COUNT",
+                    "0",
+                    "STREAMS",
+                    "s",
+                    ">"
+                ],
+                &mut server,
+                &mut client
+            )),
+            3
+        );
+
+        // XINFO STREAM FULL: a negative COUNT is the default of 10.
+        fill_stream("big", 12, &mut server, &mut client);
+        let listed = |count: &str, server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(info) = run(
+                &["XINFO", "STREAM", "big", "FULL", "COUNT", count],
+                server,
+                client,
+            ) else {
+                panic!("XINFO STREAM FULL should return an array");
+            };
+            let at = info
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str("entries"))
+                .expect("entries");
+            match &info[at + 1] {
+                RespFrame::Array(rows) => rows.len(),
+                other => panic!("entries should be an array, got {other:?}"),
+            }
+        };
+        assert_eq!(listed("-1", &mut server, &mut client), 10);
+        assert_eq!(listed("0", &mut server, &mut client), 12);
+        assert_eq!(listed("5", &mut server, &mut client), 5);
+    }
+
+    #[test]
+    fn a_huge_entries_read_counter_does_not_overflow() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        server
+            .db_mut(0)
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups_mut())
+            .and_then(|groups| groups.get_mut(&Bytes::from_static(b"g")))
+            .expect("group")
+            .entries_read = Some(u64::MAX);
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert!(matches!(
+            run(&["XINFO", "GROUPS", "s"], &mut server, &mut client),
+            RespFrame::Array(_)
+        ));
+    }
+
+    fn lag_of(
+        server: &mut ServerState,
+        client: &mut ClientState,
+        idx: usize,
+    ) -> (Option<i64>, Option<i64>) {
+        let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "x"], server, client) else {
+            panic!("XINFO GROUPS should return an array");
+        };
+        let RespFrame::Array(fields) = &groups[idx] else {
+            panic!("a group should be an array");
+        };
+        let number = |frame: &RespFrame| match frame {
+            RespFrame::Integer(n) => Some(*n),
+            _ => None,
+        };
+        (number(&fields[9]), number(&fields[11]))
+    }
+
+    /// The consumer group lag tests of Redis's stream-cgroups.tcl.
+    #[test]
+    fn consumer_group_lag_matches_redis_cgroup_tests() {
+        let mut s = ServerState::with_default_dbs();
+        let mut c = ClientState::default();
+        macro_rules! r {
+            ($($a:expr),*) => { run(&[$($a),*], &mut s, &mut c) };
+        }
+        let ids = ["1-0", "2-0", "3-0", "4-0", "5-0"];
+        // Empty streams.
+        r!("XGROUP", "CREATE", "x", "g1", "0", "MKSTREAM");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(0)));
+        r!("XADD", "x", "1-0", "data", "a");
+        r!("XDEL", "x", "1-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(0)));
+        // Sanity.
+        r!("DEL", "x");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!("XGROUP", "CREATE", "x", "g1", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(5)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c11",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(4)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c12",
+            "COUNT",
+            "10",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        // XDELs.
+        r!("DEL", "x");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!("XDEL", "x", "3-0");
+        r!("XGROUP", "CREATE", "x", "g1", "0");
+        r!("XGROUP", "CREATE", "x", "g2", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, None));
+        for _ in 0..3 {
+            r!(
+                "XREADGROUP",
+                "GROUP",
+                "g1",
+                "c11",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "x",
+                ">"
+            );
+            assert_eq!(lag_of(&mut s, &mut c, 0), (None, None));
+        }
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c11",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        r!("XTRIM", "x", "MINID", "=", "3-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        assert_eq!(lag_of(&mut s, &mut c, 1), (None, Some(3)));
+        r!("XTRIM", "x", "MINID", "=", "5-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        assert_eq!(lag_of(&mut s, &mut c, 1), (None, Some(2)));
+        // A tombstone after the last ID.
+        r!("DEL", "x");
+        r!("XGROUP", "CREATE", "x", "g1", "$", "MKSTREAM");
+        r!("XADD", "x", "1-0", "data", "a");
+        r!("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "x", ">");
+        r!("XADD", "x", "2-0", "data", "c");
+        r!("XADD", "x", "3-0", "data", "d");
+        r!("XDEL", "x", "2-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), None));
+        r!("XDEL", "x", "1-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(1)));
+        r!("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "x", ">");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(3), Some(0)));
+        // XTRIM.
+        r!("DEL", "x");
+        r!("XGROUP", "CREATE", "x", "mygroup", "$", "MKSTREAM");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(4)));
+        r!("XTRIM", "x", "MAXLEN", "1");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(1)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        r!("XTRIM", "x", "MAXLEN", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0).1, Some(0));
     }
 
     #[test]

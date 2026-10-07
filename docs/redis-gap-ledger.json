@@ -4745,7 +4745,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The start is an interval bound like Redis: - and +, a bare millisecond value, and the ( exclusive prefix with Redis's invalid start ID error. COUNT must be 1 to LONG_MAX/16 (\"COUNT must be > 0\" otherwise), at most ten times COUNT pending entries are looked at, the cursor is the next pending ID (0-0 at the end), JUSTID leaves delivery counts alone, and pending IDs whose entry is gone are removed and reported as the deleted IDs, using up COUNT. The AOF logs explicit XCLAIM commands for claimed entries and XACK for deleted ones."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The start is an interval bound like Redis: - and +, a bare millisecond value, and the ( exclusive prefix with Redis's invalid start ID error. COUNT must be 1 to LONG_MAX/16 (\"COUNT must be > 0\" otherwise), at most ten times COUNT pending entries are looked at, the cursor is the next pending ID (0-0 at the end), JUSTID leaves delivery counts alone, and pending IDs whose entry is gone are removed and reported as the deleted IDs, using up COUNT. The AOF logs explicit XCLAIM commands for claimed entries, XACK for deleted ones and, when nothing was claimed, an XCLAIM that only carries LASTID for the consumer. AOF replay still accepts the XAUTOCLAIM records earlier versions logged as sent (COUNT 0 or above the limit, no cap on the entries looked at, JUSTID adding a delivery)."
     },
     {
       "name": "XCFGSET",
@@ -4771,7 +4771,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). Follows Redis 7.2: the key and group are checked first, then the minimum idle time (negative is 0), the IDs (the run of arguments that parse as strict IDs) and the options JUSTID, FORCE, IDLE, TIME, RETRYCOUNT and LASTID, with Redis's option errors (an option missing its value is unrecognized). A claim counts one delivery unless JUSTID or RETRYCOUNT says otherwise, FORCE creates the pending entry of an entry that exists, a delivery time in the future is now, LASTID only moves the group's last delivered ID forward, and the consumer is created even when nothing is claimed. The AOF logs one explicit XCLAIM per claimed entry (new owner, TIME, RETRYCOUNT, FORCE, JUSTID and LASTID), like Redis, so replay reproduces the pending list whatever the clock says; a claim that found nothing is logged as sent. Not supported: the newer XNACK zone."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). Follows Redis 7.2: the key and group are checked first, then the minimum idle time (negative is 0), the IDs (the run of arguments that parse as strict IDs) and the options JUSTID, FORCE, IDLE, TIME, RETRYCOUNT and LASTID, with Redis's option errors (an option missing its value is unrecognized). A claim counts one delivery unless JUSTID or RETRYCOUNT says otherwise, FORCE creates the pending entry of an entry that exists, a delivery time in the future is now, LASTID only moves the group's last delivered ID forward, and the consumer is created even when nothing is claimed. The AOF logs one explicit XCLAIM per claimed entry (new owner, TIME, RETRYCOUNT, FORCE, JUSTID and LASTID), like Redis, so replay reproduces the pending list whatever the clock says; pending entries dropped because their stream entry is gone are logged as XACK, and a claim that found nothing is logged as an XCLAIM that only carries LASTID, which stands for the consumer it created. AOF replay still accepts the XCLAIM records earlier versions logged as sent (options among the IDs, JUSTID adding a delivery, no consumer from a claim that found nothing). Not supported: the newer XNACK zone."
     },
     {
       "name": "XDEL",
@@ -4810,7 +4810,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. CREATE takes a strict ID (a bare millisecond value is <ms>-0, - and + are refused) or $; SETID takes any ID including - and +. CREATE and SETID take ENTRIESREAD. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag with Redis's estimation (null when deletions make it unknowable). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
+      "notes": "M3 stream group baseline implemented (CREATE/DESTROY/SETID/CREATECONSUMER/DELCONSUMER/HELP dispatch). RDB/BASE snapshots retain groups, consumers, delivery cursor and pending message metadata. CREATE takes a strict ID (a bare millisecond value is <ms>-0, - and + are refused) or $; SETID takes any ID including - and +. CREATE and SETID take ENTRIESREAD. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag by the rules of newer Redis (null when deletions make it unknowable); Redis 7.2.5 keeps reporting the lag from before a trim (read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
     },
     {
       "name": "XGROUP CREATE",
@@ -4823,7 +4823,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (MKSTREAM + BUSYGROUP + strict ID or $; a bare millisecond value is <ms>-0, - and + are refused). ENTRIESREAD is supported. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag with Redis's estimation (null when deletions make it unknowable). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
+      "notes": "M3 stream group baseline implemented (MKSTREAM + BUSYGROUP + strict ID or $; a bare millisecond value is <ms>-0, - and + are refused). ENTRIESREAD is supported. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag by the rules of newer Redis (null when deletions make it unknowable); Redis 7.2.5 keeps reporting the lag from before a trim (read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
     },
     {
       "name": "XGROUP CREATECONSUMER",
@@ -4888,7 +4888,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented. The ID is parsed non-strictly like Redis: a bare millisecond value, - and +, or $. ENTRIESREAD is supported. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag with Redis's estimation (null when deletions make it unknowable). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
+      "notes": "M3 stream group baseline implemented. The ID is parsed non-strictly like Redis: a bare millisecond value, - and +, or $. ENTRIESREAD is supported. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag by the rules of newer Redis (null when deletions make it unknowable); Redis 7.2.5 keeps reporting the lag from before a trim (read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
     },
     {
       "name": "XINFO",
@@ -4901,7 +4901,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). XINFO GROUPS and XINFO STREAM FULL report entries-read and lag. XINFO STREAM FULL lists groups and consumers with their pending entries and treats COUNT 0 as no limit; a consumer's active-time repeats its seen-time because only one is kept."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). XINFO GROUPS and XINFO STREAM FULL report entries-read and lag by the rules of newer Redis, not 7.2.5 (which keeps the lag from before a trim: read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here). XINFO STREAM FULL lists groups and consumers with their pending entries and treats COUNT 0 as no limit and a negative COUNT as 10; a consumer's active-time repeats its seen-time because only one is kept."
     },
     {
       "name": "XINFO CONSUMERS",
@@ -4927,7 +4927,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). Reports entries-read and lag as in Redis 7.2."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). Reports entries-read and lag by the rules of newer Redis, not 7.2.5: 7.2.5 keeps reporting the lag from before a trim (read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here)."
     },
     {
       "name": "XINFO HELP",
@@ -4953,7 +4953,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). FULL lists the entries (COUNT 0 is no limit) and the groups with entries-read, lag, pending entries and consumers; a consumer's active-time repeats its seen-time because only one is kept."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). FULL lists the entries (COUNT 0 is no limit, a negative COUNT is 10) and the groups with entries-read, lag, pending entries and consumers; a consumer's active-time repeats its seen-time because only one is kept."
     },
     {
       "name": "XLEN",
@@ -5005,7 +5005,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). IDs use Redis's strict parser (a bare millisecond value is <ms>-0, - is refused), and $ and + are accepted; + reads the last entry."
+      "notes": "M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). COUNT 0 and a negative COUNT mean no limit. IDs use Redis's strict parser (a bare millisecond value is <ms>-0, - is refused), and $ and + are accepted; + reads the last entry."
     },
     {
       "name": "XREADGROUP",
@@ -5018,7 +5018,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). RDB/BASE snapshots retain group delivery cursor and PEL owner, delivery count and timestamp. $ and + give Redis's \"meaningless in the context of XREADGROUP\" errors, and every stream's group and ID are checked before anything is delivered. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag with Redis's estimation (null when deletions make it unknowable). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
+      "notes": "M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). RDB/BASE snapshots retain group delivery cursor and PEL owner, delivery count and timestamp. $ and + give Redis's \"meaningless in the context of XREADGROUP\" errors, and every stream's group and ID are checked before anything is delivered. COUNT 0 and a negative COUNT mean no limit. An ID still pending for another consumer (after XGROUP SETID rewound the group) moves to the reading consumer with its delivery count back at 1. Each group keeps Redis's entries_read counter, advanced per delivered entry by XREADGROUP, set by XGROUP CREATE and SETID ENTRIESREAD (negative other than -1 is an error, a larger value is clamped to entries_added, SETID without it forgets the counter) and clamped by XSETID when it lowers entries_added. XINFO GROUPS and XINFO STREAM FULL report entries-read and lag by the rules of newer Redis (null when deletions make it unknowable); Redis 7.2.5 keeps reporting the lag from before a trim (read 1 of 5, then XTRIM MAXLEN 1 gives 4 there and 1 here). RDB writes private type 131 only when some group has a known counter, DUMP payloads are RATSK4 and RATSK1 to RATSK3 still restore, and the AOF logs these commands as sent, which carries ENTRIESREAD."
     },
     {
       "name": "XREVRANGE",
