@@ -28,6 +28,9 @@ The format is based on Keep a Changelog and the versioning policy in
 - AOF manifests may only name files inside their own directory.
 - The audit log and audit chain state default to the data directory instead of
   the shared `/tmp`, where every instance on a host clobbered one chain.
+  When no data directory is set (tests, or the engine embedded as a library),
+  each process now uses its own `ratatosk-audit-<pid>` directory under the
+  system temp directory instead of `/tmp`.
 - The insecure-bind guard parses addresses: a hostname that merely starts with
   `127.` is no longer treated as loopback.
 - `AUTH`/`HELLO` failure limits are shared across reconnects, Lua callbacks

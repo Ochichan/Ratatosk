@@ -219,7 +219,18 @@ pub fn set_default_audit_dir(dir: &Path) {
 fn default_audit_file(name: &str) -> PathBuf {
     AUDIT_DEFAULT_DIR
         .get()
-        .map_or_else(|| Path::new("/tmp").join(name), |dir| dir.join(name))
+        .map_or_else(|| fallback_audit_dir().join(name), |dir| dir.join(name))
+}
+
+/// Audit files when no data directory was set. Only the server binary sets
+/// one (from its `dir`); tests and embedders do not. Every such process gets
+/// its own directory: a shared `/tmp` file made parallel processes race on the
+/// chain checkpoint, which marked the chain dirty and turned `health_status`
+/// degraded at random.
+fn fallback_audit_dir() -> PathBuf {
+    let dir = env::temp_dir().join(format!("ratatosk-audit-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 fn audit_state_path() -> PathBuf {
