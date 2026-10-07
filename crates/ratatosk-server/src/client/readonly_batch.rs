@@ -135,22 +135,36 @@ fn purge_expired_key_in_shard(
     }
 }
 
-fn purge_expired_keys_in_shard(
-    shard: &mut DbShard,
-    server_state: &SharedServerState,
+/// Returns a shard read guard in which none of `keys` is logically expired at `now_ms`.
+///
+/// Pure hits and misses stay on the shared read lock. If any key is expired, the
+/// helper takes the write lock, purges those keys with the same removal, WATCH
+/// bump, and memory accounting as the locked path, then atomically downgrades to a
+/// read guard so no writer can run between the purge and the read.
+fn read_db_unexpired<'a>(
+    server_state: &'a SharedServerState,
     selected_db: usize,
+    keys: &[Bytes],
     now_ms: i64,
-) {
-    let expired_keys = shard
-        .data
-        .iter()
-        .filter(|(_, value)| value.expire_at_ms().is_some_and(|ts| ts <= now_ms))
-        .map(|(key, _)| key.clone())
-        .collect::<Vec<_>>();
-
-    for key in expired_keys {
-        tracked_remove_from_shard(shard, server_state, selected_db, &key);
+) -> parking_lot::RwLockReadGuard<'a, DbShard> {
+    {
+        let db = server_state.data.read_db(selected_db);
+        let any_expired = keys.iter().any(|key| {
+            db.data
+                .get(key.as_ref())
+                .is_some_and(|value| value.expire_at_ms().is_some_and(|ts| ts <= now_ms))
+        });
+        if !any_expired {
+            return db;
+        }
     }
+
+    // Re-check under the write lock: another thread may have purged or rewritten the key.
+    let mut db = server_state.data.write_db(selected_db);
+    for key in keys {
+        purge_expired_key_in_shard(&mut db, server_state, selected_db, key, now_ms);
+    }
+    parking_lot::RwLockWriteGuard::downgrade(db)
 }
 
 fn parse_score_bound(raw: &Bytes) -> Option<ScoreBound> {
@@ -474,8 +488,7 @@ fn lock_free_zrange_response(
     with_scores: bool,
 ) -> Result<RespFrame, RespFrame> {
     let now_ms = ratatosk_core::time::now_ms();
-    let mut db = server_state.data.write_db(selected_db);
-    purge_expired_key_in_shard(&mut db, server_state, selected_db, key, now_ms);
+    let db = read_db_unexpired(server_state, selected_db, std::slice::from_ref(key), now_ms);
 
     let response = match db.data.get(key.as_ref()) {
         None => RespFrame::Array(vec![]),
@@ -559,10 +572,9 @@ pub(super) fn try_execute_lock_free_fast_command(
     } else if command.eq_ignore_ascii_case(b"DBSIZE") {
         match args {
             [] => {
-                let now_ms = ratatosk_core::time::now_ms();
                 let selected_db = client_state.selected_db();
-                let mut db = server_state.data.write_db(selected_db);
-                purge_expired_keys_in_shard(&mut db, server_state, selected_db, now_ms);
+                // Like Redis, DBSIZE counts expired keys that are not yet reclaimed.
+                let db = server_state.data.read_db(selected_db);
                 RespFrame::Integer(db.data.len() as i64)
             }
             _ => wrong_arity_response("dbsize"),
@@ -571,12 +583,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
                 let value_type = db
@@ -591,12 +601,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -619,16 +627,9 @@ pub(super) fn try_execute_lock_free_fast_command(
             [] => wrong_arity_response("mget"),
             _ => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
+                let db = read_db_unexpired(server_state, client_state.selected_db(), args, now_ms);
                 let mut out = Vec::with_capacity(args.len());
                 for key in args {
-                    purge_expired_key_in_shard(
-                        &mut db,
-                        server_state,
-                        client_state.selected_db(),
-                        key,
-                        now_ms,
-                    );
                     let value = db
                         .data
                         .get(key.as_ref())
@@ -642,12 +643,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
                 match db.data.get(key.as_ref()) {
@@ -667,12 +666,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         } else {
             let key = &args[0];
             let now_ms = ratatosk_core::time::now_ms();
-            let mut db = server_state.data.write_db(client_state.selected_db());
-            purge_expired_key_in_shard(
-                &mut db,
+            let db = read_db_unexpired(
                 server_state,
                 client_state.selected_db(),
-                key,
+                std::slice::from_ref(key),
                 now_ms,
             );
 
@@ -784,12 +781,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 }
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -833,12 +828,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 };
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -865,12 +858,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, field] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -893,12 +884,10 @@ pub(super) fn try_execute_lock_free_fast_command(
             [] | [_] => wrong_arity_response("hmget"),
             [key, fields @ ..] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -931,12 +920,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -966,12 +953,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -994,12 +979,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1024,12 +1007,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, field] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1056,12 +1037,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1086,12 +1065,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, field] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1116,12 +1093,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, member] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1140,12 +1115,10 @@ pub(super) fn try_execute_lock_free_fast_command(
             [] | [_] => wrong_arity_response("smismember"),
             [key, members @ ..] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1183,12 +1156,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1206,12 +1177,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, member] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1231,12 +1200,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1257,12 +1224,10 @@ pub(super) fn try_execute_lock_free_fast_command(
             [] | [_] => wrong_arity_response("zmscore"),
             [key, members @ ..] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1314,12 +1279,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 };
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1365,12 +1328,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 };
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1670,12 +1631,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, member] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1698,12 +1657,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key, member] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1726,12 +1683,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1764,12 +1719,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 };
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1825,12 +1778,10 @@ pub(super) fn try_execute_lock_free_fast_command(
                 };
 
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1884,12 +1835,10 @@ pub(super) fn try_execute_lock_free_fast_command(
         match args {
             [key] => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
-                purge_expired_key_in_shard(
-                    &mut db,
+                let db = read_db_unexpired(
                     server_state,
                     client_state.selected_db(),
-                    key,
+                    std::slice::from_ref(key),
                     now_ms,
                 );
 
@@ -1900,12 +1849,7 @@ pub(super) fn try_execute_lock_free_fast_command(
                         {
                             let remaining_ms = expire_at_ms.saturating_sub(now_ms);
                             if remaining_ms <= 0 {
-                                tracked_remove_from_shard(
-                                    &mut db,
-                                    server_state,
-                                    client_state.selected_db(),
-                                    key.as_ref(),
-                                );
+                                // Unreachable after read_db_unexpired; never removes under a read lock.
                                 RespFrame::Integer(-2)
                             } else if command.eq_ignore_ascii_case(b"TTL") {
                                 RespFrame::Integer(remaining_ms / 1000)
@@ -1931,17 +1875,10 @@ pub(super) fn try_execute_lock_free_fast_command(
             [] => wrong_arity_response("exists"),
             _ => {
                 let now_ms = ratatosk_core::time::now_ms();
-                let mut db = server_state.data.write_db(client_state.selected_db());
+                let db = read_db_unexpired(server_state, client_state.selected_db(), args, now_ms);
                 let mut count = 0i64;
                 let total_keys = args.len() as u64;
                 for key in args {
-                    purge_expired_key_in_shard(
-                        &mut db,
-                        server_state,
-                        client_state.selected_db(),
-                        key,
-                        now_ms,
-                    );
                     if db.data.contains_key(key.as_ref()) {
                         count += 1;
                     }
@@ -2182,5 +2119,63 @@ mod tests {
         assert_ne!(shared.data.watch_key(0, &key), watched_version);
         shared.data.unwatch_key(0, &key);
         shared.data.unwatch_key(0, &key);
+    }
+
+    fn fast_get(shared: &Arc<SharedState>, client: &mut ClientState, key: &[u8]) -> RespFrame {
+        let argv = vec![Bytes::from_static(b"GET"), Bytes::copy_from_slice(key)];
+        try_execute_lock_free_fast_command(&argv, shared, client)
+            .expect("GET should take the fast path")
+            .response
+    }
+
+    #[test]
+    fn fast_get_of_expired_key_removes_it_and_releases_memory() {
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let key = Bytes::from_static(b"k");
+        let value = StoredValue::string(Bytes::from_static(b"v"), Some(1));
+        let size = estimate_object_memory(&key, &value);
+        shared.data.write_db(0).data.insert(key.clone(), value);
+        shared.data.add_memory(0, size);
+        let watched_version = shared.data.watch_key(0, &key);
+        let before = shared.data.estimated_memory();
+
+        let mut client = ClientState::new(1);
+        assert_eq!(
+            fast_get(&shared, &mut client, b"k"),
+            RespFrame::BulkString(None)
+        );
+
+        assert!(!shared.data.read_db(0).data.contains_key(&key));
+        assert_eq!(shared.data.estimated_memory(), before - size);
+        assert_ne!(shared.data.watch_key(0, &key), watched_version);
+        shared.data.unwatch_key(0, &key);
+        shared.data.unwatch_key(0, &key);
+        assert_eq!(shared.stats.keyspace_misses(), 1);
+    }
+
+    #[test]
+    fn fast_get_runs_while_another_reader_holds_the_read_lock() {
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        shared.data.write_db(0).data.insert(
+            Bytes::from_static(b"hot"),
+            StoredValue::string(Bytes::from_static(b"v"), None),
+        );
+
+        let guard = shared.data.read_db(0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_state = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            let mut client = ClientState::new(2);
+            tx.send(fast_get(&worker_state, &mut client, b"hot")).ok();
+        });
+        let response = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("fast GET must not block behind a read guard");
+        drop(guard);
+        handle.join().expect("worker thread");
+        assert_eq!(
+            response,
+            RespFrame::BulkString(Some(Bytes::from_static(b"v")))
+        );
     }
 }
