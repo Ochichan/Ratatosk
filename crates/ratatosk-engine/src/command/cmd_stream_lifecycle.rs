@@ -20,20 +20,26 @@ fn stream_contains_id(stream: &[StreamEntry], id: StreamId) -> bool {
     stream.binary_search_by_key(&id, |entry| entry.id).is_ok()
 }
 
+/// Drops removed IDs from every group's pending lists. The cost follows the
+/// number of removed IDs, not the size of the lists.
 pub(super) fn prune_stream_removed_ids(entry: &mut StoredValue, removed_ids: &[StreamId]) {
     if removed_ids.is_empty() {
         return;
     }
-
-    let removed = removed_ids.iter().copied().collect::<HashSet<_>>();
     let Some(groups) = entry.as_stream_groups_mut() else {
         return;
     };
 
     for group in groups.values_mut() {
-        group.pending.retain(|id, _| !removed.contains(id));
-        for consumer in group.consumers.values_mut() {
-            consumer.pending.retain(|id| !removed.contains(id));
+        if group.pending.is_empty() {
+            continue;
+        }
+        for id in removed_ids {
+            if let Some(pending) = group.pending.remove(id) {
+                if let Some(consumer) = group.consumers.get_mut(&pending.consumer) {
+                    consumer.pending.remove(id);
+                }
+            }
         }
     }
 }
@@ -141,10 +147,25 @@ pub(super) fn purge_stream_pending_id(groups: &mut HashMap<Bytes, StreamGroup>, 
     }
 }
 
+/// Entries per radix node in Redis (`stream-node-max-entries` default). A
+/// `~` trim only removes whole nodes, so it leaves up to this many entries
+/// past the threshold and skips the work when less than that is in excess.
+const APPROX_TRIM_NODE_ENTRIES: usize = 100;
+
+/// What a `~` trim without `LIMIT` may remove at most, Redis's default of 100
+/// nodes.
+const APPROX_TRIM_DEFAULT_LIMIT: usize = 100 * APPROX_TRIM_NODE_ENTRIES;
+
 /// Trims the stream at `entry` as `options` ask and returns how many entries
-/// went. A `~` trim is exact here, since entries live in a vector, but the
-/// `LIMIT` cap still applies. Like Redis, trimming leaves `max_deleted_id`
-/// alone. Group pending lists drop the removed IDs.
+/// went.
+///
+/// A `~` trim follows Redis's granularity: it removes whole multiples of
+/// [`APPROX_TRIM_NODE_ENTRIES`] and stops at `LIMIT` (default
+/// [`APPROX_TRIM_DEFAULT_LIMIT`]; `LIMIT 0` is no cap). The logged form of
+/// the command is the exact result, so replay stays deterministic. Under AOF
+/// replay `~` is exact and `LIMIT` is the plain cap older versions applied.
+/// Like Redis, trimming leaves `max_deleted_id` alone. Group pending lists
+/// drop the removed IDs.
 pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usize {
     let Some(strategy) = options.strategy else {
         return 0;
@@ -152,14 +173,28 @@ pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usiz
     let Some(stream) = entry.as_stream_entries_mut() else {
         return 0;
     };
+    let replay = super::cmd_stream::replay_mode();
 
     let mut remove_count = match strategy {
         TrimStrategy::MaxLen(max_len) => stream
             .len()
             .saturating_sub(usize::try_from(max_len).unwrap_or(usize::MAX)),
-        TrimStrategy::MinId(min_id) => stream.iter().take_while(|item| item.id < min_id).count(),
+        TrimStrategy::MinId(min_id) => stream.partition_point(|item| item.id < min_id),
     };
-    if let Some(cap) = options.limit.filter(|cap| *cap > 0) {
+    let cap = if replay {
+        options.limit
+    } else {
+        match options.limit {
+            Some(0) => None,
+            Some(cap) => Some(cap),
+            None if options.approx => Some(APPROX_TRIM_DEFAULT_LIMIT),
+            None => None,
+        }
+    };
+    if options.approx && !replay {
+        remove_count -= remove_count % APPROX_TRIM_NODE_ENTRIES;
+    }
+    if let Some(cap) = cap {
         remove_count = remove_count.min(cap);
     }
     if remove_count == 0 {

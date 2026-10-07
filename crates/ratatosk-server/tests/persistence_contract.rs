@@ -281,15 +281,15 @@ fn aof_replays_trimmed_xadd_and_xtrim_to_identical_entries() -> io::Result<()> {
 
     let mut server = Server::new(true)?;
     let mut client = server.client()?;
-    for ms in 1..=6 {
+    for ms in 1..=300 {
         let id = format!("{ms}-0");
         client.command(&["XADD", "events", &id, "f", "v"])?;
     }
     // `~` with LIMIT is logged as an exact MAXLEN, with the generated ID.
     client.command(&[
-        "XADD", "events", "MAXLEN", "~", "3", "LIMIT", "2", "*", "g", "w",
+        "XADD", "events", "MAXLEN", "~", "3", "LIMIT", "100", "*", "g", "w",
     ])?;
-    client.command(&["XTRIM", "events", "MAXLEN", "~", "4", "LIMIT", "1"])?;
+    client.command(&["XTRIM", "events", "MAXLEN", "~", "4", "LIMIT", "50"])?;
     // NOMKSTREAM on a missing key creates and logs nothing.
     assert_eq!(
         client.command(&["XADD", "absent", "NOMKSTREAM", "*", "f", "v"])?,
@@ -299,7 +299,7 @@ fn aof_replays_trimmed_xadd_and_xtrim_to_identical_entries() -> io::Result<()> {
     let RespFrame::Array(rows) = &before else {
         panic!("XRANGE should return an array");
     };
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 151);
     drop(client);
     server.stop(false)?;
     server.start()?;
@@ -413,6 +413,85 @@ fn legacy_xsetid_records_now_set_the_last_id_on_replay() -> io::Result<()> {
     assert_eq!(
         client.command(&["XADD", "events", "91-0", "f", "v"])?,
         RespFrame::bulk_str("91-0")
+    );
+    Ok(())
+}
+
+#[test]
+fn startup_replays_raw_stream_trims_an_earlier_version_logged() -> io::Result<()> {
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    client.command(&["SET", "marker", "1"])?;
+    drop(client);
+    server.stop(false)?;
+
+    // An earlier build logged these as sent: a LIMIT without `~`, and an ID
+    // longer than a client may send.
+    let padded = format!("{}2-0", "0".repeat(130));
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    for ms in 1..=6 {
+        for key in ["a", "b"] {
+            commands.push(vec![
+                "XADD".into(),
+                key.into(),
+                format!("{ms}-0"),
+                "f".into(),
+                "v".into(),
+            ]);
+        }
+    }
+    for tail in [
+        &["XTRIM", "a", "MAXLEN", "3", "LIMIT", "2"][..],
+        &["XTRIM", "b", "MAXLEN", "~", "5"],
+    ] {
+        commands.push(tail.iter().map(|part| (*part).to_owned()).collect());
+    }
+    commands.push(vec!["XDEL".into(), "b".into(), padded]);
+    let mut record = Vec::new();
+    for command in &commands {
+        record.extend_from_slice(format!("*{}\r\n", command.len()).as_bytes());
+        for part in command {
+            record.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+    }
+    let mut incr_files = std::fs::read_dir(server.dir.path())?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.to_string_lossy().ends_with(".incr.aof"))
+        .collect::<Vec<_>>();
+    incr_files.sort();
+    let incr = incr_files.last().expect("AOF INCR file");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(incr)?
+        .write_all(&record)?;
+
+    server.start()?;
+    let mut client = server.client()?;
+    let ids = |frame: RespFrame| -> Vec<String> {
+        let RespFrame::Array(rows) = frame else {
+            panic!("XRANGE should return an array");
+        };
+        rows.into_iter()
+            .map(|row| {
+                let RespFrame::Array(parts) = row else {
+                    panic!("entry should be an array");
+                };
+                let RespFrame::BulkString(Some(id)) = &parts[0] else {
+                    panic!("entry should start with an ID");
+                };
+                String::from_utf8_lossy(id).into_owned()
+            })
+            .collect()
+    };
+    // LIMIT 2 capped the exact trim: six entries with MAXLEN 3 leave four.
+    assert_eq!(
+        ids(client.command(&["XRANGE", "a", "-", "+"])?),
+        ["3-0", "4-0", "5-0", "6-0"]
+    );
+    // `~ 5` trimmed exactly (one entry), then the padded ID 2-0 was already gone.
+    assert_eq!(
+        ids(client.command(&["XRANGE", "b", "-", "+"])?),
+        ["3-0", "4-0", "5-0", "6-0"]
     );
     Ok(())
 }

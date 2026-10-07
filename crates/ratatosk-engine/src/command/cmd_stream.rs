@@ -18,6 +18,36 @@ pub(super) fn stream_id_to_bytes(id: StreamId) -> Bytes {
     Bytes::from(text)
 }
 
+thread_local! {
+    static AOF_REPLAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the command being executed comes from AOF replay. Redis relaxes
+/// the same checks for must-obey clients (master link, AOF): replay accepts
+/// the old raw forms an earlier version logged. Under replay a `LIMIT` without
+/// `~` is not an error but still caps the trim (a `LIMIT 0` caps it at zero, as
+/// those versions did), `~` trims exactly with no node rounding or default
+/// cap, and the 127-byte ID limit does not apply.
+pub(super) fn replay_mode() -> bool {
+    AOF_REPLAY.with(std::cell::Cell::get)
+}
+
+/// Sets [`replay_mode`] for one command execution and restores the previous
+/// value, so nested execution (EXEC) stays consistent.
+pub(super) struct ReplayScope(bool);
+
+impl ReplayScope {
+    pub(super) fn enter(replaying: bool) -> Self {
+        Self(AOF_REPLAY.with(|flag| flag.replace(replaying)))
+    }
+}
+
+impl Drop for ReplayScope {
+    fn drop(&mut self) {
+        AOF_REPLAY.with(|flag| flag.set(self.0));
+    }
+}
+
 /// Redis's `string2ull`: `string2ll` first (a negative result is refused),
 /// then `strtoull` in base 10. `strtoull` skips leading whitespace and takes
 /// a `+` or `-` sign, so `+5` and ` 5` parse, `-0` is 0, and a negative number
@@ -76,7 +106,7 @@ fn parse_stream_id_inner(
     strict: bool,
     auto_seq: bool,
 ) -> Option<(StreamId, bool)> {
-    if raw.len() > 127 {
+    if raw.len() > 127 && !replay_mode() {
         return None;
     }
     // Redis copies the argument into a C buffer, so an embedded NUL ends it.
@@ -420,7 +450,7 @@ pub(super) fn parse_add_or_trim_args(args: &[Bytes], xadd: bool) -> Result<AddTr
             "syntax error, XTRIM must be called with a trimming strategy",
         ));
     }
-    if limit_given && !parsed.approx {
+    if limit_given && !parsed.approx && !replay_mode() {
         return Err(syntax_error_reply(
             "syntax error, LIMIT cannot be used without the special ~ option",
         ));
