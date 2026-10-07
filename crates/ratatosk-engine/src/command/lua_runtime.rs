@@ -133,11 +133,15 @@ impl LuaRuntime {
             mode,
         } = request;
 
+        // Redis restores the caller's selected db when a script ends.
+        let caller_db = client.selected_db;
+
         // Wrap mutable references in RefCell for shared access by closures.
         let server_cell = RefCell::new(server);
         let client_cell = RefCell::new(client);
 
-        self.lua
+        let result = self
+            .lua
             .scope(|scope| {
                 let globals = self.lua.globals();
 
@@ -255,7 +259,10 @@ impl LuaRuntime {
                 // Convert the first return value to a RESP frame.
                 Ok(lua_multi_to_resp(&result))
             })
-            .map_err(lua_err)
+            .map_err(lua_err);
+        // Every exit path of the scope, including script errors, lands here.
+        client_cell.borrow_mut().selected_db = caller_db;
+        result
     }
 }
 

@@ -839,6 +839,78 @@ mod tests {
 
     #[cfg(feature = "lua-scripting")]
     #[test]
+    fn script_select_is_undone_on_every_exit_path() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SELECT", "2"]);
+        let scripts = [
+            "redis.call('SELECT','1') return redis.call('SET','a','1')",
+            "redis.call('SELECT','1') return redis.call('LPUSH','nokey')",
+            "redis.call('SELECT','1') return redis.pcall('NOSUCHCMD')",
+            "redis.call('SELECT','1') error('boom')",
+            "redis.call('SELECT','1') return redis.call('NOSUCHCMD')",
+            "redis.call('SELECT','1') while true do end",
+        ];
+        for script in scripts {
+            for cmd in ["EVAL", "EVAL_RO"] {
+                run_argv(&mut server, &mut client, &[cmd, script, "0"]);
+                assert_eq!(client.selected_db(), 2, "{cmd} {script}");
+            }
+        }
+        let (_, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SELECT','1') return redis.call('SET','b','1')",
+                "0",
+            ],
+        );
+        assert_eq!(
+            durable_strings(&effects.expect("effects")),
+            vec![(1, vec!["SET".into(), "b".into(), "1".into()])]
+        );
+        assert_eq!(client.selected_db(), 2);
+        run_argv(
+            &mut server,
+            &mut client,
+            &["EVALSHA", "0000000000000000000000000000000000000000", "0"],
+        );
+        assert_eq!(client.selected_db(), 2);
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn queued_commands_after_eval_in_multi_run_in_the_original_db() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SELECT", "2"]);
+        run_argv(&mut server, &mut client, &["MULTI"]);
+        run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SELECT','1') return redis.call('SET','in1','x')",
+                "0",
+            ],
+        );
+        run_argv(&mut server, &mut client, &["SET", "in2", "y"]);
+        let (_, effects) = run_argv(&mut server, &mut client, &["EXEC"]);
+        assert_eq!(
+            durable_strings(&effects.expect("effects"))
+                .iter()
+                .map(|(db, a)| (*db, a[1].clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, "in1".to_string()), (2, "in2".to_string())]
+        );
+        assert_eq!(client.selected_db(), 2);
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
     fn eval_inside_multi_exec_joins_the_exec_transaction() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();

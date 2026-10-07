@@ -594,8 +594,7 @@ fn eval_writes_survive_sigkill_across_databases() -> io::Result<()> {
         ])?,
         RespFrame::Integer(2)
     );
-    // The script's SELECT stays in effect for this connection.
-    assert_ok(client.command(&["SELECT", "0"])?);
+    // The script's SELECT must not leak: this reads db 0.
     let events = client.command(&["XRANGE", "events", "-", "+"])?;
     drop(client);
 

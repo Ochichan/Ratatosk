@@ -526,7 +526,7 @@ With `lua-scripting` and AOF enabled, EVAL and EVALSHA persist what the script d
 (Redis 7 effects replication), not the script text. Each successful nested write
 logs its canonical form (for example XADD with its generated ID, SPOP as SREM or
 DEL), in execution order, with the database it ran in, so a `SELECT` inside the
-script replays against the right database. The writes of one invocation form a
+script replays against the right database. The caller's selected database is restored when the script ends, on success and on every error path. The writes of one invocation form a
 single MULTI/EXEC transaction, and inside a client MULTI they join the EXEC
 transaction. A script that wrote nothing, or whose writes all failed, logs
 nothing, and writes made before a script error are still logged because they
