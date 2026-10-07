@@ -505,10 +505,17 @@ Reads, deletion and administrative recovery remain available. An accepted large
 command, transaction or Lua invocation can cross the limit; later growing work is
 refused. Raising the limit or setting it to `0` permits writes again.
 
-The limited path measures current values instead of relying on the periodically
-corrected counter, so repeated in-place hash/list growth and shrinking values are
-visible without waiting for cron. This requires a dataset scan and has a cost
-that increases with dataset size. The default unlimited path avoids that scan.
+The incremental memory counter does not see collections that grow or shrink in
+place (HSET on an existing hash, LPUSH onto an existing list), so it only decides
+admission while it is clearly below the limit. Once the counter comes within a
+margin of the limit, each growing command pays for a full dataset scan that
+measures current values and corrects the counter. The margin is a tenth of
+`maxmemory`, or twice the shortfall the last once-a-second cron scan found,
+whichever is larger. Far from the limit, a burst of in-place growth larger than
+that margin can therefore be admitted past the limit until the next cron scan
+(at most one second later) corrects the counter; from then on the larger margin
+makes admission scan. With 100k keys, a SET far from the limit costs about the
+same as with no limit, and a SET near it costs a scan (about 0.8 ms).
 Estimates include sorted-set member bytes, but are not exact allocator accounting.
 Other eviction policies continue to use the existing cron eviction behavior.
 

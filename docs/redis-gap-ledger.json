@@ -1274,7 +1274,7 @@
       "capability_tier": "baseline_local",
       "milestone": "m0-foundation",
       "owner": "",
-      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. maxmemory accepts decimal byte limits at runtime (0 disables the cap); noeviction admission uses a current dataset estimate. Policies/samples remain startup-only."
+      "notes": "Local runtime settings; appendonly activation materializes an authoritative BASE, disable drains the writer, and appendfsync updates the active writer. Actual appendonly/appendfsync lifecycle is reconciled for direct commands and EXEC; successful fresh writer activation clears a prior storage-error latch. maxmemory accepts decimal byte limits at runtime (0 disables the cap); noeviction admission scans the current dataset near the limit and uses the incremental counter elsewhere. Policies/samples remain startup-only."
     },
     {
       "name": "COPY",

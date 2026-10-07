@@ -1222,6 +1222,10 @@ pub struct DataState {
     /// Per-DB estimated memory in bytes — updated incrementally on insert/remove,
     /// corrected periodically via full scan in `server_cron`.
     db_memory_bytes: Arc<[AtomicUsize]>,
+    /// Bytes the counters fell short of the last periodic full scan, summed
+    /// over databases. In-place collection growth is not counted
+    /// incrementally; noeviction admission widens its scan margin by this.
+    memory_undercount: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for DataState {
@@ -1255,6 +1259,7 @@ impl DataState {
             next_key_version: Arc::new(AtomicU64::new(1)),
             watched_keys: Arc::new(AtomicUsize::new(0)),
             db_memory_bytes: Arc::from(mem),
+            memory_undercount: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1293,6 +1298,22 @@ impl DataState {
     /// periodic full-scan correction and after FLUSHDB).
     pub fn reset_memory(&self, db_idx: usize, bytes: usize) {
         self.db_memory_bytes[db_idx].store(bytes, AtomicOrdering::Relaxed);
+    }
+
+    /// Replace a database's counter with a full-scan result and return how
+    /// far the counter had fallen short of it.
+    pub(crate) fn correct_memory(&self, db_idx: usize, bytes: usize) -> usize {
+        let counted = self.db_memory_bytes[db_idx].swap(bytes, AtomicOrdering::Relaxed);
+        bytes.saturating_sub(counted)
+    }
+
+    /// Undercount found by the last periodic full scan.
+    pub fn memory_undercount(&self) -> usize {
+        self.memory_undercount.load(AtomicOrdering::Relaxed)
+    }
+
+    pub(crate) fn set_memory_undercount(&self, bytes: usize) {
+        self.memory_undercount.store(bytes, AtomicOrdering::Relaxed);
     }
 
     pub fn db_count(&self) -> usize {

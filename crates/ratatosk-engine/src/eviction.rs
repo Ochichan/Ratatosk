@@ -222,15 +222,39 @@ pub fn estimate_used_memory(state: &ServerState) -> usize {
 /// scan until its counter is stored. Writers update the counter under the
 /// write lock, so no write lands between the two and drops out of the count.
 /// Other databases, and reads of the one being measured, keep running.
+///
+/// The periodic caller also records how far the counters had fallen short,
+/// which sets the noeviction admission scan margin. Admission's own scans
+/// run much more often and would hide the per-second drift, so they pass
+/// `record_undercount = false`.
 pub fn recompute_memory_estimates(data: &crate::keyspace::DataState) -> usize {
-    (0..data.db_count())
+    recompute_memory(data, true)
+}
+
+pub(crate) fn recompute_memory(
+    data: &crate::keyspace::DataState,
+    record_undercount: bool,
+) -> usize {
+    let mut undercount = 0usize;
+    let total = (0..data.db_count())
         .map(|db_idx| {
             let shard = data.read_db(db_idx);
             let bytes = estimate_shard_memory(&shard);
-            data.reset_memory(db_idx, bytes);
+            undercount = undercount.saturating_add(data.correct_memory(db_idx, bytes));
             bytes
         })
-        .fold(0usize, usize::saturating_add)
+        .fold(0usize, usize::saturating_add);
+    if record_undercount {
+        data.set_memory_undercount(undercount);
+    }
+    total
+}
+
+/// How close the incremental counter may come to `maxmemory` before
+/// noeviction admission pays for a full scan: a tenth of the limit, or twice
+/// the undercount the last periodic scan found, whichever is larger.
+pub fn admission_scan_margin(maxmemory: usize, undercount: usize) -> usize {
+    (maxmemory / 10).max(undercount.saturating_mul(2))
 }
 
 fn estimate_shard_memory(shard: &crate::keyspace::DbShard) -> usize {
