@@ -3618,6 +3618,10 @@ pub struct ClientState {
     monitor_mode: bool,
     durability_capture_enabled: bool,
     durability_effects: Option<DurabilityEffects>,
+    /// Effects of the nested writes of the script that is currently running,
+    /// in execution order. Drained into one transaction when the script ends.
+    #[cfg(feature = "lua-scripting")]
+    script_durable_commands: Vec<DurableCommand>,
     /// Nested EXEC/EVAL dispatches are admitted as one atomic command unit.
     memory_admission_bypass_depth: usize,
 }
@@ -3742,6 +3746,27 @@ impl ClientState {
 
     fn set_durability_effects(&mut self, effects: Option<DurabilityEffects>) {
         self.durability_effects = effects;
+    }
+
+    /// Move the effects of the command that just ran into the running
+    /// script's log. Called after each nested `redis.call`.
+    #[cfg(feature = "lua-scripting")]
+    fn collect_script_durability_effects(&mut self) {
+        if let Some(effects) = self.durability_effects.take() {
+            self.script_durable_commands.extend(effects.commands);
+        }
+    }
+
+    /// Publish the collected script effects as one atomic transaction. Reads
+    /// and writes that changed nothing leave the log empty, so nothing is set.
+    #[cfg(feature = "lua-scripting")]
+    fn finish_script_durability_effects(&mut self) {
+        let commands = std::mem::take(&mut self.script_durable_commands);
+        self.durability_effects = if commands.is_empty() {
+            None
+        } else {
+            Some(DurabilityEffects::transaction(commands))
+        };
     }
 
     pub fn set_protocol_version(&mut self, protocol_version: i64) {
@@ -3960,6 +3985,8 @@ impl ClientState {
             monitor_mode: false,
             durability_capture_enabled: false,
             durability_effects: None,
+            #[cfg(feature = "lua-scripting")]
+            script_durable_commands: Vec::new(),
             memory_admission_bypass_depth: 0,
         }
     }
@@ -4548,10 +4575,16 @@ fn execute_argv_inner(
         track_latency,
     );
 
-    // `cmd_exec` gathers the effects of its nested commands itself.  Replacing
-    // them here with a bare EXEC would make recovery both incomplete and
-    // vulnerable to a torn transaction tail.
-    if client.durability_capture_enabled && command.as_slice() != b"EXEC" {
+    // `cmd_exec` and the script commands gather the effects of their nested
+    // commands themselves.  Replacing them here with a bare EXEC (or an EVAL
+    // that is not flagged as a write) would make recovery incomplete or lose
+    // the script's writes entirely.
+    if client.durability_capture_enabled
+        && !matches!(
+            command.as_slice(),
+            b"EXEC" | b"EVAL" | b"EVALSHA" | b"EVAL_RO" | b"EVALSHA_RO"
+        )
+    {
         client.set_durability_effects(capture_durability_effects(
             command.as_slice(),
             argv,

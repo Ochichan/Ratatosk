@@ -326,6 +326,8 @@ fn redis_call_impl(
         let mut access = super::ServerAccess::new_inline(server);
         super::execute(frame, &mut access, client)
     };
+    // Redis 7 effects replication: log what the script did, not the script.
+    client.collect_script_durability_effects();
 
     if !protected {
         // redis.call() -- propagate errors as Lua errors

@@ -576,3 +576,34 @@ fn exec_runtime_aof_config_uses_the_final_committed_state() -> io::Result<()> {
     assert_bulk(client.command(&["GET", "counter"])?, "4");
     Ok(())
 }
+
+#[cfg(feature = "lua-scripting")]
+#[test]
+fn eval_writes_survive_sigkill_across_databases() -> io::Result<()> {
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    assert_eq!(
+        client.command(&[
+            "EVAL",
+            "redis.call('SET','scripted','yes') \
+             redis.call('XADD','events','*','f','v') \
+             redis.call('SELECT','1') \
+             redis.call('INCR','counter') \
+             return redis.call('INCR','counter')",
+            "0",
+        ])?,
+        RespFrame::Integer(2)
+    );
+    // The script's SELECT stays in effect for this connection.
+    assert_ok(client.command(&["SELECT", "0"])?);
+    let events = client.command(&["XRANGE", "events", "-", "+"])?;
+    drop(client);
+
+    server.restart(true)?;
+    let mut client = server.client()?;
+    assert_bulk(client.command(&["GET", "scripted"])?, "yes");
+    assert_eq!(client.command(&["XRANGE", "events", "-", "+"])?, events);
+    assert_ok(client.command(&["SELECT", "1"])?);
+    assert_bulk(client.command(&["GET", "counter"])?, "2");
+    Ok(())
+}
