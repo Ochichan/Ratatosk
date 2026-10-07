@@ -101,7 +101,17 @@ pub(crate) fn spawn_aof_worker(
         let mut active_aof_path = aof_path;
         let mut manifest_path = manifest_path;
         let mut policy = policy;
+        let mut delayed_reported = 0u64;
         let exit = loop {
+            let delayed = writer.delayed_fsync_count();
+            if delayed < delayed_reported {
+                // A rewrite replaced the writer and its counter restarted.
+                delayed_reported = 0;
+            }
+            if delayed > delayed_reported {
+                crate::metrics::record_aof_delayed_fsync(delayed - delayed_reported);
+                delayed_reported = delayed;
+            }
             // While an everysec fsync runs, wake briefly so records postponed
             // behind it are written soon after it finishes even if no client
             // appends again.
@@ -517,11 +527,20 @@ pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
 /// The worker answers immediately: it never waits for the disk here, so this
 /// is safe to call without holding the server `meta` lock. It is a no-op when
 /// the worker's policy is not `everysec`.
-pub async fn tick_aof_everysec(runtime: &PersistenceRuntime) -> io::Result<()> {
+pub async fn tick_aof_everysec(runtime: &PersistenceRuntime) -> Result<(), (u64, io::Error)> {
     let Some((sender, generation)) = runtime.aof_sender_with_generation() else {
         return Ok(());
     };
+    tick_aof_everysec_inner(runtime, sender, generation)
+        .await
+        .map_err(|error| (generation, error))
+}
 
+async fn tick_aof_everysec_inner(
+    runtime: &PersistenceRuntime,
+    sender: mpsc::Sender<AofWorkerCommand>,
+    generation: u64,
+) -> io::Result<()> {
     let (reply_tx, reply_rx) = oneshot::channel();
     match tokio::time::timeout(
         AOF_APPEND_QUEUE_TIMEOUT,
@@ -2008,6 +2027,10 @@ mod tests {
 
     #[tokio::test]
     async fn everysec_worker_keeps_order_across_background_fsync_and_drains_on_controls() {
+        // Own subscriber so worker log callsites register as enabled; without
+        // one they can cache "disabled" and starve the log-asserting tests.
+        let _subscriber =
+            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("everysec-worker.aof");
         let writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open AOF writer");
@@ -2066,6 +2089,162 @@ mod tests {
             &path,
             &["k1", "k2", "k3", "k4", "k5", "k6"]
         ));
+    }
+
+    /// An everysec worker whose first background fsync fails, with that
+    /// failure already collected and stored by the writer.
+    async fn worker_with_failed_background_fsync(path: &Path) -> mpsc::Sender<AofWorkerCommand> {
+        let mut writer = AofWriter::open(path, FsyncPolicy::EverySec).expect("open AOF writer");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        writer.set_fsync_hook_for_tests(Arc::new(move |file: &std::fs::File| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Err(io::Error::other("synthetic background fsync failure"))
+            } else {
+                file.sync_all()
+            }
+        }));
+        let sender = spawn_aof_worker(path.to_path_buf(), None, writer, FsyncPolicy::EverySec, 64);
+        worker_append(&sender, "k1").await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // Due: this append starts the failing background fsync.
+        worker_append(&sender, "k2").await;
+        // The worker polls every 10 ms and collects the failure.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sender
+    }
+
+    async fn worker_append_result(
+        sender: &mpsc::Sender<AofWorkerCommand>,
+        key: &str,
+    ) -> Result<(), String> {
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Append {
+                db_index: 0,
+                argv: vec![
+                    Bytes::from("SET"),
+                    Bytes::from(key.to_string()),
+                    Bytes::from("v"),
+                ],
+                timestamp_ms: 1,
+                reply,
+            })
+            .await
+            .expect("enqueue append");
+        reply_rx.await.expect("append reply")
+    }
+
+    /// Stop the worker explicitly so it never logs the channel-closed warning,
+    /// which would pollute the tracing callsite cache that
+    /// `worker_channel_disconnect_remains_a_warning` depends on.
+    async fn worker_shutdown(sender: &mpsc::Sender<AofWorkerCommand>) {
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Shutdown { reply })
+            .await
+            .expect("enqueue shutdown");
+        let _ = reply_rx.await;
+    }
+
+    #[tokio::test]
+    async fn config_set_does_not_swallow_a_background_fsync_failure() {
+        // Own subscriber so worker log callsites register as enabled; without
+        // one they can cache "disabled" and starve the log-asserting tests.
+        let _subscriber =
+            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("bg-fail-policy.aof");
+        let sender = worker_with_failed_background_fsync(&path).await;
+
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::SetPolicy {
+                policy: FsyncPolicy::Always,
+                reply,
+            })
+            .await
+            .expect("enqueue set policy");
+        reply_rx
+            .await
+            .expect("set policy reply")
+            .expect("CONFIG SET itself must succeed");
+
+        let error = worker_append_result(&sender, "k3")
+            .await
+            .expect_err("the stored failure must reach the next append, which latches it");
+        assert!(
+            error.contains("synthetic background fsync failure"),
+            "{error}"
+        );
+        worker_append_result(&sender, "k4")
+            .await
+            .expect("the failure is delivered once");
+        worker_shutdown(&sender).await;
+    }
+
+    #[tokio::test]
+    async fn rewrite_reports_a_background_fsync_failure_and_keeps_it_for_the_latch() {
+        // Own subscriber so worker log callsites register as enabled; without
+        // one they can cache "disabled" and starve the log-asserting tests.
+        let _subscriber =
+            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("bg-fail-rewrite.aof");
+        let sender = worker_with_failed_background_fsync(&path).await;
+
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Rewrite {
+                snapshot: ServerState::with_default_dbs().snapshot_dbs(),
+                reply,
+            })
+            .await
+            .expect("enqueue rewrite");
+        let error = reply_rx
+            .await
+            .expect("rewrite reply")
+            .expect_err("rewrite must not succeed over a failed fsync");
+        assert!(
+            error.contains("synthetic background fsync failure"),
+            "{error}"
+        );
+
+        let error = worker_append_result(&sender, "k3")
+            .await
+            .expect_err("append still latches the failure");
+        assert!(
+            error.contains("synthetic background fsync failure"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_a_background_fsync_failure_after_fsyncing() {
+        // Own subscriber so worker log callsites register as enabled; without
+        // one they can cache "disabled" and starve the log-asserting tests.
+        let _subscriber =
+            tracing::subscriber::set_default(aof_log_subscriber(Arc::new(Mutex::new(Vec::new()))));
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("bg-fail-shutdown.aof");
+        let sender = worker_with_failed_background_fsync(&path).await;
+
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Shutdown { reply })
+            .await
+            .expect("enqueue shutdown");
+        let error = reply_rx
+            .await
+            .expect("shutdown reply")
+            .expect_err("shutdown must surface the failure");
+        assert!(
+            error.contains("synthetic background fsync failure"),
+            "{error}"
+        );
+        assert!(
+            aof_has_keys_in_order(&path, &["k1", "k2"]),
+            "held-back records are still written"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

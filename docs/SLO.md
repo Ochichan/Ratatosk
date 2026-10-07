@@ -41,7 +41,7 @@ modest and honest — "safe within this workload", not "fastest in the world".
 | Process availability | **99.9%** of 1m windows healthy | `avg_over_time((ratatosk_aof_write_latched == bool 0)[28d])` + `up` |
 | Read p99 latency | **≤ 1 ms** at ≤ 50k ops/s pipelined | `ratatosk_command_duration_seconds` histogram, aggregated over read commands (`GET`, `MGET`, `HGET`, `LRANGE`, ...) via the per-command `command` label |
 | Write p99 latency | **≤ 2 ms** (`appendfsync everysec`) | `ratatosk_command_duration_seconds` histogram, aggregated over write commands (`SET`, `HSET`, `LPUSH`, `XADD`, ...) via the per-command `command` label |
-| Durable-write loss window | **≤ 1 s** of acknowledged writes (`everysec`); **0** (`always`) | durability contract, `docs/operations.md` |
+| Durable-write loss window | `everysec`: power loss or OS crash about **1 s plus up to two fsync durations** of acknowledged writes; `kill -9` the unwritten tail of up to 8 KiB plus records held behind a running fsync (at most 2 s or 64 MiB). `always`: **0** | durability contract, `docs/operations.md` |
 | AOF write error budget | **0** sustained write errors | `increase(ratatosk_aof_write_errors_total[5m]) == 0` |
 | Memory estimate freshness | **< 100 ticks** stale | `ratatosk_memory_estimate_age_ticks` |
 

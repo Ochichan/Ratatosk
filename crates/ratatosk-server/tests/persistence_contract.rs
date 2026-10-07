@@ -16,12 +16,18 @@ struct Server {
     port: u16,
     starts: u32,
     appendonly: bool,
+    appendfsync: &'static str,
     compatibility_mode: &'static str,
 }
 
 impl Server {
     fn new(appendonly: bool) -> io::Result<Self> {
+        Self::with_fsync(appendonly, "always")
+    }
+
+    fn with_fsync(appendonly: bool, appendfsync: &'static str) -> io::Result<Self> {
         let mut server = Self {
+            appendfsync,
             child: None,
             dir: tempfile::tempdir()?,
             port: 0,
@@ -53,7 +59,7 @@ impl Server {
             .env("RATATOSK_DIR", self.dir.path())
             .env("RATATOSK_APPENDONLY", self.appendonly.to_string())
             .env("RATATOSK_COMPATIBILITY_MODE", self.compatibility_mode)
-            .env("RATATOSK_APPENDFSYNC", "always")
+            .env("RATATOSK_APPENDFSYNC", self.appendfsync)
             .env("RATATOSK_METRICS_BIND", "127.0.0.1:0")
             .env("RATATOSK_ALLOW_NO_METRICS", "true")
             .env("RATATOSK_CONN_RATE_LIMIT_MAX_ATTEMPTS", "100000")
@@ -215,6 +221,29 @@ fn aof_exec_survives_sigkill_with_selected_db() -> io::Result<()> {
     let mut client = server.client()?;
     assert_ok(client.command(&["SELECT", "1"])?);
     assert_bulk(client.command(&["GET", "committed"])?, "yes");
+    Ok(())
+}
+
+/// Under `appendfsync everysec` the writer postpones writes behind a
+/// background fsync. After the timer has run (writes idle for longer than one
+/// tick), a SIGKILL must lose nothing, including records appended while an
+/// fsync was in flight.
+#[test]
+fn everysec_aof_survives_sigkill_once_the_timer_has_flushed() -> io::Result<()> {
+    let mut server = Server::with_fsync(true, "everysec")?;
+    let mut client = server.client()?;
+    // Spread writes over ~2.5 s so at least one background fsync overlaps them.
+    for i in 0..500 {
+        assert_ok(client.command(&["SET", &format!("everysec:{i}"), "v"])?);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(client);
+    std::thread::sleep(std::time::Duration::from_millis(2600));
+
+    server.restart(true)?;
+    let mut client = server.client()?;
+    assert_eq!(client.command(&["DBSIZE"])?, RespFrame::Integer(500));
+    assert_bulk(client.command(&["GET", "everysec:499"])?, "v");
     Ok(())
 }
 

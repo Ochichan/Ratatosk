@@ -877,9 +877,9 @@ writer.append_command(0, &[
 
 `CONFIG SET appendfsync always|everysec|no`로 런타임 변경 가능.
 
-`EverySec`의 background fsync 동안 새 record는 응답한 뒤 메모리 pending buffer에만 쌓고 fd에는 쓰지 않는다(macOS의 `F_FULLFSYNC`가 같은 파일의 `write`를 막기 때문). fsync가 끝나면(worker가 10ms마다 확인) pending buffer를 순서대로 fd에 쓰고 `last_fsync`를 갱신한다. fsync 실패는 다음 append 또는 timer tick에서 보고되어 기존처럼 AOF 쓰기를 latch한다. pending buffer는 64 MiB로 제한되며, 한도에 도달하면 다음 append가 fsync 완료를 기다린다(backpressure). `Flush`, `Shutdown`, `Rewrite`, `SetPolicy`는 진행 중인 fsync를 기다리고 pending buffer를 비운 뒤 자기 작업을 수행하므로 파일 안의 record 순서와 SELECT 추적은 논리적 append 순서를 따른다. 1초 timer는 `meta` lock을 잡지 않고 worker에 tick만 보내며, tick은 디스크를 기다리지 않는다.
+`EverySec`는 fsync가 진행 중이 아닐 때 buffer가 8 KiB에 도달하거나 1초 timer가 울릴 때 fd에 쓴다(기존 `BufWriter`와 같은 syscall 패턴). background fsync 동안 새 record는 응답한 뒤 메모리 buffer에만 쌓고 fd에는 쓰지 않는다(macOS의 `F_FULLFSYNC`가 같은 파일의 `write`를 막기 때문). fsync가 끝나면(worker가 10ms마다 확인) buffer를 순서대로 fd에 쓰고 `last_fsync`를 갱신한다. 보류는 최대 2초(`MAX_HOLD_DURING_FSYNC`) 또는 64 MiB(`MAX_PENDING_DURING_FSYNC`)이며, 한도에 도달하면 fsync가 끝나지 않았어도 fd에 쓴다(이 write는 fsync가 끝날 때까지 막힐 수 있고, Redis의 `aof_delayed_fsync`처럼 `ratatosk_aof_delayed_fsync_total` metric으로 센다). fsync 실패는 다음 append 또는 timer tick이 반환할 때까지 보관되고, 그 호출이 AOF 쓰기를 latch한다. `Flush`, `Shutdown`, `Rewrite`, `SetPolicy`는 진행 중인 fsync를 기다리고 buffer를 비운 뒤 자기 작업을 수행하며(`Flush`/`Shutdown`/`Rewrite`는 이전 fsync가 실패했어도 마지막 fsync를 실행하고 실패를 반환, `SetPolicy`는 보관된 실패를 소비하지 않음), 파일 안의 record 순서와 SELECT 추적은 논리적 append 순서를 따른다. 1초 timer는 `meta` lock을 잡지 않고 worker에 tick만 보내며, tick은 디스크를 기다리지 않는다. 오래된 writer 세대의 tick 실패는 현재 writer를 latch하지 않는다.
 
-손실 한도: 프로세스 crash는 한 번의 fsync 동안 응답한 write(보통 수 ms 분량, 최대 64 MiB), 전원 장애/OS crash는 마지막 완료된 fsync 이후의 write(fsync 간격 약 1초 + 진행 중인 fsync 시간).
+손실 한도: 프로세스 crash는 아직 쓰지 않은 최대 8 KiB 꼬리(기존과 동일)와 진행 중인 fsync 뒤에 보류된 record(최대 2초 또는 64 MiB), 전원 장애/OS crash는 완료된 fsync가 덮지 못한 write(fsync 간격 약 1초 + 최대 두 번의 fsync 시간 + 최대 10ms 폴링 지연).
 
 ### AofManifest
 

@@ -835,7 +835,17 @@ async fn flush_everysec_persistence(
             return;
         }
     }
-    if let Err(error) = tick_aof_everysec(persistence).await {
+    if let Err((generation, error)) = tick_aof_everysec(persistence).await {
+        // A tick that raced with CONFIG SET appendonly no/yes belongs to a
+        // writer that is gone; its failure must not latch the new one.
+        if !persistence.aof_generation_is_current(generation) {
+            tracing::warn!(
+                target = "ratatosk::aof",
+                error = %error,
+                "ignoring everysec tick failure from a replaced AOF writer"
+            );
+            return;
+        }
         let detail = format!("periodic AOF fsync failed: {error}");
         let mut state = server_state.meta.lock().await;
         state.set_aof_last_error(detail.clone());

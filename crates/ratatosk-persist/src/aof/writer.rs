@@ -55,9 +55,19 @@ impl FsyncPolicy {
 
 /// Upper bound on bytes held back from the file descriptor while a background
 /// fsync is in flight (`appendfsync everysec`).  When the bound is reached the
-/// next append blocks until the fsync finishes and the buffer is written, so
-/// memory use stays bounded even if the disk stalls.
+/// buffer is written to the fd even though the fsync is still running (the
+/// write may block on it), so memory use stays bounded even if the disk stalls.
 pub const MAX_PENDING_DURING_FSYNC: usize = 64 * 1024 * 1024;
+
+/// Longest time records are held back from the fd behind one in-flight fsync.
+/// After this the writer writes anyway and accepts that the write may block on
+/// the fsync, like Redis does (it counts these in `aof_delayed_fsync`).
+pub const MAX_HOLD_DURING_FSYNC: Duration = Duration::from_secs(2);
+
+/// Without an fsync in flight the buffer is written to the fd in chunks of at
+/// least this many bytes, matching the old `BufWriter` capacity, so everysec
+/// does about one `write(2)` per 8 KiB instead of one per append.
+const WRITE_BATCH: usize = 8 * 1024;
 
 /// Minimum spacing between everysec fsyncs, measured from the previous
 /// fsync's completion.
@@ -78,10 +88,13 @@ struct FsyncDone {
 struct InFlightFsync {
     done: Receiver<FsyncDone>,
     thread: JoinHandle<()>,
+    started: Instant,
+    /// Already counted in `delayed_fsync`.
+    counted_delayed: bool,
 }
 
-#[cfg(test)]
-type FsyncHook = std::sync::Arc<dyn Fn(&File) -> io::Result<()> + Send + Sync>;
+/// Replacement for `File::sync_all`, for fault injection in tests.
+pub type FsyncHook = std::sync::Arc<dyn Fn(&File) -> io::Result<()> + Send + Sync>;
 
 /// Appends RESP-encoded commands to the AOF file.
 ///
@@ -101,16 +114,22 @@ pub struct AofWriter {
     /// so another fsync would make something durable.
     dirty: bool,
     in_flight: Option<InFlightFsync>,
-    /// A background fsync failure observed by [`AofWriter::poll_background`],
-    /// reported by the next call that can return an error.
-    deferred_error: Option<PersistError>,
+    /// A background fsync failure.  It stays set until an append or timer tick
+    /// returns it, because only those callers latch the server's AOF write
+    /// error.  Flush, policy change, rewrite and shutdown report it too but
+    /// leave it in place.
+    deferred_error: Option<(io::ErrorKind, String)>,
+    /// How many times records were written to the fd while an fsync was still
+    /// in flight (size or time bound reached).
+    delayed_fsync: u64,
+    /// Time bound for holding records back; [`MAX_HOLD_DURING_FSYNC`] outside tests.
+    max_hold: Duration,
     /// Held-back byte bound; [`MAX_PENDING_DURING_FSYNC`] outside tests.
     max_pending: usize,
     // An existing AOF can end after any SELECT.  Keep this unknown until the
     // first append so that reopening a writer always establishes its replay
     // database explicitly instead of inheriting an old file tail's DB.
     current_db: Option<usize>,
-    #[cfg(test)]
     fsync_hook: Option<FsyncHook>,
 }
 
@@ -180,8 +199,9 @@ impl AofWriter {
             max_pending: MAX_PENDING_DURING_FSYNC,
             in_flight: None,
             deferred_error: None,
+            delayed_fsync: 0,
+            max_hold: MAX_HOLD_DURING_FSYNC,
             current_db: None,
-            #[cfg(test)]
             fsync_hook: None,
         };
         if needs_header {
@@ -293,64 +313,71 @@ impl AofWriter {
     /// Apply a runtime `appendfsync` update without reopening the AOF file.
     ///
     /// Waits for any in-flight fsync and writes the held-back buffer first, so
-    /// the new policy starts from a state with nothing postponed.  On error the
-    /// old policy stays in effect.
+    /// the new policy starts from a state with nothing postponed.  Only an I/O
+    /// failure of that drain fails the call (old policy stays).  A background
+    /// fsync failure is kept for the next append or tick to report and latch.
     pub fn set_policy(&mut self, policy: FsyncPolicy) -> Result<(), PersistError> {
-        self.drain()?;
+        self.drain_quiet()?;
         self.policy = policy;
         Ok(())
     }
 
     /// Hand buffered records to the file and fsync if the policy requires it.
     ///
-    /// Under `EverySec` this never waits for the disk except when the held
-    /// back buffer exceeds [`MAX_PENDING_DURING_FSYNC`].  An error from a
-    /// previously started background fsync is returned by the first call that
-    /// observes its completion.
+    /// Under `EverySec` this never waits for the disk.  Without an fsync in
+    /// flight it writes the buffer once it holds 8 KiB or an
+    /// fsync is due; during an fsync it holds records back (bounded by
+    /// [`MAX_PENDING_DURING_FSYNC`] bytes and [`MAX_HOLD_DURING_FSYNC`]).  A
+    /// failed background fsync is returned here, once, so the caller latches it.
     pub fn maybe_fsync(&mut self) -> Result<(), PersistError> {
-        match self.policy {
-            FsyncPolicy::Always => {
-                self.drain()?;
-                self.sync_now()?;
-            }
-            FsyncPolicy::EverySec => self.everysec_step(EVERYSEC_INTERVAL)?,
-            FsyncPolicy::No => self.drain()?,
-        }
-        Ok(())
+        let result = match self.policy {
+            FsyncPolicy::Always => self.drain_quiet().and_then(|()| self.sync_now()),
+            FsyncPolicy::EverySec => self.everysec_step(EVERYSEC_INTERVAL, false),
+            FsyncPolicy::No => self.drain_quiet(),
+        };
+        self.deliver(result)
     }
 
     /// Periodic `EverySec` housekeeping, called from the server's timer.
     ///
-    /// Collects a finished background fsync (recording its error, writing the
-    /// held-back buffer) and starts the next one when due, even if no client
-    /// has written since.  Does nothing under other policies.
+    /// Collects a finished background fsync, writes the buffered tail, and
+    /// starts the next fsync when due, even if no client has written since.
+    /// Under other policies it only delivers a pending fsync failure.
     pub fn everysec_tick(&mut self) -> Result<(), PersistError> {
-        if self.policy != FsyncPolicy::EverySec {
-            return Ok(());
-        }
-        self.everysec_step(EVERYSEC_INTERVAL - EVERYSEC_TICK_SLACK)
+        let result = if self.policy == FsyncPolicy::EverySec {
+            self.everysec_step(EVERYSEC_INTERVAL - EVERYSEC_TICK_SLACK, true)
+        } else {
+            Ok(())
+        };
+        self.deliver(result)
     }
 
     /// Force a flush and fsync regardless of policy.
     ///
-    /// Waits for any in-flight fsync and drains the held-back buffer first.
+    /// Waits for any in-flight fsync, writes the held-back buffer, and always
+    /// runs the final fsync, even after an earlier failure.  Returns the first
+    /// error; a stored background fsync failure is reported but stays set.
     pub fn force_fsync(&mut self) -> Result<(), PersistError> {
-        self.drain()?;
-        self.sync_now()
-    }
-
-    /// Wait for an in-flight fsync and write everything held back, without
-    /// starting a new fsync.  The buffer is written even when the in-flight
-    /// fsync failed, so record order is preserved; the fsync error is then
-    /// returned.
-    fn drain(&mut self) -> Result<(), PersistError> {
-        let fsync_result = self.drain_in_flight();
-        self.write_pending_ctx()?;
-        fsync_result?;
-        match self.deferred_error.take() {
+        let drained = self.drain_quiet();
+        let synced = self.sync_now();
+        drained?;
+        synced?;
+        match self.stored_error() {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Replace the fsync call with `hook`.  Test-only fault injection; the
+    /// hook runs on the fsync thread for background fsyncs.
+    #[doc(hidden)]
+    pub fn set_fsync_hook_for_tests(&mut self, hook: FsyncHook) {
+        self.fsync_hook = Some(hook);
+    }
+
+    /// Number of times records were written while an fsync was still in flight.
+    pub fn delayed_fsync_count(&self) -> u64 {
+        self.delayed_fsync
     }
 
     /// True while a background fsync has been started and not yet collected.
@@ -362,36 +389,74 @@ impl AofWriter {
     ///
     /// The server worker calls this on a short poll while an fsync is in
     /// flight so postponed records reach the file soon after the fsync ends,
-    /// even when no further append arrives.  A failure is kept and returned
-    /// by the next append, tick, flush or policy change.
+    /// even when no further append arrives.  Failures are kept for the next
+    /// append or tick.
     pub fn poll_background(&mut self) {
         if self.policy != FsyncPolicy::EverySec || self.in_flight.is_none() {
             return;
         }
-        if let Err(error) = self.everysec_step(EVERYSEC_INTERVAL) {
-            self.deferred_error = Some(error);
+        if let Err(error) = self.everysec_step(EVERYSEC_INTERVAL, true) {
+            if self.deferred_error.is_none() {
+                self.deferred_error = Some((io::ErrorKind::Other, error.to_string()));
+            }
         }
     }
 
-    fn everysec_step(&mut self, interval: Duration) -> Result<(), PersistError> {
-        if let Some(error) = self.deferred_error.take() {
-            return Err(error);
+    fn stored_error(&self) -> Option<PersistError> {
+        self.deferred_error
+            .as_ref()
+            .map(|(kind, message)| io::Error::new(*kind, message.clone()).into())
+    }
+
+    /// Return and clear a stored background fsync failure, otherwise `result`.
+    fn deliver(&mut self, result: Result<(), PersistError>) -> Result<(), PersistError> {
+        match self.deferred_error.take() {
+            Some((kind, message)) => Err(io::Error::new(kind, message).into()),
+            None => result,
         }
+    }
+
+    /// Wait for an in-flight fsync and write everything held back, without
+    /// starting a new fsync.  Only write failures are returned.
+    fn drain_quiet(&mut self) -> Result<(), PersistError> {
+        self.drain_in_flight();
+        self.write_pending_ctx()
+    }
+
+    /// One step of the everysec state machine.  `flush_tail` is set by the
+    /// timer and the poll, which write whatever is buffered; appends write only
+    /// when the buffer reaches [`WRITE_BATCH`] or an fsync is due.  Returns
+    /// only I/O errors of its own writes; fsync failures are stored.
+    fn everysec_step(&mut self, interval: Duration, flush_tail: bool) -> Result<(), PersistError> {
         if self.in_flight.is_some() {
-            let finished = match self.try_reap() {
-                Some(result) => result,
-                // Backpressure: do not let the postponed buffer grow without
-                // bound while an fsync is stuck.
-                None if self.buf.len() >= self.max_pending => self.reap_blocking(),
-                // Still running: keep accumulating, write nothing.
-                None => return Ok(()),
-            };
-            self.write_pending_ctx()?;
-            finished?;
+            if self.try_reap() {
+                self.write_pending_ctx()?;
+            } else {
+                let (held, counted) = self.in_flight.as_ref().map_or((Duration::ZERO, true), |f| {
+                    (f.started.elapsed(), f.counted_delayed)
+                });
+                let over_size = self.buf.len() >= self.max_pending;
+                let over_time = held >= self.max_hold;
+                // Stop holding back: bounded memory and bounded delay win over
+                // the risk that this write blocks on the fsync.
+                if over_size || (over_time && (flush_tail || self.buf.len() >= WRITE_BATCH)) {
+                    if !counted {
+                        self.delayed_fsync += 1;
+                        if let Some(in_flight) = self.in_flight.as_mut() {
+                            in_flight.counted_delayed = true;
+                        }
+                    }
+                    self.write_pending_ctx()?;
+                }
+                return Ok(());
+            }
         }
 
-        self.write_pending_ctx()?;
-        if self.dirty && self.last_fsync.elapsed() >= interval {
+        let due = (self.dirty || !self.buf.is_empty()) && self.last_fsync.elapsed() >= interval;
+        if due || flush_tail || self.buf.len() >= WRITE_BATCH {
+            self.write_pending_ctx()?;
+        }
+        if due {
             self.start_background_fsync()?;
         }
         Ok(())
@@ -405,19 +470,15 @@ impl AofWriter {
             .file
             .try_clone()
             .map_err(|e| io::Error::new(e.kind(), format!("cloning AOF fd for fsync: {e}")))?;
-        #[cfg(test)]
         let hook = self.fsync_hook.clone();
         let (tx, rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("aof-fsync".to_string())
             .spawn(move || {
-                #[cfg(test)]
                 let result = match &hook {
                     Some(hook) => hook(&file),
                     None => file.sync_all(),
                 };
-                #[cfg(not(test))]
-                let result = file.sync_all();
                 let _ = tx.send(FsyncDone {
                     finished_at: Instant::now(),
                     result,
@@ -425,70 +486,73 @@ impl AofWriter {
             })
             .map_err(|e| io::Error::new(e.kind(), format!("spawning AOF fsync thread: {e}")))?;
         self.dirty = false;
-        self.in_flight = Some(InFlightFsync { done: rx, thread });
+        self.in_flight = Some(InFlightFsync {
+            done: rx,
+            thread,
+            started: Instant::now(),
+            counted_delayed: false,
+        });
         Ok(())
     }
 
-    /// Non-blocking check of the in-flight fsync.  `Some` means it finished
-    /// and the in-flight slot is now empty.
-    fn try_reap(&mut self) -> Option<Result<(), PersistError>> {
-        let in_flight = self.in_flight.as_ref()?;
+    /// Non-blocking check of the in-flight fsync.  True means it finished and
+    /// the in-flight slot is now empty (a failure is stored).
+    fn try_reap(&mut self) -> bool {
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return true;
+        };
         match in_flight.done.try_recv() {
-            Ok(done) => Some(self.finish_fsync(Some(done))),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(self.finish_fsync(None)),
+            Ok(done) => {
+                self.finish_fsync(Some(done));
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.finish_fsync(None);
+                true
+            }
         }
     }
 
-    fn reap_blocking(&mut self) -> Result<(), PersistError> {
-        let done = self
-            .in_flight
-            .as_ref()
-            .and_then(|in_flight| in_flight.done.recv().ok());
-        self.finish_fsync(done)
+    fn drain_in_flight(&mut self) {
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return;
+        };
+        let done = in_flight.done.recv().ok();
+        self.finish_fsync(done);
     }
 
-    fn drain_in_flight(&mut self) -> Result<(), PersistError> {
-        if self.in_flight.is_some() {
-            self.reap_blocking()
-        } else {
-            Ok(())
-        }
-    }
-
-    fn finish_fsync(&mut self, done: Option<FsyncDone>) -> Result<(), PersistError> {
+    fn finish_fsync(&mut self, done: Option<FsyncDone>) {
         if let Some(in_flight) = self.in_flight.take() {
             let _ = in_flight.thread.join();
         }
-        match done {
+        let failure = match done {
             Some(FsyncDone {
                 finished_at,
                 result: Ok(()),
             }) => {
                 self.last_fsync = finished_at;
-                Ok(())
+                return;
             }
-            Some(FsyncDone { result: Err(e), .. }) => {
-                self.dirty = true;
-                Err(io::Error::new(e.kind(), format!("fsync AOF file: {e}")).into())
-            }
-            None => {
-                self.dirty = true;
-                Err(io::Error::other("fsync AOF file: fsync thread exited without a result").into())
-            }
+            Some(FsyncDone { result: Err(e), .. }) => (e.kind(), format!("fsync AOF file: {e}")),
+            None => (
+                io::ErrorKind::Other,
+                "fsync AOF file: fsync thread exited without a result".to_string(),
+            ),
+        };
+        self.dirty = true;
+        if self.deferred_error.is_none() {
+            self.deferred_error = Some(failure);
         }
     }
 
-    /// Synchronous fsync of the file.  Nothing may be in flight or buffered.
+    /// Synchronous fsync of the file.  Nothing may be in flight.
     fn sync_now(&mut self) -> Result<(), PersistError> {
-        debug_assert!(self.buf.is_empty() && self.in_flight.is_none());
-        #[cfg(test)]
+        debug_assert!(self.in_flight.is_none());
         let result = match &self.fsync_hook {
             Some(hook) => hook(&self.file),
             None => self.file.sync_all(),
         };
-        #[cfg(not(test))]
-        let result = self.file.sync_all();
         result.map_err(|e| io::Error::new(e.kind(), format!("fsync AOF file: {e}")))?;
         self.dirty = false;
         self.last_fsync = Instant::now();
@@ -502,9 +566,9 @@ impl AofWriter {
 
     /// Write the held-back buffer to the file in order.  On failure the
     /// unwritten tail stays buffered so a retry cannot duplicate or reorder
-    /// records.  Must not be called while an fsync is in flight.
+    /// records.  Called with an fsync in flight only when the size or time
+    /// bound forces it.
     fn write_pending(&mut self) -> io::Result<()> {
-        debug_assert!(self.in_flight.is_none());
         if self.buf.is_empty() {
             return Ok(());
         }
@@ -556,7 +620,7 @@ impl AofWriter {
 impl Drop for AofWriter {
     /// Best effort: do not lose records held back for an fsync.
     fn drop(&mut self) {
-        let _ = self.drain_in_flight();
+        self.drain_in_flight();
         let _ = self.write_pending();
     }
 }
@@ -952,17 +1016,22 @@ mod tests {
         gate.release();
         wait_fsync_finished(&writer);
         writer.poll_background();
-        assert!(!writer.fsync_in_flight());
         assert_eq!(
             key_order(&path),
             ["ka", "kb", "kc"],
             "pending written by poll"
         );
+        // Flush-like callers report the failure but leave it set.
         let err = writer
             .force_fsync()
-            .expect_err("deferred fsync failure must be reported");
+            .expect_err("stored fsync failure must be reported");
         assert!(err.to_string().contains("synthetic fsync failure"), "{err}");
-        writer.force_fsync().expect("error is reported once");
+        // Only an append or tick delivers it, once.
+        let err = writer
+            .everysec_tick()
+            .expect_err("tick delivers the stored failure");
+        assert!(err.to_string().contains("synthetic fsync failure"), "{err}");
+        writer.force_fsync().expect("failure was delivered once");
     }
 
     #[test]
@@ -1023,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_buffer_is_bounded_by_blocking_on_the_inflight_fsync() {
+    fn size_bound_writes_to_the_fd_even_while_fsync_is_in_flight() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let path = dir.path().join("t.aof");
         let gate = Gate::new(true, false);
@@ -1035,27 +1104,124 @@ mod tests {
         writer
             .append_command(0, &set_cmd("kb"))
             .expect("b starts fsync");
-        // Below the bound appends return immediately and stay buffered.
-        writer.append_command(0, &set_cmd("kc")).expect("c");
-        assert!(writer.buf.len() < writer.max_pending);
-
-        let releaser = {
-            let gate = Arc::clone(&gate);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(100));
-                gate.release();
-            })
-        };
-        let started = Instant::now();
-        // Crosses the bound: this append must wait for the fsync.
+        writer
+            .append_command(0, &set_cmd("kc"))
+            .expect("c held back");
+        assert_eq!(key_order(&path), ["ka", "kb"]);
+        assert_eq!(writer.delayed_fsync_count(), 0);
+        // Crossing the bound writes without waiting for the blocked fsync.
         writer.append_command(0, &set_cmd("kd")).expect("d");
-        assert!(
-            started.elapsed() >= Duration::from_millis(50),
-            "append over the bound must wait for the fsync"
-        );
-        releaser.join().expect("releaser");
-        assert!(writer.buf.is_empty() && writer.in_flight.is_none());
         assert_eq!(key_order(&path), ["ka", "kb", "kc", "kd"]);
+        assert!(writer.buf.is_empty());
+        assert_eq!(writer.delayed_fsync_count(), 1);
+        gate.release();
+        writer.force_fsync().expect("drain");
+    }
+
+    #[test]
+    fn time_bound_stops_holding_back_after_max_hold() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let gate = Gate::new(true, false);
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        writer.fsync_hook = Some(gate.hook());
+        writer.max_hold = Duration::from_millis(40);
+        writer.append_command(0, &set_cmd("ka")).expect("a");
+        make_due(&mut writer);
+        writer
+            .append_command(0, &set_cmd("kb"))
+            .expect("b starts fsync");
+        writer
+            .append_command(0, &set_cmd("kc"))
+            .expect("c held back");
+        assert_eq!(key_order(&path), ["ka", "kb"]);
+        thread::sleep(Duration::from_millis(60));
+        writer.poll_background();
+        assert_eq!(key_order(&path), ["ka", "kb", "kc"], "held too long");
+        assert_eq!(writer.delayed_fsync_count(), 1);
+        writer.poll_background();
+        assert_eq!(writer.delayed_fsync_count(), 1, "counted once per fsync");
+        gate.release();
+        writer.force_fsync().expect("drain");
+    }
+
+    #[test]
+    fn everysec_batches_writes_until_8kib_then_tick_flushes_tail() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        let header_len = fs::metadata(&path).expect("meta").len();
+        for key in ["ka", "kb", "kc"] {
+            writer.append_command(0, &set_cmd(key)).expect("append");
+        }
+        assert_eq!(
+            fs::metadata(&path).expect("meta").len(),
+            header_len,
+            "small appends must not reach the fd one by one"
+        );
+        let big = [
+            Bytes::from("SET"),
+            Bytes::from("kd"),
+            Bytes::from(vec![b'x'; 9000]),
+        ];
+        writer.append_command(0, &big).expect("big append");
+        assert!(fs::metadata(&path).expect("meta").len() > header_len + 9000);
+        writer.append_command(0, &set_cmd("ka")).expect("tail");
+        let before = fs::metadata(&path).expect("meta").len();
+        writer.everysec_tick().expect("tick");
+        assert!(fs::metadata(&path).expect("meta").len() > before);
+        assert!(writer.buf.is_empty());
+    }
+
+    #[test]
+    fn policy_change_keeps_background_failure_for_the_next_append() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let gate = Gate::new(false, true);
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        writer.fsync_hook = Some(gate.hook());
+        writer.append_command(0, &set_cmd("ka")).expect("a");
+        make_due(&mut writer);
+        writer
+            .append_command(0, &set_cmd("kb"))
+            .expect("b starts failing fsync");
+        wait_fsync_finished(&writer);
+        // CONFIG SET appendfsync always must neither fail nor swallow it.
+        writer.set_policy(FsyncPolicy::Always).expect("set policy");
+        let err = writer
+            .append_command(0, &set_cmd("kc"))
+            .expect_err("failure must reach the next append");
+        assert!(err.to_string().contains("synthetic fsync failure"), "{err}");
+        writer
+            .append_command(0, &set_cmd("kd"))
+            .expect("delivered once");
+        assert_eq!(key_order(&path), ["ka", "kb", "kc", "kd"]);
+    }
+
+    #[test]
+    fn force_fsync_after_background_failure_still_fsyncs_held_records() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("t.aof");
+        let gate = Gate::new(true, true);
+        let mut writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open");
+        writer.fsync_hook = Some(gate.hook());
+        writer.append_command(0, &set_cmd("ka")).expect("a");
+        make_due(&mut writer);
+        writer
+            .append_command(0, &set_cmd("kb"))
+            .expect("b starts failing fsync");
+        writer
+            .append_command(0, &set_cmd("kc"))
+            .expect("c held back");
+        gate.release();
+        let err = writer.force_fsync().expect_err("failure reported");
+        assert!(err.to_string().contains("synthetic fsync failure"), "{err}");
+        assert_eq!(key_order(&path), ["ka", "kb", "kc"]);
+        // 1 failing background fsync + 1 final synchronous fsync.
+        assert_eq!(gate.calls(), 2, "final fsync must run after the failure");
+        // The failure is still pending for the append/tick path.
+        assert!(writer.maybe_fsync().is_err());
+        assert!(writer.maybe_fsync().is_ok());
     }
 
     #[test]
