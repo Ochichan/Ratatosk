@@ -425,6 +425,55 @@ mod tests {
         assert_eq!(consumers, ["c", "c2", "c3", "c4"]);
     }
 
+    /// Earlier versions delivered nothing for `XREADGROUP COUNT 0` and logged
+    /// it as sent, so replay must deliver nothing too.
+    #[test]
+    fn replay_keeps_an_earlier_xreadgroup_count_zero_delivering_nothing() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["XADD", "s", "1-0", "f", "v"],
+            vec!["XADD", "s", "2-0", "f", "v"],
+            vec!["XGROUP", "CREATE", "s", "g", "0"],
+            vec![
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "a",
+                "COUNT",
+                "0",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            vec![
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "b",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+        ];
+        let slices: Vec<&[&str]> = commands.iter().map(Vec::as_slice).collect();
+        let mut state = ServerState::with_default_dbs();
+        AofRecovery::replay_reader(encode_aof(&slices).as_slice(), &mut state).expect("replay");
+        let db = state.db(0);
+        let group = db
+            .get(b"s".as_slice())
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(b"g".as_slice()))
+            .expect("group");
+        // Only b's COUNT 1 delivered, so a COUNT 0 read delivered nothing.
+        let owners = group
+            .pending
+            .values()
+            .map(|pending| String::from_utf8_lossy(&pending.consumer).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(owners, ["b"]);
+    }
+
     #[test]
     fn legacy_exec_preserves_successful_siblings_of_a_runtime_error() {
         let mut state = ServerState::with_default_dbs();

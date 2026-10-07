@@ -342,7 +342,7 @@ pub(super) struct AddTrimArgs {
 /// Under AOF replay, a MAXLEN or LIMIT of digits only, however large. Earlier
 /// versions parsed these as unsigned numbers and logged them as sent, so a
 /// value past `i64::MAX` is on disk and saturates here.
-fn replayed_count(raw: &Bytes) -> Option<u64> {
+pub(super) fn replayed_count(raw: &Bytes) -> Option<u64> {
     if !replay_mode() || raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
         return None;
     }
@@ -559,7 +559,9 @@ pub(super) fn cmd_xadd(
     };
     stream.push(StreamEntry { id, fields });
     meta.last_id = id;
-    meta.entries_added = meta.entries_added.saturating_add(1);
+    // Capped at i64::MAX, the largest value XSETID takes and the RDB
+    // loader accepts.
+    meta.entries_added = meta.entries_added.saturating_add(1).min(i64::MAX as u64);
     if let Some(entry) = db.get_mut(key) {
         apply_trim(entry, &options);
     }

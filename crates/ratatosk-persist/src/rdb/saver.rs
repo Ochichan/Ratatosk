@@ -276,7 +276,9 @@ impl<W: Write> RdbSaver<W> {
                 if with_meta {
                     self.write_bytes(&meta.last_id.ms.to_le_bytes())?;
                     self.write_bytes(&meta.last_id.seq.to_le_bytes())?;
-                    self.write_bytes(&meta.entries_added.to_le_bytes())?;
+                    // The loader reads this as a signed value, as DUMP does.
+                    let entries_added = meta.entries_added.min(i64::MAX as u64);
+                    self.write_bytes(&entries_added.to_le_bytes())?;
                     self.write_bytes(&meta.max_deleted_id.ms.to_le_bytes())?;
                     self.write_bytes(&meta.max_deleted_id.seq.to_le_bytes())?;
                 }

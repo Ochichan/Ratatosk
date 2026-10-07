@@ -328,6 +328,13 @@ pub(super) fn cmd_xreadgroup(
             let Some(raw) = args.get(idx + 1) else {
                 return CommandOutcome::reply(err("ERR syntax error"));
             };
+            if let Some(earlier) = super::cmd_stream::replayed_count(raw) {
+                // Earlier versions delivered nothing for COUNT 0 and logged
+                // XREADGROUP as sent, so replay keeps that.
+                count = Some(usize::try_from(earlier).unwrap_or(usize::MAX));
+                idx += 2;
+                continue;
+            }
             let Some(parsed) = parse_i64(raw) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };

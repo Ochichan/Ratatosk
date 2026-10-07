@@ -1028,9 +1028,61 @@ mod tests {
     }
 
     #[test]
+    fn an_entries_added_counter_at_the_limit_saves_and_loads() {
+        use ratatosk_engine::command::{ClientState, ServerAccess, execute};
+        use ratatosk_resp::frame::RespFrame;
+
+        let state = ServerState::with_default_dbs();
+        let mut state = state;
+        let mut client = ClientState::default();
+        let mut run = |parts: &[&str], state: &mut ServerState| {
+            let frame = RespFrame::Array(
+                parts
+                    .iter()
+                    .map(|part| RespFrame::BulkString(Some(Bytes::from((*part).to_owned()))))
+                    .collect(),
+            );
+            let mut access = ServerAccess::new_inline(state);
+            execute(frame, &mut access, &mut client).response
+        };
+        run(&["XADD", "s", "1-0", "f", "v"], &mut state);
+        assert_eq!(
+            run(
+                &["XSETID", "s", "1-0", "ENTRIESADDED", "9223372036854775807"],
+                &mut state
+            ),
+            RespFrame::ok()
+        );
+        // Another XADD would pass i64::MAX; the counter stays there.
+        run(&["XADD", "s", "2-0", "f", "v"], &mut state);
+        run(&["XADD", "s", "3-0", "f", "v"], &mut state);
+        let counter = |state: &ServerState| {
+            state
+                .db(0)
+                .get(&Bytes::from("s"))
+                .and_then(|value| value.as_stream_meta().map(|meta| meta.entries_added))
+                .expect("stream")
+        };
+        assert_eq!(counter(&state), i64::MAX as u64);
+
+        let loaded = roundtrip_state(&state);
+        assert_eq!(counter(&loaded), i64::MAX as u64);
+
+        // A counter beyond the limit, however it came about, is saved clamped
+        // rather than as a snapshot the loader rejects.
+        state
+            .db_mut(0)
+            .get_mut(&Bytes::from("s"))
+            .and_then(|value| value.as_stream_meta_mut())
+            .expect("meta")
+            .entries_added = u64::MAX;
+        assert_eq!(counter(&roundtrip_state(&state)), i64::MAX as u64);
+    }
+
+    #[test]
     fn a_negative_entries_added_counter_is_corrupt() {
-        // entries_added is stored as 8 raw bytes, so a value past i64::MAX
-        // reads back negative and must not turn into a huge counter.
+        // entries_added is stored as 8 raw bytes, so a crafted file can read
+        // back negative and must not turn into a huge counter.
         let state = ServerState::with_default_dbs();
         let mut stream = StoredValue::stream(
             vec![StreamEntry {
@@ -1039,10 +1091,21 @@ mod tests {
             }],
             None,
         );
-        stream.as_stream_meta_mut().expect("meta").entries_added = u64::MAX;
+        let marker = 0x0123_4567_89ab_u64;
+        stream.as_stream_meta_mut().expect("meta").entries_added = marker;
         state.db_mut(0).insert(Bytes::from("s"), stream);
         let mut bytes = Vec::new();
         RdbSaver::new(&mut bytes).save_state(&state).expect("save");
+        let at = bytes
+            .windows(8)
+            .position(|window| window == marker.to_le_bytes())
+            .expect("entries added in the snapshot");
+        bytes[at..at + 8].copy_from_slice(&(-1i64).to_le_bytes());
+        // Fix the trailing checksum so only the counter is wrong.
+        let body = bytes.len() - 8;
+        let mut digest = Crc64Digest::new();
+        digest.update(&bytes[..body]);
+        bytes[body..].copy_from_slice(&digest.finalize().to_le_bytes());
         let mut target = ServerState::with_default_dbs();
         assert!(matches!(
             RdbLoader::new(bytes.as_slice()).load_into(&mut target),

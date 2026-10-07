@@ -4614,6 +4614,11 @@ fn capture_durability_effects(
         }
         b"XTRIM" => None,
         b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
+        // COUNT 0 and negative mean no limit now, but earlier versions delivered
+        // nothing for them and replay still does, so new records leave them out.
+        b"XREADGROUP" if xreadgroup_has_unlimited_count(argv) => {
+            Some(xreadgroup_without_unlimited_count(argv))
+        }
         b"XCLAIM" | b"XAUTOCLAIM" => {
             return claim_durability_effects(command, argv, server, db_index, response);
         }
@@ -4632,6 +4637,40 @@ fn capture_durability_effects(
     }?;
 
     Some(DurabilityEffects::single(db_index, canonical))
+}
+
+/// The positions of `COUNT n` options with n of 0 or less before STREAMS.
+fn unlimited_count_positions(argv: &[Bytes]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut idx = 1usize;
+    while idx < argv.len() && !argv[idx].eq_ignore_ascii_case(b"STREAMS") {
+        if argv[idx].eq_ignore_ascii_case(b"COUNT") {
+            if argv
+                .get(idx + 1)
+                .and_then(parse_i64)
+                .is_some_and(|count| count <= 0)
+            {
+                found.push(idx);
+            }
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    found
+}
+
+fn xreadgroup_has_unlimited_count(argv: &[Bytes]) -> bool {
+    !unlimited_count_positions(argv).is_empty()
+}
+
+fn xreadgroup_without_unlimited_count(argv: &[Bytes]) -> Vec<Bytes> {
+    let dropped = unlimited_count_positions(argv);
+    argv.iter()
+        .enumerate()
+        .filter(|(at, _)| !dropped.iter().any(|start| at == start || *at == start + 1))
+        .map(|(_, arg)| arg.clone())
+        .collect()
 }
 
 /// IDs in an XCLAIM or XAUTOCLAIM reply, which lists bare IDs with JUSTID and
@@ -9653,6 +9692,83 @@ mod tests {
         assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
         r!("XTRIM", "x", "MAXLEN", "0");
         assert_eq!(lag_of(&mut s, &mut c, 0).1, Some(0));
+    }
+
+    #[test]
+    fn xreadgroup_logs_leave_out_a_count_of_zero_or_less() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        client.take_durability_effects();
+        // COUNT 0 is no limit now, so everything is delivered, and the logged
+        // record has no COUNT for an earlier version to read as "nothing".
+        let reply = run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "0",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert!(matches!(reply, RespFrame::Array(_)));
+        assert_eq!(pending_of(&server, "g").len(), 3);
+        let logged = logged_argv(&mut client).expect("XREADGROUP is logged");
+        assert_eq!(
+            logged,
+            ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"].map(str::to_owned)
+        );
+        // A positive COUNT stays in the record.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        client.take_durability_effects();
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "2",
+                "COUNT",
+                "-1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client).expect("XREADGROUP is logged"),
+            [
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "2",
+                "STREAMS",
+                "s",
+                ">"
+            ]
+            .map(str::to_owned)
+        );
     }
 
     #[test]
