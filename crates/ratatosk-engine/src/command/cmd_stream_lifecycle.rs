@@ -373,25 +373,32 @@ pub(super) fn cmd_xclaim(
         return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
     }
 
-    let mut justid = false;
+    // As Redis: the IDs are the run of arguments that parse as IDs, and what
+    // follows are options.
     let mut ids = Vec::new();
     let mut idx = 4usize;
-    while idx < args.len() {
-        if args[idx].eq_ignore_ascii_case(b"JUSTID") {
-            justid = true;
-            idx += 1;
-            continue;
-        }
-
-        let Some(parsed_id) = parse_strict_stream_id(&args[idx]) else {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        };
-        ids.push(parsed_id);
+    while let Some(id) = args.get(idx).and_then(|raw| parse_strict_stream_id(raw)) {
+        ids.push(id);
         idx += 1;
     }
-
-    if ids.is_empty() {
-        return wrong_arity("xclaim");
+    let mut justid = false;
+    while idx < args.len() {
+        let option = &args[idx];
+        if option.eq_ignore_ascii_case(b"JUSTID") {
+            justid = true;
+        } else if [&b"FORCE"[..], b"IDLE", b"TIME", b"RETRYCOUNT", b"LASTID"]
+            .iter()
+            .any(|known| option.eq_ignore_ascii_case(known))
+        {
+            // Redis options Ratatosk does not implement.
+            return CommandOutcome::reply(err("ERR syntax error"));
+        } else {
+            return CommandOutcome::reply(err(&format!(
+                "ERR Unrecognized XCLAIM option '{}'",
+                String::from_utf8_lossy(option)
+            )));
+        }
+        idx += 1;
     }
 
     let now = now_ms();

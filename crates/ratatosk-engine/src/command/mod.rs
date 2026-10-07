@@ -8122,6 +8122,296 @@ mod tests {
     }
 
     #[test]
+    fn xreadgroup_and_xread_report_redis_errors_for_special_ids() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+
+        for id in ["$", "+"] {
+            assert_eq!(
+                run(
+                    &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", id],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::error_str(&format!(
+                    "ERR The {id} ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The {id} ID would just return an empty result set."
+                ))
+            );
+        }
+        // Nothing was delivered or created by the rejected commands, even
+        // when the bad ID is on the second stream.
+        run(
+            &["XGROUP", "CREATE", "t", "g", "0", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(
+                &[
+                    "XREADGROUP",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "STREAMS",
+                    "s",
+                    "t",
+                    ">",
+                    "$"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str(
+                "ERR The $ ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The $ ID would just return an empty result set."
+            )
+        );
+        assert_eq!(
+            run(&["XINFO", "CONSUMERS", "s", "g"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", "bad"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        // The group is looked up before the ID is judged.
+        assert!(matches!(
+            run(
+                &["XREADGROUP", "GROUP", "nogroup", "c", "STREAMS", "s", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+        ));
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "s", ">"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option."
+            )
+        );
+    }
+
+    #[test]
+    fn xrange_count_follows_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        // A negative COUNT is 0, and COUNT 0 is a null array.
+        for count in ["-1", "0"] {
+            assert_eq!(
+                run(
+                    &["XRANGE", "s", "-", "+", "COUNT", count],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::NullArray
+            );
+            assert_eq!(
+                run(
+                    &["XREVRANGE", "s", "+", "-", "COUNT", count],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::NullArray
+            );
+        }
+        // A missing key is still an empty array, and the last COUNT wins.
+        assert_eq!(
+            run(
+                &["XRANGE", "none", "-", "+", "COUNT", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            stream_ids(run(
+                &["XRANGE", "s", "-", "+", "COUNT", "1", "COUNT", "2"],
+                &mut server,
+                &mut client
+            )),
+            ["1-0", "2-0"]
+        );
+        assert_eq!(
+            run(
+                &["XRANGE", "s", "-", "+", "COUNT"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR syntax error")
+        );
+        assert_eq!(
+            run(
+                &["XRANGE", "s", "-", "+", "COUNT", "x"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+    }
+
+    #[test]
+    fn xpending_idle_and_argument_order_follow_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let syntax = RespFrame::error_str("ERR syntax error");
+        // Argument shapes Redis rejects as syntax errors.
+        for parts in [
+            &["XPENDING", "s", "g", "-"][..],
+            &["XPENDING", "s", "g", "-", "+"],
+            &[
+                "XPENDING", "s", "g", "-", "+", "10", "c", "extra", "more", "most",
+            ],
+            &["XPENDING", "s", "g", "IDLE", "5", "-", "+"],
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), syntax, "{parts:?}");
+        }
+        // The IDs and count are checked before the group is looked up.
+        assert_eq!(
+            run(
+                &["XPENDING", "none", "g", "x", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(
+                &["XPENDING", "none", "g", "-", "+", "x"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "IDLE", "x", "-", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+        assert!(matches!(
+            run(&["XPENDING", "none", "g", "-", "+", "10"], &mut server, &mut client),
+            RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+        ));
+        // A negative count lists nothing.
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "-", "+", "-1"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+
+        // IDLE keeps only entries idle for at least that long.
+        let listed = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            stream_ids(run(parts, server, client))
+        };
+        assert_eq!(
+            listed(
+                &["XPENDING", "s", "g", "IDLE", "0", "-", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            ["1-0", "2-0", "3-0"]
+        );
+        assert_eq!(
+            listed(
+                &["XPENDING", "s", "g", "IDLE", "3600000", "-", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            listed(
+                &["XPENDING", "s", "g", "IDLE", "0", "-", "+", "2", "c"],
+                &mut server,
+                &mut client
+            ),
+            ["1-0", "2-0"]
+        );
+    }
+
+    #[test]
+    fn xclaim_options_follow_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        for (parts, expected) in [
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "1-0", "BOGUS"][..],
+                "ERR Unrecognized XCLAIM option 'BOGUS'",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "foo"],
+                "ERR Unrecognized XCLAIM option 'foo'",
+            ),
+            // An option before the IDs ends the ID list, so the ID after it
+            // is read as an option.
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "JUSTID", "1-0"],
+                "ERR Unrecognized XCLAIM option '1-0'",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+        // JUSTID after the IDs still works, and no IDs is an empty reply.
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c2", "0", "1-0", "2-0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("2-0")])
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c2", "0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+    }
+
+    #[test]
     fn xreadgroup_reassigning_a_pending_id_moves_it_between_consumers() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();

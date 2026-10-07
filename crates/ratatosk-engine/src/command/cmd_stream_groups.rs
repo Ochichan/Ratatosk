@@ -373,6 +373,42 @@ pub(super) fn cmd_xreadgroup(
     let keys = &tail[..stream_count];
     let ids = &tail[stream_count..];
 
+    // As Redis, every stream's group and ID are checked before any entry is
+    // delivered, so a bad ID later in the list changes nothing.
+    {
+        let now = now_ms();
+        for (key, id_raw) in keys.iter().zip(ids.iter()) {
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
+            let Some(entry) = db.get(key) else {
+                return xreadgroup_nogroup_error(key, &group_name);
+            };
+            if !entry.is_stream() {
+                return wrong_type_response();
+            }
+            if !entry
+                .as_stream_groups()
+                .is_some_and(|groups| groups.contains_key(&group_name))
+            {
+                return xreadgroup_nogroup_error(key, &group_name);
+            }
+            match id_raw.as_ref() {
+                b"$" | b"+" => {
+                    let id = String::from_utf8_lossy(id_raw);
+                    return CommandOutcome::reply(err(&format!(
+                        "ERR The {id} ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The {id} ID would just return an empty result set."
+                    )));
+                }
+                b">" => {}
+                _ => {
+                    if parse_strict_stream_id(id_raw).is_none() {
+                        return CommandOutcome::reply(invalid_stream_id());
+                    }
+                }
+            }
+        }
+    }
+
     let mut out = Vec::new();
     let now = now_ms();
 
@@ -668,6 +704,54 @@ pub(super) fn cmd_xpending(
     let key = &args[0];
     let group_name = &args[1];
 
+    // As Redis's xpendingCommand, the range form's arguments are checked
+    // before the key and group are looked up: `XPENDING key group [[IDLE
+    // min-idle] start end count [consumer]]`.
+    struct PendingRange<'a> {
+        start: StreamId,
+        end: StreamId,
+        count: usize,
+        min_idle: i64,
+        consumer: Option<&'a Bytes>,
+    }
+    let range = if args.len() == 2 {
+        None
+    } else {
+        if !(5..=8).contains(&args.len()) {
+            return CommandOutcome::reply(err("ERR syntax error"));
+        }
+        let mut min_idle = 0i64;
+        let mut first = 2usize;
+        if args[2].eq_ignore_ascii_case(b"IDLE") {
+            let Some(parsed) = parse_i64(&args[3]) else {
+                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+            };
+            if args.len() < 7 {
+                return CommandOutcome::reply(err("ERR syntax error"));
+            }
+            min_idle = parsed;
+            first = 4;
+        }
+        let Some(count) = parse_i64(&args[first + 2]) else {
+            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+        };
+        let start = match parse_interval_id(&args[first], IntervalEdge::Start) {
+            Ok(id) => id,
+            Err(reply) => return CommandOutcome::reply(reply),
+        };
+        let end = match parse_interval_id(&args[first + 1], IntervalEdge::End) {
+            Ok(id) => id,
+            Err(reply) => return CommandOutcome::reply(reply),
+        };
+        Some(PendingRange {
+            start,
+            end,
+            count: usize::try_from(count).unwrap_or(0),
+            min_idle,
+            consumer: args.get(first + 3),
+        })
+    };
+
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
@@ -685,7 +769,14 @@ pub(super) fn cmd_xpending(
         return xreadgroup_nogroup_error(key, group_name);
     };
 
-    if args.len() == 2 {
+    let Some(PendingRange {
+        start,
+        end,
+        count,
+        min_idle,
+        consumer: consumer_filter,
+    }) = range
+    else {
         if group.pending.is_empty() {
             return CommandOutcome::reply(RespFrame::Array(vec![
                 RespFrame::Integer(0),
@@ -721,25 +812,9 @@ pub(super) fn cmd_xpending(
                     .collect(),
             ),
         ]));
-    }
-
-    if args.len() != 5 && args.len() != 6 {
-        return wrong_arity("xpending");
-    }
-
-    let start = match parse_interval_id(&args[2], IntervalEdge::Start) {
-        Ok(id) => id,
-        Err(reply) => return CommandOutcome::reply(reply),
     };
-    let end = match parse_interval_id(&args[3], IntervalEdge::End) {
-        Ok(id) => id,
-        Err(reply) => return CommandOutcome::reply(reply),
-    };
-    let Some(count) = parse_usize(&args[4]) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    };
-    let consumer_filter = args.get(5);
 
+    // IDLE keeps only entries idle for at least that long.
     let mut pending_ids = group
         .pending
         .iter()
@@ -747,6 +822,7 @@ pub(super) fn cmd_xpending(
             **id >= start
                 && **id <= end
                 && consumer_filter.is_none_or(|consumer| pending.consumer == *consumer)
+                && (min_idle == 0 || now.saturating_sub(pending.last_delivered_ms) >= min_idle)
         })
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();

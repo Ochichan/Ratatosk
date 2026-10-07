@@ -596,7 +596,7 @@ pub(super) fn cmd_xrange(
     client: &ClientState,
     reverse: bool,
 ) -> CommandOutcome {
-    if args.len() != 3 && args.len() != 5 {
+    if args.len() < 3 {
         return if reverse {
             wrong_arity("xrevrange")
         } else {
@@ -623,17 +623,20 @@ pub(super) fn cmd_xrange(
     };
     let low_high = (low, high);
 
-    let count = if args.len() == 5 {
-        if !args[3].eq_ignore_ascii_case(b"COUNT") {
+    // COUNT may repeat and the last one wins; a negative count is 0, as in
+    // Redis.
+    let mut count: Option<usize> = None;
+    let mut idx = 3usize;
+    while idx < args.len() {
+        if !args[idx].eq_ignore_ascii_case(b"COUNT") || idx + 1 >= args.len() {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
-        let Some(parsed) = parse_usize(&args[4]) else {
+        let Some(parsed) = parse_i64(&args[idx + 1]) else {
             return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
         };
-        Some(parsed)
-    } else {
-        None
-    };
+        count = Some(usize::try_from(parsed).unwrap_or(0));
+        idx += 2;
+    }
 
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
@@ -645,6 +648,11 @@ pub(super) fn cmd_xrange(
     let Some(stream) = entry.as_stream_entries() else {
         return wrong_type_response();
     };
+
+    // Redis answers COUNT 0 with a null array once the key is a stream.
+    if count == Some(0) {
+        return CommandOutcome::reply(RespFrame::NullArray);
+    }
 
     let (low, high) = low_high;
     if low > high {
@@ -757,6 +765,10 @@ pub(super) fn cmd_xread(
                 .and_then(|entry| entry.as_stream_meta())
                 .map(|meta| meta.last_id)
                 .unwrap_or(StreamId { ms: 0, seq: 0 })
+        } else if id_raw.as_ref() == b">" {
+            return CommandOutcome::reply(err(
+                "ERR The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option.",
+            ));
         } else if id_raw.as_ref() == b"+" {
             // `+` reads the last entry, so the threshold is the ID right
             // before it (0-0 when the stream is empty or missing).
