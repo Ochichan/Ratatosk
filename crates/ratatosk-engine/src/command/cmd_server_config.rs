@@ -387,7 +387,14 @@ fn cmd_config_set(
             "configuration parameter changed"
         );
         match op {
-            ConfigSetOp::Maxmemory(value) => server.config.set_maxmemory(value),
+            ConfigSetOp::Maxmemory(value) => {
+                server.config.set_maxmemory(value);
+                // Admission trusts the counter far from the limit; correct it
+                // now so a lowered limit applies to the next write.
+                if value != 0 {
+                    crate::eviction::recompute_memory_estimates(&server.data);
+                }
+            }
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),
             ConfigSetOp::Hz(value) => server.config.set_hz(value),
             ConfigSetOp::AppendOnly(value) => server.config.set_appendonly(value),

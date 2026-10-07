@@ -195,10 +195,12 @@ The format is based on Keep a Changelog and the versioning policy in
 - With `maxmemory-policy noeviction` and a limit set, admission no longer scans
   the whole dataset on every growing command. The incremental counter decides
   while it is below the limit by a margin (a tenth of `maxmemory`, or twice the
-  undercount the last cron scan found); within that margin each growing command
-  still scans. At 100k keys a SET far from the limit went from about 0.8 ms to
-  28 µs. In-place collection growth larger than the margin can now be admitted
-  past the limit until the next cron scan, at most one second later.
+  in-place growth measured over the last cron memory interval); within that
+  margin each growing command still scans. At 100k keys a SET far from the
+  limit went from about 0.8 ms to 28 µs. In-place collection growth larger than
+  the margin can now be admitted past the limit until the next cron memory scan
+  (10 cron ticks, one second at the default `hz 10`). `CONFIG SET maxmemory`
+  rescans immediately.
 - `XCFGSET` is now `syntax_only`, so `compatibility-mode strict` rejects it. It
   validates its arguments and replies OK without storing them.
 - `XSETID` now works: it sets the stream's last generated ID and, with

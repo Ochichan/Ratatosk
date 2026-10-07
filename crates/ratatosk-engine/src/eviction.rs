@@ -223,18 +223,17 @@ pub fn estimate_used_memory(state: &ServerState) -> usize {
 /// write lock, so no write lands between the two and drops out of the count.
 /// Other databases, and reads of the one being measured, keep running.
 ///
-/// The periodic caller also records how far the counters had fallen short,
-/// which sets the noeviction admission scan margin. Admission's own scans
-/// run much more often and would hide the per-second drift, so they pass
-/// `record_undercount = false`.
+/// This is the periodic scan: it records how far the counters fell short
+/// over the interval, which sets the noeviction admission scan margin.
 pub fn recompute_memory_estimates(data: &crate::keyspace::DataState) -> usize {
     recompute_memory(data, true)
 }
 
-pub(crate) fn recompute_memory(
-    data: &crate::keyspace::DataState,
-    record_undercount: bool,
-) -> usize {
+/// Full-scan correction of the counters. A periodic scan (`periodic = true`)
+/// records the interval's shortfall; an admission scan defers its shortfall
+/// to the next periodic scan, so frequent admission scans near the limit do
+/// not hide the drift a whole interval accumulates.
+pub(crate) fn recompute_memory(data: &crate::keyspace::DataState, periodic: bool) -> usize {
     let mut undercount = 0usize;
     let total = (0..data.db_count())
         .map(|db_idx| {
@@ -244,8 +243,10 @@ pub(crate) fn recompute_memory(
             bytes
         })
         .fold(0usize, usize::saturating_add);
-    if record_undercount {
-        data.set_memory_undercount(undercount);
+    if periodic {
+        data.finish_memory_interval(undercount);
+    } else {
+        data.defer_memory_undercount(undercount);
     }
     total
 }
