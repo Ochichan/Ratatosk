@@ -725,11 +725,11 @@ pub(super) fn cmd_xpending(
     let range = if args.len() == 2 {
         None
     } else {
-        // Without IDLE: start end count [consumer]. With IDLE: IDLE n start
-        // end count [consumer]. Redis ignores arguments past those, this does
-        // not.
+        // Redis accepts 6 to 9 arguments in all (xpendingCommand) and
+        // ignores any past the consumer, so a stray trailing argument is not
+        // an error there either.
         let with_idle = args[2].eq_ignore_ascii_case(b"IDLE");
-        if args.len() < 5 || (!with_idle && args.len() > 6) || args.len() > 8 {
+        if !(5..=8).contains(&args.len()) {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
         let mut min_idle = 0i64;

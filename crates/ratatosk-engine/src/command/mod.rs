@@ -8461,14 +8461,26 @@ mod tests {
                 "XPENDING", "s", "g", "-", "+", "10", "c", "extra", "more", "most",
             ],
             &["XPENDING", "s", "g", "IDLE", "5", "-", "+"],
-            // Arguments past the consumer are refused in both forms.
-            &["XPENDING", "s", "g", "-", "+", "10", "c", "extra"],
+            // More than 9 arguments in all.
             &[
                 "XPENDING", "s", "g", "IDLE", "0", "-", "+", "10", "c", "extra",
             ],
         ] {
             assert_eq!(run(parts, &mut server, &mut client), syntax, "{parts:?}");
         }
+        // Within 9 arguments Redis ignores anything past the consumer.
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "-", "+", "10", "c", "extra"],
+                &mut server,
+                &mut client
+            ),
+            run(
+                &["XPENDING", "s", "g", "-", "+", "10", "c"],
+                &mut server,
+                &mut client
+            )
+        );
         // The IDs and count are checked before the group is looked up.
         assert_eq!(
             run(
