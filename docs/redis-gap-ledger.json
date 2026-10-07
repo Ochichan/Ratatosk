@@ -4745,7 +4745,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The start is an interval bound like Redis: - and +, a bare millisecond value, and the ( exclusive prefix with Redis's invalid start ID error."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The start is an interval bound like Redis: - and +, a bare millisecond value, and the ( exclusive prefix with Redis's invalid start ID error. COUNT must be 1 to LONG_MAX/16 (\"COUNT must be > 0\" otherwise), at most ten times COUNT pending entries are looked at, the cursor is the next pending ID (0-0 at the end), JUSTID leaves delivery counts alone, and pending IDs whose entry is gone are removed and reported as the deleted IDs, using up COUNT. The AOF logs explicit XCLAIM commands for claimed entries and XACK for deleted ones."
     },
     {
       "name": "XCFGSET",
@@ -4771,7 +4771,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). The IDs are the run of arguments that parse as strict IDs and what follows are options, as in Redis: JUSTID is supported and anything else gives \"Unrecognized XCLAIM option\". FORCE, IDLE, TIME, RETRYCOUNT and LASTID are not supported and give a syntax error."
+      "notes": "Batch-5 baseline implemented (ordered 1->2 execution). Follows Redis 7.2: the key and group are checked first, then the minimum idle time (negative is 0), the IDs (the run of arguments that parse as strict IDs) and the options JUSTID, FORCE, IDLE, TIME, RETRYCOUNT and LASTID, with Redis's option errors (an option missing its value is unrecognized). A claim counts one delivery unless JUSTID or RETRYCOUNT says otherwise, FORCE creates the pending entry of an entry that exists, a delivery time in the future is now, LASTID only moves the group's last delivered ID forward, and the consumer is created even when nothing is claimed. The AOF logs one explicit XCLAIM per claimed entry (new owner, TIME, RETRYCOUNT, FORCE, JUSTID and LASTID), like Redis, so replay reproduces the pending list whatever the clock says; a claim that found nothing is logged as sent. Not supported: the newer XNACK zone."
     },
     {
       "name": "XDEL",
@@ -4979,7 +4979,7 @@
       "capability_tier": "behavioral_subset",
       "milestone": "m3-events",
       "owner": "",
-      "notes": "M3 stream group baseline implemented (summary + range forms). The range bounds use Redis's interval parser (- and +, incomplete IDs, and the ( exclusive prefix with Redis's invalid start/end ID errors). The IDLE option is supported, and the range arguments are checked before the key and group are looked up, with Redis's syntax errors for a wrong argument count."
+      "notes": "M3 stream group baseline implemented (summary + range forms). The range bounds use Redis's interval parser (- and +, incomplete IDs, and the ( exclusive prefix with Redis's invalid start/end ID errors). The IDLE option is supported, the range arguments are checked before the key and group are looked up with Redis's syntax errors for a wrong argument count, and the summary of an empty list is [0, nil, nil, nil array] as in Redis."
     },
     {
       "name": "XRANGE",

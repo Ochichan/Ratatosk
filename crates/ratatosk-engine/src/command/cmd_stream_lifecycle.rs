@@ -4,12 +4,14 @@ use hashbrown::{HashMap, HashSet};
 use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{
-    ServerState, StoredValue, StreamConsumer, StreamEntry, StreamGroup, StreamId, purge_expired_key,
+    ServerState, StoredValue, StreamConsumer, StreamEntry, StreamGroup, StreamId,
+    StreamPendingEntry, purge_expired_key,
 };
 
 use super::cmd_stream::{
-    AddTrimArgs, IntervalEdge, TrimStrategy, parse_add_or_trim_args, parse_interval_id,
-    parse_strict_stream_id, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
+    AddTrimArgs, IntervalEdge, TrimStrategy, invalid_stream_id, parse_add_or_trim_args,
+    parse_interval_id, parse_strict_stream_id, stream_entry_frame, stream_id_to_bytes,
+    stream_nogroup_error,
 };
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
@@ -69,38 +71,84 @@ pub(super) fn prune_stream_removed_ids(entry: &mut StoredValue, removed_ids: &[S
     }
 }
 
-pub(super) fn claim_pending_id(
+/// Drops `id` from the group's pending list and its owner's.
+fn remove_pending_id(group: &mut StreamGroup, id: StreamId) {
+    if let Some(pending) = group.pending.remove(&id) {
+        if let Some(consumer) = group.consumers.get_mut(&pending.consumer) {
+            consumer.pending.remove(&id);
+        }
+    }
+}
+
+/// Makes `consumer_name` the owner of `id`, as Redis's XCLAIM and XAUTOCLAIM
+/// do: the delivery time is `delivery_ms`, and the delivery count is
+/// `retry_count` when given, else one more than `base` unless `justid`.
+#[derive(Clone, Copy)]
+struct ClaimTerms {
+    delivery_ms: i64,
+    retry_count: Option<i64>,
+    justid: bool,
+    base: i64,
+}
+
+fn assign_pending_id(
     group: &mut StreamGroup,
     consumer_name: &Bytes,
     id: StreamId,
-    now: i64,
-) -> bool {
-    let Some(pending) = group.pending.get_mut(&id) else {
-        return false;
-    };
-
-    let previous_consumer = pending.consumer.clone();
-    if previous_consumer != *consumer_name {
-        if let Some(previous) = group.consumers.get_mut(&previous_consumer) {
-            previous.pending.remove(&id);
+    terms: &ClaimTerms,
+) {
+    let ClaimTerms {
+        delivery_ms,
+        retry_count,
+        justid,
+        base,
+    } = *terms;
+    if let Some(previous) = group
+        .pending
+        .get(&id)
+        .map(|pending| pending.consumer.clone())
+    {
+        if previous != *consumer_name {
+            if let Some(previous) = group.consumers.get_mut(&previous) {
+                previous.pending.remove(&id);
+            }
         }
-        pending.consumer = consumer_name.clone();
     }
+    let deliveries = match retry_count {
+        Some(count) => count,
+        None if justid => base,
+        None => base.saturating_add(1),
+    };
+    group.pending.insert(
+        id,
+        StreamPendingEntry {
+            consumer: consumer_name.clone(),
+            deliveries,
+            last_delivered_ms: delivery_ms,
+        },
+    );
+    group
+        .consumers
+        .entry(consumer_name.clone())
+        .or_insert_with(|| StreamConsumer {
+            seen_time_ms: delivery_ms,
+            pending: HashSet::new(),
+        })
+        .pending
+        .insert(id);
+}
 
-    pending.deliveries = pending.deliveries.saturating_add(1);
-    pending.last_delivered_ms = now;
-
-    let consumer = group
+/// The consumer exists after XCLAIM and XAUTOCLAIM even when nothing is
+/// claimed, and its seen time moves to now.
+fn touch_consumer(group: &mut StreamGroup, consumer_name: &Bytes, now: i64) {
+    group
         .consumers
         .entry(consumer_name.clone())
         .or_insert_with(|| StreamConsumer {
             seen_time_ms: now,
             pending: HashSet::new(),
-        });
-    consumer.seen_time_ms = now;
-    consumer.pending.insert(id);
-
-    true
+        })
+        .seen_time_ms = now;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +401,46 @@ fn record_deleted_ids(entry: &mut StoredValue, deleted: impl IntoIterator<Item =
     }
 }
 
+/// Looks up the stream and group like Redis's xclaimCommand and
+/// xautoclaimCommand do, before anything else is judged.
+fn require_group(
+    server: &mut ServerState,
+    client: &ClientState,
+    key: &Bytes,
+    group_name: &Bytes,
+    now: i64,
+) -> Option<CommandOutcome> {
+    let mut db = server.db_mut(client.selected_db);
+    purge_expired_key(&mut db, key, now);
+    let Some(entry) = db.get(key) else {
+        return Some(stream_nogroup_error(key, group_name));
+    };
+    if !entry.is_stream() {
+        return Some(wrong_type_response());
+    }
+    if !entry
+        .as_stream_groups()
+        .is_some_and(|groups| groups.contains_key(group_name))
+    {
+        return Some(stream_nogroup_error(key, group_name));
+    }
+    None
+}
+
+fn entry_exists(entries: &[StreamEntry], id: StreamId) -> bool {
+    entries.binary_search_by_key(&id, |entry| entry.id).is_ok()
+}
+
+fn claimed_reply(entries: &[StreamEntry], id: StreamId, justid: bool) -> Option<RespFrame> {
+    if justid {
+        return Some(RespFrame::BulkString(Some(stream_id_to_bytes(id))));
+    }
+    entries
+        .binary_search_by_key(&id, |entry| entry.id)
+        .ok()
+        .map(|at| stream_entry_frame(&entries[at]))
+}
+
 pub(super) fn cmd_xclaim(
     args: &[Bytes],
     server: &mut ServerState,
@@ -364,16 +452,20 @@ pub(super) fn cmd_xclaim(
 
     let key = &args[0];
     let group_name = &args[1];
-    let consumer_name = args[2].clone();
+    let consumer_name = &args[2];
+    let now = now_ms();
 
-    let Some(min_idle) = parse_i64(&args[3]) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    };
-    if min_idle < 0 {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+    // Redis's order: the key and group, then the minimum idle time, the IDs
+    // and the options.
+    if let Some(reply) = require_group(server, client, key, group_name, now) {
+        return reply;
     }
+    let Some(min_idle) = parse_i64(&args[3]) else {
+        return CommandOutcome::reply(err("ERR Invalid min-idle-time argument for XCLAIM"));
+    };
+    let min_idle = min_idle.max(0);
 
-    // As Redis: the IDs are the run of arguments that parse as IDs, and what
+    // The IDs are the run of arguments that parse as strict IDs and what
     // follows are options.
     let mut ids = Vec::new();
     let mut idx = 4usize;
@@ -382,16 +474,44 @@ pub(super) fn cmd_xclaim(
         idx += 1;
     }
     let mut justid = false;
+    let mut force = false;
+    let mut delivery_time: Option<i64> = None;
+    let mut retry_count: Option<i64> = None;
+    let mut last_id = StreamId { ms: 0, seq: 0 };
     while idx < args.len() {
+        let more = args.len() - 1 - idx;
         let option = &args[idx];
-        if option.eq_ignore_ascii_case(b"JUSTID") {
+        if option.eq_ignore_ascii_case(b"FORCE") {
+            force = true;
+        } else if option.eq_ignore_ascii_case(b"JUSTID") {
             justid = true;
-        } else if [&b"FORCE"[..], b"IDLE", b"TIME", b"RETRYCOUNT", b"LASTID"]
-            .iter()
-            .any(|known| option.eq_ignore_ascii_case(known))
-        {
-            // Redis options Ratatosk does not implement.
-            return CommandOutcome::reply(err("ERR syntax error"));
+        } else if option.eq_ignore_ascii_case(b"IDLE") && more > 0 {
+            idx += 1;
+            let Some(idle) = parse_i64(&args[idx]) else {
+                return CommandOutcome::reply(err("ERR Invalid IDLE option argument for XCLAIM"));
+            };
+            delivery_time = Some(now.saturating_sub(idle));
+        } else if option.eq_ignore_ascii_case(b"TIME") && more > 0 {
+            idx += 1;
+            let Some(time) = parse_i64(&args[idx]) else {
+                return CommandOutcome::reply(err("ERR Invalid TIME option argument for XCLAIM"));
+            };
+            delivery_time = Some(time);
+        } else if option.eq_ignore_ascii_case(b"RETRYCOUNT") && more > 0 {
+            idx += 1;
+            let Some(count) = parse_i64(&args[idx]) else {
+                return CommandOutcome::reply(err(
+                    "ERR Invalid RETRYCOUNT option argument for XCLAIM",
+                ));
+            };
+            // A negative count is the same as not giving one.
+            retry_count = (count >= 0).then_some(count);
+        } else if option.eq_ignore_ascii_case(b"LASTID") && more > 0 {
+            idx += 1;
+            let Some(id) = parse_strict_stream_id(&args[idx]) else {
+                return CommandOutcome::reply(invalid_stream_id());
+            };
+            last_id = id;
         } else {
             return CommandOutcome::reply(err(&format!(
                 "ERR Unrecognized XCLAIM option '{}'",
@@ -401,77 +521,68 @@ pub(super) fn cmd_xclaim(
         idx += 1;
     }
 
-    let now = now_ms();
-    let mut db = server.db_mut(client.selected_db);
-    purge_expired_key(&mut db, key, now);
+    // A time that is in the future or negative falls back to now, as Redis
+    // does, since clients derive it from their own clocks.
+    let delivery_ms = match delivery_time {
+        Some(time) if (0..=now).contains(&time) => time,
+        _ => now,
+    };
 
+    let mut db = server.db_mut(client.selected_db);
     let Some(entry) = db.get_mut(key) else {
         return stream_nogroup_error(key, group_name);
     };
-    if entry.as_stream_entries().is_none() {
+    let Some((entries, groups, _)) = entry.as_stream_parts_mut() else {
         return wrong_type_response();
+    };
+    let Some(group) = groups.get_mut(group_name) else {
+        return stream_nogroup_error(key, group_name);
+    };
+
+    if last_id > group.last_delivered_id {
+        group.last_delivered_id = last_id;
     }
+    touch_consumer(group, consumer_name, now);
 
-    let claimed_ids = {
-        let Some(groups) = entry.as_stream_groups_mut() else {
-            return stream_nogroup_error(key, group_name);
-        };
-        let Some(group) = groups.get_mut(group_name) else {
-            return stream_nogroup_error(key, group_name);
-        };
-
-        let mut claimed = Vec::new();
-        for id in ids {
-            let Some(pending) = group.pending.get(&id) else {
-                continue;
-            };
-            let idle = now.saturating_sub(pending.last_delivered_ms);
-            if idle < min_idle {
-                continue;
-            }
-
-            if claim_pending_id(group, &consumer_name, id, now) {
-                claimed.push(id);
-            }
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let pending = group
+            .pending
+            .get(&id)
+            .map(|pending| (pending.deliveries, pending.last_delivered_ms));
+        // An entry that is gone leaves the pending list instead of moving.
+        if !entry_exists(entries, id) {
+            remove_pending_id(group, id);
+            continue;
         }
-        claimed
-    };
-
-    let out = if justid {
-        claimed_ids
-            .iter()
-            .copied()
-            .map(|id| RespFrame::BulkString(Some(stream_id_to_bytes(id))))
-            .collect::<Vec<_>>()
-    } else {
-        let Some(stream) = entry.as_stream_entries() else {
-            return wrong_type_response();
-        };
-
-        let mut order_by_id = HashMap::with_capacity(claimed_ids.len());
-        for (idx, id) in claimed_ids.iter().copied().enumerate() {
-            order_by_id.insert(id, idx);
-        }
-
-        let mut ordered_rows: Vec<Option<RespFrame>> = vec![None; claimed_ids.len()];
-        let mut filled = 0usize;
-        for item in stream {
-            if let Some(position) = order_by_id.get(&item.id).copied() {
-                if ordered_rows[position].is_none() {
-                    ordered_rows[position] = Some(stream_entry_frame(item));
-                    filled = filled.saturating_add(1);
-                    if filled >= claimed_ids.len() {
-                        break;
-                    }
+        let base = match pending {
+            Some((deliveries, last_delivered_ms)) => {
+                if min_idle > 0 && now.saturating_sub(last_delivered_ms) < min_idle {
+                    continue;
                 }
+                deliveries
             }
-        }
-
-        ordered_rows.into_iter().flatten().collect::<Vec<_>>()
-    };
+            // FORCE creates the pending entry of an entry that exists.
+            None if force => 1,
+            None => continue,
+        };
+        let terms = ClaimTerms {
+            delivery_ms,
+            retry_count,
+            justid,
+            base,
+        };
+        assign_pending_id(group, consumer_name, id, &terms);
+        out.extend(claimed_reply(entries, id, justid));
+    }
 
     CommandOutcome::reply(RespFrame::Array(out))
 }
+
+/// The largest COUNT Redis accepts for XAUTOCLAIM, `LONG_MAX` over the size of
+/// a stream ID (16 bytes, more than the attempts factor of 10).
+const XAUTOCLAIM_MAX_COUNT: i64 = i64::MAX / 16;
+const XAUTOCLAIM_ATTEMPTS_FACTOR: usize = 10;
 
 pub(super) fn cmd_xautoclaim(
     args: &[Bytes],
@@ -484,14 +595,12 @@ pub(super) fn cmd_xautoclaim(
 
     let key = &args[0];
     let group_name = &args[1];
-    let consumer_name = args[2].clone();
+    let consumer_name = &args[2];
 
     let Some(min_idle) = parse_i64(&args[3]) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+        return CommandOutcome::reply(err("ERR Invalid min-idle-time argument for XAUTOCLAIM"));
     };
-    if min_idle < 0 {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    }
+    let min_idle = min_idle.max(0);
 
     // The start is an interval bound, as in Redis: `-`, `+`, a bare
     // millisecond value and the `(` exclusive prefix are accepted.
@@ -504,116 +613,96 @@ pub(super) fn cmd_xautoclaim(
     let mut justid = false;
     let mut idx = 5usize;
     while idx < args.len() {
-        if args[idx].eq_ignore_ascii_case(b"COUNT") {
-            let Some(raw_count) = args.get(idx + 1) else {
-                return CommandOutcome::reply(err("ERR syntax error"));
+        let more = args.len() - 1 - idx;
+        if args[idx].eq_ignore_ascii_case(b"COUNT") && more > 0 {
+            let parsed = parse_i64(&args[idx + 1])
+                .filter(|count| (1..=XAUTOCLAIM_MAX_COUNT).contains(count));
+            let Some(parsed) = parsed else {
+                return CommandOutcome::reply(err("ERR COUNT must be > 0"));
             };
-            let Some(parsed_count) = parse_usize(raw_count) else {
-                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-            };
-            count = parsed_count;
+            count = usize::try_from(parsed).unwrap_or(usize::MAX);
             idx += 2;
-            continue;
-        }
-        if args[idx].eq_ignore_ascii_case(b"JUSTID") {
+        } else if args[idx].eq_ignore_ascii_case(b"JUSTID") {
             justid = true;
             idx += 1;
-            continue;
+        } else {
+            return CommandOutcome::reply(err("ERR syntax error"));
         }
-
-        return CommandOutcome::reply(err("ERR syntax error"));
     }
 
     let now = now_ms();
+    if let Some(reply) = require_group(server, client, key, group_name, now) {
+        return reply;
+    }
     let mut db = server.db_mut(client.selected_db);
-    purge_expired_key(&mut db, key, now);
-
     let Some(entry) = db.get_mut(key) else {
         return stream_nogroup_error(key, group_name);
     };
-    if entry.as_stream_entries().is_none() {
+    let Some((entries, groups, _)) = entry.as_stream_parts_mut() else {
         return wrong_type_response();
+    };
+    let Some(group) = groups.get_mut(group_name) else {
+        return stream_nogroup_error(key, group_name);
+    };
+    touch_consumer(group, consumer_name, now);
+
+    let mut pending_ids = group
+        .pending
+        .keys()
+        .copied()
+        .filter(|id| *id >= start)
+        .collect::<Vec<_>>();
+    pending_ids.sort_unstable();
+
+    // As Redis: at most COUNT claimed or deleted entries, and at most ten
+    // times that many pending entries looked at. The cursor is the next
+    // pending ID, 0-0 at the end.
+    let mut attempts = count.saturating_mul(XAUTOCLAIM_ATTEMPTS_FACTOR);
+    let mut remaining = count;
+    let mut claimed = Vec::new();
+    let mut deleted = Vec::new();
+    let mut examined = 0usize;
+    while attempts > 0 && remaining > 0 && examined < pending_ids.len() {
+        attempts -= 1;
+        let id = pending_ids[examined];
+        examined += 1;
+
+        if !entry_exists(entries, id) {
+            remove_pending_id(group, id);
+            deleted.push(id);
+            remaining -= 1;
+            continue;
+        }
+        let Some(pending) = group.pending.get(&id) else {
+            continue;
+        };
+        if min_idle > 0 && now.saturating_sub(pending.last_delivered_ms) < min_idle {
+            continue;
+        }
+        let terms = ClaimTerms {
+            delivery_ms: now,
+            retry_count: None,
+            justid,
+            base: pending.deliveries,
+        };
+        assign_pending_id(group, consumer_name, id, &terms);
+        claimed.extend(claimed_reply(entries, id, justid));
+        remaining -= 1;
     }
-
-    let (claimed_ids, next_cursor) = {
-        let Some(groups) = entry.as_stream_groups_mut() else {
-            return stream_nogroup_error(key, group_name);
-        };
-        let Some(group) = groups.get_mut(group_name) else {
-            return stream_nogroup_error(key, group_name);
-        };
-
-        let mut pending_ids = group.pending.keys().copied().collect::<Vec<_>>();
-        pending_ids.sort_unstable();
-
-        let mut claimed_ids = Vec::new();
-        let mut next_cursor = StreamId { ms: 0, seq: 0 };
-
-        for (pos, id) in pending_ids.iter().copied().enumerate() {
-            if id < start {
-                continue;
-            }
-
-            let Some(pending) = group.pending.get(&id) else {
-                continue;
-            };
-            let idle = now.saturating_sub(pending.last_delivered_ms);
-            if idle < min_idle {
-                continue;
-            }
-
-            if claim_pending_id(group, &consumer_name, id, now) {
-                claimed_ids.push(id);
-                if claimed_ids.len() >= count {
-                    next_cursor = pending_ids
-                        .get(pos + 1)
-                        .copied()
-                        .unwrap_or(StreamId { ms: 0, seq: 0 });
-                    break;
-                }
-            }
-        }
-
-        (claimed_ids, next_cursor)
-    };
-
-    let entries = if justid {
-        claimed_ids
-            .iter()
-            .copied()
-            .map(|id| RespFrame::BulkString(Some(stream_id_to_bytes(id))))
-            .collect::<Vec<_>>()
-    } else {
-        let Some(stream) = entry.as_stream_entries() else {
-            return wrong_type_response();
-        };
-
-        let mut order_by_id = HashMap::with_capacity(claimed_ids.len());
-        for (idx, id) in claimed_ids.iter().copied().enumerate() {
-            order_by_id.insert(id, idx);
-        }
-
-        let mut ordered_rows: Vec<Option<RespFrame>> = vec![None; claimed_ids.len()];
-        let mut filled = 0usize;
-        for item in stream {
-            if let Some(position) = order_by_id.get(&item.id).copied() {
-                if ordered_rows[position].is_none() {
-                    ordered_rows[position] = Some(stream_entry_frame(item));
-                    filled = filled.saturating_add(1);
-                    if filled >= claimed_ids.len() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        ordered_rows.into_iter().flatten().collect::<Vec<_>>()
-    };
+    let next_cursor = pending_ids
+        .get(examined)
+        .copied()
+        .unwrap_or(StreamId { ms: 0, seq: 0 });
 
     CommandOutcome::reply(RespFrame::Array(vec![
         RespFrame::BulkString(Some(stream_id_to_bytes(next_cursor))),
-        RespFrame::Array(entries),
-        RespFrame::Array(vec![]),
+        RespFrame::Array(claimed),
+        RespFrame::Array(
+            deleted
+                .into_iter()
+                .map(|id| RespFrame::BulkString(Some(stream_id_to_bytes(id))))
+                .collect(),
+        ),
     ]))
 }
 

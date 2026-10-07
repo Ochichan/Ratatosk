@@ -4614,6 +4614,9 @@ fn capture_durability_effects(
         }
         b"XTRIM" => None,
         b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
+        b"XCLAIM" | b"XAUTOCLAIM" => {
+            return claim_durability_effects(command, argv, server, db_index, response);
+        }
         // These commands are administrative/session actions, not keyspace
         // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
         // a successful CONFIG reply as if it were data.
@@ -4629,6 +4632,98 @@ fn capture_durability_effects(
     }?;
 
     Some(DurabilityEffects::single(db_index, canonical))
+}
+
+/// IDs in an XCLAIM or XAUTOCLAIM reply, which lists bare IDs with JUSTID and
+/// entries (ID first) without it.
+fn claimed_reply_ids(items: &[RespFrame]) -> Vec<Bytes> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            RespFrame::BulkString(Some(id)) => Some(id.clone()),
+            RespFrame::Array(parts) => match parts.first() {
+                Some(RespFrame::BulkString(Some(id))) => Some(id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Record XCLAIM and XAUTOCLAIM by their outcome, as Redis does: one XCLAIM per
+/// claimed entry that names the new owner, delivery time and count, forces
+/// the entry into the pending list and carries the group's last delivered
+/// ID, so replay reproduces the same pending list whatever the clock says.
+/// Entries XAUTOCLAIM found deleted leave the list through XACK. A command
+/// that claimed nothing is logged as sent, which still creates the consumer.
+fn claim_durability_effects(
+    command: &[u8],
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<DurabilityEffects> {
+    let (claimed, deleted) = match response {
+        RespFrame::Array(items) if command == b"XCLAIM" => (claimed_reply_ids(items), Vec::new()),
+        RespFrame::Array(parts) if command == b"XAUTOCLAIM" && parts.len() == 3 => {
+            let ids = |frame: &RespFrame| match frame {
+                RespFrame::Array(items) => claimed_reply_ids(items),
+                _ => Vec::new(),
+            };
+            (ids(&parts[1]), ids(&parts[2]))
+        }
+        _ => return None,
+    };
+    if claimed.is_empty() && deleted.is_empty() {
+        return Some(DurabilityEffects::single(db_index, argv.to_vec()));
+    }
+
+    let key = argv.get(1)?;
+    let group_name = argv.get(2)?;
+    let db = server.db(db_index);
+    let group = db.get(key)?.as_stream_groups()?.get(group_name)?;
+    let last_id = cmd_stream::stream_id_to_bytes(group.last_delivered_id);
+    let mut commands = Vec::with_capacity(claimed.len() + deleted.len());
+    for id in claimed {
+        let pending = group
+            .pending
+            .get(&cmd_stream::parse_strict_stream_id(&id)?)?;
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XCLAIM"),
+                key.clone(),
+                group_name.clone(),
+                pending.consumer.clone(),
+                Bytes::from_static(b"0"),
+                id,
+                Bytes::from_static(b"TIME"),
+                Bytes::from(pending.last_delivered_ms.to_string()),
+                Bytes::from_static(b"RETRYCOUNT"),
+                Bytes::from(pending.deliveries.to_string()),
+                Bytes::from_static(b"FORCE"),
+                Bytes::from_static(b"JUSTID"),
+                Bytes::from_static(b"LASTID"),
+                last_id.clone(),
+            ],
+        });
+    }
+    for id in deleted {
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XACK"),
+                key.clone(),
+                group_name.clone(),
+                id,
+            ],
+        });
+    }
+    if commands.len() == 1 {
+        let only = commands.pop()?;
+        return Some(DurabilityEffects::single(db_index, only.argv));
+    }
+    Some(DurabilityEffects::transaction(commands))
 }
 
 /// Members per replayed `SREM`, well under the RESP parser's array limit.
@@ -8409,6 +8504,618 @@ mod tests {
             ),
             RespFrame::Array(vec![])
         );
+    }
+
+    /// `(consumer, deliveries)` of each pending entry of group `g` on `s`.
+    fn pending_of(server: &ServerState, group: &str) -> Vec<(String, String, i64, i64)> {
+        let mut rows = server
+            .db(0)
+            .get(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(&Bytes::from(group.to_owned())))
+            .map(|group| {
+                group
+                    .pending
+                    .iter()
+                    .map(|(id, pending)| {
+                        (
+                            format!("{}-{}", id.ms, id.seq),
+                            String::from_utf8_lossy(&pending.consumer).into_owned(),
+                            pending.deliveries,
+                            pending.last_delivered_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        rows.sort();
+        rows
+    }
+
+    fn claim_setup() -> (ServerState, ClientState) {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        (server, client)
+    }
+
+    #[test]
+    fn xclaim_options_and_delivery_counts_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        let deliveries = |server: &ServerState, id: &str| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == id)
+                .map(|row| row.2)
+                .expect("pending entry")
+        };
+        let consumer_of = |server: &ServerState, id: &str| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == id)
+                .map(|row| row.1)
+                .expect("pending entry")
+        };
+
+        // A claim counts a delivery, JUSTID does not, RETRYCOUNT sets it, and a
+        // negative RETRYCOUNT is as if absent.
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "1-0"), 2);
+        assert_eq!(consumer_of(&server, "1-0"), "c2");
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "2-0", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "2-0"), 1);
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "3-0", "RETRYCOUNT", "7"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "3-0"), 7);
+        run(
+            &["XCLAIM", "s", "g", "c3", "0", "3-0", "RETRYCOUNT", "-4"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "3-0"), 8);
+        assert_eq!(consumer_of(&server, "3-0"), "c3");
+        // The reply is the entries, or bare IDs with JUSTID.
+        assert_eq!(
+            stream_ids(run(
+                &["XCLAIM", "s", "g", "c3", "0", "1-0", "2-0"],
+                &mut server,
+                &mut client
+            )),
+            ["1-0", "2-0"]
+        );
+
+        // The minimum idle time skips entries delivered more recently, and a
+        // negative one is 0.
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c4", "3600000", "1-0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c4", "-5", "1-0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0")])
+        );
+
+        // IDLE and TIME set the delivery time; a time in the future is now.
+        let now = now_ms();
+        run(
+            &[
+                "XCLAIM", "s", "g", "c4", "0", "1-0", "IDLE", "10000", "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        let at = pending_of(&server, "g")
+            .into_iter()
+            .find(|row| row.0 == "1-0")
+            .unwrap()
+            .3;
+        assert!(
+            at <= now - 10_000 + 50 && at >= now - 10_000 - 50,
+            "{at} vs {now}"
+        );
+        run(
+            &[
+                "XCLAIM", "s", "g", "c4", "0", "1-0", "TIME", "12345", "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            pending_of(&server, "g")
+                .into_iter()
+                .find(|row| row.0 == "1-0")
+                .unwrap()
+                .3,
+            12345
+        );
+        run(
+            &[
+                "XCLAIM",
+                "s",
+                "g",
+                "c4",
+                "0",
+                "1-0",
+                "TIME",
+                "99999999999999",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert!(
+            pending_of(&server, "g")
+                .into_iter()
+                .find(|row| row.0 == "1-0")
+                .unwrap()
+                .3
+                >= now
+        );
+
+        // FORCE creates the pending entry of an entry that exists, counting
+        // the creation as the first delivery; a missing entry is ignored.
+        run(
+            &["XGROUP", "CREATE", "s", "h", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "FORCE"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "3-0", "FORCE", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "9-0", "FORCE", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        let forced = pending_of(&server, "h");
+        assert_eq!(
+            forced
+                .iter()
+                .map(|row| (row.0.as_str(), row.2))
+                .collect::<Vec<_>>(),
+            [("2-0", 2), ("3-0", 1)]
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "h", "c", "0", "1-0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+
+        // LASTID moves the group's last delivered ID forward only.
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "LASTID", "2-5"],
+            &mut server,
+            &mut client,
+        );
+        let last = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_groups())
+                .and_then(|groups| groups.get(&Bytes::from_static(b"h")))
+                .map(|group| (group.last_delivered_id.ms, group.last_delivered_id.seq))
+                .unwrap()
+        };
+        assert_eq!(last(&server), (2, 5));
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "LASTID", "1-1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(last(&server), (2, 5));
+
+        // Claiming creates the consumer even when nothing is claimed.
+        run(
+            &["XCLAIM", "s", "h", "newbie", "0", "8-0"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(consumers) =
+            run(&["XINFO", "CONSUMERS", "s", "h"], &mut server, &mut client)
+        else {
+            panic!("XINFO CONSUMERS should return an array");
+        };
+        assert_eq!(consumers.len(), 2);
+    }
+
+    #[test]
+    fn xclaim_errors_and_their_order_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        // The key and group come first, whatever else is wrong.
+        for parts in [
+            &["XCLAIM", "none", "g", "c", "x", "bad", "BOGUS"][..],
+            &["XCLAIM", "s", "nogroup", "c", "x", "1-0"],
+        ] {
+            assert!(
+                matches!(
+                    run(parts, &mut server, &mut client),
+                    RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+                ),
+                "{parts:?}"
+            );
+        }
+        for (parts, expected) in [
+            (
+                &["XCLAIM", "s", "g", "c", "x", "1-0"][..],
+                "ERR Invalid min-idle-time argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "IDLE", "x"],
+                "ERR Invalid IDLE option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "TIME", "x"],
+                "ERR Invalid TIME option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "RETRYCOUNT", "x"],
+                "ERR Invalid RETRYCOUNT option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "LASTID", "x"],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+            // An option that needs a value but is last is unrecognized.
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "IDLE"],
+                "ERR Unrecognized XCLAIM option 'IDLE'",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xautoclaim_bounds_cursor_and_deleted_ids_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        for (parts, expected) in [
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "0"][..],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "-1"],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "x"],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &[
+                    "XAUTOCLAIM",
+                    "s",
+                    "g",
+                    "c2",
+                    "0",
+                    "0",
+                    "COUNT",
+                    "9223372036854775807",
+                ],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "x", "0"],
+                "ERR Invalid min-idle-time argument for XAUTOCLAIM",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT"],
+                "ERR syntax error",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "BOGUS"],
+                "ERR syntax error",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+        // The largest accepted COUNT is LONG_MAX / 16.
+        assert!(matches!(
+            run(
+                &[
+                    "XAUTOCLAIM",
+                    "s",
+                    "g",
+                    "c2",
+                    "0",
+                    "0",
+                    "COUNT",
+                    "576460752303423487",
+                    "JUSTID"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(_)
+        ));
+
+        // JUSTID leaves the delivery count alone, a plain claim adds one, and
+        // a negative min-idle is 0.
+        run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c2",
+                "-3",
+                "0",
+                "COUNT",
+                "1",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(pending_of(&server, "g")[0].2, 1);
+        run(
+            &["XAUTOCLAIM", "s", "g", "c3", "0", "0", "COUNT", "1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(pending_of(&server, "g")[0].2, 2);
+
+        // COUNT bounds the claims and the cursor is the next pending ID.
+        let RespFrame::Array(parts) = run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c4",
+                "0",
+                "0",
+                "COUNT",
+                "2",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("3-0"));
+        assert_eq!(
+            parts[1],
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("2-0")])
+        );
+        assert_eq!(parts[2], RespFrame::Array(vec![]));
+
+        // Only ten times COUNT pending entries are looked at: skipped ones
+        // (too fresh for min-idle) use up attempts, so the cursor stops early.
+        let mut busy = ServerState::with_default_dbs();
+        let mut client2 = ClientState::default();
+        fill_stream("s", 12, &mut busy, &mut client2);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut busy,
+            &mut client2,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut busy,
+            &mut client2,
+        );
+        let RespFrame::Array(parts) = run(
+            &["XAUTOCLAIM", "s", "g", "c2", "3600000", "0", "COUNT", "1"],
+            &mut busy,
+            &mut client2,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("11-0"));
+        assert_eq!(parts[1], RespFrame::Array(vec![]));
+
+        // Entries missing from the stream leave the pending list and are
+        // reported as deleted, using up COUNT.
+        let (mut server, mut client) = claim_setup();
+        server
+            .db_mut(0)
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_entries_mut())
+            .expect("stream")
+            .retain(|entry| entry.id.ms != 2);
+        let RespFrame::Array(parts) = run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c2",
+                "0",
+                "0",
+                "COUNT",
+                "5",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("0-0"));
+        assert_eq!(
+            parts[1],
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("3-0")])
+        );
+        assert_eq!(parts[2], RespFrame::Array(vec![RespFrame::bulk_str("2-0")]));
+        assert_eq!(pending_of(&server, "g").len(), 2);
+    }
+
+    #[test]
+    fn empty_xpending_summary_ends_with_a_null_array() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 1, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(&["XPENDING", "s", "g"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::Integer(0),
+                RespFrame::BulkString(None),
+                RespFrame::BulkString(None),
+                RespFrame::NullArray,
+            ])
+        );
+    }
+
+    #[test]
+    fn claims_are_logged_by_outcome_and_replay_to_the_same_pending_list() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        fn record(
+            parts: &[&str],
+            server: &mut ServerState,
+            client: &mut ClientState,
+            log: &mut Vec<Vec<Bytes>>,
+        ) {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        }
+        fn shape(argv: &[Bytes]) -> Vec<String> {
+            argv.iter()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        }
+        for ms in 1..=4 {
+            let id = format!("{ms}-0");
+            record(
+                &["XADD", "s", &id, "f", "v"],
+                &mut server,
+                &mut client,
+                &mut log,
+            );
+        }
+        record(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        record(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        record(
+            &["XCLAIM", "s", "g", "c2", "0", "3-0", "4-0", "JUSTID"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        let before = log.len();
+        record(
+            &["XCLAIM", "s", "g", "c2", "0", "1-0", "2-0", "IDLE", "5000"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        // Two claimed entries make two explicit commands.
+        assert_eq!(log.len(), before + 2);
+        let first = shape(&log[before]);
+        assert_eq!(&first[..6], ["XCLAIM", "s", "g", "c2", "0", "1-0"]);
+        assert_eq!(first[6], "TIME");
+        assert_eq!(
+            &first[8..],
+            ["RETRYCOUNT", "2", "FORCE", "JUSTID", "LASTID", "4-0"]
+        );
+        record(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c3",
+                "0",
+                "0",
+                "COUNT",
+                "1",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        // A claim that finds nothing is logged as sent.
+        let before = log.len();
+        record(
+            &["XCLAIM", "s", "g", "c4", "3600000", "3-0"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        assert_eq!(log.len(), before + 1);
+        assert_eq!(shape(&log[before])[0], "XCLAIM");
+        assert_eq!(shape(&log[before])[5], "3-0");
+        assert_eq!(log[before].len(), 6);
+
+        // Replay later, so that the clock differs; the delivery times and
+        // counts still match because they are logged.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
     }
 
     #[test]

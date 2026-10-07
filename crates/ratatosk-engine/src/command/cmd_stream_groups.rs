@@ -782,7 +782,7 @@ pub(super) fn cmd_xpending(
                 RespFrame::Integer(0),
                 RespFrame::BulkString(None),
                 RespFrame::BulkString(None),
-                RespFrame::Array(vec![]),
+                RespFrame::NullArray,
             ]));
         }
 
