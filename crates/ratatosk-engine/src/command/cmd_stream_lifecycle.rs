@@ -8,8 +8,8 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    IntervalEdge, parse_interval_id, parse_strict_stream_id, stream_entry_frame,
-    stream_id_to_bytes, stream_nogroup_error,
+    AddTrimArgs, IntervalEdge, TrimStrategy, parse_add_or_trim_args, parse_interval_id,
+    parse_strict_stream_id, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
 };
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
@@ -141,6 +141,39 @@ pub(super) fn purge_stream_pending_id(groups: &mut HashMap<Bytes, StreamGroup>, 
     }
 }
 
+/// Trims the stream at `entry` as `options` ask and returns how many entries
+/// went. A `~` trim is exact here, since entries live in a vector, but the
+/// `LIMIT` cap still applies. Like Redis, trimming leaves `max_deleted_id`
+/// alone. Group pending lists drop the removed IDs.
+pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usize {
+    let Some(strategy) = options.strategy else {
+        return 0;
+    };
+    let Some(stream) = entry.as_stream_entries_mut() else {
+        return 0;
+    };
+
+    let mut remove_count = match strategy {
+        TrimStrategy::MaxLen(max_len) => stream
+            .len()
+            .saturating_sub(usize::try_from(max_len).unwrap_or(usize::MAX)),
+        TrimStrategy::MinId(min_id) => stream.iter().take_while(|item| item.id < min_id).count(),
+    };
+    if let Some(cap) = options.limit.filter(|cap| *cap > 0) {
+        remove_count = remove_count.min(cap);
+    }
+    if remove_count == 0 {
+        return 0;
+    }
+
+    let removed_ids = stream
+        .drain(0..remove_count)
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    prune_stream_removed_ids(entry, &removed_ids);
+    removed_ids.len()
+}
+
 pub(super) fn cmd_xtrim(
     args: &[Bytes],
     server: &mut ServerState,
@@ -151,52 +184,10 @@ pub(super) fn cmd_xtrim(
     }
 
     let key = &args[0];
-    let strategy = &args[1];
-
-    let mut idx = 2usize;
-    if idx < args.len() && (args[idx].as_ref() == b"=" || args[idx].as_ref() == b"~") {
-        idx += 1;
-    }
-    if idx >= args.len() {
-        return CommandOutcome::reply(err("ERR syntax error"));
-    }
-
-    enum TrimStrategy {
-        MaxLen(usize),
-        MinId(StreamId),
-    }
-
-    let mode = if strategy.eq_ignore_ascii_case(b"MAXLEN") {
-        let Some(parsed) = parse_usize(&args[idx]) else {
-            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-        };
-        TrimStrategy::MaxLen(parsed)
-    } else if strategy.eq_ignore_ascii_case(b"MINID") {
-        let Some(parsed) = parse_strict_stream_id(&args[idx]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        TrimStrategy::MinId(parsed)
-    } else {
-        return CommandOutcome::reply(err("ERR syntax error"));
+    let options = match parse_add_or_trim_args(args, false) {
+        Ok(options) => options,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
-    idx += 1;
-
-    let mut limit = None;
-    while idx < args.len() {
-        if !args[idx].eq_ignore_ascii_case(b"LIMIT") {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        }
-        let Some(raw_limit) = args.get(idx + 1) else {
-            return CommandOutcome::reply(err("ERR syntax error"));
-        };
-        let Some(parsed_limit) = parse_usize(raw_limit) else {
-            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-        };
-        limit = Some(parsed_limit);
-        idx += 2;
-    }
 
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
@@ -205,30 +196,12 @@ pub(super) fn cmd_xtrim(
     let Some(entry) = db.get_mut(key) else {
         return CommandOutcome::reply(RespFrame::Integer(0));
     };
-    let Some(stream) = entry.as_stream_entries_mut() else {
+    if !entry.is_stream() {
         return wrong_type_response();
-    };
-
-    let mut remove_count = match mode {
-        TrimStrategy::MaxLen(max_len) => stream.len().saturating_sub(max_len),
-        TrimStrategy::MinId(min_id) => stream.iter().take_while(|item| item.id < min_id).count(),
-    };
-
-    if let Some(max_remove) = limit {
-        remove_count = remove_count.min(max_remove);
     }
 
-    if remove_count == 0 {
-        return CommandOutcome::reply(RespFrame::Integer(0));
-    }
-
-    let removed_ids = stream
-        .drain(0..remove_count)
-        .map(|entry| entry.id)
-        .collect::<Vec<_>>();
-    prune_stream_removed_ids(entry, &removed_ids);
-
-    CommandOutcome::reply(RespFrame::Integer(removed_ids.len() as i64))
+    let removed = apply_trim(entry, &options);
+    CommandOutcome::reply(RespFrame::Integer(removed as i64))
 }
 
 pub(super) fn cmd_xdel(

@@ -6,6 +6,7 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, StoredValue, StreamEntry, StreamId, purge_expired_key};
 
+use super::cmd_stream_lifecycle::apply_trim;
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
     wrong_type_response,
@@ -272,44 +273,191 @@ pub(super) fn blocking_watch_keys(client: &ClientState, keys: &[Bytes]) -> Vec<(
         .collect()
 }
 
+/// How XADD chooses the new entry's ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IdSpec {
+    /// `*`: the current time, or the next sequence after the last ID.
+    Auto,
+    /// `<ms>-*`: the next sequence within the millisecond.
+    AutoSeq(u64),
+    Explicit(StreamId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrimStrategy {
+    MaxLen(u64),
+    MinId(StreamId),
+}
+
+/// The options of XADD and XTRIM, as parsed by Redis's
+/// `streamParseAddOrTrimArgsOrReply`. Positions index the command's arguments
+/// without the command name, so the key is at 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct AddTrimArgs {
+    pub strategy: Option<TrimStrategy>,
+    /// `~`: trimming may stop early. Ratatosk stores entries in a vector, so
+    /// it still trims exactly, only capped by `limit`.
+    pub approx: bool,
+    /// The most entries one trim removes. `0` and `None` mean no cap.
+    pub limit: Option<usize>,
+    /// Positions of every `LIMIT <n>` pair.
+    pub limit_positions: Vec<usize>,
+    /// Position of the MAXLEN or MINID threshold.
+    pub strategy_arg_idx: usize,
+    pub no_mkstream: bool,
+    /// XADD only: the position of the ID argument and what it asks for. `None`
+    /// when the arguments ran out before an ID.
+    pub id: Option<(usize, IdSpec)>,
+}
+
+fn syntax_error_reply(message: &str) -> RespFrame {
+    err(&format!("ERR {message}"))
+}
+
+/// Parses the options in front of the ID (XADD) or the whole argument list
+/// (XTRIM), validating everything Redis validates before touching the key.
+pub(super) fn parse_add_or_trim_args(args: &[Bytes], xadd: bool) -> Result<AddTrimArgs, RespFrame> {
+    let mut parsed = AddTrimArgs {
+        strategy: None,
+        approx: false,
+        limit: None,
+        limit_positions: Vec::new(),
+        strategy_arg_idx: 0,
+        no_mkstream: false,
+        id: None,
+    };
+    let not_an_integer = || err("ERR value is not an integer or out of range");
+
+    let mut i = 1usize;
+    let mut limit_given = false;
+    while i < args.len() {
+        let more = args.len() - 1 - i;
+        let opt = &args[i];
+        if xadd && opt.as_ref() == b"*" {
+            parsed.id = Some((i, IdSpec::Auto));
+            break;
+        } else if opt.eq_ignore_ascii_case(b"MAXLEN") && more > 0 {
+            if parsed.strategy.is_some() {
+                return Err(syntax_error_reply(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ));
+            }
+            parsed.approx = false;
+            let next = args[i + 1].as_ref();
+            if more >= 2 && next == b"~" {
+                parsed.approx = true;
+                i += 1;
+            } else if more >= 2 && next == b"=" {
+                i += 1;
+            }
+            let Some(maxlen) = parse_i64(&args[i + 1]) else {
+                return Err(not_an_integer());
+            };
+            let Ok(maxlen) = u64::try_from(maxlen) else {
+                return Err(err("ERR The MAXLEN argument must be >= 0."));
+            };
+            i += 1;
+            parsed.strategy = Some(TrimStrategy::MaxLen(maxlen));
+            parsed.strategy_arg_idx = i;
+        } else if opt.eq_ignore_ascii_case(b"MINID") && more > 0 {
+            if parsed.strategy.is_some() {
+                return Err(syntax_error_reply(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ));
+            }
+            parsed.approx = false;
+            let next = args[i + 1].as_ref();
+            if more >= 2 && next == b"~" {
+                parsed.approx = true;
+                i += 1;
+            } else if more >= 2 && next == b"=" {
+                i += 1;
+            }
+            let Some(min_id) = parse_strict_stream_id(&args[i + 1]) else {
+                return Err(invalid_stream_id());
+            };
+            i += 1;
+            parsed.strategy = Some(TrimStrategy::MinId(min_id));
+            parsed.strategy_arg_idx = i;
+        } else if opt.eq_ignore_ascii_case(b"LIMIT") && more > 0 {
+            let Some(limit) = parse_i64(&args[i + 1]) else {
+                return Err(not_an_integer());
+            };
+            let Ok(limit) = usize::try_from(limit) else {
+                return Err(err("ERR The LIMIT argument must be >= 0."));
+            };
+            parsed.limit = Some(limit);
+            parsed.limit_positions.push(i);
+            limit_given = true;
+            i += 1;
+        } else if xadd && opt.eq_ignore_ascii_case(b"NOMKSTREAM") {
+            parsed.no_mkstream = true;
+        } else if xadd {
+            // Not an option, so this is the ID (or a syntax error).
+            let Some((id, seq_given)) = parse_stream_id_inner(opt, 0, true, true) else {
+                return Err(invalid_stream_id());
+            };
+            let spec = if seq_given {
+                IdSpec::Explicit(id)
+            } else {
+                IdSpec::AutoSeq(id.ms)
+            };
+            parsed.id = Some((i, spec));
+            break;
+        } else {
+            return Err(err("ERR syntax error"));
+        }
+        i += 1;
+    }
+
+    if parsed.limit.is_some_and(|limit| limit > 0) && parsed.strategy.is_none() {
+        return Err(syntax_error_reply(
+            "syntax error, LIMIT cannot be used without specifying a trimming strategy",
+        ));
+    }
+    if !xadd && parsed.strategy.is_none() {
+        return Err(syntax_error_reply(
+            "syntax error, XTRIM must be called with a trimming strategy",
+        ));
+    }
+    if limit_given && !parsed.approx {
+        return Err(syntax_error_reply(
+            "syntax error, LIMIT cannot be used without the special ~ option",
+        ));
+    }
+    Ok(parsed)
+}
+
 pub(super) fn cmd_xadd(
     args: &[Bytes],
     server: &mut ServerState,
     client: &ClientState,
 ) -> CommandOutcome {
-    if args.len() < 4 || args.len() % 2 != 0 {
+    if args.len() < 4 {
         return wrong_arity("xadd");
     }
 
     let key = &args[0];
-    let id_raw = &args[1];
 
-    // How the ID is chosen, validated before the key is touched so that a
-    // rejected XADD never leaves an empty stream behind (Redis rejects these
-    // forms while parsing its arguments).
-    enum IdSpec {
-        Auto,
-        AutoSeq(u64),
-        Explicit(StreamId),
-    }
-    let invalid_id = || CommandOutcome::reply(invalid_stream_id());
-    let spec = if id_raw.as_ref() == b"*" {
-        IdSpec::Auto
-    } else {
-        let Some((parsed, seq_given)) = parse_stream_id_inner(id_raw, 0, true, true) else {
-            return invalid_id();
-        };
-        if !seq_given {
-            IdSpec::AutoSeq(parsed.ms)
-        } else {
-            if parsed == (StreamId { ms: 0, seq: 0 }) {
-                return CommandOutcome::reply(err(
-                    "ERR The ID specified in XADD must be greater than 0-0",
-                ));
-            }
-            IdSpec::Explicit(parsed)
-        }
+    // Every option and the ID are validated before the key is touched so that
+    // a rejected XADD never leaves an empty stream behind (Redis rejects
+    // these while parsing its arguments). The field count is checked after
+    // the ID, as Redis does: `XADD k bad f` is an invalid ID, `XADD k 1-1 f`
+    // an arity error.
+    let options = match parse_add_or_trim_args(args, true) {
+        Ok(options) => options,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
+    let Some((id_idx, spec)) = options.id else {
+        return wrong_arity("xadd");
+    };
+    let field_args = &args[id_idx + 1..];
+    if field_args.len() < 2 || field_args.len() % 2 != 0 {
+        return wrong_arity("xadd");
+    }
+    if spec == IdSpec::Explicit(StreamId { ms: 0, seq: 0 }) {
+        return CommandOutcome::reply(err("ERR The ID specified in XADD must be greater than 0-0"));
+    }
 
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
@@ -322,6 +470,7 @@ pub(super) fn cmd_xadd(
             };
             meta.last_id
         }
+        None if options.no_mkstream => return CommandOutcome::reply(RespFrame::BulkString(None)),
         None => StreamId { ms: 0, seq: 0 },
     };
     if last_id == MAX_STREAM_ID {
@@ -342,12 +491,10 @@ pub(super) fn cmd_xadd(
         ));
     };
 
-    let mut fields = Vec::with_capacity((args.len() - 2) / 2);
-    let mut idx = 2usize;
-    while idx < args.len() {
-        fields.push((args[idx].clone(), args[idx + 1].clone()));
-        idx += 2;
-    }
+    let fields = field_args
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), pair[1].clone()))
+        .collect::<Vec<_>>();
 
     if !db.contains_key(key) {
         db.insert(key.clone(), StoredValue::stream(Vec::new(), None));
@@ -361,6 +508,9 @@ pub(super) fn cmd_xadd(
     stream.push(StreamEntry { id, fields });
     meta.last_id = id;
     meta.entries_added = meta.entries_added.saturating_add(1);
+    if let Some(entry) = db.get_mut(key) {
+        apply_trim(entry, &options);
+    }
     CommandOutcome::reply(RespFrame::BulkString(Some(stream_id_to_bytes(id))))
 }
 
