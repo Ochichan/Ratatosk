@@ -61,6 +61,14 @@ impl AclUser {
         }
     }
 
+    /// Remove every stored hash that matches `raw_password`.
+    pub fn remove_password(&mut self, raw_password: &[u8]) -> bool {
+        let before = self.passwords.len();
+        self.passwords
+            .retain(|stored| !verify_password_hash(stored, raw_password));
+        self.passwords.len() != before
+    }
+
     pub fn category_allowed(&self, category: &[u8]) -> bool {
         self.allow_all_commands || self.allowed_categories.contains(category)
     }
@@ -102,6 +110,11 @@ impl AclState {
 
     pub fn get_user(&self, username: &Bytes) -> Option<&AclUser> {
         self.users.get(username)
+    }
+
+    /// Store `user` under `username`, replacing any previous definition.
+    pub fn put_user(&mut self, username: Bytes, user: AclUser) {
+        self.users.insert(username, user);
     }
 
     pub fn get_or_create_user_mut(&mut self, username: &Bytes) -> &mut AclUser {
@@ -212,16 +225,7 @@ impl AclState {
         let Some(user) = self.users.get_mut(username) else {
             return false;
         };
-
-        let mut removed = false;
-        let current = user.passwords.iter().cloned().collect::<Vec<_>>();
-        for stored in current {
-            if verify_password_hash(&stored, raw_password) && user.passwords.remove(&stored) {
-                removed = true;
-            }
-        }
-
-        removed
+        user.remove_password(raw_password)
     }
 
     pub fn push_log(&mut self, line: Bytes) {
@@ -344,14 +348,20 @@ impl AclState {
                 ));
             }
 
+            // Older builds kept passwords next to `nopass`; `nopass` forgets
+            // them, so a later `>pass` cannot bring them back.
+            let passwords = if user.nopass {
+                HashSet::new()
+            } else {
+                user.passwords
+                    .into_iter()
+                    .map(Bytes::from)
+                    .collect::<HashSet<_>>()
+            };
             let acl_user = AclUser {
                 enabled: user.enabled,
                 nopass: user.nopass,
-                passwords: user
-                    .passwords
-                    .into_iter()
-                    .map(Bytes::from)
-                    .collect::<HashSet<_>>(),
+                passwords,
                 allow_all_commands: user.allow_all_commands,
                 allowed_categories,
             };
@@ -424,6 +434,26 @@ mod tests {
     use super::{AclState, AclUser};
     use bytes::Bytes;
     use std::io;
+
+    #[test]
+    fn loading_a_nopass_user_forgets_its_passwords() -> io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = AclState::file_path(dir.path());
+        let mut acl = AclState::default();
+        let user = acl.get_or_create_user_mut(&Bytes::from_static(b"bob"));
+        user.enabled = true;
+        user.nopass = true;
+        user.passwords
+            .insert(AclState::hash_password(b"old").expect("hash"));
+        acl.save_to_file(&path)?;
+
+        let loaded = AclState::load_from_file(&path)?.expect("ACL file should exist");
+        let bob = loaded
+            .get_user(&Bytes::from_static(b"bob"))
+            .expect("bob should be restored");
+        assert!(bob.nopass && bob.passwords.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn acl_state_roundtrips_via_file() -> io::Result<()> {
