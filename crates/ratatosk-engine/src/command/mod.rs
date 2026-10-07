@@ -3706,7 +3706,7 @@ impl ClientState {
     pub fn has_queued_writes(&self) -> bool {
         match &self.tx_state {
             TransactionState::InTransaction { queue, .. } => {
-                queue.iter().any(|argv| is_write_command(argv))
+                queue.iter().any(|argv| may_write_command(argv))
             }
             TransactionState::Normal => false,
         }
@@ -5104,6 +5104,19 @@ pub fn command_name(argv: &[Bytes]) -> Option<Bytes> {
     Some(Bytes::copy_from_slice(
         to_uppercase_stack(command).as_slice(),
     ))
+}
+
+/// Return whether a command can change the dataset, counting EVAL and
+/// EVALSHA. Their own flags are only `noscript`, but a script may write, and
+/// Redis refuses scripts without `no-writes` when writes are blocked. The
+/// `_RO` variants cannot write.
+pub fn may_write_command(argv: &[Bytes]) -> bool {
+    if is_write_command(argv) {
+        return true;
+    }
+    argv.first().is_some_and(|name| {
+        name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA")
+    })
 }
 
 pub fn is_write_command(argv: &[Bytes]) -> bool {

@@ -204,10 +204,10 @@ async fn append_durability_effects_while_locked(
     let Some(effects) = effects else {
         return true;
     };
-    if effects.is_empty()
-        || !server.aof_enabled()
-        || matches!(outcome.response, RespFrame::Error(_))
-    {
+    // An error reply does not discard effects. A script that wrote and then
+    // failed already changed the dataset, so its transaction must be logged.
+    // Plain failed commands never produce effects in the engine.
+    if effects.is_empty() || !server.aof_enabled() {
         return true;
     }
     if persistence.aof_sender().is_none() {
@@ -326,7 +326,7 @@ pub(super) async fn run_with_blocking_retry<S: SessionStream>(
         })
         .unwrap_or_else(|| "UNKNOWN".to_string());
 
-    let is_write_operation = first_argv.as_deref().is_some_and(is_write_command)
+    let is_write_operation = first_argv.as_deref().is_some_and(may_write_command)
         || (command_name == "EXEC" && client_state.has_queued_writes());
 
     breadcrumbs::record_command(client_state.id(), &command_name, first_db, 0, "execute");
@@ -598,7 +598,7 @@ pub(super) async fn run_with_blocking_retry<S: SessionStream>(
 
         let outcome = {
             let argv = frame_to_argv_for_persistence(&frame);
-            let is_retry_write = argv.as_deref().is_some_and(is_write_command);
+            let is_retry_write = argv.as_deref().is_some_and(may_write_command);
 
             let lock_wait_start = std::time::Instant::now();
             let mut server = server_state.meta.lock().await;

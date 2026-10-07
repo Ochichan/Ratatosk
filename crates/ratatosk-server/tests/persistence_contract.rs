@@ -606,3 +606,45 @@ fn eval_writes_survive_sigkill_across_databases() -> io::Result<()> {
     assert_bulk(client.command(&["GET", "counter"])?, "2");
     Ok(())
 }
+
+#[cfg(feature = "lua-scripting")]
+#[test]
+fn eval_writes_before_a_script_error_survive_sigkill() -> io::Result<()> {
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    let scripts = [
+        (
+            "e1",
+            "redis.call('SET','e1','1') return redis.call('LPUSH','e1','x')",
+        ),
+        (
+            "e2",
+            "redis.call('SET','e2','1') return redis.error_reply('custom')",
+        ),
+        ("e3", "redis.call('SET','e3','1') error('boom')"),
+        ("e4", "redis.call('SET','e4','1') while true do end"),
+        (
+            "e5",
+            "redis.call('SET','e5','1') return redis.call('NOSUCHCMD')",
+        ),
+    ];
+    for (_, script) in scripts {
+        assert!(matches!(
+            client.command(&["EVAL", script, "0"])?,
+            RespFrame::Error(_)
+        ));
+    }
+    // A plain failed command must still log nothing.
+    assert!(matches!(
+        client.command(&["LPUSH", "e1", "y"])?,
+        RespFrame::Error(_)
+    ));
+    drop(client);
+
+    server.restart(true)?;
+    let mut client = server.client()?;
+    for (key, _) in scripts {
+        assert_bulk(client.command(&["GET", key])?, "1");
+    }
+    Ok(())
+}

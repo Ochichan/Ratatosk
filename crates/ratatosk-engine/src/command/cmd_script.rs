@@ -911,6 +911,53 @@ mod tests {
 
     #[cfg(feature = "lua-scripting")]
     #[test]
+    fn reset_is_blocked_in_scripts_and_capture_survives() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SET','a','1') redis.pcall('RESET') redis.call('SET','b','2') return 1",
+                "0",
+            ],
+        );
+        assert_eq!(reply, RespFrame::Integer(1));
+        let keys: Vec<String> = durable_strings(&effects.expect("effects"))
+            .into_iter()
+            .map(|(_, a)| a[1].clone())
+            .collect();
+        assert_eq!(keys, vec!["a", "b"]);
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('RESET')", "0"],
+        );
+        assert_error_contains(&reply, "not allowed from script");
+    }
+
+    #[test]
+    fn may_write_command_counts_eval_but_not_ro_variants() {
+        for (name, expected) in [
+            ("EVAL", true),
+            ("evalsha", true),
+            ("SET", true),
+            ("EVAL_RO", false),
+            ("EVALSHA_RO", false),
+            ("GET", false),
+        ] {
+            assert_eq!(
+                crate::command::may_write_command(&[Bytes::copy_from_slice(name.as_bytes())]),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
     fn eval_inside_multi_exec_joins_the_exec_transaction() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();

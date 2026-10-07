@@ -5,7 +5,7 @@ use ratatosk_engine::{
     command::{
         ClientState, CommandOutcome, DurabilityEffects, ExecuteArgvPrecheck, ServerAccess,
         apply_post_execute_side_effects, execute, execute_argv, is_write_command,
-        post_execute_tracking_flags, precheck_execute_argv_with_default_acl,
+        may_write_command, post_execute_tracking_flags, precheck_execute_argv_with_default_acl,
     },
     keyspace::{PubSubMessage, ServerState, SharedState},
     object::normalize_range,
@@ -1621,6 +1621,73 @@ mod tests {
         assert_eq!(n, 0);
 
         server_task.await.expect("server task complete");
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[tokio::test]
+    async fn aof_latch_refuses_scripts_that_may_write_but_not_ro_scripts() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+        {
+            let mut server = shared.meta.lock().await;
+            server.set_aof_enabled(true);
+            server.set_aof_last_error("injected disk error");
+        }
+
+        for (name, parts) in [
+            ("plain SET", vec!["SET", "k", "v"]),
+            ("EVAL", vec!["EVAL", "redis.call('SET','k','v')", "0"]),
+        ] {
+            let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+            for part in &parts {
+                frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            client.write_all(&frame).await.expect("write");
+            let reply = read_reply(&mut client).await;
+            assert!(reply.starts_with(b"-MISCONF"), "{name}: {reply:?}");
+        }
+        // An EVAL queued before the latch makes EXEC a write operation too.
+        shared.meta.lock().await.clear_aof_last_error();
+        for parts in [
+            vec!["MULTI"],
+            vec!["EVAL", "redis.call('SET','k','v')", "0"],
+        ] {
+            let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+            for part in &parts {
+                frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            client.write_all(&frame).await.expect("write");
+            let _ = read_reply(&mut client).await;
+        }
+        shared
+            .meta
+            .lock()
+            .await
+            .set_aof_last_error("injected disk error");
+        client
+            .write_all(b"*1\r\n$4\r\nEXEC\r\n")
+            .await
+            .expect("write exec");
+        let reply = read_reply(&mut client).await;
+        assert!(reply.starts_with(b"-MISCONF"), "EXEC: {reply:?}");
+        // The refused EXEC leaves the transaction open; leave it explicitly.
+        client
+            .write_all(b"*1\r\n$7\r\nDISCARD\r\n")
+            .await
+            .expect("write discard");
+        let _ = read_reply(&mut client).await;
+        let mut frame = b"*3\r\n".to_vec();
+        for part in ["EVAL_RO", "return 7", "0"] {
+            frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+        client.write_all(&frame).await.expect("write");
+        assert_eq!(read_reply(&mut client).await, b":7\r\n");
+
+        client.write_all(b"QUIT\r\n").await.expect("write quit");
+        let _ = read_reply(&mut client).await;
+        server_task.await.expect("server task complete");
+        let server = shared.meta.lock().await;
+        assert!(!server.db(0).contains_key(&Bytes::from_static(b"k")));
     }
 
     #[tokio::test]

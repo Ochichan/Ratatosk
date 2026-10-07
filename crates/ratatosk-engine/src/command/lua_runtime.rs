@@ -370,7 +370,7 @@ fn script_command_restriction(command: &[u8], mode: ScriptMode) -> Option<&'stat
         return Some("ERR Lua scripts can't execute EVAL or EVALSHA commands");
     }
 
-    if matches!(command, b"AUTH" | b"HELLO") {
+    if matches!(command, b"AUTH" | b"HELLO" | b"RESET") {
         return Some("ERR This Redis command is not allowed from script");
     }
 
@@ -654,7 +654,6 @@ mod tests {
             b"PUBLISH",
             b"SPUBLISH",
             b"SELECT",
-            b"RESET",
             b"SORT_RO",
             b"GEOSEARCH",
             b"BITFIELD_RO",
@@ -672,7 +671,7 @@ mod tests {
     #[test]
     fn authentication_nested_eval_and_noscript_metadata_apply_to_all_modes() {
         for mode in [ScriptMode::ReadWrite, ScriptMode::ReadOnly] {
-            for command in [b"AUTH".as_slice(), b"HELLO"] {
+            for command in [b"AUTH".as_slice(), b"HELLO", b"RESET"] {
                 assert_eq!(
                     script_command_restriction(command, mode),
                     Some("ERR This Redis command is not allowed from script")
