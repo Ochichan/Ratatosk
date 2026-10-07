@@ -18,7 +18,7 @@ pub(super) const MAX_ZSET_NUMKEYS: usize = 10_000;
 /// Collect all entries from a sorted set in ascending order by score.
 pub(super) fn sorted_entries(zset: &SortedSet) -> Vec<(Bytes, f64)> {
     zset.by_score
-        .keys()
+        .iter()
         .map(|e| (e.member.clone(), e.score.value()))
         .collect()
 }
@@ -176,10 +176,8 @@ pub(super) fn cmd_zadd(
                     continue;
                 }
 
-                let _ = new_score; // suppress warning
-                if (new_score - old_score).abs() > f64::EPSILON
-                    || new_score.to_bits() != old_score.to_bits()
-                {
+                // Redis compares with `!=`, so -0 -> 0 is not a change.
+                if new_score != old_score {
                     zset.insert(member.clone(), new_score);
                     changed += 1;
                 }

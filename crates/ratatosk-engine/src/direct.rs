@@ -117,9 +117,7 @@ impl DirectDb<'_> {
                         if opts.lt && score >= old_score {
                             return 0;
                         }
-                        if (score - old_score).abs() > f64::EPSILON
-                            || score.to_bits() != old_score.to_bits()
-                        {
+                        if score != old_score {
                             zset.insert(member, score);
                             if opts.ch { 1 } else { 0 }
                         } else {
@@ -274,10 +272,7 @@ impl DirectDb<'_> {
         }
 
         let take_len = (stop_idx - start_idx + 1).min(limit);
-        zset.by_score
-            .keys()
-            .skip(start_idx)
-            .take(take_len)
+        zset.range_by_rank(start_idx, take_len)
             .map(|e| (e.member.clone(), e.score.value()))
             .collect()
     }
@@ -334,11 +329,7 @@ impl DirectDb<'_> {
 
         let take_len = (stop_idx - start_idx + 1).min(limit);
 
-        zset.by_score
-            .keys()
-            .rev()
-            .skip(start_idx)
-            .take(take_len)
+        zset.rev_range_by_rank(start_idx, take_len)
             .map(|e| (e.member.clone(), e.score.value()))
             .collect()
     }
@@ -1447,6 +1438,19 @@ mod tests {
         let removed = db.zremrangebyscore(b"myzset", 2.0, 3.0);
         assert_eq!(removed, 2);
         assert_eq!(db.zcard(b"myzset"), 2);
+    }
+
+    #[test]
+    fn zremrangebyscore_includes_members_scored_negative_zero() {
+        let mut server = make_server();
+        let mut db = server.direct(0);
+
+        db.zadd(b"z", -0.0, b"neg");
+        db.zadd(b"z", 0.0, b"pos");
+        db.zadd(b"z", 1.0, b"one");
+
+        assert_eq!(db.zremrangebyscore(b"z", 0.0, 0.0), 2);
+        assert_eq!(db.zcard(b"z"), 1);
     }
 
     #[test]

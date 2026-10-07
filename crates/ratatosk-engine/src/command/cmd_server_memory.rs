@@ -117,7 +117,7 @@ fn estimate_value_memory_usage(key: &Bytes, value: &StoredValue) -> i64 {
         }
         ValueData::SortedSet(zset) => {
             total = total.saturating_add(64);
-            for entry in zset.by_score.keys() {
+            for entry in zset.by_score.iter() {
                 total = total
                     .saturating_add(entry.member.len())
                     .saturating_add(8)

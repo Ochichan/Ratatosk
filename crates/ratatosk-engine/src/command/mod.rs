@@ -13678,6 +13678,49 @@ mod tests {
     }
 
     #[test]
+    fn zadd_negative_zero_matches_redis_ordering_and_change_counts() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(
+            &["ZADD", "k", "-0", "b", "0", "a"],
+            &mut server,
+            &mut client,
+        );
+
+        // -0 == 0 for ordering, so the member name decides.
+        assert_eq!(
+            run(&["ZRANGE", "k", "0", "-1"], &mut server, &mut client),
+            RespFrame::Array(vec![RespFrame::bulk_str("a"), RespFrame::bulk_str("b")])
+        );
+        // Rescoring -0 to 0 is not a change, and ZSCORE keeps the sign.
+        assert_eq!(
+            run(&["ZADD", "k", "CH", "0", "b"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+        assert_eq!(
+            run(&["ZINCRBY", "k", "0", "b"], &mut server, &mut client),
+            RespFrame::bulk_str("0")
+        );
+        assert_eq!(
+            run(&["ZSCORE", "k", "b"], &mut server, &mut client),
+            RespFrame::bulk_str("-0")
+        );
+        // ZRANK and ZREMRANGEBYSCORE see both zeros as one score.
+        assert_eq!(
+            run(&["ZRANK", "k", "b"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(
+                &["ZREMRANGEBYSCORE", "k", "0", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(2)
+        );
+    }
+
+    #[test]
     fn zset_set_operations_follow_redis_input_and_nan_rules() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
