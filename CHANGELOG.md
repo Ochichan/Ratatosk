@@ -194,6 +194,13 @@ The format is based on Keep a Changelog and the versioning policy in
 
 - `XCFGSET` is now `syntax_only`, so `compatibility-mode strict` rejects it. It
   validates its arguments and replies OK without storing them.
+- With `appendfsync everysec`, the once-a-second fsync no longer runs while
+  the server lock is held or while the AOF file is being written. It runs on a
+  separate thread; appends made meanwhile wait in memory and are written once
+  it finishes, or after 2 s or 64 MiB, whichever comes first. Writes are still
+  batched to 8 KiB between fsyncs. A failed background fsync latches AOF write
+  errors exactly as before, and shutdown and `BGREWRITEAOF` still fsync after
+  one. The loss bounds are in `docs/operations.md` and `docs/SLO.md`.
 - `XSETID` now works: it sets the stream's last generated ID and, with
   `ENTRIESADDED` and `MAXDELETEDID`, its counters, using Redis's checks and
   error messages. Streams keep that metadata, so `XADD` (including `*` and
