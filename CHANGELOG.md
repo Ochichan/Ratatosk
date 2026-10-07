@@ -230,6 +230,15 @@ The format is based on Keep a Changelog and the versioning policy in
 - The macOS launchd installer now defaults to port 6380, like the systemd unit.
   An existing `dev.ratatosk.serve.plist` keeps its port until the installer is
   run again; `set-ratatosk-autostart-port-macos.sh 6379` restores the old port.
+- With `maxmemory-policy noeviction` and a limit set, admission no longer scans
+  the whole dataset on every growing command. The incremental counter decides
+  while it is below the limit by a margin (a tenth of `maxmemory`, or twice the
+  in-place growth measured over the last cron memory interval); within that
+  margin each growing command still scans. At 100k keys a SET far from the
+  limit went from about 0.8 ms to 28 µs. In-place collection growth larger than
+  the margin can now be admitted past the limit until the next cron memory scan
+  (10 cron ticks, one second at the default `hz 10`). `CONFIG SET maxmemory`
+  rescans immediately.
 
 ### Removed
 

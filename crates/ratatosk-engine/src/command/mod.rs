@@ -69,7 +69,7 @@ use smallvec::SmallVec;
 use ratatosk_resp::frame::RespFrame;
 
 use crate::{
-    eviction::estimate_used_memory,
+    eviction::{admission_scan_margin, recompute_memory},
     expiry::{ExpireCondition, ExpireMode, ExpireTimeMode, GetExPolicy, TtlMode},
     keyspace::{AtomicStatsState, ClientSnapshot, DataState, DefaultAclPolicyState, ServerState},
     security::sanitize_error_message,
@@ -5121,9 +5121,15 @@ fn maxmemory_limit_exceeded(server: &ServerState) -> bool {
         return false;
     }
 
-    // The incremental counter can drift when handlers mutate StoredValue in
-    // place. Limited mode therefore pays for a current full scan at admission.
-    estimate_used_memory(server) > maxmemory
+    // The incremental counter misses in-place collection growth, so it only
+    // decides while it is clearly below the limit. Near the limit a full scan
+    // measures current values and corrects the counters.
+    let counted = server.data.estimated_memory();
+    let margin = admission_scan_margin(maxmemory, server.data.memory_undercount());
+    if counted.saturating_add(margin) < maxmemory {
+        return false;
+    }
+    recompute_memory(&server.data, false) > maxmemory
 }
 
 fn should_reject_for_maxmemory(
@@ -5705,6 +5711,175 @@ mod tests {
     }
 
     #[test]
+    fn admission_scans_only_near_the_limit_and_widens_after_drift() {
+        use crate::eviction::recompute_memory_estimates;
+
+        let limit = 256 * 1024;
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(limit);
+        let mut client = ClientState::default();
+        let field_value = "x".repeat(4 * 1024);
+
+        // In-place HSET growth is invisible to the counter, so far below
+        // the limit it is admitted past the limit until a scan runs.
+        assert_eq!(
+            run(&["HSET", "h", "f0", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for index in 1..100 {
+            let field = format!("f{index}");
+            assert_eq!(
+                run(
+                    &["HSET", "h", &field, &field_value],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::Integer(1)
+            );
+        }
+        assert!(server.data.estimated_memory() < limit / 2);
+
+        // The periodic scan corrects the counter and records the drift.
+        assert!(recompute_memory_estimates(&server.data) > limit);
+        let drift = server.data.memory_undercount();
+        assert!(drift > limit);
+        assert_oom(run(&["HSET", "h", "more", "v"], &mut server, &mut client));
+        // A quiet interval halves the recorded drift instead of clearing it.
+        recompute_memory_estimates(&server.data);
+        assert_eq!(server.data.memory_undercount(), drift / 2);
+
+        // With the recorded drift as margin, every write scans, so the same
+        // in-place growth is stopped right after it crosses the limit.
+        assert_eq!(
+            run(&["DEL", "h"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert!(server.data.estimated_memory() < limit / 10);
+        let mut accepted = 0usize;
+        for index in 0..100 {
+            let field = format!("f{index}");
+            match run(
+                &["HSET", "h", &field, &field_value],
+                &mut server,
+                &mut client,
+            ) {
+                RespFrame::Integer(1) => accepted += 1,
+                other => {
+                    assert_oom(other);
+                    break;
+                }
+            }
+        }
+        assert!(
+            (50..70).contains(&accepted),
+            "accepted {accepted} fields of 4 KiB under a 256 KiB limit"
+        );
+    }
+
+    #[test]
+    fn admission_scan_corrections_count_toward_the_next_interval() {
+        use crate::eviction::recompute_memory_estimates;
+
+        let limit = 256 * 1024;
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(limit);
+        let mut client = ClientState::default();
+        let big = "x".repeat(limit / 2);
+        assert_eq!(
+            run(&["HSET", "h", "a", &big], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        recompute_memory_estimates(&server.data);
+        assert_eq!(server.data.memory_undercount(), 0);
+
+        // Near the limit every growing write scans; in-place growth those
+        // scans correct is still reported by the next periodic scan.
+        let field_value = "y".repeat(8 * 1024);
+        for index in 0..4 {
+            let field = format!("f{index}");
+            assert_eq!(
+                run(
+                    &["HSET", "h", &field, &field_value],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::Integer(1)
+            );
+        }
+        recompute_memory_estimates(&server.data);
+        assert!(server.data.memory_undercount() >= 3 * 8 * 1024);
+    }
+
+    #[test]
+    fn config_set_maxmemory_applies_to_the_next_write() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let field_value = "x".repeat(4 * 1024);
+        assert_eq!(
+            run(&["HSET", "h", "f0", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for index in 1..64 {
+            let field = format!("f{index}");
+            run(
+                &["HSET", "h", &field, &field_value],
+                &mut server,
+                &mut client,
+            );
+        }
+        // The counter has not seen the in-place growth; lowering the limit
+        // below the real size must still refuse the next growing write.
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", "65536"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_oom(run(&["SET", "k", "v"], &mut server, &mut client));
+    }
+
+    #[test]
+    fn config_set_maxmemory_does_not_decay_the_learned_margin() {
+        use crate::eviction::recompute_memory_estimates;
+
+        let limit = 256 * 1024;
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(limit);
+        let mut client = ClientState::default();
+        let field_value = "x".repeat(4 * 1024);
+        assert_eq!(
+            run(&["HSET", "h", "f0", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for index in 1..32 {
+            let field = format!("f{index}");
+            run(
+                &["HSET", "h", &field, &field_value],
+                &mut server,
+                &mut client,
+            );
+        }
+        recompute_memory_estimates(&server.data);
+        let drift = server.data.memory_undercount();
+        assert!(drift > 0);
+
+        let limit_arg = limit.to_string();
+        for _ in 0..4 {
+            assert_eq!(
+                run(
+                    &["CONFIG", "SET", "maxmemory", &limit_arg],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::ok()
+            );
+        }
+        assert_eq!(server.data.memory_undercount(), drift);
+    }
+
+    #[test]
     fn limited_admission_counts_stream_consumer_and_pending_metadata() {
         use crate::eviction::estimate_used_memory;
 
@@ -5726,9 +5901,17 @@ mod tests {
             ),
             RespFrame::ok()
         );
-        server
-            .config
-            .set_maxmemory(estimate_used_memory(&server).saturating_add(1));
+        // XGROUP CREATE grew the stream in place, which the counter misses;
+        // CONFIG SET maxmemory rescans so the new limit applies at once.
+        let limit = estimate_used_memory(&server).saturating_add(1).to_string();
+        assert_eq!(
+            run(
+                &["CONFIG", "SET", "maxmemory", &limit],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
         let first = "a".repeat(1024);
         let second = "b".repeat(1024);
         assert_eq!(
