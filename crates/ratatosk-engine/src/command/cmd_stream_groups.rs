@@ -725,12 +725,17 @@ pub(super) fn cmd_xpending(
     let range = if args.len() == 2 {
         None
     } else {
-        if !(5..=8).contains(&args.len()) {
+        // Without IDLE: start end count [consumer]. With IDLE: IDLE n start
+        // end count [consumer]. Redis ignores arguments past those, this does
+        // not.
+        let with_idle = args[2].eq_ignore_ascii_case(b"IDLE");
+        if args.len() < 5 || (!with_idle && args.len() > 6) || args.len() > 8 {
             return CommandOutcome::reply(err("ERR syntax error"));
         }
         let mut min_idle = 0i64;
         let mut first = 2usize;
-        if args[2].eq_ignore_ascii_case(b"IDLE") {
+        if with_idle {
+            // The IDLE value is judged before the number of arguments.
             let Some(parsed) = parse_i64(&args[3]) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };

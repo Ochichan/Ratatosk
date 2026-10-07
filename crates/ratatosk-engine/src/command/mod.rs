@@ -4639,36 +4639,45 @@ fn capture_durability_effects(
     Some(DurabilityEffects::single(db_index, canonical))
 }
 
-/// The positions of `COUNT n` options with n of 0 or less before STREAMS.
-fn unlimited_count_positions(argv: &[Bytes]) -> Vec<usize> {
+/// The positions of every `COUNT n` option before STREAMS and the value of the
+/// last one, which is the one XREADGROUP runs with.
+fn xreadgroup_counts(argv: &[Bytes]) -> (Vec<usize>, Option<i64>) {
     let mut found = Vec::new();
+    let mut effective = None;
     let mut idx = 1usize;
     while idx < argv.len() && !argv[idx].eq_ignore_ascii_case(b"STREAMS") {
         if argv[idx].eq_ignore_ascii_case(b"COUNT") {
-            if argv
-                .get(idx + 1)
-                .and_then(parse_i64)
-                .is_some_and(|count| count <= 0)
-            {
-                found.push(idx);
-            }
+            found.push(idx);
+            effective = argv.get(idx + 1).and_then(parse_i64);
             idx += 2;
         } else {
             idx += 1;
         }
     }
-    found
+    (found, effective)
 }
 
+/// Whether the logged XREADGROUP needs rewriting: its effective COUNT is 0 or
+/// less, or COUNT repeats.
 fn xreadgroup_has_unlimited_count(argv: &[Bytes]) -> bool {
-    !unlimited_count_positions(argv).is_empty()
+    let (found, effective) = xreadgroup_counts(argv);
+    effective.is_some_and(|count| count <= 0) || found.len() > 1
 }
 
+/// The record with the COUNT XREADGROUP effectively ran with: none when that
+/// is 0 or less, since earlier versions read COUNT 0 as nothing, otherwise a
+/// single COUNT with the last value.
 fn xreadgroup_without_unlimited_count(argv: &[Bytes]) -> Vec<Bytes> {
-    let dropped = unlimited_count_positions(argv);
+    let (found, effective) = xreadgroup_counts(argv);
+    let keep_last = effective.is_some_and(|count| count > 0);
+    let last = found.last().copied();
     argv.iter()
         .enumerate()
-        .filter(|(at, _)| !dropped.iter().any(|start| at == start || *at == start + 1))
+        .filter(|(at, _)| {
+            !found.iter().any(|start| {
+                (at == start || *at == start + 1) && !(keep_last && Some(*start) == last)
+            })
+        })
         .map(|(_, arg)| arg.clone())
         .collect()
 }
@@ -8452,6 +8461,11 @@ mod tests {
                 "XPENDING", "s", "g", "-", "+", "10", "c", "extra", "more", "most",
             ],
             &["XPENDING", "s", "g", "IDLE", "5", "-", "+"],
+            // Arguments past the consumer are refused in both forms.
+            &["XPENDING", "s", "g", "-", "+", "10", "c", "extra"],
+            &[
+                "XPENDING", "s", "g", "IDLE", "0", "-", "+", "10", "c", "extra",
+            ],
         ] {
             assert_eq!(run(parts, &mut server, &mut client), syntax, "{parts:?}");
         }
@@ -9318,6 +9332,10 @@ mod tests {
             .and_then(|value| value.as_stream_groups_mut())
             .and_then(|groups| groups.get_mut(&Bytes::from_static(b"g")))
             .expect("group");
+        // Both builds of this state must match, whatever the clock said.
+        for pending in group.pending.values_mut() {
+            pending.last_delivered_ms = 1;
+        }
         let id = crate::keyspace::StreamId { ms: 9, seq: 0 };
         group.pending.insert(
             id,
@@ -9401,7 +9419,7 @@ mod tests {
         let (mut server, mut client) = dangling_claim_setup();
         client.set_durability_capture_enabled(true);
         run(
-            &["XCLAIM", "s", "g", "ghost", "3600000", "1-0"],
+            &["XCLAIM", "s", "g", "ghost", "9223372036854775807", "1-0"],
             &mut server,
             &mut client,
         );
@@ -9730,45 +9748,68 @@ mod tests {
             logged,
             ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"].map(str::to_owned)
         );
-        // A positive COUNT stays in the record.
-        run(
-            &["XGROUP", "SETID", "s", "g", "0"],
-            &mut server,
-            &mut client,
-        );
-        client.take_durability_effects();
-        run(
-            &[
-                "XREADGROUP",
-                "GROUP",
-                "g",
-                "c",
-                "COUNT",
-                "2",
-                "COUNT",
-                "-1",
-                "STREAMS",
-                "s",
-                ">",
-            ],
-            &mut server,
-            &mut client,
-        );
-        assert_eq!(
-            logged_argv(&mut client).expect("XREADGROUP is logged"),
-            [
-                "XREADGROUP",
-                "GROUP",
-                "g",
-                "c",
-                "COUNT",
-                "2",
-                "STREAMS",
-                "s",
-                ">"
-            ]
-            .map(str::to_owned)
-        );
+        // A repeated COUNT is logged as the one that ran: the last, dropped
+        // when it is 0 or less and kept alone when positive.
+        let cases: [(&[&str], &[&str]); 3] = [
+            (&["COUNT", "2", "COUNT", "-1"], &[]),
+            (&["COUNT", "1", "COUNT", "0"], &[]),
+            (&["COUNT", "5", "COUNT", "2"], &["COUNT", "2"]),
+        ];
+        for (given, logged_count) in cases {
+            run(
+                &["XGROUP", "SETID", "s", "g", "0"],
+                &mut server,
+                &mut client,
+            );
+            client.take_durability_effects();
+            let mut parts = vec!["XREADGROUP", "GROUP", "g", "c"];
+            parts.extend_from_slice(given);
+            parts.extend_from_slice(&["STREAMS", "s", ">"]);
+            run(&parts, &mut server, &mut client);
+            let mut expected = vec!["XREADGROUP", "GROUP", "g", "c"];
+            expected.extend_from_slice(logged_count);
+            expected.extend_from_slice(&["STREAMS", "s", ">"]);
+            let logged = logged_argv(&mut client).expect("XREADGROUP is logged");
+            assert_eq!(
+                logged,
+                expected
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .collect::<Vec<_>>()
+            );
+
+            // Replaying the record reads the same entries as the live command.
+            let mut replayed = ServerState::with_default_dbs();
+            let mut replay_client = ClientState::default();
+            fill_stream("s", 3, &mut replayed, &mut replay_client);
+            run(
+                &["XGROUP", "CREATE", "s", "g", "0"],
+                &mut replayed,
+                &mut replay_client,
+            );
+            let argv = logged
+                .iter()
+                .map(|part| Bytes::from(part.clone()))
+                .collect::<Vec<_>>();
+            run_bytes(&argv, &mut replayed, &mut replay_client);
+            // The cursor and read counter match (the live group also holds
+            // entries pending from the earlier cases).
+            let progress = |server: &mut ServerState, client: &mut ClientState| {
+                let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "s"], server, client)
+                else {
+                    panic!("XINFO GROUPS should return an array");
+                };
+                let RespFrame::Array(group) = &groups[0] else {
+                    panic!("a group should be an array");
+                };
+                (group[7].clone(), group[9].clone(), group[11].clone())
+            };
+            assert_eq!(
+                progress(&mut replayed, &mut replay_client),
+                progress(&mut server, &mut client),
+                "{given:?}"
+            );
+        }
     }
 
     #[test]
