@@ -38,6 +38,10 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Fixed
 
+- Sorted sets treat `-0` and `0` as the same score, as Redis does: they tie and
+  order by member, `ZADD` and `ZINCRBY` from `-0` to `0` change nothing (and
+  `ZADD CH` does not count it), and `ZSCORE` keeps printing `-0`. Removing by a
+  score range starting at `0` now also removes members scored `-0`.
 - Positive `COUNT` arguments of `LPOP`/`RPOP`, `LMPOP`/`BLMPOP`, `ZPOPMIN`/`ZPOPMAX`,
   `ZMPOP`/`BZMPOP`, `SPOP`, `SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` no
   longer fail above 100000, as in Redis. A count larger than the collection
@@ -192,6 +196,12 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
+- `ZRANK`, `ZREVRANK`, `ZRANGE` by index and `ZREMRANGEBYRANK` take O(log n)
+  instead of O(n): at 1M members `ZRANK` went from about 1.5 ms to 0.6 µs. Sorted
+  sets now keep their score order in a counted B+ tree. Random `ZADD`, rescoring
+  and churn on large sets cost about 1.3x more; sequential fills, pops and small
+  sets are within about 1.15x. Memory stays close to before, and deleting most
+  of a large set leaves at most about 15 bytes per peak member behind.
 - `XCFGSET` is now `syntax_only`, so `compatibility-mode strict` rejects it. It
   validates its arguments and replies OK without storing them.
 - `XSETID` now works: it sets the stream's last generated ID and, with
