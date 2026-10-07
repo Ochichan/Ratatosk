@@ -6585,6 +6585,385 @@ mod tests {
         assert_eq!(meta("copy", &server), Some(original));
     }
 
+    fn invalid_id_error() -> RespFrame {
+        RespFrame::error_str("ERR Invalid stream ID specified as stream command argument")
+    }
+
+    fn stream_ids(frame: RespFrame) -> Vec<String> {
+        let RespFrame::Array(rows) = frame else {
+            panic!("expected an array of entries, got {frame:?}");
+        };
+        rows.into_iter()
+            .map(|row| {
+                let RespFrame::Array(parts) = row else {
+                    panic!("entry should be an array");
+                };
+                let Some(RespFrame::BulkString(Some(id))) = parts.first() else {
+                    panic!("entry should start with its ID");
+                };
+                String::from_utf8_lossy(id).into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_stream_commands_take_bare_ms_and_refuse_dash_and_plus() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // XADD takes a bare millisecond value as `<ms>-0`.
+        assert_eq!(
+            run(&["XADD", "s", "5", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("5-0")
+        );
+        for bad in ["-", "+", "5-", "-5", "5-6-7", "x", "5-+"] {
+            assert_eq!(
+                run(&["XADD", "s", bad, "f", "v"], &mut server, &mut client),
+                invalid_id_error(),
+                "XADD {bad}"
+            );
+        }
+        // A leading plus sign and whitespace parse like Redis's strtoull.
+        assert_eq!(
+            run(&["XADD", "s", "+7-+1", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("7-1")
+        );
+        assert_eq!(
+            run(&["XADD", "s", " 8", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("8-0")
+        );
+        // Overflow is an invalid ID.
+        assert_eq!(
+            run(
+                &["XADD", "s", "18446744073709551616", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        // More than 127 bytes is an invalid ID.
+        let long = format!("{}9", "0".repeat(127));
+        assert_eq!(
+            run(&["XADD", "s", &long, "f", "v"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XDEL.
+        assert_eq!(
+            run(&["XDEL", "s", "5"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XDEL", "s", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XDEL {bad}"
+            );
+        }
+
+        // XREAD: bare ms, `$` and `+`; `-` is refused.
+        run(&["XADD", "r", "10-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "20-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "30-0", "f", "v"], &mut server, &mut client);
+        let read = |id: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XREAD", "STREAMS", "r", id], server, client)
+        };
+        let read_ids = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(streams) = frame else {
+                return Vec::new();
+            };
+            let RespFrame::Array(stream) = &streams[0] else {
+                panic!("stream reply should be an array");
+            };
+            stream_ids(stream[1].clone())
+        };
+        assert_eq!(
+            read_ids(read("10", &mut server, &mut client)),
+            ["20-0", "30-0"]
+        );
+        assert_eq!(read_ids(read("+", &mut server, &mut client)), ["30-0"]);
+        assert_eq!(read("$", &mut server, &mut client), RespFrame::NullArray);
+        assert_eq!(read("-", &mut server, &mut client), invalid_id_error());
+        // `+` on a missing stream reads nothing.
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "none", "+"], &mut server, &mut client),
+            RespFrame::NullArray
+        );
+
+        // XTRIM MINID takes a bare ms and refuses `-`.
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "20"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "-"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XSETID.
+        assert_eq!(
+            run(&["XSETID", "r", "40"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XSETID", "r", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XSETID {bad}"
+            );
+        }
+
+        // XGROUP CREATE: bare ms and `$` are accepted, `-` and `+` are not.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g2", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(
+                    &["XGROUP", "CREATE", "r", "g3", bad],
+                    &mut server,
+                    &mut client
+                ),
+                invalid_id_error(),
+                "XGROUP CREATE {bad}"
+            );
+        }
+
+        // XGROUP SETID is not strict: `-`, `+` and a bare ms all parse.
+        for (id, expected) in [
+            ("-", "0-0"),
+            ("+", "18446744073709551615-18446744073709551615"),
+            ("25", "25-0"),
+        ] {
+            assert_eq!(
+                run(&["XGROUP", "SETID", "r", "g", id], &mut server, &mut client),
+                RespFrame::ok(),
+                "XGROUP SETID {id}"
+            );
+            let last = server
+                .db(0)
+                .get(&Bytes::from_static(b"r"))
+                .and_then(|value| value.as_stream_groups())
+                .and_then(|groups| groups.get(&Bytes::from_static(b"g")))
+                .map(|group| group.last_delivered_id)
+                .expect("group");
+            assert_eq!(format!("{}-{}", last.ms, last.seq), expected);
+        }
+        assert_eq!(
+            run(
+                &["XGROUP", "SETID", "r", "g", "x"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+
+        // XREADGROUP, XACK and XCLAIM take strict IDs.
+        run(
+            &["XGROUP", "SETID", "r", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(&["XADD", "r", "50-0", "f", "v"], &mut server, &mut client);
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "r", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            stream_ids(run(
+                &["XCLAIM", "r", "g", "c2", "0", "50"],
+                &mut server,
+                &mut client
+            )),
+            ["50-0"]
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "r", "-"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "+"], &mut server, &mut client),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "50"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn interval_stream_commands_follow_redis_bounds() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for id in ["1-0", "1-5", "2-0", "2-7", "3-0"] {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let range = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+        let rev = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XREVRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+
+        // An incomplete start has sequence 0 and an incomplete end the maximum.
+        assert_eq!(
+            stream_ids(range(&["1", "2"], &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["2", "1"], &mut server, &mut client)),
+            ["2-7", "2-0", "1-5", "1-0"]
+        );
+        assert_eq!(
+            stream_ids(range(&["-", "+"], &mut server, &mut client)).len(),
+            5
+        );
+        // `(` excludes the bound; an incomplete exclusive start skips the
+        // whole `<ms>-0` and an incomplete exclusive end excludes `<ms>-MAX`.
+        assert_eq!(
+            stream_ids(range(&["(1-5", "(3-0"], &mut server, &mut client)),
+            ["2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(range(&["(1", "(3"], &mut server, &mut client)),
+            ["1-5", "2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["(3-0", "(1-5"], &mut server, &mut client)),
+            ["2-7", "2-0"]
+        );
+        // Edge errors.
+        assert_eq!(
+            range(
+                &["(18446744073709551615-18446744073709551615", "+"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            range(&["-", "(0-0"], &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        for bad in ["(-", "(+", "(", "x", "1-"] {
+            assert_eq!(
+                range(&[bad, "+"], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE {bad}"
+            );
+            assert_eq!(
+                range(&["-", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE end {bad}"
+            );
+        }
+        // The IDs are checked before COUNT, as in Redis.
+        assert_eq!(
+            range(&["x", "+", "COUNT", "y"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XPENDING and XAUTOCLAIM use the same interval bounds.
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending =
+            |start: &str, end: &str, server: &mut ServerState, client: &mut ClientState| {
+                run(&["XPENDING", "s", "g", start, end, "10"], server, client)
+            };
+        assert_eq!(
+            stream_ids(pending("1", "2", &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(pending("(1-5", "(3", &mut server, &mut client)),
+            ["2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            pending(
+                "(18446744073709551615-18446744073709551615",
+                "+",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            pending("-", "(0-0", &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        assert_eq!(
+            pending("(-", "+", &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        let claim = |start: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(
+                &["XAUTOCLAIM", "s", "g", "c2", "0", start, "JUSTID"],
+                server,
+                client,
+            )
+        };
+        // The JUSTID reply lists bare IDs, so read them directly.
+        let bare = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(parts) = frame else {
+                panic!("XAUTOCLAIM should return an array, got {frame:?}");
+            };
+            let RespFrame::Array(ids) = &parts[1] else {
+                panic!("claimed IDs should be an array");
+            };
+            ids.iter()
+                .map(|id| match id {
+                    RespFrame::BulkString(Some(raw)) => String::from_utf8_lossy(raw).into_owned(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(bare(claim("(2", &mut server, &mut client)), ["2-7", "3-0"]);
+        assert_eq!(
+            claim(
+                "(18446744073709551615-18446744073709551615",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(claim("(-", &mut server, &mut client), invalid_id_error());
+        assert_eq!(
+            bare(claim("+", &mut server, &mut client)),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn dump_restore_roundtrips_stream_ids_across_the_u64_range() {
         let mut server = ServerState::with_default_dbs();

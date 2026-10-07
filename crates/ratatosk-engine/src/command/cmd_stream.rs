@@ -17,29 +17,168 @@ pub(super) fn stream_id_to_bytes(id: StreamId) -> Bytes {
     Bytes::from(text)
 }
 
-pub(super) fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
-    let text = std::str::from_utf8(raw).ok()?;
-    let (ms_raw, seq_raw) = text.split_once('-')?;
-    if ms_raw.is_empty() || seq_raw.is_empty() {
+/// Redis's `string2ull`: `string2ll` first (a negative result is refused),
+/// then `strtoull` in base 10. `strtoull` skips leading whitespace and takes
+/// a `+` or `-` sign, so `+5` and ` 5` parse, `-0` is 0, and a negative number
+/// that `string2ll` could not hold wraps around. Overflow and trailing bytes
+/// are refused.
+fn string2ull(raw: &[u8]) -> Option<u64> {
+    if let [b'-', b'1'..=b'9', rest @ ..] = raw {
+        if rest.iter().all(u8::is_ascii_digit) {
+            let text = std::str::from_utf8(raw).ok()?;
+            if text.parse::<i64>().is_ok() {
+                return None;
+            }
+        }
+    }
+
+    let mut idx = 0usize;
+    while idx < raw.len() && matches!(raw[idx], b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+        idx += 1;
+    }
+    let negative = match raw.get(idx) {
+        Some(b'-') => {
+            idx += 1;
+            true
+        }
+        Some(b'+') => {
+            idx += 1;
+            false
+        }
+        _ => false,
+    };
+    let digits = &raw[idx..];
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
-
-    let ms = ms_raw.parse::<u64>().ok()?;
-    let seq = seq_raw.parse::<u64>().ok()?;
-
-    Some(StreamId { ms, seq })
+    let mut magnitude = 0u64;
+    for digit in digits {
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(u64::from(digit - b'0'))?;
+    }
+    Some(if negative {
+        magnitude.wrapping_neg()
+    } else {
+        magnitude
+    })
 }
 
-pub(super) fn parse_stream_range_bound(raw: &Bytes) -> Option<StreamId> {
-    if raw.as_ref() == b"-" {
-        return Some(StreamId { ms: 0, seq: 0 });
+/// Redis's `streamGenericParseIDOrReply` without the reply: `<ms>-<seq>`, or
+/// a bare `<ms>` whose sequence is `missing_seq`. `-` and `+` are the minimum
+/// and maximum IDs unless `strict`. With `auto_seq`, `<ms>-*` parses as
+/// `(<ms>, 0)` and reports the sequence as not given. Returns the ID and
+/// whether the sequence was given.
+fn parse_stream_id_inner(
+    raw: &[u8],
+    missing_seq: u64,
+    strict: bool,
+    auto_seq: bool,
+) -> Option<(StreamId, bool)> {
+    if raw.len() > 127 {
+        return None;
     }
-    if raw.as_ref() == b"+" {
-        return Some(MAX_STREAM_ID);
+    // Redis copies the argument into a C buffer, so an embedded NUL ends it.
+    let raw = raw
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(raw, |nul| &raw[..nul]);
+
+    if raw == b"-" || raw == b"+" {
+        if strict {
+            return None;
+        }
+        let id = if raw == b"-" {
+            StreamId { ms: 0, seq: 0 }
+        } else {
+            MAX_STREAM_ID
+        };
+        return Some((id, true));
     }
 
-    let id = parse_stream_id(raw)?;
-    Some(id)
+    let (ms_raw, seq_raw) = match raw.iter().position(|byte| *byte == b'-') {
+        Some(dash) => (&raw[..dash], Some(&raw[dash + 1..])),
+        None => (raw, None),
+    };
+    let ms = string2ull(ms_raw)?;
+    let (seq, seq_given) = match seq_raw {
+        Some(b"*") if auto_seq => (0, false),
+        Some(seq_raw) => (string2ull(seq_raw)?, true),
+        None => (missing_seq, true),
+    };
+    Some((StreamId { ms, seq }, seq_given))
+}
+
+/// Parses a stream ID like Redis's `streamGenericParseIDOrReply`.
+pub(super) fn parse_stream_id_generic(
+    raw: &[u8],
+    missing_seq: u64,
+    strict: bool,
+) -> Option<StreamId> {
+    parse_stream_id_inner(raw, missing_seq, strict, false).map(|(id, _)| id)
+}
+
+/// A strict ID (`streamParseStrictIDOrReply`): a bare `<ms>` means `<ms>-0`
+/// and `-` and `+` are refused.
+pub(super) fn parse_strict_stream_id(raw: &[u8]) -> Option<StreamId> {
+    parse_stream_id_generic(raw, 0, true)
+}
+
+pub(super) const INVALID_STREAM_ID_ERROR: &str =
+    "ERR Invalid stream ID specified as stream command argument";
+
+pub(super) fn invalid_stream_id() -> RespFrame {
+    err(INVALID_STREAM_ID_ERROR)
+}
+
+/// The ID right before `id`, borrowing from the millisecond when the sequence
+/// is 0, as Redis's `streamDecrID`. `None` before the first ID.
+pub(super) fn decremented_stream_id(id: StreamId) -> Option<StreamId> {
+    if id.seq > 0 {
+        Some(StreamId {
+            ms: id.ms,
+            seq: id.seq - 1,
+        })
+    } else if id.ms > 0 {
+        Some(StreamId {
+            ms: id.ms - 1,
+            seq: u64::MAX,
+        })
+    } else {
+        None
+    }
+}
+
+/// Which side of an interval an argument is, as in Redis's
+/// `streamParseIntervalIDOrReply`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum IntervalEdge {
+    Start,
+    End,
+}
+
+/// Parses an interval bound: an ID where `-` and `+` are allowed and an
+/// incomplete one gets sequence 0 (start) or the maximum (end). A `(` prefix
+/// (only when the argument is longer than one byte) excludes the ID, which
+/// then must be a strict ID, and the bound moves one ID inward. Errors are
+/// ready-made replies.
+pub(super) fn parse_interval_id(raw: &[u8], edge: IntervalEdge) -> Result<StreamId, RespFrame> {
+    let missing_seq = match edge {
+        IntervalEdge::Start => 0,
+        IntervalEdge::End => u64::MAX,
+    };
+    if raw.len() > 1 && raw[0] == b'(' {
+        let id =
+            parse_stream_id_generic(&raw[1..], missing_seq, true).ok_or_else(invalid_stream_id)?;
+        return match edge {
+            IntervalEdge::Start => incremented_stream_id(id)
+                .ok_or_else(|| err("ERR invalid start ID for the interval")),
+            IntervalEdge::End => {
+                decremented_stream_id(id).ok_or_else(|| err("ERR invalid end ID for the interval"))
+            }
+        };
+    }
+    parse_stream_id_generic(raw, missing_seq, false).ok_or_else(invalid_stream_id)
 }
 
 /// The largest stream ID; a stream whose last ID is this accepts no more entries.
@@ -50,7 +189,7 @@ const MAX_STREAM_ID: StreamId = StreamId {
 
 /// The ID right after `id`, carrying into the next millisecond when the
 /// sequence is exhausted, as Redis's `streamIncrID`. `None` past the last ID.
-fn incremented_stream_id(id: StreamId) -> Option<StreamId> {
+pub(super) fn incremented_stream_id(id: StreamId) -> Option<StreamId> {
     if id.seq < u64::MAX {
         Some(StreamId {
             ms: id.ms,
@@ -153,31 +292,23 @@ pub(super) fn cmd_xadd(
         AutoSeq(u64),
         Explicit(StreamId),
     }
-    let invalid_id = || {
-        CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ))
-    };
+    let invalid_id = || CommandOutcome::reply(invalid_stream_id());
     let spec = if id_raw.as_ref() == b"*" {
         IdSpec::Auto
-    } else if let Some(ms_raw) = id_raw.as_ref().strip_suffix(b"-*") {
-        let Some(ms) = std::str::from_utf8(ms_raw)
-            .ok()
-            .and_then(|text| text.parse::<u64>().ok())
-        else {
-            return invalid_id();
-        };
-        IdSpec::AutoSeq(ms)
     } else {
-        let Some(parsed) = parse_stream_id(id_raw) else {
+        let Some((parsed, seq_given)) = parse_stream_id_inner(id_raw, 0, true, true) else {
             return invalid_id();
         };
-        if parsed == (StreamId { ms: 0, seq: 0 }) {
-            return CommandOutcome::reply(err(
-                "ERR The ID specified in XADD must be greater than 0-0",
-            ));
+        if !seq_given {
+            IdSpec::AutoSeq(parsed.ms)
+        } else {
+            if parsed == (StreamId { ms: 0, seq: 0 }) {
+                return CommandOutcome::reply(err(
+                    "ERR The ID specified in XADD must be greater than 0-0",
+                ));
+            }
+            IdSpec::Explicit(parsed)
         }
-        IdSpec::Explicit(parsed)
     };
 
     let now = now_ms();
@@ -272,6 +403,23 @@ pub(super) fn cmd_xrange(
 
     let key = &args[0];
 
+    // As Redis's xrangeGenericCommand: the interval bounds first, the start
+    // before the end (XREVRANGE lists the end first), then COUNT.
+    let (low_arg, high_arg) = if reverse {
+        (&args[2], &args[1])
+    } else {
+        (&args[1], &args[2])
+    };
+    let low = match parse_interval_id(low_arg, IntervalEdge::Start) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
+    };
+    let high = match parse_interval_id(high_arg, IntervalEdge::End) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
+    };
+    let low_high = (low, high);
+
     let count = if args.len() == 5 {
         if !args[3].eq_ignore_ascii_case(b"COUNT") {
             return CommandOutcome::reply(err("ERR syntax error"));
@@ -282,32 +430,6 @@ pub(super) fn cmd_xrange(
         Some(parsed)
     } else {
         None
-    };
-
-    let low_high = if reverse {
-        let Some(high) = parse_stream_range_bound(&args[1]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        let Some(low) = parse_stream_range_bound(&args[2]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        (low, high)
-    } else {
-        let Some(low) = parse_stream_range_bound(&args[1]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        let Some(high) = parse_stream_range_bound(&args[2]) else {
-            return CommandOutcome::reply(err(
-                "ERR Invalid stream ID specified as stream command argument",
-            ));
-        };
-        (low, high)
     };
 
     let now = now_ms();
@@ -432,11 +554,17 @@ pub(super) fn cmd_xread(
                 .and_then(|entry| entry.as_stream_meta())
                 .map(|meta| meta.last_id)
                 .unwrap_or(StreamId { ms: 0, seq: 0 })
+        } else if id_raw.as_ref() == b"+" {
+            // `+` reads the last entry, so the threshold is the ID right
+            // before it (0-0 when the stream is empty or missing).
+            stream
+                .and_then(|stream| stream.last())
+                .map_or(StreamId { ms: 0, seq: 0 }, |last| {
+                    decremented_stream_id(last.id).unwrap_or(last.id)
+                })
         } else {
-            let Some(parsed) = parse_stream_id(id_raw) else {
-                return CommandOutcome::reply(err(
-                    "ERR Invalid stream ID specified as stream command argument",
-                ));
+            let Some(parsed) = parse_strict_stream_id(id_raw) else {
+                return CommandOutcome::reply(invalid_stream_id());
             };
             parsed
         };
@@ -520,4 +648,106 @@ pub(super) fn stream_nogroup_error(key: &Bytes, group: &Bytes) -> CommandOutcome
         String::from_utf8_lossy(key),
         String::from_utf8_lossy(group)
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(ms: u64, seq: u64) -> StreamId {
+        StreamId { ms, seq }
+    }
+
+    #[test]
+    fn string2ull_matches_redis() {
+        assert_eq!(string2ull(b"0"), Some(0));
+        assert_eq!(string2ull(b"18446744073709551615"), Some(u64::MAX));
+        assert_eq!(string2ull(b"18446744073709551616"), None);
+        // strtoull accepts a leading plus sign, whitespace and leading zeros.
+        assert_eq!(string2ull(b"+5"), Some(5));
+        assert_eq!(string2ull(b" 5"), Some(5));
+        assert_eq!(string2ull(b"\t\n5"), Some(5));
+        assert_eq!(string2ull(b"007"), Some(7));
+        // Trailing bytes, empty input and non-decimal forms are refused.
+        assert_eq!(string2ull(b"5 "), None);
+        assert_eq!(string2ull(b""), None);
+        assert_eq!(string2ull(b"+"), None);
+        assert_eq!(string2ull(b"0x10"), None);
+        assert_eq!(string2ull(b"1e3"), None);
+        // A negative that string2ll parses is refused, but `-0` and a negative
+        // beyond i64 go through strtoull and wrap.
+        assert_eq!(string2ull(b"-1"), None);
+        assert_eq!(string2ull(b"-9223372036854775808"), None);
+        assert_eq!(string2ull(b"-0"), Some(0));
+        assert_eq!(
+            string2ull(b"-9223372036854775809"),
+            Some(9_223_372_036_854_775_807)
+        );
+        assert_eq!(string2ull(b"-18446744073709551615"), Some(1));
+        assert_eq!(string2ull(b"-18446744073709551616"), None);
+    }
+
+    #[test]
+    fn generic_parser_matches_redis() {
+        assert_eq!(parse_stream_id_generic(b"5", 0, true), Some(id(5, 0)));
+        assert_eq!(parse_stream_id_generic(b"5", 9, true), Some(id(5, 9)));
+        assert_eq!(parse_stream_id_generic(b"5-6", 9, true), Some(id(5, 6)));
+        assert_eq!(parse_stream_id_generic(b"+5-+6", 0, true), Some(id(5, 6)));
+        assert_eq!(parse_stream_id_generic(b"5-", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"-5", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"5-6-7", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"5-*", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"", 0, false), None);
+        assert_eq!(parse_stream_id_generic(b"abc", 0, false), None);
+        // `-` and `+` only when not strict.
+        assert_eq!(parse_stream_id_generic(b"-", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"+", 0, true), None);
+        assert_eq!(parse_stream_id_generic(b"-", 7, false), Some(id(0, 0)));
+        assert_eq!(parse_stream_id_generic(b"+", 7, false), Some(MAX_STREAM_ID));
+        // 127 bytes is the longest accepted argument.
+        let mut long = vec![b'0'; 126];
+        long.push(b'5');
+        assert_eq!(parse_stream_id_generic(&long, 0, true), Some(id(5, 0)));
+        long.insert(0, b'0');
+        assert_eq!(parse_stream_id_generic(&long, 0, true), None);
+        // The auto-sequence form reports that the sequence was not given.
+        assert_eq!(
+            parse_stream_id_inner(b"5-*", 0, true, true),
+            Some((id(5, 0), false))
+        );
+        assert_eq!(
+            parse_stream_id_inner(b"5-1", 0, true, true),
+            Some((id(5, 1), true))
+        );
+    }
+
+    #[test]
+    fn interval_parser_matches_redis() {
+        let start = |raw: &[u8]| parse_interval_id(raw, IntervalEdge::Start);
+        let end = |raw: &[u8]| parse_interval_id(raw, IntervalEdge::End);
+        assert_eq!(start(b"5"), Ok(id(5, 0)));
+        assert_eq!(end(b"5"), Ok(id(5, u64::MAX)));
+        assert_eq!(start(b"-"), Ok(id(0, 0)));
+        assert_eq!(end(b"+"), Ok(MAX_STREAM_ID));
+        assert_eq!(start(b"(5-1"), Ok(id(5, 2)));
+        assert_eq!(start(b"(5-18446744073709551615"), Ok(id(6, 0)));
+        assert_eq!(start(b"(5"), Ok(id(5, 1)));
+        assert_eq!(end(b"(5-1"), Ok(id(5, 0)));
+        assert_eq!(end(b"(5-0"), Ok(id(4, u64::MAX)));
+        assert_eq!(end(b"(5"), Ok(id(5, u64::MAX - 1)));
+        assert_eq!(
+            start(b"(18446744073709551615-18446744073709551615"),
+            Err(err("ERR invalid start ID for the interval"))
+        );
+        assert_eq!(
+            end(b"(0-0"),
+            Err(err("ERR invalid end ID for the interval"))
+        );
+        // A lone `(` is not an exclusive prefix, so it is just a bad ID, and
+        // `(-` and `(+` are refused because the exclusive form is strict.
+        for raw in [&b"("[..], b"(-", b"(+", b"(x", b"((5"] {
+            assert_eq!(start(raw), Err(invalid_stream_id()), "{raw:?}");
+            assert_eq!(end(raw), Err(invalid_stream_id()), "{raw:?}");
+        }
+    }
 }

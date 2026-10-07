@@ -4,17 +4,7 @@ use ratatosk_resp::frame::RespFrame;
 
 use crate::keyspace::{ServerState, StreamId, purge_expired_key};
 
-use super::cmd_stream::parse_stream_id;
-
-/// Parse an XSETID ID strictly, as Redis's `streamParseStrictIDOrReply`: a
-/// bare millisecond value means sequence 0, and `-`, `+` and `*` are refused.
-fn parse_xsetid_id(raw: &Bytes) -> Option<StreamId> {
-    if !raw.contains(&b'-') {
-        let ms = std::str::from_utf8(raw).ok()?.parse::<u64>().ok()?;
-        return Some(StreamId { ms, seq: 0 });
-    }
-    parse_stream_id(raw)
-}
+use super::cmd_stream::{invalid_stream_id, parse_strict_stream_id};
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
     wrong_type_response,
@@ -30,10 +20,8 @@ pub(super) fn cmd_xsetid(
     let [key, id_raw, options @ ..] = args else {
         return wrong_arity("xsetid");
     };
-    let Some(new_id) = parse_xsetid_id(id_raw) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
+    let Some(new_id) = parse_strict_stream_id(id_raw) else {
+        return CommandOutcome::reply(invalid_stream_id());
     };
 
     let mut entries_added = None;
@@ -57,10 +45,8 @@ pub(super) fn cmd_xsetid(
                 entries_added = Some(parsed);
             }
             b"MAXDELETEDID" => {
-                let Some(parsed) = parse_xsetid_id(value) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_strict_stream_id(value) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
                 if new_id < parsed {
                     return CommandOutcome::reply(err(

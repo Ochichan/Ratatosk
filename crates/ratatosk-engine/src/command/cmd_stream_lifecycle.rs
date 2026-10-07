@@ -8,7 +8,8 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    parse_stream_id, stream_entry_frame, stream_id_to_bytes, stream_nogroup_error,
+    IntervalEdge, parse_interval_id, parse_strict_stream_id, stream_entry_frame,
+    stream_id_to_bytes, stream_nogroup_error,
 };
 use super::{
     ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, wrong_arity,
@@ -113,7 +114,7 @@ pub(super) fn parse_stream_ids_block(
 
     let mut ids = Vec::with_capacity(num_ids);
     for raw_id in &args[start..end] {
-        let Some(id) = parse_stream_id(raw_id) else {
+        let Some(id) = parse_strict_stream_id(raw_id) else {
             return Err(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -171,7 +172,7 @@ pub(super) fn cmd_xtrim(
         };
         TrimStrategy::MaxLen(parsed)
     } else if strategy.eq_ignore_ascii_case(b"MINID") {
-        let Some(parsed) = parse_stream_id(&args[idx]) else {
+        let Some(parsed) = parse_strict_stream_id(&args[idx]) else {
             return CommandOutcome::reply(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -244,7 +245,7 @@ pub(super) fn cmd_xdel(
 
     let mut id_set = HashSet::new();
     for raw_id in ids {
-        let Some(id) = parse_stream_id(raw_id) else {
+        let Some(id) = parse_strict_stream_id(raw_id) else {
             return CommandOutcome::reply(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -318,7 +319,7 @@ pub(super) fn cmd_xclaim(
             continue;
         }
 
-        let Some(parsed_id) = parse_stream_id(&args[idx]) else {
+        let Some(parsed_id) = parse_strict_stream_id(&args[idx]) else {
             return CommandOutcome::reply(err("ERR syntax error"));
         };
         ids.push(parsed_id);
@@ -421,10 +422,11 @@ pub(super) fn cmd_xautoclaim(
         return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
     }
 
-    let Some(start) = parse_stream_id(&args[4]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
+    // The start is an interval bound, as in Redis: `-`, `+`, a bare
+    // millisecond value and the `(` exclusive prefix are accepted.
+    let start = match parse_interval_id(&args[4], IntervalEdge::Start) {
+        Ok(id) => id,
+        Err(reply) => return CommandOutcome::reply(reply),
     };
 
     let mut count = 100usize;
