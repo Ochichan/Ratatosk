@@ -99,6 +99,9 @@ The format is based on Keep a Changelog and the versioning policy in
 - The Nix `ratatosk-nextest` check copies the gap ledger its tier test reads.
 - Capability-tier counts in the README and contract docs (75 `baseline_local`,
   64 `unsupported`); the gap-ledger check now verifies those tables.
+- `BZPOPMIN`, `BZPOPMAX` and `BZMPOP` with a positive timeout returned nil at
+  once instead of blocking. Their deadline was compared with wall-clock time
+  while it is counted on the monotonic clock.
 
 ### Added
 

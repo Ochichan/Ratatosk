@@ -11259,6 +11259,30 @@ mod tests {
     }
 
     #[test]
+    fn sorted_set_blocking_pops_wait_until_their_timeout() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        for parts in [
+            &["BZPOPMIN", "missing", "5"][..],
+            &["BZPOPMAX", "missing", "5"][..],
+            &["BZMPOP", "5", "1", "missing", "MIN"][..],
+        ] {
+            let outcome = run_full(parts, &mut server, &mut client);
+            let retry = outcome
+                .retry_blocking
+                .unwrap_or_else(|| panic!("{} returned without blocking", parts[0]));
+            let deadline = retry.deadline_ms.expect("positive timeout sets a deadline");
+            let now = ratatosk_core::time::monotonic_ms() as i64;
+            assert!(
+                deadline > now && deadline <= now + 5_000,
+                "{} deadline {deadline} is not within 5s of monotonic now {now}",
+                parts[0]
+            );
+        }
+    }
+
+    #[test]
     fn m2_list_blocking_move_baseline_commands() {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();

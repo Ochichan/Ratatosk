@@ -217,7 +217,8 @@ fn zmpop_inner(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        // blocking_deadline_ms counts on the monotonic clock, not wall time.
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
@@ -346,7 +347,8 @@ fn cmd_bzpop(
     }
 
     if let Some(deadline) = deadline_ms {
-        if now_ms() >= deadline {
+        // blocking_deadline_ms counts on the monotonic clock, not wall time.
+        if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
             return outcome;
         }
     }
