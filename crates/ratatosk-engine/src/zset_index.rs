@@ -20,7 +20,10 @@
 //!   items merges with or borrows from an adjacent sibling, and a node left
 //!   under `NODE_MIN` children does the same one level up, to the root,
 //!   which collapses when it has one child. Each step touches at most two
-//!   nodes per level, so a removal is O(log n) and never walks the tree.
+//!   nodes per level, so a removal is amortized O(log n). One removal can pay
+//!   O(peak / 16) extra when it frees the top of an arena: it pops the run of
+//!   trailing dead slots, shrinks the arena and prunes the free list (under
+//!   1 ms at 4M members).
 //! - `rank_of` / `get`: one descent, summing child counts along the way.
 //!   O(log n).
 //! - `range` / `iter_ranks`: one or two descents, then O(1) per item.
@@ -31,8 +34,11 @@
 //! them. Vectors start small and grow on demand, so a one-member set is a
 //! few hundred bytes. Freed arena slots drop their buffers at once, trailing
 //! free slots are popped, and the arenas shrink when mostly empty. A freed
-//! slot below a live one still costs its slot struct (56 or 72 bytes, about
-//! 2 to 4 bytes per member of the peak size) until it is reused.
+//! slot below a live one still costs its slot struct (56 or 72 bytes), its
+//! share of the arena's rounded-up capacity and a free-list entry until it
+//! is reused. That is typically 4 to 7 bytes per member of the peak size and
+//! at most about 15 in an adversarial shape (a peak of leaves with 8 items
+//! each, then removing all but the member in the highest-numbered leaf).
 //!
 //! The nodes sit in two arenas of `Vec`s addressed by `u32` ids, so the code
 //! is safe Rust. The state is behind one `Box` to keep the index a single
@@ -525,7 +531,6 @@ impl<T: OrderLead> Inner<T> {
         let (parent, ci) = path[lvl];
         let n = self.node(parent).kids.len();
         let left = if ci + 1 < n { ci } else { ci - 1 };
-        let right_is_last = left + 2 == n;
         let node = self.node(parent);
         let (l, r) = (node.kids[left].id, node.kids[left + 1].id);
         let (ll, rl) = (self.leaf(l).items.len(), self.leaf(r).items.len());
@@ -587,9 +592,6 @@ impl<T: OrderLead> Inner<T> {
             node.kids[left].count = new_left;
             node.kids[left + 1].count = total - new_left;
         }
-        if right_is_last {
-            self.refresh_parent_max(path, lvl);
-        }
     }
 
     /// Rebalance the internal node that is child `path[lvl].1` of
@@ -599,7 +601,6 @@ impl<T: OrderLead> Inner<T> {
         let (parent, ci) = path[lvl];
         let n = self.node(parent).kids.len();
         let left = if ci + 1 < n { ci } else { ci - 1 };
-        let right_is_last = left + 2 == n;
         let (l, r) = {
             let node = self.node(parent);
             (node.kids[left].id, node.kids[left + 1].id)
@@ -667,21 +668,6 @@ impl<T: OrderLead> Inner<T> {
             node.keys[left + 1] = rmax;
             node.kids[left].count = left_count;
             node.kids[left + 1].count = right_count;
-        }
-        if right_is_last {
-            self.refresh_parent_max(path, lvl);
-        }
-    }
-
-    /// After the last child of `path[lvl].0` changed, copy that node's
-    /// maximum into its ancestors for as long as it is their last child.
-    fn refresh_parent_max(&mut self, path: &[(u32, usize)], lvl: usize) {
-        if lvl == 0 {
-            return;
-        }
-        let key = self.node(path[lvl].0).keys.last().cloned();
-        if let Some(key) = key {
-            self.fix_max(path, lvl - 1, &key);
         }
     }
 }
@@ -826,6 +812,10 @@ impl<T: OrderLead> OrderedIndex<T> {
             }
             return true;
         }
+        // Every leaf of a tree with internal nodes holds at least two items
+        // (sparse end leaves start with two and rebalance below `LEAF_MIN`),
+        // so a removal never empties one.
+        debug_assert!(leaf_len > 0, "a removal emptied a leaf");
         if idx == leaf_len && leaf_len > 0 {
             let key = inner.leaf(cur).items.last().cloned();
             if let Some(key) = key {
@@ -1283,7 +1273,7 @@ mod tests {
         for reverse in [false, true] {
             let mut index = OrderedIndex::new();
             let mut reference = BTreeSet::new();
-            // Large enough for three internal levels over 64-way nodes
+            // Large enough for three internal levels over 128-way nodes
             // would need 64^3 items, so this covers two.
             for n in 0..30_000u32 {
                 let n = if reverse { 30_000 - n } else { n };
@@ -1457,12 +1447,13 @@ mod tests {
     }
 
     /// Memory follows the current size: a few multiples of the bytes the items
-    /// need, plus a small constant, plus a few bytes per member of the peak
-    /// size (a freed arena slot that cannot be popped still costs its slot
-    /// struct, about 56 bytes per 20-32 items).
+    /// need, plus a small constant, plus up to 16 bytes per member of the peak
+    /// size. The peak term is a regression bound for freed arena slots that
+    /// cannot be popped (slot struct, rounded-up arena capacity and a
+    /// free-list entry); typical shapes use 4 to 7.
     fn assert_memory_bounded(index: &OrderedIndex<(i64, u32)>, peak: usize, context: &str) {
         let per_item = std::mem::size_of::<(i64, u32)>() + 8;
-        let bound = 6 * per_item * index.len() + 8 * peak + 4_096;
+        let bound = 6 * per_item * index.len() + 16 * peak + 4_096;
         assert!(
             index.heap_bytes() <= bound,
             "{context}: {} bytes for {} items (bound {bound})",
