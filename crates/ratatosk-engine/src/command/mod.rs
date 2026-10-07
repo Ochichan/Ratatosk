@@ -8437,6 +8437,17 @@ mod tests {
         );
     }
 
+    /// Runs a command with the clock frozen at `ms`, so delivery times and
+    /// idle times are exact however loaded the machine is.
+    fn run_at(
+        ms: i64,
+        parts: &[&str],
+        server: &mut ServerState,
+        client: &mut ClientState,
+    ) -> RespFrame {
+        ratatosk_core::time::with_command_time(ms, || run(parts, server, client))
+    }
+
     #[test]
     fn xpending_idle_and_argument_order_follow_redis() {
         let mut server = ServerState::with_default_dbs();
@@ -8447,7 +8458,8 @@ mod tests {
             &mut server,
             &mut client,
         );
-        run(
+        run_at(
+            1_000_000,
             &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
             &mut server,
             &mut client,
@@ -8520,34 +8532,43 @@ mod tests {
             RespFrame::Array(vec![])
         );
 
-        // IDLE keeps only entries idle for at least that long.
-        let listed = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
-            stream_ids(run(parts, server, client))
-        };
+        // IDLE keeps only entries idle for at least that long. The entries
+        // were delivered at 1_000_000 and are listed 5000 ms later.
+        let listed =
+            |idle: &str, tail: &[&str], server: &mut ServerState, client: &mut ClientState| {
+                let mut parts = vec!["XPENDING", "s", "g", "IDLE", idle, "-", "+"];
+                parts.extend_from_slice(tail);
+                stream_ids(run_at(1_005_000, &parts, server, client))
+            };
+        for (idle, expected) in [
+            ("0", vec!["1-0", "2-0", "3-0"]),
+            ("5000", vec!["1-0", "2-0", "3-0"]),
+            ("5001", vec![]),
+            ("3600000", vec![]),
+        ] {
+            assert_eq!(
+                listed(idle, &["10"], &mut server, &mut client),
+                expected,
+                "IDLE {idle}"
+            );
+        }
         assert_eq!(
-            listed(
-                &["XPENDING", "s", "g", "IDLE", "0", "-", "+", "10"],
-                &mut server,
-                &mut client
-            ),
-            ["1-0", "2-0", "3-0"]
-        );
-        assert_eq!(
-            listed(
-                &["XPENDING", "s", "g", "IDLE", "3600000", "-", "+", "10"],
-                &mut server,
-                &mut client
-            ),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            listed(
-                &["XPENDING", "s", "g", "IDLE", "0", "-", "+", "2", "c"],
-                &mut server,
-                &mut client
-            ),
+            listed("0", &["2", "c"], &mut server, &mut client),
             ["1-0", "2-0"]
         );
+        // The idle time in the reply is exact too.
+        let RespFrame::Array(rows) = run_at(
+            1_005_000,
+            &["XPENDING", "s", "g", "-", "+", "1"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XPENDING should return an array");
+        };
+        let RespFrame::Array(row) = &rows[0] else {
+            panic!("a pending entry should be an array");
+        };
+        assert_eq!(row[2], RespFrame::Integer(5000));
     }
 
     #[test]
@@ -8725,39 +8746,34 @@ mod tests {
         );
 
         // IDLE and TIME set the delivery time; a time in the future is now.
-        let now = now_ms();
-        run(
+        // The clock is frozen so the times are exact.
+        let delivery_time = |server: &ServerState| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == "1-0")
+                .expect("pending entry")
+                .3
+        };
+        run_at(
+            2_000_000,
             &[
                 "XCLAIM", "s", "g", "c4", "0", "1-0", "IDLE", "10000", "JUSTID",
             ],
             &mut server,
             &mut client,
         );
-        let at = pending_of(&server, "g")
-            .into_iter()
-            .find(|row| row.0 == "1-0")
-            .unwrap()
-            .3;
-        assert!(
-            at <= now - 10_000 + 50 && at >= now - 10_000 - 50,
-            "{at} vs {now}"
-        );
-        run(
+        assert_eq!(delivery_time(&server), 1_990_000);
+        run_at(
+            2_000_000,
             &[
                 "XCLAIM", "s", "g", "c4", "0", "1-0", "TIME", "12345", "JUSTID",
             ],
             &mut server,
             &mut client,
         );
-        assert_eq!(
-            pending_of(&server, "g")
-                .into_iter()
-                .find(|row| row.0 == "1-0")
-                .unwrap()
-                .3,
-            12345
-        );
-        run(
+        assert_eq!(delivery_time(&server), 12345);
+        run_at(
+            2_000_000,
             &[
                 "XCLAIM",
                 "s",
@@ -8772,14 +8788,7 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert!(
-            pending_of(&server, "g")
-                .into_iter()
-                .find(|row| row.0 == "1-0")
-                .unwrap()
-                .3
-                >= now
-        );
+        assert_eq!(delivery_time(&server), 2_000_000);
 
         // FORCE creates the pending entry of an entry that exists, counting
         // the creation as the first delivery; a missing entry is ignored.
