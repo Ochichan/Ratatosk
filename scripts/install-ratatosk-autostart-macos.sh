@@ -65,7 +65,7 @@ cat > "${PLIST_PATH}" <<PLIST
     <key>RATATOSK_BIND</key>
     <string>127.0.0.1</string>
     <key>RATATOSK_PORT</key>
-    <string>6379</string>
+    <string>6380</string>
     <key>RATATOSK_DIR</key>
     <string>${DATA_DIR}</string>
     <key>RATATOSK_AUDIT_LOG</key>

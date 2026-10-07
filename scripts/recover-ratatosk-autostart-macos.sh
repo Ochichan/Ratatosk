@@ -33,7 +33,7 @@ launchctl print "${DOMAIN_TARGET}/${PLIST_LABEL}" 2>&1 | head -20 || true
 echo
 echo "[ratatosk] port probe:"
 # set-ratatosk-autostart-port-macos.sh may have changed the port.
-PORT="$(plutil -extract EnvironmentVariables.RATATOSK_PORT raw "${PLIST_PATH}" 2>/dev/null || echo 6379)"
+PORT="$(plutil -extract EnvironmentVariables.RATATOSK_PORT raw "${PLIST_PATH}" 2>/dev/null || echo 6380)"
 if nc -z 127.0.0.1 "${PORT}" 2>/dev/null; then
   echo "TCP port ${PORT}: open"
 else

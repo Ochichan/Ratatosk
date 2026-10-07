@@ -190,6 +190,9 @@ The format is based on Keep a Changelog and the versioning policy in
   contract verbatim; `ratatosk.conf` documents `compatibility-mode` and
   `protected-mode` with a pointer to it.
 - `cargo-deny` configuration updated to match the current tool schema
+- The macOS launchd installer now defaults to port 6380, like the systemd unit.
+  An existing `dev.ratatosk.serve.plist` keeps its port until the installer is
+  run again; `set-ratatosk-autostart-port-macos.sh 6379` restores the old port.
 
 ### Removed
 
