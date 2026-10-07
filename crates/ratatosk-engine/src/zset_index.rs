@@ -124,7 +124,8 @@ fn cut<T: OrderLead>(items: &[T], leads: &[u64], target: &T, lead: u64, after: b
 /// Position of `target` among `items`, or where it would be inserted.
 fn find<T: OrderLead>(items: &[T], leads: &[u64], target: &T, lead: u64) -> Result<usize, usize> {
     let lo = cut(items, leads, target, lead, false);
-    if lo < items.len() && items[lo] == *target {
+    // Comparing leads first spares a cold read of `items` for absent targets.
+    if lo < items.len() && leads[lo] == lead && items[lo] == *target {
         Ok(lo)
     } else {
         Err(lo)
