@@ -390,9 +390,11 @@ fn cmd_config_set(
             ConfigSetOp::Maxmemory(value) => {
                 server.config.set_maxmemory(value);
                 // Admission trusts the counter far from the limit; correct it
-                // now so a lowered limit applies to the next write.
+                // now so a lowered limit applies to the next write. This is
+                // not a periodic scan, so it defers the shortfall it finds to
+                // the next one instead of closing (and decaying) an interval.
                 if value != 0 {
-                    crate::eviction::recompute_memory_estimates(&server.data);
+                    crate::eviction::recompute_memory(&server.data, false);
                 }
             }
             ConfigSetOp::Timeout(value) => server.config.set_timeout(value),

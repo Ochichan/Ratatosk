@@ -5841,6 +5841,45 @@ mod tests {
     }
 
     #[test]
+    fn config_set_maxmemory_does_not_decay_the_learned_margin() {
+        use crate::eviction::recompute_memory_estimates;
+
+        let limit = 256 * 1024;
+        let mut server = ServerState::with_default_dbs();
+        server.config.set_maxmemory(limit);
+        let mut client = ClientState::default();
+        let field_value = "x".repeat(4 * 1024);
+        assert_eq!(
+            run(&["HSET", "h", "f0", "v"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for index in 1..32 {
+            let field = format!("f{index}");
+            run(
+                &["HSET", "h", &field, &field_value],
+                &mut server,
+                &mut client,
+            );
+        }
+        recompute_memory_estimates(&server.data);
+        let drift = server.data.memory_undercount();
+        assert!(drift > 0);
+
+        let limit_arg = limit.to_string();
+        for _ in 0..4 {
+            assert_eq!(
+                run(
+                    &["CONFIG", "SET", "maxmemory", &limit_arg],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::ok()
+            );
+        }
+        assert_eq!(server.data.memory_undercount(), drift);
+    }
+
+    #[test]
     fn limited_admission_counts_stream_consumer_and_pending_metadata() {
         use crate::eviction::estimate_used_memory;
 
