@@ -74,6 +74,24 @@ The format is based on Keep a Changelog and the versioning policy in
   the stream. `XADD *` now carries an exhausted sequence into the next
   millisecond, and a stream whose last ID is the largest possible ID replies
   Redis's "exhausted the last possible ID" error.
+- Stream IDs are parsed like Redis. `XADD`, `XDEL`, `XACK`, `XCLAIM`, `XREAD`,
+  `XREADGROUP`, `XTRIM MINID`, `XSETID` and `XGROUP CREATE` accept a bare
+  millisecond ID (`5` means `5-0`). `XRANGE`, `XREVRANGE`, `XPENDING` and the
+  `XAUTOCLAIM` start accept the `(` exclusive prefix and incomplete IDs, and
+  `XGROUP SETID` accepts `-` and `+`. Errors use Redis's text, and `XADD`
+  checks its options and ID before the field count.
+- Stream IDs are unsigned 64-bit, as in Redis, so IDs above
+  9223372036854775807 are valid. RDB and `DUMP` bytes are unchanged for every
+  ID that was valid before.
+- `XTRIM` now rejects `LIMIT` without `~`, a negative `MAXLEN` or `LIMIT`, and
+  `MAXLEN` with `MINID`, with Redis's errors. `~` trims whole 100-entry nodes
+  from the front, as Redis does with its default node size, and its `LIMIT`
+  defaults to 10000. An `XTRIM` that removes nothing is no longer logged.
+- `XREADGROUP >` that redelivers an entry still pending for another consumer
+  moves it to the reading consumer and resets its delivery count to 1, as in
+  Redis. The previous owner kept it before.
+- Removing entries from the front of a stream (`XTRIM`, capped `XADD`) costs
+  time in proportion to the entries removed rather than the stream length.
 - `ZADD`/`ZINCRBY` silently dropped `+inf`/`-inf` scores. Score ranges treat
   `±inf` as inclusive bounds and reject NaN; `ZUNION`, `ZINTER`, `ZDIFF` and
   their `STORE`/`CARD` forms accept plain sets, turn NaN into 0, and check every
@@ -105,6 +123,10 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Added
 
+- `XADD` accepts `NOMKSTREAM`, `MAXLEN [=|~] n`, `MINID [=|~] id` and
+  `LIMIT n`. Approximate trims are written to the AOF in their exact form, so
+  replay reproduces the same stream. AOFs written by earlier versions still
+  replay as they did, including `XTRIM ... LIMIT` without `~`.
 - **Unix-domain socket listener** (`unixsocket`, `unixsocketperm`), guarded by
   a `<path>.lock` ownership lock, and an **experimental shared-memory transport**
   behind the `shm-transport` feature (`shm-socket`). See
