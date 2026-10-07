@@ -10,7 +10,7 @@ use ratatosk_engine::{
     keyspace::{PubSubMessage, ServerState, SharedState},
     object::normalize_range,
 };
-use ratatosk_resp::{RespFrame, encode, parse};
+use ratatosk_resp::{ReplySegments, RespFrame, RespVersion, encode, parse};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -2377,27 +2377,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_response_disconnects_client() {
+    async fn oversized_response_is_delivered_and_keeps_the_connection() {
         let limits = ClientIoLimits {
             output_buffer_limit_bytes: 256,
             client_read_timeout_sec: 0,
         };
         let (mut client, server_task) = setup_client_server_with_limits(limits).await;
 
+        // A reply over the limit, between two small pipelined replies.
         let payload = "x".repeat(1024);
-        let command = format!("ECHO {payload}\r\n");
+        let command = format!("PING\r\nECHO {payload}\r\nPING\r\n");
         client
             .write_all(command.as_bytes())
             .await
-            .expect("write oversized echo");
+            .expect("write pipelined commands");
 
-        let reply = read_reply(&mut client).await;
-        assert_eq!(reply, b"-ERR output buffer limit exceeded\r\n");
+        let expected = format!("+PONG\r\n${}\r\n{payload}\r\n+PONG\r\n", payload.len());
+        let mut reply = vec![0u8; expected.len()];
+        timeout(Duration::from_secs(1), client.read_exact(&mut reply))
+            .await
+            .expect("read timeout")
+            .expect("read replies");
+        assert_eq!(reply, expected.as_bytes());
 
-        let mut eof = [0u8; 1];
-        let n = client.read(&mut eof).await.expect("read eof");
-        assert_eq!(n, 0);
+        client.write_all(b"PING\r\n").await.expect("write ping");
+        assert_eq!(read_reply(&mut client).await, b"+PONG\r\n");
 
+        drop(client);
+        server_task.await.expect("server task complete");
+    }
+
+    #[tokio::test]
+    async fn steady_reader_gets_a_reply_that_outlasts_the_write_timeout() {
+        let limits = ClientIoLimits {
+            output_buffer_limit_bytes: 256,
+            client_read_timeout_sec: 0,
+        };
+        let (mut client, server_task) = setup_client_server_with_limits(limits).await;
+
+        client
+            .write_all(b"CONFIG SET client-write-timeout-sec 1\r\n")
+            .await
+            .expect("set write timeout");
+        assert_eq!(read_reply(&mut client).await, b"+OK\r\n");
+        // Larger than the loopback socket buffers can absorb (up to 4 MiB on
+        // each side on macOS), so the server must keep writing past the timeout.
+        let size = 16 * 1024 * 1024;
+        client
+            .write_all(format!("SETRANGE big {} x\r\n", size - 1).as_bytes())
+            .await
+            .expect("write setrange");
+        assert_eq!(
+            read_reply(&mut client).await,
+            format!(":{size}\r\n").as_bytes()
+        );
+
+        // Reading 64 KiB every 10 ms takes about 2.5 seconds, more than twice
+        // the write timeout, while the server keeps making progress.
+        client.write_all(b"GET big\r\n").await.expect("write get");
+        let header = format!("${size}\r\n");
+        let total = header.len() + size + 2;
+        let mut received = Vec::with_capacity(total);
+        let mut chunk = vec![0u8; 64 * 1024];
+        while received.len() < total {
+            let n = timeout(Duration::from_secs(5), client.read(&mut chunk))
+                .await
+                .expect("read timeout")
+                .expect("read reply");
+            assert!(n > 0, "server closed after {} bytes", received.len());
+            received.extend_from_slice(&chunk[..n]);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(received.len(), total);
+        assert!(received.starts_with(header.as_bytes()));
+        assert!(received.ends_with(b"x\r\n"));
+
+        client.write_all(b"PING\r\n").await.expect("write ping");
+        assert_eq!(read_reply(&mut client).await, b"+PONG\r\n");
+
+        drop(client);
         server_task.await.expect("server task complete");
     }
 

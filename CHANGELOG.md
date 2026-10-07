@@ -207,6 +207,15 @@ The format is based on Keep a Changelog and the versioning policy in
   and `RATSK3`.
 - CI workflows run with read-only repository permissions, and the security scan
   also runs weekly.
+- A command reply larger than `output-buffer-limit-bytes` is now sent instead
+  of closing the connection with `ERR output buffer limit exceeded`. The command
+  had already run, so a large pop removed and logged elements the client never
+  received. The reply goes out in pieces of the limit's size, and bulk values of
+  64 KiB or more are not copied, so per-client memory stays near the limit for
+  any reply size. The limit still applies to pub/sub and MONITOR backlogs.
+- `client-write-timeout-sec` now bounds each write call rather than a whole
+  reply, so it drops a client that makes no progress for that long instead of
+  any client too slow to take a large reply within it.
 - **License changed from MIT to GPL-3.0-or-later.** The workspace `license`
   field, `flake.nix` metadata, and `LICENSE` file were updated together.
 - The product contract sentence now says the supported subset is tested against

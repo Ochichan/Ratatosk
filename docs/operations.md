@@ -462,7 +462,7 @@ cargo run -p ratatosk-server --bin ratatosk --release
 | `RATATOSK_SHM_SPIN_ITERS` | `2000` | experimental; requires `--features shm-transport`; see `docs/shm-transport.md` |
 | `RATATOSK_BOUND_ADDR_FILE` | unset | optional sidecar handoff file for the actual bound address/port when using `RATATOSK_PORT=0` |
 | `RATATOSK_MAX_CLIENTS` | `4096` | concurrent connection cap |
-| `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client output limit |
+| `RATATOSK_OUTPUT_BUFFER_LIMIT_BYTES` | `8388608` | per-client pub/sub and MONITOR backlog limit; a command reply larger than this is still sent |
 | `RATATOSK_SHUTDOWN_GRACE_MS` | `10000` | graceful drain window |
 | `RATATOSK_ALLOW_INSECURE_BIND` | unset | non-loopback bind opt-in |
 | `RATATOSK_SHUTDOWN_BEST_EFFORT` | unset | allow shutdown to continue after appendonly flush failure |
@@ -613,7 +613,8 @@ Ratatosk은 선택적 의존성으로 취급한다.
 ### Backpressure and limits
 
 - query buffer limit: 1 MiB
-- output buffer limit: 기본 8 MiB
+- output buffer limit: 기본 8 MiB. pub/sub와 MONITOR backlog가 이를 넘으면 연결을 끊는다. 명령 응답 하나는 한도보다 커도 한도 크기 조각으로 나눠 끝까지 보낸다 (Redis의 normal client 기본값과 같음). 64 KiB 이상의 bulk 값은 복사하지 않으므로 응답 크기와 무관하게 클라이언트당 메모리는 한도 근처에 머문다.
+- `client-write-timeout-sec`(기본 5초)은 각 write 호출에 걸린다. 그 시간 동안 한 바이트도 보내지 못한 클라이언트만 끊으며, 천천히라도 계속 읽는 클라이언트는 큰 응답을 끝까지 받는다.
 - pubsub delivery: per-subscriber `mpsc::channel` (capacity = hard_limit). `try_send()` 실패 시 overflow -> disconnect
 - lazy free channel capacity: 4096
 

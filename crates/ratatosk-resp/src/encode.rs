@@ -359,6 +359,134 @@ fn shared_encoding(frame: &RespFrame) -> Option<&'static [u8]> {
     }
 }
 
+/// Encodes a logical reply as a sequence of bounded byte pieces.
+///
+/// Concatenating the pieces gives exactly the bytes of
+/// [`encode_to_vec_for_version`]. Small values are gathered into pieces of
+/// about `chunk_bytes`. A bulk string of at least `zero_copy_min` bytes is
+/// yielded as its own `Bytes` handle, without copying. A writer can therefore
+/// send a reply of any size while holding at most one piece in memory, even
+/// when the reply repeats a large value many times.
+pub struct ReplySegments<'a> {
+    /// Work left, innermost last. Aggregates keep an iterator over their
+    /// children, so this grows with nesting depth rather than reply width.
+    pending: Vec<Pending<'a>>,
+    ready: std::collections::VecDeque<Bytes>,
+    buf: Vec<u8>,
+    chunk_bytes: usize,
+    zero_copy_min: usize,
+}
+
+enum Pending<'a> {
+    One(&'a RespFrame, RespVersion),
+    Items(std::slice::Iter<'a, RespFrame>, RespVersion),
+    Entries(std::slice::Iter<'a, (RespFrame, RespFrame)>, RespVersion),
+}
+
+impl<'a> ReplySegments<'a> {
+    #[must_use]
+    pub fn new(
+        frame: &'a RespFrame,
+        version: RespVersion,
+        chunk_bytes: usize,
+        zero_copy_min: usize,
+    ) -> Self {
+        Self {
+            pending: vec![Pending::One(frame, version)],
+            ready: std::collections::VecDeque::new(),
+            buf: Vec::new(),
+            chunk_bytes: chunk_bytes.max(1),
+            zero_copy_min: zero_copy_min.max(1),
+        }
+    }
+
+    fn take_buf(&mut self) -> Bytes {
+        Bytes::from(std::mem::take(&mut self.buf))
+    }
+
+    /// Writes one frame's own bytes and queues its children in wire order.
+    fn step(&mut self, frame: &'a RespFrame, version: RespVersion) {
+        match frame {
+            RespFrame::Versioned { version, frame } => self.pending.push(Pending::One(
+                frame,
+                RespVersion::from_protocol_version(*version),
+            )),
+            RespFrame::Array(items) => {
+                write_aggregate_header(b'*', items.len(), &mut self.buf);
+                self.pending.push(Pending::Items(items.iter(), version));
+            }
+            RespFrame::Push(items) => {
+                let marker = match version {
+                    RespVersion::Resp2 => b'*',
+                    RespVersion::Resp3 => b'>',
+                };
+                write_aggregate_header(marker, items.len(), &mut self.buf);
+                self.pending.push(Pending::Items(items.iter(), version));
+            }
+            RespFrame::Map(entries) => {
+                match version {
+                    RespVersion::Resp3 => {
+                        write_aggregate_header(b'%', entries.len(), &mut self.buf);
+                    }
+                    RespVersion::Resp2 => {
+                        write_aggregate_header(b'*', entries.len().saturating_mul(2), &mut self.buf)
+                    }
+                }
+                self.pending.push(Pending::Entries(entries.iter(), version));
+            }
+            RespFrame::Sequence(frames) => {
+                self.pending.push(Pending::Items(frames.iter(), version))
+            }
+            RespFrame::BulkString(Some(value)) if value.len() >= self.zero_copy_min => {
+                self.buf.push(b'$');
+                let mut len_buf = Buffer::new();
+                self.buf
+                    .extend_from_slice(len_buf.format(value.len()).as_bytes());
+                self.buf.extend_from_slice(b"\r\n");
+                let header = self.take_buf();
+                self.ready.push_back(header);
+                self.ready.push_back(value.clone());
+                self.buf.extend_from_slice(b"\r\n");
+            }
+            leaf => encode_for_version_into(leaf, &mut self.buf, version),
+        }
+    }
+}
+
+impl Iterator for ReplySegments<'_> {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Bytes> {
+        loop {
+            if let Some(piece) = self.ready.pop_front() {
+                return Some(piece);
+            }
+            if self.buf.len() >= self.chunk_bytes {
+                return Some(self.take_buf());
+            }
+            let Some(work) = self.pending.pop() else {
+                return (!self.buf.is_empty()).then(|| self.take_buf());
+            };
+            match work {
+                Pending::One(frame, version) => self.step(frame, version),
+                Pending::Items(mut items, version) => {
+                    if let Some(item) = items.next() {
+                        self.pending.push(Pending::Items(items, version));
+                        self.step(item, version);
+                    }
+                }
+                Pending::Entries(mut entries, version) => {
+                    if let Some((key, value)) = entries.next() {
+                        self.pending.push(Pending::Entries(entries, version));
+                        self.pending.push(Pending::One(value, version));
+                        self.step(key, version);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::frame::RespFrame;
@@ -510,5 +638,80 @@ mod tests {
             let encoded = encode(&frame);
             assert_eq!(encoded_len(&frame), encoded.len());
         }
+    }
+    #[test]
+    fn reply_segments_concatenate_to_the_full_encoding() {
+        use super::{ReplySegments, encode_to_vec_for_version};
+        use bytes::Bytes;
+
+        let big = Bytes::from(vec![b'x'; 300]);
+        let frames = vec![
+            RespFrame::ok(),
+            RespFrame::Integer(-7),
+            RespFrame::BulkString(None),
+            RespFrame::NullArray,
+            RespFrame::Null,
+            RespFrame::simple_str("line\r\nbreak"),
+            RespFrame::BulkString(Some(big.clone())),
+            RespFrame::Array(vec![
+                RespFrame::bulk_str("a"),
+                RespFrame::BulkString(Some(big.clone())),
+                RespFrame::Array(vec![RespFrame::Integer(1), RespFrame::Null]),
+                RespFrame::Map(vec![(
+                    RespFrame::bulk_str("k"),
+                    RespFrame::BulkString(Some(big.clone())),
+                )]),
+            ]),
+            RespFrame::Push(vec![RespFrame::bulk_str("message"), RespFrame::NullArray]),
+            RespFrame::Sequence(vec![
+                RespFrame::ok(),
+                RespFrame::Versioned {
+                    version: 3,
+                    frame: Box::new(RespFrame::Map(vec![(
+                        RespFrame::bulk_str("proto"),
+                        RespFrame::Integer(3),
+                    )])),
+                },
+                RespFrame::Array(vec![]),
+            ]),
+            RespFrame::Array((0..1000).map(RespFrame::Integer).collect()),
+        ];
+
+        for frame in &frames {
+            for version in [RespVersion::Resp2, RespVersion::Resp3] {
+                let mut expected = Vec::new();
+                encode_to_vec_for_version(frame, &mut expected, version);
+                for (chunk_bytes, zero_copy_min) in [(1, 1), (7, 64), (64, 256), (4096, 1 << 20)] {
+                    let pieces: Vec<Bytes> =
+                        ReplySegments::new(frame, version, chunk_bytes, zero_copy_min).collect();
+                    assert!(pieces.iter().all(|piece| !piece.is_empty()));
+                    assert_eq!(
+                        pieces.concat(),
+                        expected,
+                        "frame {frame:?} version {version:?} chunk {chunk_bytes} zero-copy {zero_copy_min}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reply_segments_share_large_bulk_payloads() {
+        use super::ReplySegments;
+        use bytes::Bytes;
+
+        let big = Bytes::from(vec![b'y'; 1 << 16]);
+        let frame = RespFrame::Array(vec![RespFrame::BulkString(Some(big.clone())); 4]);
+        let pieces: Vec<Bytes> =
+            ReplySegments::new(&frame, RespVersion::Resp2, 1024, 1024).collect();
+        let shared = pieces
+            .iter()
+            .filter(|piece| piece.as_ptr() == big.as_ptr())
+            .count();
+        assert_eq!(
+            shared, 4,
+            "every repeat of the payload should be the same buffer"
+        );
+        assert!(pieces.iter().all(|piece| piece.len() <= big.len()));
     }
 }
