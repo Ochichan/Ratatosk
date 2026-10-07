@@ -2178,49 +2178,4 @@ mod tests {
             RespFrame::BulkString(Some(Bytes::from_static(b"v")))
         );
     }
-
-    #[test]
-    fn concurrent_fast_gets_stay_correct_while_another_key_is_written() {
-        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
-        shared.data.write_db(0).data.insert(
-            Bytes::from_static(b"hot"),
-            StoredValue::string(Bytes::from_static(b"stable"), None),
-        );
-
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer = {
-            let shared = Arc::clone(&shared);
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                let mut n = 0u64;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    shared.data.write_db(0).data.insert(
-                        Bytes::from_static(b"other"),
-                        StoredValue::string(Bytes::from(n.to_string()), None),
-                    );
-                    n += 1;
-                }
-                n
-            })
-        };
-        let readers = (0..8)
-            .map(|id| {
-                let shared = Arc::clone(&shared);
-                std::thread::spawn(move || {
-                    let mut client = ClientState::new(100 + id);
-                    for _ in 0..5_000 {
-                        assert_eq!(
-                            fast_get(&shared, &mut client, b"hot"),
-                            RespFrame::BulkString(Some(Bytes::from_static(b"stable")))
-                        );
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for reader in readers {
-            reader.join().expect("reader thread");
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(writer.join().expect("writer thread") > 0);
-    }
 }

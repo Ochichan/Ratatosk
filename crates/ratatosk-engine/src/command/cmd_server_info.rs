@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use ratatosk_resp::frame::RespFrame;
 
-use crate::keyspace::{AtomicStatsState, HotStatsSnapshot, ServerState, purge_expired_keys};
+use crate::keyspace::{AtomicStatsState, HotStatsSnapshot, ServerState};
 use crate::security::audit_health_snapshot;
 
 use super::{CommandOutcome, now_ms, to_uppercase_bytes};
@@ -320,33 +320,36 @@ fn append_info_persistence_section(out: &mut String, server: &ServerState) {
     out.push_str("\r\n");
 }
 
-fn append_info_keyspace_section(out: &mut String, server: &mut ServerState, now_ms: i64) {
+fn append_info_keyspace_section(out: &mut String, server: &ServerState, now_ms: i64) {
     out.push_str("# Keyspace\r\n");
 
+    // Like Redis, and like DBSIZE, the counts include keys that have expired
+    // but are not reclaimed yet; reading INFO does not reclaim them.
     let db_count = server.db_count();
     for db_idx in 0..db_count {
-        let mut db = server.db_mut(db_idx);
-        purge_expired_keys(&mut db, now_ms);
+        let db = server.db(db_idx);
 
         if db.is_empty() {
             continue;
         }
 
         let mut expires = 0u64;
+        let mut live_ttls = 0i64;
         let mut ttl_sum = 0i64;
         for value in db.values() {
             if let Some(expire_at_ms) = value.expire_at_ms() {
+                expires = expires.saturating_add(1);
                 if expire_at_ms > now_ms {
-                    expires = expires.saturating_add(1);
+                    live_ttls = live_ttls.saturating_add(1);
                     ttl_sum = ttl_sum.saturating_add(expire_at_ms.saturating_sub(now_ms));
                 }
             }
         }
 
-        let avg_ttl = if expires == 0 {
+        let avg_ttl = if live_ttls == 0 {
             0
         } else {
-            ttl_sum / i64::try_from(expires).unwrap_or(1)
+            ttl_sum / live_ttls
         };
 
         out.push_str(&format!(

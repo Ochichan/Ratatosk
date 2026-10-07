@@ -192,6 +192,14 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Changed
 
+- Read-only fast-path commands (GET, MGET, EXISTS, TTL, HGET, ZRANGE and the
+  rest of that set) now read under the database's shared read lock, so
+  concurrent readers of one database no longer serialize. Only a read that
+  finds an expired key takes the write lock to reclaim it, with the same WATCH,
+  memory and stats effects as before.
+- `DBSIZE` and `INFO keyspace` no longer reclaim expired keys while counting.
+  Like Redis, they count keys that have expired but were not reclaimed yet,
+  and two reads in a row now agree.
 - `XCFGSET` is now `syntax_only`, so `compatibility-mode strict` rejects it. It
   validates its arguments and replies OK without storing them.
 - `XSETID` now works: it sets the stream's last generated ID and, with

@@ -5581,6 +5581,49 @@ mod tests {
     }
 
     #[test]
+    fn dbsize_and_info_keyspace_count_expired_keys_until_reclaimed() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        assert_eq!(
+            run(&["SET", "live", "v"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["SET", "gone", "v", "PX", "1"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Neither command reclaims the expired key, so they agree.
+        for _ in 0..2 {
+            assert_eq!(
+                run(&["DBSIZE"], &mut server, &mut client),
+                RespFrame::Integer(2)
+            );
+            let RespFrame::BulkString(Some(info)) =
+                run(&["INFO", "keyspace"], &mut server, &mut client)
+            else {
+                panic!("INFO should return a bulk string");
+            };
+            assert!(
+                String::from_utf8_lossy(&info).contains("db0:keys=2,expires=1,avg_ttl=0"),
+                "{}",
+                String::from_utf8_lossy(&info)
+            );
+        }
+
+        // Touching the key reclaims it.
+        assert_eq!(
+            run(&["GET", "gone"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(
+            run(&["DBSIZE"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+    }
+
+    #[test]
     fn noeviction_admits_one_overshoot_then_allows_reads_and_freeing() {
         let mut server = ServerState::with_default_dbs();
         server.config.set_maxmemory(1);
