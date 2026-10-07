@@ -4594,7 +4594,13 @@ fn capture_durability_effects(
         // XADD resolves `*` (and the supported partial auto-ID form) while it
         // mutates the stream.  Replay the returned concrete ID, never the
         // caller's generator token.
-        b"XADD" => canonical_xadd(argv, response),
+        b"XADD" => canonical_xadd(argv, server, db_index, response),
+        // Like Redis, only a trim that removed entries is propagated, and a
+        // `~` trim is rewritten to the exact trim it turned out to be.
+        b"XTRIM" if matches!(response, RespFrame::Integer(removed) if *removed > 0) => {
+            canonical_xtrim(argv, server, db_index)
+        }
+        b"XTRIM" => None,
         b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
         // These commands are administrative/session actions, not keyspace
         // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
@@ -4739,14 +4745,80 @@ fn canonical_expiry_state(
     }
 }
 
-fn canonical_xadd(argv: &[Bytes], response: &RespFrame) -> Option<Vec<Bytes>> {
+/// Rewrites an XADD for the log: the ID becomes the one the server picked, and
+/// a `~` trim becomes the exact trim it turned out to be.
+fn canonical_xadd(
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<Vec<Bytes>> {
     let RespFrame::BulkString(Some(id)) = response else {
         return None;
     };
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, true).ok()?;
+    let (id_idx, _) = options.id?;
     let mut canonical = argv.to_vec();
-    let id_slot = canonical.get_mut(2)?;
-    *id_slot = id.clone();
-    Some(canonical)
+    *canonical.get_mut(id_idx + 1)? = id.clone();
+    canonical_trim_arguments(canonical, &options, server, db_index)
+}
+
+fn canonical_xtrim(argv: &[Bytes], server: &ServerState, db_index: usize) -> Option<Vec<Bytes>> {
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, false).ok()?;
+    canonical_trim_arguments(argv.to_vec(), &options, server, db_index)
+}
+
+/// As Redis's `streamRewriteApproxSpecifier` and `streamRewriteTrimArgument`:
+/// `~` becomes `=` and the threshold becomes what the stream now holds, so the
+/// replayed trim removes exactly the same entries. `LIMIT` goes too, since an
+/// exact trim has no use for it and would reject it. An exact trim is already
+/// deterministic and is logged as sent.
+fn canonical_trim_arguments(
+    mut canonical: Vec<Bytes>,
+    options: &cmd_stream::AddTrimArgs,
+    server: &ServerState,
+    db_index: usize,
+) -> Option<Vec<Bytes>> {
+    if !options.approx {
+        return Some(canonical);
+    }
+    let strategy = options.strategy?;
+    let key = canonical.get(1)?;
+    let db = server.db(db_index);
+    let value = db.get(key)?;
+    let entries = value.as_stream_entries()?;
+    let threshold = match strategy {
+        cmd_stream::TrimStrategy::MaxLen(_) => Bytes::from(entries.len().to_string()),
+        cmd_stream::TrimStrategy::MinId(_) => {
+            // The first remaining ID. A trim that emptied the stream keeps
+            // only IDs past the last one.
+            let last_id = value.as_stream_meta()?.last_id;
+            let first = entries
+                .first()
+                .map(|entry| entry.id)
+                .or_else(|| cmd_stream::incremented_stream_id(last_id))
+                .unwrap_or(last_id);
+            cmd_stream::stream_id_to_bytes(first)
+        }
+    };
+
+    // Positions in `options` skip the command name.
+    let threshold_idx = options.strategy_arg_idx + 1;
+    *canonical.get_mut(threshold_idx - 1)? = Bytes::from_static(b"=");
+    *canonical.get_mut(threshold_idx)? = threshold;
+    let dropped = options
+        .limit_positions
+        .iter()
+        .flat_map(|at| [at + 1, at + 2])
+        .collect::<Vec<_>>();
+    Some(
+        canonical
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| !dropped.contains(at))
+            .map(|(_, arg)| arg)
+            .collect(),
+    )
 }
 
 fn raw_command_changed_state(command: &[u8], response: &RespFrame) -> bool {
@@ -7276,6 +7348,248 @@ mod tests {
             run(&["XTRIM", "none", "MAXLEN", "1"], &mut server, &mut client),
             RespFrame::Integer(0)
         );
+    }
+
+    fn logged_argv(client: &mut ClientState) -> Option<Vec<String>> {
+        client.take_durability_effects().map(|effects| {
+            assert_eq!(effects.commands.len(), 1);
+            effects.commands[0]
+                .argv
+                .iter()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn aof_capture_rewrites_approximate_trims_to_exact_ones() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        fill_stream("s", 4, &mut server, &mut client);
+        client.take_durability_effects();
+
+        // `~` becomes `=`, the threshold the resulting length, LIMIT goes,
+        // and `*` becomes the generated ID.
+        let RespFrame::BulkString(Some(id)) = run(
+            &["XADD", "s", "MAXLEN", "~", "2", "LIMIT", "5", "*", "f", "v"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XADD should reply with an ID");
+        };
+        let id = String::from_utf8_lossy(&id).into_owned();
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                ["XADD", "s", "MAXLEN", "=", "2", &id, "f", "v"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+
+        // A LIMIT that stops the trim early is reflected in the length.
+        fill_stream("t", 10, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &[
+                "XADD", "t", "MAXLEN", "~", "2", "LIMIT", "3", "11-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                ["XADD", "t", "MAXLEN", "=", "8", "11-0", "f", "v"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+
+        // MINID logs the first remaining ID, and options before the ID may
+        // come in any order (the ID is not at a fixed position).
+        run(
+            &[
+                "XADD",
+                "t",
+                "NOMKSTREAM",
+                "LIMIT",
+                "2",
+                "MINID",
+                "~",
+                "9",
+                "12-0",
+                "f",
+                "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                [
+                    "XADD",
+                    "t",
+                    "NOMKSTREAM",
+                    "MINID",
+                    "=",
+                    "6-0",
+                    "12-0",
+                    "f",
+                    "v"
+                ]
+                .map(str::to_owned)
+                .to_vec()
+            )
+        );
+
+        // An exact trim is logged as sent, with only the ID resolved.
+        run(
+            &["XADD", "t", "MAXLEN", "5", "13-*", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                ["XADD", "t", "MAXLEN", "5", "13-0", "f", "v"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+
+        // NOMKSTREAM on a missing key logs nothing.
+        assert_eq!(
+            run(
+                &[
+                    "XADD",
+                    "gone",
+                    "NOMKSTREAM",
+                    "MAXLEN",
+                    "~",
+                    "1",
+                    "*",
+                    "f",
+                    "v"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(logged_argv(&mut client), None);
+
+        // XTRIM: `~` is rewritten, a trim that removed nothing is not logged.
+        // A MINID trim that empties the stream logs the ID after the last one.
+        run(
+            &["XTRIM", "t", "MAXLEN", "~", "3", "LIMIT", "1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                ["XTRIM", "t", "MAXLEN", "=", "4"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+        run(
+            &["XTRIM", "t", "MINID", "~", "100"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            Some(
+                ["XTRIM", "t", "MINID", "=", "13-1"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+        run(
+            &["XTRIM", "t", "MAXLEN", "~", "100"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(logged_argv(&mut client), None);
+        run(&["XTRIM", "t", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(logged_argv(&mut client), None);
+    }
+
+    #[test]
+    fn replaying_the_logged_trims_reproduces_the_stream() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        let mut record = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        };
+        for ms in 1..=6 {
+            let id = format!("{ms}-0");
+            record(&["XADD", "s", &id, "f", "v"], &mut server, &mut client);
+        }
+        record(
+            &["XADD", "s", "MAXLEN", "~", "3", "LIMIT", "2", "*", "g", "w"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &[
+                "XADD",
+                "s",
+                "MINID",
+                "~",
+                "4",
+                "1000000000000000-*",
+                "h",
+                "x",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XTRIM", "s", "MAXLEN", "~", "3", "LIMIT", "1"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XADD", "s", "NOMKSTREAM", "MAXLEN", "~", "0", "*", "z", "z"],
+            &mut server,
+            &mut client,
+        );
+
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        let range = |server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", "s", "-", "+"], server, client)
+        };
+        assert_eq!(
+            range(&mut replayed, &mut replay_client),
+            range(&mut server, &mut client)
+        );
+        let meta = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_meta().copied())
+        };
+        assert_eq!(meta(&replayed), meta(&server));
     }
 
     #[test]

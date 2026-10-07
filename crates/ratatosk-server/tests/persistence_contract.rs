@@ -274,6 +274,46 @@ fn aof_replays_absolute_ttl_and_resolved_stream_id() -> io::Result<()> {
 }
 
 #[test]
+fn aof_replays_trimmed_xadd_and_xtrim_to_identical_entries() -> io::Result<()> {
+    fn entries(client: &mut Client, key: &str) -> io::Result<RespFrame> {
+        client.command(&["XRANGE", key, "-", "+"])
+    }
+
+    let mut server = Server::new(true)?;
+    let mut client = server.client()?;
+    for ms in 1..=6 {
+        let id = format!("{ms}-0");
+        client.command(&["XADD", "events", &id, "f", "v"])?;
+    }
+    // `~` with LIMIT is logged as an exact MAXLEN, with the generated ID.
+    client.command(&[
+        "XADD", "events", "MAXLEN", "~", "3", "LIMIT", "2", "*", "g", "w",
+    ])?;
+    client.command(&["XTRIM", "events", "MAXLEN", "~", "4", "LIMIT", "1"])?;
+    // NOMKSTREAM on a missing key creates and logs nothing.
+    assert_eq!(
+        client.command(&["XADD", "absent", "NOMKSTREAM", "*", "f", "v"])?,
+        RespFrame::BulkString(None)
+    );
+    let before = entries(&mut client, "events")?;
+    let RespFrame::Array(rows) = &before else {
+        panic!("XRANGE should return an array");
+    };
+    assert_eq!(rows.len(), 4);
+    drop(client);
+    server.stop(false)?;
+    server.start()?;
+
+    let mut client = server.client()?;
+    assert_eq!(entries(&mut client, "events")?, before);
+    assert_eq!(
+        client.command(&["EXISTS", "absent"])?,
+        RespFrame::Integer(0)
+    );
+    Ok(())
+}
+
+#[test]
 fn stream_metadata_survives_aof_replay_and_rewrite() -> io::Result<()> {
     fn stream_info(client: &mut Client) -> io::Result<Vec<RespFrame>> {
         let RespFrame::Array(items) = client.command(&["XINFO", "STREAM", "events"])? else {
