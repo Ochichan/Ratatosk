@@ -537,6 +537,11 @@ pub(super) async fn run_with_blocking_retry<S: SessionStream>(
                     server.clear_blocked_client(client_state.id());
                 }
                 refresh_client_snapshot(server_state, client_state, addr, laddr, false).await;
+                // BLMOVE and BRPOPLPUSH park with a null bulk, which is their
+                // reply inside EXEC; a timeout replies a null array, as Redis.
+                if matches!(last_response, RespFrame::BulkString(None)) {
+                    last_response = RespFrame::NullArray;
+                }
                 return Ok(CommandOutcome {
                     response: last_response,
                     close: false,

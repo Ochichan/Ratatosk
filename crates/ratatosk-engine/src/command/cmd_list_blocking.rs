@@ -68,7 +68,7 @@ pub(super) fn cmd_bpop(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
 
     let outcome = try_bpop_once(keys, server, client, left);
-    if !matches!(outcome.response, RespFrame::BulkString(None)) {
+    if !matches!(outcome.response, RespFrame::NullArray) {
         return outcome;
     }
 
@@ -135,7 +135,7 @@ pub(super) fn try_bpop_once(
         ]));
     }
 
-    CommandOutcome::reply(RespFrame::BulkString(None))
+    CommandOutcome::reply(RespFrame::NullArray)
 }
 
 pub(super) fn parse_list_side(raw: &Bytes) -> Option<bool> {
@@ -310,13 +310,16 @@ pub(super) fn cmd_brpoplpush(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
     let wrapped = [source.clone(), destination.clone()];
 
-    let outcome = cmd_rpoplpush(&wrapped, server, client);
+    // Like Redis, an empty source replies a null bulk where the client cannot
+    // block (inside EXEC) and a null array once a real timeout expires.
+    let mut outcome = cmd_rpoplpush(&wrapped, server, client);
     if !matches!(outcome.response, RespFrame::BulkString(None)) {
         return outcome;
     }
 
     if let Some(deadline) = deadline_ms {
         if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
+            outcome.response = RespFrame::NullArray;
             return outcome;
         }
     }
@@ -352,13 +355,16 @@ pub(super) fn cmd_blmove(
         to_raw.clone(),
     ];
 
-    let outcome = cmd_lmove(&wrapped, server, client);
+    // Like Redis, an empty source replies a null bulk where the client cannot
+    // block (inside EXEC) and a null array once a real timeout expires.
+    let mut outcome = cmd_lmove(&wrapped, server, client);
     if !matches!(outcome.response, RespFrame::BulkString(None)) {
         return outcome;
     }
 
     if let Some(deadline) = deadline_ms {
         if ratatosk_core::time::monotonic_ms() as i64 >= deadline {
+            outcome.response = RespFrame::NullArray;
             return outcome;
         }
     }
@@ -467,7 +473,7 @@ pub(super) fn cmd_lmpop_inner(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
 
     let outcome = try_lmpop_once(&keys, left, count, server, client);
-    if !matches!(outcome.response, RespFrame::BulkString(None)) {
+    if !matches!(outcome.response, RespFrame::NullArray) {
         return outcome;
     }
 
@@ -546,7 +552,7 @@ pub(super) fn try_lmpop_once(
         ]));
     }
 
-    CommandOutcome::reply(RespFrame::BulkString(None))
+    CommandOutcome::reply(RespFrame::NullArray)
 }
 
 pub(super) fn blocking_deadline_ms(timeout_sec: f64) -> Option<i64> {

@@ -3201,7 +3201,7 @@ mod tests {
 
         let blocked_reply = read_reply(&mut blocked).await;
         assert!(
-            blocked_reply == b"*-1\r\n" || blocked_reply == b"$-1\r\n",
+            blocked_reply == b"*-1\r\n",
             "unexpected BLPOP timeout reply: {:?}",
             String::from_utf8_lossy(&blocked_reply)
         );
@@ -3214,6 +3214,77 @@ mod tests {
             .expect("quit observer");
         let _ = read_reply(&mut observer).await;
 
+        accept_task.await.expect("accept task join");
+    }
+
+    #[tokio::test]
+    async fn null_array_replies_on_the_wire_for_resp2_and_resp3() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let shared = Arc::new(SharedState::new(ServerState::with_default_dbs()));
+        let accept_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept client");
+            handle_client(socket, shared).await.expect("handle client");
+        });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect client");
+
+        // RESP2: LPOP with COUNT on a missing key and a BLPOP timeout are null arrays.
+        client
+            .write_all(b"*3\r\n$4\r\nLPOP\r\n$7\r\nmissing\r\n$1\r\n5\r\n")
+            .await
+            .expect("lpop count");
+        assert_eq!(read_reply(&mut client).await, b"*-1\r\n");
+        // Without COUNT the reply stays a null bulk string.
+        client
+            .write_all(b"*2\r\n$4\r\nLPOP\r\n$7\r\nmissing\r\n")
+            .await
+            .expect("lpop plain");
+        assert_eq!(read_reply(&mut client).await, b"$-1\r\n");
+        client
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$7\r\nmissing\r\n$3\r\n0.1\r\n")
+            .await
+            .expect("blpop timeout");
+        assert_eq!(read_reply(&mut client).await, b"*-1\r\n");
+        // BLMOVE parks with a null bulk but times out with a null array.
+        client
+            .write_all(b"BLMOVE missing dst LEFT RIGHT 0.1\r\n")
+            .await
+            .expect("blmove timeout");
+        assert_eq!(read_reply(&mut client).await, b"*-1\r\n");
+        // Inside EXEC it cannot block and replies a null bulk, as Redis does.
+        client
+            .write_all(b"MULTI\r\nBLMOVE missing dst LEFT RIGHT 0\r\nEXEC\r\n")
+            .await
+            .expect("blmove in exec");
+        let mut reply = Vec::new();
+        while !reply.ends_with(b"*1\r\n$-1\r\n") {
+            reply.extend_from_slice(&read_reply(&mut client).await);
+        }
+        assert_eq!(reply, b"+OK\r\n+QUEUED\r\n*1\r\n$-1\r\n");
+
+        // RESP3: both null-array cases are `_`.
+        client
+            .write_all(b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n")
+            .await
+            .expect("hello 3");
+        let hello = read_reply(&mut client).await;
+        assert!(hello.windows(5).any(|w| w == b"proto"), "{hello:?}");
+        client
+            .write_all(b"*3\r\n$4\r\nLPOP\r\n$7\r\nmissing\r\n$1\r\n5\r\n")
+            .await
+            .expect("lpop count resp3");
+        assert_eq!(read_reply(&mut client).await, b"_\r\n");
+        client
+            .write_all(b"*3\r\n$5\r\nBLPOP\r\n$7\r\nmissing\r\n$3\r\n0.1\r\n")
+            .await
+            .expect("blpop timeout resp3");
+        assert_eq!(read_reply(&mut client).await, b"_\r\n");
+
+        client.write_all(b"QUIT\r\n").await.expect("quit");
+        let _ = read_reply(&mut client).await;
         accept_task.await.expect("accept task join");
     }
 
@@ -3412,7 +3483,7 @@ mod tests {
             nil.extend(read_reply(&mut blocked).await);
         }
         assert!(
-            nil.starts_with(b"*-1") || nil.starts_with(b"$-1") || nil.starts_with(b"_"),
+            nil.starts_with(b"*-1\r\n"),
             "expected null reply, got {:?}",
             String::from_utf8_lossy(&nil)
         );

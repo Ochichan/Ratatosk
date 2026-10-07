@@ -487,7 +487,7 @@ pub(super) fn cmd_xread(
             if deadline_ms
                 .is_some_and(|deadline| ratatosk_core::time::monotonic_ms() as i64 >= deadline)
             {
-                return CommandOutcome::reply(RespFrame::Null);
+                return CommandOutcome::reply(RespFrame::NullArray);
             }
 
             let mut blocking_args = args.to_vec();
@@ -500,13 +500,13 @@ pub(super) fn cmd_xread(
 
             let full_frame = build_blocking_frame("XREAD", &blocking_args);
             CommandOutcome::blocking(
-                RespFrame::Null,
+                RespFrame::NullArray,
                 deadline_ms,
                 full_frame,
                 blocking_watch_keys(client, keys),
             )
         } else {
-            CommandOutcome::reply(RespFrame::Null)
+            CommandOutcome::reply(RespFrame::NullArray)
         }
     } else {
         CommandOutcome::reply(RespFrame::Array(out))

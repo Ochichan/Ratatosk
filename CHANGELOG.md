@@ -86,6 +86,7 @@ The format is based on Keep a Changelog and the versioning policy in
   requests (`*0`, a blank line) get no reply.
 - `DUMP`/`RESTORE` preserve hash-field TTLs and stream consumer groups.
 - `CONFIG REWRITE` flushes and fsyncs the new file before renaming it.
+- `LPOP` and `RPOP` with `COUNT` on a missing key, `LMPOP` and `ZMPOP` with nothing to pop, the timeout of every blocking list, sorted-set and stream command, and `XREAD`/`XREADGROUP` with nothing new now reply a null array (`*-1`, or `_` in RESP3) as Redis does, instead of a null bulk string. `LPOP key 0` now looks up the key first and replies a null array if it is missing or `WRONGTYPE` if it is not a list.
 - A `#` inside a config value is literal; IPv6 `bind` addresses work.
 - Descriptor exhaustion is retried as a transient accept error on macOS too.
 - `scripts/smoke_bgrewriteaof.sh`, `bench_allocator_ab.sh`, and

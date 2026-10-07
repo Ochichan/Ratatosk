@@ -212,7 +212,7 @@ fn zmpop_inner(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
 
     let outcome = try_zmpop_once(&keys, pop_min, count, server, client);
-    if !matches!(outcome.response, RespFrame::BulkString(None)) {
+    if !matches!(outcome.response, RespFrame::NullArray) {
         return outcome;
     }
 
@@ -301,7 +301,7 @@ fn try_zmpop_once(
         ]));
     }
 
-    CommandOutcome::reply(RespFrame::BulkString(None))
+    CommandOutcome::reply(RespFrame::NullArray)
 }
 
 pub(super) fn cmd_bzpopmin(
@@ -341,7 +341,7 @@ fn cmd_bzpop(
     let deadline_ms = blocking_deadline_ms(timeout_sec);
 
     let outcome = try_bzpop_once(keys, server, client, pop_min);
-    if !matches!(outcome.response, RespFrame::BulkString(None)) {
+    if !matches!(outcome.response, RespFrame::NullArray) {
         return outcome;
     }
 
@@ -417,5 +417,5 @@ fn try_bzpop_once(
         ]));
     }
 
-    CommandOutcome::reply(RespFrame::BulkString(None))
+    CommandOutcome::reply(RespFrame::NullArray)
 }

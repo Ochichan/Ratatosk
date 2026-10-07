@@ -5192,7 +5192,7 @@ fn maybe_track_write_version(
         b"SET" => !matches!(response, RespFrame::BulkString(None)),
         b"GETEX" => argv.len() > 2,
         b"LMOVE" | b"BLMOVE" | b"RPOPLPUSH" | b"BRPOPLPUSH" | b"LMPOP" | b"BLMPOP" => {
-            !matches!(response, RespFrame::BulkString(None))
+            !matches!(response, RespFrame::BulkString(None) | RespFrame::NullArray)
         }
         b"SORT" => argv.iter().any(|arg| arg.eq_ignore_ascii_case(b"STORE")),
         b"SETNX" | b"MSETNX" | b"MSETEX" | b"RENAMENX" | b"MOVE" | b"COPY" | b"EXPIRE"
@@ -5203,7 +5203,7 @@ fn maybe_track_write_version(
         }
         b"LPOP" | b"RPOP" | b"BLPOP" | b"BRPOP" | b"SPOP" | b"ZPOPMIN" | b"ZPOPMAX"
         | b"BZPOPMIN" | b"BZPOPMAX" => match response {
-            RespFrame::BulkString(None) => false,
+            RespFrame::BulkString(None) | RespFrame::NullArray => false,
             RespFrame::Array(values) => !values.is_empty(),
             _ => true,
         },
@@ -9023,7 +9023,7 @@ mod tests {
                 &mut server,
                 &mut client,
             ),
-            RespFrame::Null
+            RespFrame::NullArray
         );
 
         let xgroup_help = run(&["XGROUP", "HELP"], &mut server, &mut client);
@@ -10636,7 +10636,7 @@ mod tests {
         );
         assert_eq!(
             run(&["LPOP", "missing", "0"], &mut server, &mut client),
-            RespFrame::Array(vec![])
+            RespFrame::NullArray
         );
         assert_eq!(
             run(&["LRANGE", "missing", "0", "-1"], &mut server, &mut client),
@@ -10697,11 +10697,11 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(outcome.response, RespFrame::BulkString(None));
+        assert_eq!(outcome.response, RespFrame::NullArray);
         assert!(outcome.retry_blocking.is_some());
 
         let outcome = run_full(&["BLPOP", "missing", "0"], &mut server, &mut client);
-        assert_eq!(outcome.response, RespFrame::BulkString(None));
+        assert_eq!(outcome.response, RespFrame::NullArray);
         assert!(
             outcome
                 .retry_blocking
@@ -10714,11 +10714,11 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(outcome.response, RespFrame::BulkString(None));
+        assert_eq!(outcome.response, RespFrame::NullArray);
         assert!(outcome.retry_blocking.is_some());
 
         let outcome = run_full(&["BRPOP", "missing", "0"], &mut server, &mut client);
-        assert_eq!(outcome.response, RespFrame::BulkString(None));
+        assert_eq!(outcome.response, RespFrame::NullArray);
         assert!(
             outcome
                 .retry_blocking
@@ -11286,6 +11286,7 @@ mod tests {
             &mut server,
             &mut client,
         );
+        // Parks with a null bulk; the server replies a null array at the timeout.
         assert_eq!(outcome.response, RespFrame::BulkString(None));
         assert!(outcome.retry_blocking.is_some());
 
@@ -11294,6 +11295,7 @@ mod tests {
             &mut server,
             &mut client,
         );
+        // Parks with a null bulk; the server replies a null array at the timeout.
         assert_eq!(outcome.response, RespFrame::BulkString(None));
         assert!(outcome.retry_blocking.is_some());
 
@@ -11390,7 +11392,7 @@ mod tests {
                 &mut server,
                 &mut client
             ),
-            RespFrame::BulkString(None)
+            RespFrame::NullArray
         );
 
         assert_eq!(
@@ -11465,7 +11467,7 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(outcome.response, RespFrame::BulkString(None));
+        assert_eq!(outcome.response, RespFrame::NullArray);
         assert!(outcome.retry_blocking.is_some());
 
         assert_eq!(
@@ -12379,7 +12381,7 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(blocked.response, RespFrame::Null);
+        assert_eq!(blocked.response, RespFrame::NullArray);
         let retry = blocked.retry_blocking.expect("XREAD BLOCK should retry");
         assert!(retry.deadline_ms.is_some());
 
@@ -12446,7 +12448,7 @@ mod tests {
             &mut server,
             &mut client,
         );
-        assert_eq!(blocked_group.response, RespFrame::Null);
+        assert_eq!(blocked_group.response, RespFrame::NullArray);
         let retry_group = blocked_group
             .retry_blocking
             .expect("XREADGROUP BLOCK should retry");
@@ -12486,7 +12488,7 @@ mod tests {
 
         assert_eq!(
             run(&["LPOP", "k", "100001"], &mut server, &mut client),
-            RespFrame::BulkString(None)
+            RespFrame::NullArray
         );
         assert_eq!(
             run(&["SPOP", "k", "100001"], &mut server, &mut client),
@@ -12499,6 +12501,157 @@ mod tests {
         assert_eq!(
             run(&["LMPOP", "10001", "k", "LEFT"], &mut server, &mut client),
             RespFrame::error_str("ERR numkeys is out of range")
+        );
+    }
+
+    #[test]
+    fn empty_pops_and_blocking_timeouts_reply_null_array() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let null_array = RespFrame::NullArray;
+
+        // Non-blocking pops with COUNT on a missing key.
+        assert_eq!(
+            run(&["LPOP", "missing", "5"], &mut server, &mut client),
+            null_array
+        );
+        assert_eq!(
+            run(&["RPOP", "missing", "5"], &mut server, &mut client),
+            null_array
+        );
+        // Without COUNT a missing key stays a null bulk string.
+        assert_eq!(
+            run(&["LPOP", "missing"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+        // COUNT 0 follows the key lookup: missing is null, wrong type is an
+        // error, an existing list is an empty array.
+        assert_eq!(
+            run(&["LPOP", "missing", "0"], &mut server, &mut client),
+            null_array
+        );
+        run(&["SET", "str", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(&["LPOP", "str", "0"], &mut server, &mut client),
+            RespFrame::error_str(
+                "WRONGTYPE Operation against a key holding the wrong kind of value"
+            )
+        );
+        run(&["RPUSH", "l", "a"], &mut server, &mut client);
+        assert_eq!(
+            run(&["LPOP", "l", "0"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        // Collections that Redis answers with an empty array stay as they are.
+        assert_eq!(
+            run(&["SPOP", "missing", "2"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["ZPOPMIN", "missing", "2"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(&["ZPOPMAX", "missing", "2"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+
+        // LMPOP and ZMPOP that find nothing.
+        assert_eq!(
+            run(&["LMPOP", "1", "missing", "LEFT"], &mut server, &mut client),
+            null_array
+        );
+        assert_eq!(
+            run(&["ZMPOP", "1", "missing", "MIN"], &mut server, &mut client),
+            null_array
+        );
+
+        // Blocking commands whose timeout already elapsed reply null array.
+        // The provisional reply that the server returns at the deadline is
+        // the same frame.
+        let blocking: &[&[&str]] = &[
+            &["BLPOP", "missing", "0.1"],
+            &["BRPOP", "missing", "0.1"],
+            &["BLMPOP", "0.1", "1", "missing", "LEFT"],
+            &["BZPOPMIN", "missing", "0"],
+            &["BZPOPMAX", "missing", "0"],
+            &["BZMPOP", "0", "1", "missing", "MIN"],
+            &["XREAD", "BLOCK", "10", "STREAMS", "missing", "$"],
+        ];
+        for parts in blocking {
+            let outcome = run_full(parts, &mut server, &mut client);
+            assert_eq!(outcome.response, null_array, "{parts:?}");
+            assert!(outcome.retry_blocking.is_some(), "{parts:?}");
+        }
+        // BLMOVE and BRPOPLPUSH park with a null bulk, their reply inside
+        // EXEC; the server turns it into a null array at the timeout.
+        for parts in [
+            &["BLMOVE", "missing", "dst", "LEFT", "RIGHT", "0.1"][..],
+            &["BRPOPLPUSH", "missing", "dst", "0.1"][..],
+        ] {
+            let outcome = run_full(parts, &mut server, &mut client);
+            assert_eq!(outcome.response, RespFrame::BulkString(None), "{parts:?}");
+            assert!(outcome.retry_blocking.is_some(), "{parts:?}");
+        }
+
+        // Non-blocking XREAD with nothing new is a null array too.
+        assert_eq!(
+            run(
+                &["XREAD", "STREAMS", "missing", "0-0"],
+                &mut server,
+                &mut client
+            ),
+            null_array
+        );
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "$"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+                &mut server,
+                &mut client
+            ),
+            null_array
+        );
+        let outcome = run_full(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "BLOCK",
+                "10",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(outcome.response, null_array);
+        assert!(outcome.retry_blocking.is_some());
+
+        // A blocking command inside MULTI/EXEC on empty keys is an immediate
+        // timeout.
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["BLPOP", "missing", "0"], &mut server, &mut client);
+        run(&["BZPOPMIN", "missing", "0"], &mut server, &mut client);
+        run(
+            &["BLMOVE", "missing", "dst", "LEFT", "RIGHT", "0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                null_array.clone(),
+                null_array,
+                RespFrame::BulkString(None)
+            ])
         );
     }
 
