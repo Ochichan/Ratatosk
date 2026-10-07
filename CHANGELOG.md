@@ -38,6 +38,17 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Fixed
 
+- With `lua-scripting`, writes a script made through `redis.call` and
+  `redis.pcall` were never written to the AOF, so a restart lost them. A
+  script's writes are now logged as one `MULTI`/`EXEC` transaction of their
+  effects, as Redis does, including writes made before the script failed. A
+  `SELECT` inside a script no longer changes the caller's database, `RESET`
+  is refused inside scripts, and while AOF writes are failing a script's write
+  commands are refused while its reads still run.
+- A refused `EXEC` (AOF write error, `maxmemory`, `NOAUTH`, `NOPERM`, or extra
+  arguments) now discards the transaction and its `WATCH`es and replies
+  `EXECABORT Transaction discarded because of: ...`, as Redis does. A command
+  refused while being queued marks the transaction, so `EXEC` then aborts it.
 - Positive `COUNT` arguments of `LPOP`/`RPOP`, `LMPOP`/`BLMPOP`, `ZPOPMIN`/`ZPOPMAX`,
   `ZMPOP`/`BZMPOP`, `SPOP`, `SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` no
   longer fail above 100000, as in Redis. A count larger than the collection
