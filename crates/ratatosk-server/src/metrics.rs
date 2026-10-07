@@ -149,6 +149,13 @@ pub fn record_aof_write_error() {
     metrics::counter!("ratatosk_aof_write_errors_total").increment(1);
 }
 
+/// Records written to the AOF while a background fsync was still running,
+/// because the hold-back size or time bound was reached.
+#[inline]
+pub fn record_aof_delayed_fsync(count: u64) {
+    metrics::counter!("ratatosk_aof_delayed_fsync_total").increment(count);
+}
+
 #[inline]
 pub fn record_aof_write_rejected(reason: &str) {
     metrics::counter!("ratatosk_aof_write_rejected_total", "reason" => reason.to_string())

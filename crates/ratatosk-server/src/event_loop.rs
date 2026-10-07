@@ -32,8 +32,8 @@ use crate::{
     client::{ClientIoLimits, handle_client_with_limits},
     config::ServerConfig,
     persistence::{
-        PersistenceRuntime, drain_bgrewriteaof_tasks, drain_bgsave_tasks, flush_aof,
-        load_startup_data, start_bgsave, sync_server_aof_file_info,
+        PersistenceRuntime, drain_bgrewriteaof_tasks, drain_bgsave_tasks, load_startup_data,
+        start_bgsave, sync_server_aof_file_info, tick_aof_everysec,
     },
     rate_limiter::ConnectionRateLimiter,
     transport::ConnInfo,
@@ -824,13 +824,30 @@ async fn flush_everysec_persistence(
     server_state: &Arc<SharedState>,
     persistence: &PersistenceRuntime,
 ) {
-    // Keep this ordered with writes and runtime CONFIG changes. The timer is
-    // required even when clients stop writing after their last acknowledgement.
-    let mut state = server_state.meta.lock().await;
-    if !state.aof_enabled() || state.config.appendfsync().as_ref() != b"everysec" {
-        return;
+    // Read what the timer needs under `meta`, then release it before talking
+    // to the worker so a slow disk cannot extend the lock hold time. The
+    // worker re-checks its own policy, so a CONFIG SET that races with this
+    // tick is safe. The timer is required even when clients stop writing after
+    // their last acknowledgement.
+    {
+        let state = server_state.meta.lock().await;
+        if !state.aof_enabled() || state.config.appendfsync().as_ref() != b"everysec" {
+            return;
+        }
     }
-    if let Err(error) = flush_aof(persistence).await {
+    if let Err((generation, error)) = tick_aof_everysec(persistence).await {
+        // Take `meta` first, then check the generation under it: a CONFIG SET
+        // appendonly no/yes between a check and the lock could otherwise latch
+        // this stale failure on the new, healthy writer.
+        let mut state = server_state.meta.lock().await;
+        if !persistence.aof_generation_is_current(generation) {
+            tracing::warn!(
+                target = "ratatosk::aof",
+                error = %error,
+                "ignoring everysec tick failure from a replaced AOF writer"
+            );
+            return;
+        }
         let detail = format!("periodic AOF fsync failed: {error}");
         state.set_aof_last_error(detail.clone());
         crate::metrics::set_aof_write_latched(true);

@@ -27,7 +27,7 @@ use self::aof::{
 use self::util::{check_disk_space, validate_aof_file, validate_working_directory};
 
 // Public re-exports to maintain the existing API surface.
-pub use self::aof::{append_aof_command, append_aof_effects, flush_aof};
+pub use self::aof::{append_aof_command, append_aof_effects, flush_aof, tick_aof_everysec};
 pub(crate) use self::aof::{disable_aof, enable_aof_from_snapshot, set_aof_fsync_policy};
 pub use self::rdb::run_save;
 
