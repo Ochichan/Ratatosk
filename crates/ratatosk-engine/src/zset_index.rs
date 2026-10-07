@@ -1,6 +1,6 @@
 //! Order-statistic B+ tree with O(log n) rank and by-rank access.
 //!
-//! Items live in sorted leaves of up to [`LEAF_MAX`] entries. Internal nodes
+//! Items live in sorted leaves of up to 32 entries. Internal nodes
 //! hold, for each child, the child's largest item (`keys`), the number of
 //! items below it, and its arena id. Leaves are chained in order, so
 //! iteration walks them without touching the tree.
