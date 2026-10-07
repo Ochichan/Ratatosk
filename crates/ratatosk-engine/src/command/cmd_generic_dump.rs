@@ -18,8 +18,10 @@ const RESTORE_MAX_STREAM_FIELDS_PER_ENTRY: usize = 1_000_000;
 /// Cap on capacity reserved from a count in an untrusted payload.
 const RESTORE_MAX_PREALLOC: usize = 1024;
 /// Version 2 adds hash field deadlines and stream consumer groups; version 3
-/// adds stream metadata (last generated ID, entries added, max deleted ID).
-const DUMP_MAGIC_CURRENT: &[u8] = b"RATSK3";
+/// adds stream metadata (last generated ID, entries added, max deleted ID);
+/// version 4 adds each group's entries-read counter.
+const DUMP_MAGIC_CURRENT: &[u8] = b"RATSK4";
+const DUMP_MAGIC_V3: &[u8] = b"RATSK3";
 const DUMP_MAGIC_V2: &[u8] = b"RATSK2";
 const DUMP_MAGIC_V1: &[u8] = b"RATSK1";
 const DUMP_MAGIC_LEGACY: &[u8] = &[0x41, 0x58, 0x4f, 0x4e, 0x44, 0x31];
@@ -233,7 +235,7 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
         } => {
             out.push(b'r');
             put_u32(&mut out, entries.len());
-            for item in entries {
+            for item in entries.iter() {
                 put_stream_id(&mut out, item.id);
                 put_u32(&mut out, item.fields.len());
                 for (field, value) in &item.fields {
@@ -247,6 +249,13 @@ fn serialize_stored_value(entry: &StoredValue) -> Bytes {
             for (name, group) in groups {
                 put_bytes(&mut out, name);
                 put_stream_id(&mut out, group.last_delivered_id);
+                // -1 marks an unknown counter.
+                put_i64(
+                    &mut out,
+                    group
+                        .entries_read
+                        .map_or(-1, |read| i64::try_from(read).unwrap_or(i64::MAX)),
+                );
                 let mut consumers = group.consumers.iter().collect::<Vec<_>>();
                 consumers.sort_by(|a, b| a.0.cmp(b.0));
                 put_u32(&mut out, consumers.len());
@@ -287,8 +296,8 @@ fn put_optional_i64(buf: &mut Vec<u8>, value: Option<i64>) {
 }
 
 fn put_stream_id(buf: &mut Vec<u8>, id: StreamId) {
-    put_i64(buf, id.ms);
-    put_i64(buf, id.seq);
+    buf.extend_from_slice(&id.ms.to_le_bytes());
+    buf.extend_from_slice(&id.seq.to_le_bytes());
 }
 
 fn take_optional_i64(raw: &[u8], idx: &mut usize) -> Option<Option<i64>> {
@@ -302,9 +311,9 @@ fn take_optional_i64(raw: &[u8], idx: &mut usize) -> Option<Option<i64>> {
 }
 
 fn take_stream_id(raw: &[u8], idx: &mut usize) -> Option<StreamId> {
-    let ms = take_i64(raw, idx)?;
-    let seq = take_i64(raw, idx)?;
-    (ms >= 0 && seq >= 0).then_some(StreamId { ms, seq })
+    let ms = take_i64(raw, idx)? as u64;
+    let seq = take_i64(raw, idx)? as u64;
+    Some(StreamId { ms, seq })
 }
 
 /// Reads an element count; RESTORE refuses empty lists, sets, hashes and
@@ -326,6 +335,8 @@ fn deserialize_stored_value(payload: &Bytes) -> Option<StoredValue> {
 
     let magic = &raw[..DUMP_MAGIC_CURRENT.len()];
     let version = if magic == DUMP_MAGIC_CURRENT {
+        4
+    } else if magic == DUMP_MAGIC_V3 {
         3
     } else if magic == DUMP_MAGIC_V2 {
         2
@@ -437,6 +448,14 @@ fn take_stream(raw: &[u8], idx: &mut usize, version: u8) -> Option<StoredValue> 
     for _ in 0..group_count {
         let name = take_bytes(raw, idx)?;
         let last_delivered_id = take_stream_id(raw, idx)?;
+        let entries_read = if version >= 4 {
+            match take_i64(raw, idx)? {
+                -1 => None,
+                read => Some(u64::try_from(read).ok()?),
+            }
+        } else {
+            None
+        };
         let mut consumers = HashMap::new();
         let consumer_count = take_u32(raw, idx)?;
         for _ in 0..consumer_count {
@@ -471,6 +490,7 @@ fn take_stream(raw: &[u8], idx: &mut usize, version: u8) -> Option<StoredValue> 
         }
         let group = StreamGroup {
             last_delivered_id,
+            entries_read,
             consumers,
             pending,
         };
@@ -488,6 +508,14 @@ fn take_stream(raw: &[u8], idx: &mut usize, version: u8) -> Option<StoredValue> 
             max_deleted_id,
         };
         if !meta.is_valid_for(value.as_stream_entries()?) {
+            return None;
+        }
+        // A read counter past the entries ever added would make lag negative.
+        if value.as_stream_groups()?.values().any(|group| {
+            group
+                .entries_read
+                .is_some_and(|read| read > meta.entries_added)
+        }) {
             return None;
         }
         *value.as_stream_meta_mut()? = meta;

@@ -25,6 +25,10 @@ pub const RDB_TYPE_RATATOSK_STREAM_GROUPS: u8 = 129;
 /// differs from what the entries imply, so other streams stay readable by
 /// builds that predate it.
 pub const RDB_TYPE_RATATOSK_STREAM_META: u8 = 130;
+/// Type 130 with each group's entries-read counter after its last delivered
+/// ID (-1 when unknown). Written only when some group has a known counter, so
+/// other streams stay readable by builds that predate it.
+pub const RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ: u8 = 131;
 
 // ---------------------------------------------------------------------------
 // RDB opcodes

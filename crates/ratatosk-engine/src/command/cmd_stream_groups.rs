@@ -8,28 +8,46 @@ use crate::keyspace::{
 };
 
 use super::cmd_stream::{
-    blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame,
-    parse_stream_id as parse_full_stream_id, parse_stream_range_bound, stream_entry_frame,
-    stream_id_to_bytes, stream_nogroup_error, xreadgroup_nogroup_error,
+    IntervalEdge, blocking_deadline_ms_from_block, blocking_watch_keys, build_blocking_frame,
+    invalid_stream_id, parse_interval_id, parse_stream_id_generic, parse_strict_stream_id,
+    stream_entry_frame, stream_id_to_bytes, stream_nogroup_error, xreadgroup_nogroup_error,
 };
 
-// Group cursors accept a millisecond-only ID (notably the common `0`),
-// with an omitted sequence interpreted as zero.
-fn parse_stream_id(raw: &Bytes) -> Option<StreamId> {
-    parse_full_stream_id(raw).or_else(|| {
-        if raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
-            return None;
-        }
-        Some(StreamId {
-            ms: parse_i64(raw)?,
-            seq: 0,
-        })
-    })
-}
 use super::{
-    ClientState, CommandOutcome, err, now_ms, parse_i64, parse_usize, to_uppercase_bytes,
-    wrong_arity, wrong_type_response,
+    ClientState, CommandOutcome, err, now_ms, parse_i64, to_uppercase_bytes, wrong_arity,
+    wrong_type_response,
 };
+
+/// Parses the options after the ID of XGROUP CREATE (MKSTREAM, ENTRIESREAD)
+/// and SETID (ENTRIESREAD), as Redis's xgroupCommand does. Returns whether
+/// MKSTREAM was given and the ENTRIESREAD value, `None` for the default or
+/// `-1`.
+fn parse_xgroup_options(options: &[Bytes], create: bool) -> Result<(bool, Option<u64>), RespFrame> {
+    let mut mkstream = false;
+    let mut entries_read = None;
+    let mut idx = 0usize;
+    while idx < options.len() {
+        if create && options[idx].eq_ignore_ascii_case(b"MKSTREAM") {
+            mkstream = true;
+            idx += 1;
+        } else if options[idx].eq_ignore_ascii_case(b"ENTRIESREAD") && idx + 1 < options.len() {
+            let Some(value) = parse_i64(&options[idx + 1]) else {
+                return Err(err("ERR value is not an integer or out of range"));
+            };
+            entries_read = match u64::try_from(value) {
+                Ok(value) => Some(value),
+                Err(_) if value == -1 => None,
+                Err(_) => {
+                    return Err(err("ERR value for ENTRIESREAD must be positive or -1"));
+                }
+            };
+            idx += 2;
+        } else {
+            return Err(err("ERR syntax error"));
+        }
+    }
+    Ok((mkstream, entries_read))
+}
 
 pub(super) fn cmd_xgroup(
     args: &[Bytes],
@@ -64,20 +82,16 @@ pub(super) fn cmd_xgroup(
             ]))
         }
         b"CREATE" => {
-            if args.len() != 4 && args.len() != 5 {
+            if args.len() < 4 || args.len() > 7 {
                 return wrong_arity("xgroup");
             }
 
             let key = &args[1];
             let group_name = &args[2];
             let id_raw = &args[3];
-            let mkstream = if args.len() == 5 {
-                if !args[4].eq_ignore_ascii_case(b"MKSTREAM") {
-                    return CommandOutcome::reply(err("ERR syntax error"));
-                }
-                true
-            } else {
-                false
+            let (mkstream, entries_read) = match parse_xgroup_options(&args[4..], true) {
+                Ok(parsed) => parsed,
+                Err(reply) => return CommandOutcome::reply(reply),
             };
 
             let now = now_ms();
@@ -92,7 +106,7 @@ pub(super) fn cmd_xgroup(
                     let Some(meta) = entry.as_stream_meta() else {
                         return wrong_type_response();
                     };
-                    Some(meta.last_id)
+                    Some((meta.last_id, meta.entries_added))
                 }
                 None if mkstream => None,
                 None => {
@@ -103,12 +117,10 @@ pub(super) fn cmd_xgroup(
             };
             let id = if id_raw.as_ref() == b"$" {
                 // `$` is the stream's last generated ID.
-                existing_last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
+                existing_last_id.map_or(StreamId { ms: 0, seq: 0 }, |(last_id, _)| last_id)
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_strict_stream_id(id_raw) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
                 parsed
             };
@@ -131,6 +143,9 @@ pub(super) fn cmd_xgroup(
                 group_name.clone(),
                 crate::keyspace::StreamGroup {
                     last_delivered_id: id,
+                    // Never above the entries added so far, as in Redis.
+                    entries_read: entries_read
+                        .map(|read| read.min(existing_last_id.map_or(0, |(_, added)| added))),
                     consumers: HashMap::new(),
                     pending: HashMap::new(),
                 },
@@ -165,8 +180,15 @@ pub(super) fn cmd_xgroup(
             CommandOutcome::reply(RespFrame::Integer(removed))
         }
         b"SETID" => {
-            let [_, key, group_name, id_raw] = args else {
+            let [_, key, group_name, id_raw, options @ ..] = args else {
                 return wrong_arity("xgroup");
+            };
+            if !matches!(options.len(), 0 | 2) {
+                return wrong_arity("xgroup");
+            }
+            let (_, entries_read) = match parse_xgroup_options(options, false) {
+                Ok(parsed) => parsed,
+                Err(reply) => return CommandOutcome::reply(reply),
             };
 
             let now = now_ms();
@@ -178,6 +200,7 @@ pub(super) fn cmd_xgroup(
             };
             // `$` is the stream's last generated ID.
             let last_id = entry.as_stream_meta().map(|meta| meta.last_id);
+            let entries_added = entry.as_stream_meta().map_or(0, |meta| meta.entries_added);
             let Some(groups) = entry.as_stream_groups_mut() else {
                 return wrong_type_response();
             };
@@ -188,13 +211,13 @@ pub(super) fn cmd_xgroup(
             group.last_delivered_id = if id_raw.as_ref() == b"$" {
                 last_id.unwrap_or(StreamId { ms: 0, seq: 0 })
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_stream_id_generic(id_raw, 0, false) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
                 parsed
             };
+            // SETID without ENTRIESREAD forgets the counter, as in Redis.
+            group.entries_read = entries_read.map(|read| read.min(entries_added));
 
             CommandOutcome::reply(RespFrame::ok())
         }
@@ -305,10 +328,18 @@ pub(super) fn cmd_xreadgroup(
             let Some(raw) = args.get(idx + 1) else {
                 return CommandOutcome::reply(err("ERR syntax error"));
             };
-            let Some(parsed) = parse_usize(raw) else {
+            if let Some(earlier) = super::cmd_stream::replayed_count(raw) {
+                // Earlier versions delivered nothing for COUNT 0 and logged
+                // XREADGROUP as sent, so replay keeps that.
+                count = Some(usize::try_from(earlier).unwrap_or(usize::MAX));
+                idx += 2;
+                continue;
+            }
+            let Some(parsed) = parse_i64(raw) else {
                 return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
             };
-            count = Some(parsed);
+            // As Redis: a negative COUNT is 0, and 0 is no limit.
+            count = usize::try_from(parsed).ok().filter(|count| *count > 0);
             idx += 2;
             continue;
         }
@@ -349,6 +380,42 @@ pub(super) fn cmd_xreadgroup(
     let stream_count = tail.len() / 2;
     let keys = &tail[..stream_count];
     let ids = &tail[stream_count..];
+
+    // As Redis, every stream's group and ID are checked before any entry is
+    // delivered, so a bad ID later in the list changes nothing.
+    {
+        let now = now_ms();
+        for (key, id_raw) in keys.iter().zip(ids.iter()) {
+            let mut db = server.db_mut(client.selected_db);
+            purge_expired_key(&mut db, key, now);
+            let Some(entry) = db.get(key) else {
+                return xreadgroup_nogroup_error(key, &group_name);
+            };
+            if !entry.is_stream() {
+                return wrong_type_response();
+            }
+            if !entry
+                .as_stream_groups()
+                .is_some_and(|groups| groups.contains_key(&group_name))
+            {
+                return xreadgroup_nogroup_error(key, &group_name);
+            }
+            match id_raw.as_ref() {
+                b"$" | b"+" => {
+                    let id = String::from_utf8_lossy(id_raw);
+                    return CommandOutcome::reply(err(&format!(
+                        "ERR The {id} ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The {id} ID would just return an empty result set."
+                    )));
+                }
+                b">" => {}
+                _ => {
+                    if parse_strict_stream_id(id_raw).is_none() {
+                        return CommandOutcome::reply(invalid_stream_id());
+                    }
+                }
+            }
+        }
+    }
 
     let mut out = Vec::new();
     let now = now_ms();
@@ -409,10 +476,8 @@ pub(super) fn cmd_xreadgroup(
                         .collect::<Vec<_>>()
                 }
             } else {
-                let Some(parsed) = parse_stream_id(id_raw) else {
-                    return CommandOutcome::reply(err(
-                        "ERR Invalid stream ID specified as stream command argument",
-                    ));
+                let Some(parsed) = parse_strict_stream_id(id_raw) else {
+                    return CommandOutcome::reply(invalid_stream_id());
                 };
 
                 if let Some(limit) = count {
@@ -449,7 +514,7 @@ pub(super) fn cmd_xreadgroup(
         }
 
         {
-            let Some(groups) = entry.as_stream_groups_mut() else {
+            let Some((entries, groups, meta)) = entry.as_stream_parts_mut() else {
                 return xreadgroup_nogroup_error(key, &group_name);
             };
             let Some(group) = groups.get_mut(&group_name) else {
@@ -458,6 +523,22 @@ pub(super) fn cmd_xreadgroup(
 
             if id_raw.as_ref() == b">" {
                 if !noack {
+                    // An ID still pending for another consumer (after XGROUP SETID
+                    // rewound the group) moves to this one, so it leaves the old
+                    // owner's list, and its delivery count restarts at 1, as in
+                    // Redis.
+                    for id in &selected_ids {
+                        let previous = group
+                            .pending
+                            .get(id)
+                            .filter(|pending| pending.consumer != consumer_name)
+                            .map(|pending| pending.consumer.clone());
+                        if let Some(previous) = previous {
+                            if let Some(owner) = group.consumers.get_mut(&previous) {
+                                owner.pending.remove(id);
+                            }
+                        }
+                    }
                     let consumer_state = group
                         .consumers
                         .entry(consumer_name.clone())
@@ -473,7 +554,7 @@ pub(super) fn cmd_xreadgroup(
                             .entry(*id)
                             .and_modify(|pending| {
                                 pending.consumer = consumer_name.clone();
-                                pending.deliveries = pending.deliveries.saturating_add(1);
+                                pending.deliveries = 1;
                                 pending.last_delivered_ms = now;
                             })
                             .or_insert_with(|| StreamPendingEntry {
@@ -484,8 +565,30 @@ pub(super) fn cmd_xreadgroup(
                     }
                 }
 
-                if let Some(last) = selected_ids.last() {
-                    group.last_delivered_id = *last;
+                // As Redis, per entry past the group's last ID: keep the read
+                // counter exact while it is valid and nothing was deleted
+                // ahead, otherwise estimate it from the stream's shape.
+                for id in &selected_ids {
+                    if *id <= group.last_delivered_id {
+                        continue;
+                    }
+                    let first_id = entries.first().map(|entry| entry.id);
+                    group.entries_read = match group.entries_read {
+                        Some(read)
+                            if first_id.is_some_and(|first| group.last_delivered_id >= first)
+                                && !meta.range_has_tombstones(
+                                    &entries[..],
+                                    group.last_delivered_id,
+                                ) =>
+                        {
+                            Some(read.saturating_add(1))
+                        }
+                        _ if meta.entries_added > 0 => {
+                            meta.estimate_distance_from_first_entry(&entries[..], *id)
+                        }
+                        other => other,
+                    };
+                    group.last_delivered_id = *id;
                 }
             } else if !noack {
                 for id in &selected_ids {
@@ -580,7 +683,7 @@ pub(super) fn cmd_xack(
 
     let mut removed = 0i64;
     for id_raw in ids {
-        let Some(id) = parse_stream_id(id_raw) else {
+        let Some(id) = parse_strict_stream_id(id_raw) else {
             return CommandOutcome::reply(err(
                 "ERR Invalid stream ID specified as stream command argument",
             ));
@@ -609,6 +712,59 @@ pub(super) fn cmd_xpending(
     let key = &args[0];
     let group_name = &args[1];
 
+    // As Redis's xpendingCommand, the range form's arguments are checked
+    // before the key and group are looked up: `XPENDING key group [[IDLE
+    // min-idle] start end count [consumer]]`.
+    struct PendingRange<'a> {
+        start: StreamId,
+        end: StreamId,
+        count: usize,
+        min_idle: i64,
+        consumer: Option<&'a Bytes>,
+    }
+    let range = if args.len() == 2 {
+        None
+    } else {
+        // Redis accepts 6 to 9 arguments in all (xpendingCommand) and
+        // ignores any past the consumer, so a stray trailing argument is not
+        // an error there either.
+        let with_idle = args[2].eq_ignore_ascii_case(b"IDLE");
+        if !(5..=8).contains(&args.len()) {
+            return CommandOutcome::reply(err("ERR syntax error"));
+        }
+        let mut min_idle = 0i64;
+        let mut first = 2usize;
+        if with_idle {
+            // The IDLE value is judged before the number of arguments.
+            let Some(parsed) = parse_i64(&args[3]) else {
+                return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+            };
+            if args.len() < 7 {
+                return CommandOutcome::reply(err("ERR syntax error"));
+            }
+            min_idle = parsed;
+            first = 4;
+        }
+        let Some(count) = parse_i64(&args[first + 2]) else {
+            return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
+        };
+        let start = match parse_interval_id(&args[first], IntervalEdge::Start) {
+            Ok(id) => id,
+            Err(reply) => return CommandOutcome::reply(reply),
+        };
+        let end = match parse_interval_id(&args[first + 1], IntervalEdge::End) {
+            Ok(id) => id,
+            Err(reply) => return CommandOutcome::reply(reply),
+        };
+        Some(PendingRange {
+            start,
+            end,
+            count: usize::try_from(count).unwrap_or(0),
+            min_idle,
+            consumer: args.get(first + 3),
+        })
+    };
+
     let now = now_ms();
     let mut db = server.db_mut(client.selected_db);
     purge_expired_key(&mut db, key, now);
@@ -626,13 +782,20 @@ pub(super) fn cmd_xpending(
         return xreadgroup_nogroup_error(key, group_name);
     };
 
-    if args.len() == 2 {
+    let Some(PendingRange {
+        start,
+        end,
+        count,
+        min_idle,
+        consumer: consumer_filter,
+    }) = range
+    else {
         if group.pending.is_empty() {
             return CommandOutcome::reply(RespFrame::Array(vec![
                 RespFrame::Integer(0),
                 RespFrame::BulkString(None),
                 RespFrame::BulkString(None),
-                RespFrame::Array(vec![]),
+                RespFrame::NullArray,
             ]));
         }
 
@@ -662,27 +825,9 @@ pub(super) fn cmd_xpending(
                     .collect(),
             ),
         ]));
-    }
-
-    if args.len() != 5 && args.len() != 6 {
-        return wrong_arity("xpending");
-    }
-
-    let Some(start) = parse_stream_range_bound(&args[2]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
     };
-    let Some(end) = parse_stream_range_bound(&args[3]) else {
-        return CommandOutcome::reply(err(
-            "ERR Invalid stream ID specified as stream command argument",
-        ));
-    };
-    let Some(count) = parse_usize(&args[4]) else {
-        return CommandOutcome::reply(err("ERR value is not an integer or out of range"));
-    };
-    let consumer_filter = args.get(5);
 
+    // IDLE keeps only entries idle for at least that long.
     let mut pending_ids = group
         .pending
         .iter()
@@ -690,6 +835,7 @@ pub(super) fn cmd_xpending(
             **id >= start
                 && **id <= end
                 && consumer_filter.is_none_or(|consumer| pending.consumer == *consumer)
+                && (min_idle == 0 || now.saturating_sub(pending.last_delivered_ms) >= min_idle)
         })
         .map(|(id, _)| *id)
         .collect::<Vec<_>>();
@@ -711,6 +857,21 @@ pub(super) fn cmd_xpending(
             })
             .collect(),
     ))
+}
+
+fn optional_count(value: Option<u64>) -> RespFrame {
+    value.map_or(RespFrame::Null, |value| {
+        RespFrame::Integer(i64::try_from(value).unwrap_or(i64::MAX))
+    })
+}
+
+/// The group's `lag`, null when fragmentation makes it unknowable.
+fn group_lag_frame(
+    entries: &[crate::keyspace::StreamEntry],
+    meta: &crate::keyspace::StreamMeta,
+    group: &crate::keyspace::StreamGroup,
+) -> RespFrame {
+    optional_count(meta.group_lag(entries, group))
 }
 
 pub(super) fn cmd_xinfo(
@@ -757,12 +918,14 @@ pub(super) fn cmd_xinfo(
                     let Some(raw) = args.get(idx + 1) else {
                         return CommandOutcome::reply(err("ERR syntax error"));
                     };
-                    let Some(parsed) = parse_usize(raw) else {
+                    let Some(parsed) = parse_i64(raw) else {
                         return CommandOutcome::reply(err(
                             "ERR value is not an integer or out of range",
                         ));
                     };
-                    count = Some(parsed);
+                    // A negative COUNT is the default 10, as in Redis, and 0
+                    // lists everything.
+                    count = Some(usize::try_from(parsed).unwrap_or(10));
                     idx += 2;
                     continue;
                 }
@@ -806,29 +969,121 @@ pub(super) fn cmd_xinfo(
                 RespFrame::Integer(i64::try_from(meta.entries_added).unwrap_or(i64::MAX)),
                 RespFrame::bulk_str("recorded-first-entry-id"),
                 RespFrame::BulkString(Some(stream_id_to_bytes(first_id))),
-                RespFrame::bulk_str("groups"),
-                RespFrame::Integer(group_count as i64),
-                RespFrame::bulk_str("first-entry"),
-                stream
-                    .first()
-                    .map(stream_entry_frame)
-                    .unwrap_or(RespFrame::Null),
-                RespFrame::bulk_str("last-entry"),
-                stream
-                    .last()
-                    .map(stream_entry_frame)
-                    .unwrap_or(RespFrame::Null),
             ];
 
-            if full {
-                let limit = count.unwrap_or(10);
-                let entries = stream
+            if !full {
+                out.push(RespFrame::bulk_str("groups"));
+                out.push(RespFrame::Integer(group_count as i64));
+                out.push(RespFrame::bulk_str("first-entry"));
+                out.push(
+                    stream
+                        .first()
+                        .map(stream_entry_frame)
+                        .unwrap_or(RespFrame::Null),
+                );
+                out.push(RespFrame::bulk_str("last-entry"));
+                out.push(
+                    stream
+                        .last()
+                        .map(stream_entry_frame)
+                        .unwrap_or(RespFrame::Null),
+                );
+            } else {
+                // COUNT 0 means no limit, as in Redis.
+                let limit = match count.unwrap_or(10) {
+                    0 => usize::MAX,
+                    limit => limit,
+                };
+                let rows = stream
                     .iter()
                     .take(limit)
                     .map(stream_entry_frame)
                     .collect::<Vec<_>>();
                 out.push(RespFrame::bulk_str("entries"));
-                out.push(RespFrame::Array(entries));
+                out.push(RespFrame::Array(rows));
+
+                let mut group_rows = groups_ref.iter().collect::<Vec<_>>();
+                group_rows.sort_by(|a, b| a.0.cmp(b.0));
+                let pending_row = |id: &StreamId,
+                                   pending: &crate::keyspace::StreamPendingEntry,
+                                   with_owner: bool| {
+                    let mut row = vec![RespFrame::BulkString(Some(stream_id_to_bytes(*id)))];
+                    if with_owner {
+                        row.push(RespFrame::BulkString(Some(pending.consumer.clone())));
+                    }
+                    row.push(RespFrame::Integer(pending.last_delivered_ms));
+                    row.push(RespFrame::Integer(pending.deliveries));
+                    RespFrame::Array(row)
+                };
+                let groups_out = group_rows
+                    .into_iter()
+                    .map(|(name, group)| {
+                        let mut pending_ids = group.pending.keys().copied().collect::<Vec<_>>();
+                        pending_ids.sort_unstable();
+                        let group_pel = pending_ids
+                            .iter()
+                            .take(limit)
+                            .filter_map(|id| {
+                                group
+                                    .pending
+                                    .get(id)
+                                    .map(|pending| pending_row(id, pending, true))
+                            })
+                            .collect::<Vec<_>>();
+                        let mut consumers = group.consumers.iter().collect::<Vec<_>>();
+                        consumers.sort_by(|a, b| a.0.cmp(b.0));
+                        let consumers_out = consumers
+                            .into_iter()
+                            .map(|(consumer_name, consumer)| {
+                                let mut ids = consumer.pending.iter().copied().collect::<Vec<_>>();
+                                ids.sort_unstable();
+                                let consumer_pel = ids
+                                    .iter()
+                                    .take(limit)
+                                    .filter_map(|id| {
+                                        group
+                                            .pending
+                                            .get(id)
+                                            .map(|pending| pending_row(id, pending, false))
+                                    })
+                                    .collect::<Vec<_>>();
+                                RespFrame::Array(vec![
+                                    RespFrame::bulk_str("name"),
+                                    RespFrame::BulkString(Some(consumer_name.clone())),
+                                    RespFrame::bulk_str("seen-time"),
+                                    RespFrame::Integer(consumer.seen_time_ms),
+                                    // Ratatosk keeps one activity time per consumer.
+                                    RespFrame::bulk_str("active-time"),
+                                    RespFrame::Integer(consumer.seen_time_ms),
+                                    RespFrame::bulk_str("pel-count"),
+                                    RespFrame::Integer(consumer.pending.len() as i64),
+                                    RespFrame::bulk_str("pending"),
+                                    RespFrame::Array(consumer_pel),
+                                ])
+                            })
+                            .collect::<Vec<_>>();
+                        RespFrame::Array(vec![
+                            RespFrame::bulk_str("name"),
+                            RespFrame::BulkString(Some(name.clone())),
+                            RespFrame::bulk_str("last-delivered-id"),
+                            RespFrame::BulkString(Some(stream_id_to_bytes(
+                                group.last_delivered_id,
+                            ))),
+                            RespFrame::bulk_str("entries-read"),
+                            optional_count(group.entries_read),
+                            RespFrame::bulk_str("lag"),
+                            group_lag_frame(stream, &meta, group),
+                            RespFrame::bulk_str("pel-count"),
+                            RespFrame::Integer(group.pending.len() as i64),
+                            RespFrame::bulk_str("pending"),
+                            RespFrame::Array(group_pel),
+                            RespFrame::bulk_str("consumers"),
+                            RespFrame::Array(consumers_out),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                out.push(RespFrame::bulk_str("groups"));
+                out.push(RespFrame::Array(groups_out));
             }
 
             CommandOutcome::reply(RespFrame::Array(out))
@@ -845,9 +1100,13 @@ pub(super) fn cmd_xinfo(
             let Some(entry) = db.get(key) else {
                 return CommandOutcome::reply(err("ERR no such key"));
             };
-            let Some(groups_ref) = entry.as_stream_groups() else {
+            let Some((entries, groups_ref)) = entry.as_stream() else {
                 return wrong_type_response();
             };
+            let meta = entry
+                .as_stream_meta()
+                .copied()
+                .unwrap_or_else(|| crate::keyspace::StreamMeta::derived_from(entries));
 
             let mut group_rows = groups_ref.iter().collect::<Vec<_>>();
             group_rows.sort_by(|a, b| a.0.cmp(b.0));
@@ -864,6 +1123,10 @@ pub(super) fn cmd_xinfo(
                         RespFrame::Integer(group.pending.len() as i64),
                         RespFrame::bulk_str("last-delivered-id"),
                         RespFrame::BulkString(Some(stream_id_to_bytes(group.last_delivered_id))),
+                        RespFrame::bulk_str("entries-read"),
+                        optional_count(group.entries_read),
+                        RespFrame::bulk_str("lag"),
+                        group_lag_frame(entries, &meta, group),
                     ])
                 })
                 .collect::<Vec<_>>();

@@ -221,15 +221,18 @@ impl<W: Write> RdbSaver<W> {
                 groups,
                 meta,
             } => {
-                let with_meta = **meta != StreamMeta::derived_from(entries);
-                self.write_bytes(&[if with_meta {
+                let with_reads = groups.values().any(|group| group.entries_read.is_some());
+                let with_meta = with_reads || **meta != StreamMeta::derived_from(entries);
+                self.write_bytes(&[if with_reads {
+                    RDB_TYPE_RATATOSK_STREAM_ENTRIES_READ
+                } else if with_meta {
                     RDB_TYPE_RATATOSK_STREAM_META
                 } else {
                     RDB_TYPE_RATATOSK_STREAM_GROUPS
                 }])?;
                 self.write_string(key)?;
                 self.write_length(entries.len() as u64)?;
-                for entry in entries {
+                for entry in entries.iter() {
                     // Stream ID: ms + seq
                     self.write_bytes(&entry.id.ms.to_le_bytes())?;
                     self.write_bytes(&entry.id.seq.to_le_bytes())?;
@@ -245,6 +248,12 @@ impl<W: Write> RdbSaver<W> {
                     self.write_string(name)?;
                     self.write_bytes(&group.last_delivered_id.ms.to_le_bytes())?;
                     self.write_bytes(&group.last_delivered_id.seq.to_le_bytes())?;
+                    if with_reads {
+                        let read = group
+                            .entries_read
+                            .map_or(-1, |read| i64::try_from(read).unwrap_or(i64::MAX));
+                        self.write_bytes(&read.to_le_bytes())?;
+                    }
                     self.write_length(group.consumers.len() as u64)?;
                     for (name, consumer) in &group.consumers {
                         self.write_string(name)?;
@@ -267,7 +276,9 @@ impl<W: Write> RdbSaver<W> {
                 if with_meta {
                     self.write_bytes(&meta.last_id.ms.to_le_bytes())?;
                     self.write_bytes(&meta.last_id.seq.to_le_bytes())?;
-                    self.write_bytes(&meta.entries_added.to_le_bytes())?;
+                    // The loader reads this as a signed value, as DUMP does.
+                    let entries_added = meta.entries_added.min(i64::MAX as u64);
+                    self.write_bytes(&entries_added.to_le_bytes())?;
                     self.write_bytes(&meta.max_deleted_id.ms.to_le_bytes())?;
                     self.write_bytes(&meta.max_deleted_id.seq.to_le_bytes())?;
                 }

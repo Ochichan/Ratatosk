@@ -74,6 +74,29 @@ The format is based on Keep a Changelog and the versioning policy in
   the stream. `XADD *` now carries an exhausted sequence into the next
   millisecond, and a stream whose last ID is the largest possible ID replies
   Redis's "exhausted the last possible ID" error.
+- Stream IDs are parsed like Redis. `XADD`, `XDEL`, `XACK`, `XCLAIM`, `XREAD`,
+  `XREADGROUP`, `XTRIM MINID`, `XSETID` and `XGROUP CREATE` accept a bare
+  millisecond ID (`5` means `5-0`). `XRANGE`, `XREVRANGE`, `XPENDING` and the
+  `XAUTOCLAIM` start accept the `(` exclusive prefix and incomplete IDs, and
+  `XGROUP SETID` accepts `-` and `+`. Errors use Redis's text, and `XADD`
+  checks its options and ID before the field count.
+- Stream IDs are unsigned 64-bit, as in Redis, so IDs above
+  9223372036854775807 are valid. RDB and `DUMP` bytes are unchanged for every
+  ID that was valid before.
+- `XTRIM` now rejects `LIMIT` without `~`, a negative `MAXLEN` or `LIMIT`, and
+  `MAXLEN` with `MINID`, with Redis's errors. `~` trims whole 100-entry nodes
+  from the front, as Redis does with its default node size, and its `LIMIT`
+  defaults to 10000. An `XTRIM` that removes nothing is no longer logged.
+- `XREADGROUP` with `$` or `+`, `XREAD` with `>`, `XCLAIM` with an unknown
+  option, `XAUTOCLAIM` with a bad `COUNT` and `XPENDING` with bad range
+  arguments reply with Redis's errors, checked in Redis's order. `COUNT 0` or a
+  negative `COUNT` in `XREAD`/`XREADGROUP` means no limit, a negative `XRANGE`
+  `COUNT` means 0, and the empty `XPENDING` summary ends in a null array.
+- `XREADGROUP >` that redelivers an entry still pending for another consumer
+  moves it to the reading consumer and resets its delivery count to 1, as in
+  Redis. The previous owner kept it before.
+- Removing entries from the front of a stream (`XTRIM`, capped `XADD`) costs
+  time in proportion to the entries removed rather than the stream length.
 - `ZADD`/`ZINCRBY` silently dropped `+inf`/`-inf` scores. Score ranges treat
   `±inf` as inclusive bounds and reject NaN; `ZUNION`, `ZINTER`, `ZDIFF` and
   their `STORE`/`CARD` forms accept plain sets, turn NaN into 0, and check every
@@ -105,6 +128,19 @@ The format is based on Keep a Changelog and the versioning policy in
 
 ### Added
 
+- Consumer groups track `entries-read`, and `XINFO GROUPS` and `XINFO STREAM
+  FULL` report it with `lag`, following Redis's current lag rules (Redis 7.2.5
+  reports a stale lag after trims). `XGROUP CREATE` and `XGROUP SETID` accept
+  `ENTRIESREAD`. `XINFO STREAM FULL` lists groups, consumers and pending
+  entries in Redis's layout.
+- `XCLAIM` accepts `IDLE`, `TIME`, `RETRYCOUNT`, `FORCE`, `JUSTID` and
+  `LASTID`, and `XPENDING` accepts `IDLE`. `JUSTID` no longer counts a
+  delivery, and claims are logged to the AOF by their outcome, so replay
+  restores the same owners, delivery counts and times.
+- `XADD` accepts `NOMKSTREAM`, `MAXLEN [=|~] n`, `MINID [=|~] id` and
+  `LIMIT n`. Approximate trims are written to the AOF in their exact form, so
+  replay reproduces the same stream. AOFs written by earlier versions still
+  replay as they did, including `XTRIM ... LIMIT` without `~`.
 - **Unix-domain socket listener** (`unixsocket`, `unixsocketperm`), guarded by
   a `<path>.lock` ownership lock, and an **experimental shared-memory transport**
   behind the `shm-transport` feature (`shm-socket`). See
@@ -203,8 +239,8 @@ The format is based on Keep a Changelog and the versioning policy in
   `entries-added` and `max-deleted-entry-id` values.
 - `RATATOSK_BOUND_ADDR_FILE` is written once the dataset has loaded, so it
   doubles as a readiness signal and is never written by a failed startup.
-- `DUMP` emits payload version `RATSK3`; `RESTORE` accepts `RATSK1`, `RATSK2`
-  and `RATSK3`.
+- `DUMP` emits payload version `RATSK4`; `RESTORE` accepts `RATSK1` to
+  `RATSK4`.
 - CI workflows run with read-only repository permissions, and the security scan
   also runs weekly.
 - A command reply larger than `output-buffer-limit-bytes` is now sent instead
@@ -268,6 +304,21 @@ The format is based on Keep a Changelog and the versioning policy in
   only streams that have only ever been appended to keep type 129. Older
   snapshots load here with the metadata derived from the entries as before.
   `RATSK3` `DUMP` payloads likewise need this build.
+- A stream with a consumer group whose entries-read counter is known (any group
+  after its first `XREADGROUP`, or one created or set with `ENTRIESREAD`) is
+  saved with the private RDB type 131. Older builds stop at startup on such a
+  `dump.rdb` or AOF base file (`UnknownType { type_byte: 131 }`) and refuse
+  `RATSK4` `DUMP` payloads ("DUMP payload version or checksum are wrong").
+  Type 129 and 130 snapshots and `RATSK1` to `RATSK3` payloads load here with
+  the counter unknown. Rolling back after a save needs a snapshot taken before
+  the upgrade.
+- AOFs written by earlier builds replay as they did, with no `BGREWRITEAOF`
+  needed: replay accepts `XTRIM ... LIMIT` without `~`, unsigned `LIMIT` and
+  `MAXLEN` of any size, IDs longer than 127 bytes, `XREADGROUP ... COUNT 0`, and
+  the earlier `XCLAIM`/`XAUTOCLAIM` forms with their earlier delivery counting.
+  New AOFs log claims by outcome (`XCLAIM ... TIME ... RETRYCOUNT ... FORCE
+  JUSTID LASTID`, `XACK`), which older builds do not fully understand, so
+  downgrading after new writes is not supported.
 - Older builds logged `XSETID` without applying it. Replaying such a record now
   sets the stream's last ID and runs Redis's checks, so a record that set an ID
   below an earlier `XDEL`, or one followed by an `XADD` below the ID it set,

@@ -947,6 +947,12 @@ consumer별 pending ID와 seen time, PEL의 소유자·전달 횟수·전달 시
 보존한다. 이 metadata는 Ratatosk 전용 type 128/129로 저장하며 기존
 hash/stream 인코딩은 읽기 호환을 유지한다. stream의 마지막 생성 ID,
 entries added, 가장 큰 삭제 ID가 항목에서 유도되는 값과 다르면 type 130으로 저장한다.
+일부 group이 알려진 entries-read 카운터(XINFO lag의 기준)를 가지면 type 130에 group별
+카운터를 더한 type 131로 저장한다. 카운터가 없으면 이전과 같은 type 129/130이므로
+이전 빌드도 읽는다. DUMP payload는 카운터가 추가된 `RATSK4`이며 `RATSK1`~`RATSK3`도
+계속 복원된다. 이전 빌드는 type 131 키를 만나면 `dump.rdb`나 AOF BASE를 읽는 시작
+단계에서 `UnknownType { type_byte: 131 }`로 중단하고, `RATSK4` payload의 RESTORE는
+`ERR DUMP payload version or checksum are wrong`으로 거부한다.
 
 `CONFIG SET appendonly yes`는 현재 상태를 BASE로 저장하고 실제 writer를 활성화한다. `no`는 flush 후 writer를 종료하며, 재활성화는 당시의 현재 상태에서 새 lineage를 만든다. 정상 종료는 시작 옵션이 아니라 현재 AOF 활성 상태를 따른다. 클라이언트·background 작업 정리 후 worker에 Shutdown을 보내 fsync 결과를 확인하고 종료한다. 성공한 명시적 종료는 INFO, 예기치 않은 채널 단절은 WARN, shutdown fsync 실패는 ERROR로 구분한다. 최종 종료의 응답 대기는 제한되지만 동기 fsync 자체를 중단하는 hard deadline은 아니다.
 
@@ -2295,7 +2301,7 @@ Redis 명령 카탈로그 대비 Ratatosk 구현 상태 추적표.
 | `XREAD` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (COUNT/BLOCK parse + STREAMS read, blocked wait registry + producer wakeup with timeout fallback). |
 | `XREADGROUP` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream group baseline implemented (GROUP/COUNT/BLOCK/NOACK parse + STREAMS read path with blocked wait registry + producer wakeup fallback). |
 | `XREVRANGE` | stream | 5.0.0 | done | behavioral_subset | m3-events | M3 stream core baseline implemented (reverse inclusive range + COUNT option). |
-| `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Sets the last generated ID, ENTRIESADDED and MAXDELETEDID with Redis's checks. XADD, XREAD $ and XGROUP $ follow the stored last ID, which RDB (private type 130) and DUMP (RATSK3) persist. |
+| `XSETID` | stream | 5.0.0 | done | behavioral_subset | m3-events | Sets the last generated ID, ENTRIESADDED and MAXDELETEDID with Redis's checks. XADD, XREAD $ and XGROUP $ follow the stored last ID, which RDB (private types 130 and 131) and DUMP (RATSK4) persist. Lowering ENTRIESADDED clamps each group's entries_read to it, as in Redis. |
 | `XTRIM` | stream | 5.0.0 | done | behavioral_subset | m3-events | Batch-5 baseline implemented (ordered 1->2 execution). |
 | `ZADD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |
 | `ZCARD` | sorted_set | 1.2.0 | done | behavioral_subset | m2-collections |  |

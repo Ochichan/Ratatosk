@@ -3617,6 +3617,9 @@ pub struct ClientState {
     unix_socket: bool,
     monitor_mode: bool,
     durability_capture_enabled: bool,
+    /// Set by AOF recovery. Stream commands then accept what an earlier
+    /// version logged raw (see `cmd_stream::replay_mode`).
+    replaying_aof: bool,
     durability_effects: Option<DurabilityEffects>,
     /// Nested EXEC/EVAL dispatches are admitted as one atomic command unit.
     memory_admission_bypass_depth: usize,
@@ -3738,6 +3741,13 @@ impl ClientState {
         if !enabled {
             self.durability_effects = None;
         }
+    }
+
+    /// Marks this client as the one AOF recovery replays commands through.
+    /// Like Redis's must-obey clients, it is trusted to carry commands the
+    /// server logged itself, including ones an older version logged raw.
+    pub fn set_aof_replay(&mut self, replaying: bool) {
+        self.replaying_aof = replaying;
     }
 
     fn set_durability_effects(&mut self, effects: Option<DurabilityEffects>) {
@@ -3959,6 +3969,7 @@ impl ClientState {
             unix_socket: false,
             monitor_mode: false,
             durability_capture_enabled: false,
+            replaying_aof: false,
             durability_effects: None,
             memory_admission_bypass_depth: 0,
         }
@@ -4046,6 +4057,7 @@ pub fn execute_argv(
     access: &mut ServerAccess<'_>,
     client: &mut ClientState,
 ) -> CommandOutcome {
+    let _replay = cmd_stream::ReplayScope::enter(client.replaying_aof);
     if client.durability_capture_enabled {
         // All relative expiries and lazy expiry decisions in this operation
         // use the same clock that recovery will use, including nested EXEC.
@@ -4594,8 +4606,22 @@ fn capture_durability_effects(
         // XADD resolves `*` (and the supported partial auto-ID form) while it
         // mutates the stream.  Replay the returned concrete ID, never the
         // caller's generator token.
-        b"XADD" => canonical_xadd(argv, response),
+        b"XADD" => canonical_xadd(argv, server, db_index, response),
+        // Like Redis, only a trim that removed entries is propagated, and a
+        // `~` trim is rewritten to the exact trim it turned out to be.
+        b"XTRIM" if matches!(response, RespFrame::Integer(removed) if *removed > 0) => {
+            canonical_xtrim(argv, server, db_index)
+        }
+        b"XTRIM" => None,
         b"SPOP" => return spop_durability_effects(argv, server, db_index, response),
+        // COUNT 0 and negative mean no limit now, but earlier versions delivered
+        // nothing for them and replay still does, so new records leave them out.
+        b"XREADGROUP" if xreadgroup_has_unlimited_count(argv) => {
+            Some(xreadgroup_without_unlimited_count(argv))
+        }
+        b"XCLAIM" | b"XAUTOCLAIM" => {
+            return claim_durability_effects(command, argv, server, db_index, response);
+        }
         // These commands are administrative/session actions, not keyspace
         // mutations.  In particular, persist neither MULTI/EXEC wrappers nor
         // a successful CONFIG reply as if it were data.
@@ -4611,6 +4637,176 @@ fn capture_durability_effects(
     }?;
 
     Some(DurabilityEffects::single(db_index, canonical))
+}
+
+/// The positions of every `COUNT n` option before STREAMS and the value of the
+/// last one, which is the one XREADGROUP runs with.
+fn xreadgroup_counts(argv: &[Bytes]) -> (Vec<usize>, Option<i64>) {
+    let mut found = Vec::new();
+    let mut effective = None;
+    let mut idx = 1usize;
+    while idx < argv.len() && !argv[idx].eq_ignore_ascii_case(b"STREAMS") {
+        if argv[idx].eq_ignore_ascii_case(b"COUNT") {
+            found.push(idx);
+            effective = argv.get(idx + 1).and_then(parse_i64);
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    (found, effective)
+}
+
+/// Whether the logged XREADGROUP needs rewriting: its effective COUNT is 0 or
+/// less, or COUNT repeats.
+fn xreadgroup_has_unlimited_count(argv: &[Bytes]) -> bool {
+    let (found, effective) = xreadgroup_counts(argv);
+    effective.is_some_and(|count| count <= 0) || found.len() > 1
+}
+
+/// The record with the COUNT XREADGROUP effectively ran with: none when that
+/// is 0 or less, since earlier versions read COUNT 0 as nothing, otherwise a
+/// single COUNT with the last value.
+fn xreadgroup_without_unlimited_count(argv: &[Bytes]) -> Vec<Bytes> {
+    let (found, effective) = xreadgroup_counts(argv);
+    let keep_last = effective.is_some_and(|count| count > 0);
+    let last = found.last().copied();
+    argv.iter()
+        .enumerate()
+        .filter(|(at, _)| {
+            !found.iter().any(|start| {
+                (at == start || *at == start + 1) && !(keep_last && Some(*start) == last)
+            })
+        })
+        .map(|(_, arg)| arg.clone())
+        .collect()
+}
+
+/// IDs in an XCLAIM or XAUTOCLAIM reply, which lists bare IDs with JUSTID and
+/// entries (ID first) without it.
+fn claimed_reply_ids(items: &[RespFrame]) -> Vec<Bytes> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            RespFrame::BulkString(Some(id)) => Some(id.clone()),
+            RespFrame::Array(parts) => match parts.first() {
+                Some(RespFrame::BulkString(Some(id))) => Some(id.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// Record XCLAIM and XAUTOCLAIM by their outcome, as Redis does: one XCLAIM per
+/// claimed entry that names the new owner, delivery time and count, forces
+/// the entry into the pending list and carries the group's last delivered
+/// ID, so replay reproduces the same pending list whatever the clock says.
+/// Pending entries whose stream entry is gone leave the list through XACK.
+/// When nothing was claimed, an XCLAIM that only carries LASTID stands for
+/// the consumer the command still created. Records without these options are
+/// what earlier versions logged as sent, and replay runs them as they were.
+fn claim_durability_effects(
+    command: &[u8],
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<DurabilityEffects> {
+    let (claimed, mut gone) = match response {
+        RespFrame::Array(items) if command == b"XCLAIM" => (claimed_reply_ids(items), Vec::new()),
+        RespFrame::Array(parts) if command == b"XAUTOCLAIM" && parts.len() == 3 => {
+            let ids = |frame: &RespFrame| match frame {
+                RespFrame::Array(items) => claimed_reply_ids(items),
+                _ => Vec::new(),
+            };
+            (ids(&parts[1]), ids(&parts[2]))
+        }
+        _ => return None,
+    };
+
+    let key = argv.get(1)?;
+    let group_name = argv.get(2)?;
+    let consumer_name = argv.get(3)?;
+    let db = server.db(db_index);
+    let value = db.get(key)?;
+    let group = value.as_stream_groups()?.get(group_name)?;
+    let entries = value.as_stream_entries()?;
+
+    // XCLAIM drops the requested IDs that were pending for an entry that no
+    // longer exists; they are in neither the reply nor the pending list.
+    if command == b"XCLAIM" {
+        for raw in argv.iter().skip(5) {
+            let Some(id) = cmd_stream::parse_strict_stream_id(raw) else {
+                break;
+            };
+            let exists = entries.binary_search_by_key(&id, |entry| entry.id).is_ok();
+            if !exists
+                && !group.pending.contains_key(&id)
+                && !gone.contains(raw)
+                && !claimed.contains(raw)
+            {
+                gone.push(raw.clone());
+            }
+        }
+    }
+
+    let last_id = cmd_stream::stream_id_to_bytes(group.last_delivered_id);
+    let mut commands = Vec::with_capacity(claimed.len() + gone.len() + 1);
+    if claimed.is_empty() {
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XCLAIM"),
+                key.clone(),
+                group_name.clone(),
+                consumer_name.clone(),
+                Bytes::from_static(b"0"),
+                Bytes::from_static(b"LASTID"),
+                last_id.clone(),
+            ],
+        });
+    }
+    for id in claimed {
+        let pending = group
+            .pending
+            .get(&cmd_stream::parse_strict_stream_id(&id)?)?;
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XCLAIM"),
+                key.clone(),
+                group_name.clone(),
+                pending.consumer.clone(),
+                Bytes::from_static(b"0"),
+                id,
+                Bytes::from_static(b"TIME"),
+                Bytes::from(pending.last_delivered_ms.to_string()),
+                Bytes::from_static(b"RETRYCOUNT"),
+                Bytes::from(pending.deliveries.to_string()),
+                Bytes::from_static(b"FORCE"),
+                Bytes::from_static(b"JUSTID"),
+                Bytes::from_static(b"LASTID"),
+                last_id.clone(),
+            ],
+        });
+    }
+    for id in gone {
+        commands.push(DurableCommand {
+            db_index,
+            argv: vec![
+                Bytes::from_static(b"XACK"),
+                key.clone(),
+                group_name.clone(),
+                id,
+            ],
+        });
+    }
+    if commands.len() == 1 {
+        let only = commands.pop()?;
+        return Some(DurabilityEffects::single(db_index, only.argv));
+    }
+    Some(DurabilityEffects::transaction(commands))
 }
 
 /// Members per replayed `SREM`, well under the RESP parser's array limit.
@@ -4739,14 +4935,80 @@ fn canonical_expiry_state(
     }
 }
 
-fn canonical_xadd(argv: &[Bytes], response: &RespFrame) -> Option<Vec<Bytes>> {
+/// Rewrites an XADD for the log: the ID becomes the one the server picked, and
+/// a `~` trim becomes the exact trim it turned out to be.
+fn canonical_xadd(
+    argv: &[Bytes],
+    server: &ServerState,
+    db_index: usize,
+    response: &RespFrame,
+) -> Option<Vec<Bytes>> {
     let RespFrame::BulkString(Some(id)) = response else {
         return None;
     };
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, true).ok()?;
+    let (id_idx, _) = options.id?;
     let mut canonical = argv.to_vec();
-    let id_slot = canonical.get_mut(2)?;
-    *id_slot = id.clone();
-    Some(canonical)
+    *canonical.get_mut(id_idx + 1)? = id.clone();
+    canonical_trim_arguments(canonical, &options, server, db_index)
+}
+
+fn canonical_xtrim(argv: &[Bytes], server: &ServerState, db_index: usize) -> Option<Vec<Bytes>> {
+    let options = cmd_stream::parse_add_or_trim_args(argv.get(1..)?, false).ok()?;
+    canonical_trim_arguments(argv.to_vec(), &options, server, db_index)
+}
+
+/// As Redis's `streamRewriteApproxSpecifier` and `streamRewriteTrimArgument`:
+/// `~` becomes `=` and the threshold becomes what the stream now holds, so the
+/// replayed trim removes exactly the same entries. `LIMIT` goes too, since an
+/// exact trim has no use for it and would reject it. An exact trim is already
+/// deterministic and is logged as sent.
+fn canonical_trim_arguments(
+    mut canonical: Vec<Bytes>,
+    options: &cmd_stream::AddTrimArgs,
+    server: &ServerState,
+    db_index: usize,
+) -> Option<Vec<Bytes>> {
+    if !options.approx {
+        return Some(canonical);
+    }
+    let strategy = options.strategy?;
+    let key = canonical.get(1)?;
+    let db = server.db(db_index);
+    let value = db.get(key)?;
+    let entries = value.as_stream_entries()?;
+    let threshold = match strategy {
+        cmd_stream::TrimStrategy::MaxLen(_) => Bytes::from(entries.len().to_string()),
+        cmd_stream::TrimStrategy::MinId(_) => {
+            // The first remaining ID. A trim that emptied the stream keeps
+            // only IDs past the last one.
+            let last_id = value.as_stream_meta()?.last_id;
+            let first = entries
+                .first()
+                .map(|entry| entry.id)
+                .or_else(|| cmd_stream::incremented_stream_id(last_id))
+                .unwrap_or(last_id);
+            cmd_stream::stream_id_to_bytes(first)
+        }
+    };
+
+    // Positions in `options` skip the command name.
+    let threshold_idx = options.strategy_arg_idx + 1;
+    *canonical.get_mut(threshold_idx - 1)? = Bytes::from_static(b"=");
+    *canonical.get_mut(threshold_idx)? = threshold;
+    let dropped = options
+        .limit_positions
+        .iter()
+        .flat_map(|at| [at + 1, at + 2])
+        .collect::<Vec<_>>();
+    Some(
+        canonical
+            .into_iter()
+            .enumerate()
+            .filter(|(at, _)| !dropped.contains(at))
+            .map(|(_, arg)| arg)
+            .collect(),
+    )
 }
 
 fn raw_command_changed_state(command: &[u8], response: &RespFrame) -> bool {
@@ -5189,7 +5451,8 @@ fn maybe_track_write_version(
 
     let integer_zero = matches!(response, RespFrame::Integer(0));
     let should_mark = match command {
-        b"SET" => !matches!(response, RespFrame::BulkString(None)),
+        // XADD NOMKSTREAM on a missing key replies null and changes nothing.
+        b"SET" | b"XADD" => !matches!(response, RespFrame::BulkString(None)),
         b"GETEX" => argv.len() > 2,
         b"LMOVE" | b"BLMOVE" | b"RPOPLPUSH" | b"BRPOPLPUSH" | b"LMPOP" | b"BLMPOP" => {
             !matches!(response, RespFrame::BulkString(None) | RespFrame::NullArray)
@@ -6485,8 +6748,8 @@ mod tests {
         let mut server = ServerState::with_default_dbs();
         let mut client = ClientState::default();
         run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
-        let max = i64::MAX.to_string();
-        let near_end = format!("{}-{max}", i64::MAX - 1);
+        let max = u64::MAX.to_string();
+        let near_end = format!("{}-{max}", u64::MAX - 1);
 
         // `*` carries an exhausted sequence into the next millisecond.
         assert_eq!(
@@ -6553,7 +6816,7 @@ mod tests {
         else {
             panic!("DUMP should return a payload");
         };
-        assert!(payload.starts_with(b"RATSK3"));
+        assert!(payload.starts_with(b"RATSK4"));
         let restored = run_bytes(
             &[
                 Bytes::from_static(b"RESTORE"),
@@ -6583,6 +6846,3033 @@ mod tests {
             crate::keyspace::StreamId { ms: 6, seq: 0 }
         );
         assert_eq!(meta("copy", &server), Some(original));
+    }
+
+    fn invalid_id_error() -> RespFrame {
+        RespFrame::error_str("ERR Invalid stream ID specified as stream command argument")
+    }
+
+    fn stream_ids(frame: RespFrame) -> Vec<String> {
+        let RespFrame::Array(rows) = frame else {
+            panic!("expected an array of entries, got {frame:?}");
+        };
+        rows.into_iter()
+            .map(|row| {
+                let RespFrame::Array(parts) = row else {
+                    panic!("entry should be an array");
+                };
+                let Some(RespFrame::BulkString(Some(id))) = parts.first() else {
+                    panic!("entry should start with its ID");
+                };
+                String::from_utf8_lossy(id).into_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn strict_stream_commands_take_bare_ms_and_refuse_dash_and_plus() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+
+        // XADD takes a bare millisecond value as `<ms>-0`.
+        assert_eq!(
+            run(&["XADD", "s", "5", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("5-0")
+        );
+        for bad in ["-", "+", "5-", "-5", "5-6-7", "x", "5-+"] {
+            assert_eq!(
+                run(&["XADD", "s", bad, "f", "v"], &mut server, &mut client),
+                invalid_id_error(),
+                "XADD {bad}"
+            );
+        }
+        // A leading plus sign and whitespace parse like Redis's strtoull.
+        assert_eq!(
+            run(&["XADD", "s", "+7-+1", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("7-1")
+        );
+        assert_eq!(
+            run(&["XADD", "s", " 8", "f", "v"], &mut server, &mut client),
+            RespFrame::bulk_str("8-0")
+        );
+        // Overflow is an invalid ID.
+        assert_eq!(
+            run(
+                &["XADD", "s", "18446744073709551616", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        // More than 127 bytes is an invalid ID.
+        let long = format!("{}9", "0".repeat(127));
+        assert_eq!(
+            run(&["XADD", "s", &long, "f", "v"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XDEL.
+        assert_eq!(
+            run(&["XDEL", "s", "5"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XDEL", "s", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XDEL {bad}"
+            );
+        }
+
+        // XREAD: bare ms, `$` and `+`; `-` is refused.
+        run(&["XADD", "r", "10-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "20-0", "f", "v"], &mut server, &mut client);
+        run(&["XADD", "r", "30-0", "f", "v"], &mut server, &mut client);
+        let read = |id: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XREAD", "STREAMS", "r", id], server, client)
+        };
+        let read_ids = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(streams) = frame else {
+                return Vec::new();
+            };
+            let RespFrame::Array(stream) = &streams[0] else {
+                panic!("stream reply should be an array");
+            };
+            stream_ids(stream[1].clone())
+        };
+        assert_eq!(
+            read_ids(read("10", &mut server, &mut client)),
+            ["20-0", "30-0"]
+        );
+        assert_eq!(read_ids(read("+", &mut server, &mut client)), ["30-0"]);
+        assert_eq!(read("$", &mut server, &mut client), RespFrame::NullArray);
+        assert_eq!(read("-", &mut server, &mut client), invalid_id_error());
+        // `+` on a missing stream reads nothing.
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "none", "+"], &mut server, &mut client),
+            RespFrame::NullArray
+        );
+
+        // XTRIM MINID takes a bare ms and refuses `-`.
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "20"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["XTRIM", "r", "MINID", "-"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XSETID.
+        assert_eq!(
+            run(&["XSETID", "r", "40"], &mut server, &mut client),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(&["XSETID", "r", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XSETID {bad}"
+            );
+        }
+
+        // XGROUP CREATE: bare ms and `$` are accepted, `-` and `+` are not.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "r", "g2", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        for bad in ["-", "+"] {
+            assert_eq!(
+                run(
+                    &["XGROUP", "CREATE", "r", "g3", bad],
+                    &mut server,
+                    &mut client
+                ),
+                invalid_id_error(),
+                "XGROUP CREATE {bad}"
+            );
+        }
+
+        // XGROUP SETID is not strict: `-`, `+` and a bare ms all parse.
+        for (id, expected) in [
+            ("-", "0-0"),
+            ("+", "18446744073709551615-18446744073709551615"),
+            ("25", "25-0"),
+        ] {
+            assert_eq!(
+                run(&["XGROUP", "SETID", "r", "g", id], &mut server, &mut client),
+                RespFrame::ok(),
+                "XGROUP SETID {id}"
+            );
+            let last = server
+                .db(0)
+                .get(&Bytes::from_static(b"r"))
+                .and_then(|value| value.as_stream_groups())
+                .and_then(|groups| groups.get(&Bytes::from_static(b"g")))
+                .map(|group| group.last_delivered_id)
+                .expect("group");
+            assert_eq!(format!("{}-{}", last.ms, last.seq), expected);
+        }
+        assert_eq!(
+            run(
+                &["XGROUP", "SETID", "r", "g", "x"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+
+        // XREADGROUP, XACK and XCLAIM take strict IDs.
+        run(
+            &["XGROUP", "SETID", "r", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(&["XADD", "r", "50-0", "f", "v"], &mut server, &mut client);
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "r", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            stream_ids(run(
+                &["XCLAIM", "r", "g", "c2", "0", "50"],
+                &mut server,
+                &mut client
+            )),
+            ["50-0"]
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c2", "STREAMS", "r", "-"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "+"], &mut server, &mut client),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(&["XACK", "r", "g", "50"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+    }
+
+    #[test]
+    fn interval_stream_commands_follow_redis_bounds() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        for id in ["1-0", "1-5", "2-0", "2-7", "3-0"] {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let range = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+        let rev = |args: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            let mut parts = vec!["XREVRANGE", "s"];
+            parts.extend_from_slice(args);
+            run(&parts, server, client)
+        };
+
+        // An incomplete start has sequence 0 and an incomplete end the maximum.
+        assert_eq!(
+            stream_ids(range(&["1", "2"], &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["2", "1"], &mut server, &mut client)),
+            ["2-7", "2-0", "1-5", "1-0"]
+        );
+        assert_eq!(
+            stream_ids(range(&["-", "+"], &mut server, &mut client)).len(),
+            5
+        );
+        // `(` excludes the bound; an incomplete exclusive start skips the
+        // whole `<ms>-0` and an incomplete exclusive end excludes `<ms>-MAX`.
+        assert_eq!(
+            stream_ids(range(&["(1-5", "(3-0"], &mut server, &mut client)),
+            ["2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(range(&["(1", "(3"], &mut server, &mut client)),
+            ["1-5", "2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            stream_ids(rev(&["(3-0", "(1-5"], &mut server, &mut client)),
+            ["2-7", "2-0"]
+        );
+        // Edge errors.
+        assert_eq!(
+            range(
+                &["(18446744073709551615-18446744073709551615", "+"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            range(&["-", "(0-0"], &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        for bad in ["(-", "(+", "(", "x", "1-"] {
+            assert_eq!(
+                range(&[bad, "+"], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE {bad}"
+            );
+            assert_eq!(
+                range(&["-", bad], &mut server, &mut client),
+                invalid_id_error(),
+                "XRANGE end {bad}"
+            );
+        }
+        // The IDs are checked before COUNT, as in Redis.
+        assert_eq!(
+            range(&["x", "+", "COUNT", "y"], &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        // XPENDING and XAUTOCLAIM use the same interval bounds.
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending =
+            |start: &str, end: &str, server: &mut ServerState, client: &mut ClientState| {
+                run(&["XPENDING", "s", "g", start, end, "10"], server, client)
+            };
+        assert_eq!(
+            stream_ids(pending("1", "2", &mut server, &mut client)),
+            ["1-0", "1-5", "2-0", "2-7"]
+        );
+        assert_eq!(
+            stream_ids(pending("(1-5", "(3", &mut server, &mut client)),
+            ["2-0", "2-7", "3-0"]
+        );
+        assert_eq!(
+            pending(
+                "(18446744073709551615-18446744073709551615",
+                "+",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(
+            pending("-", "(0-0", &mut server, &mut client),
+            RespFrame::error_str("ERR invalid end ID for the interval")
+        );
+        assert_eq!(
+            pending("(-", "+", &mut server, &mut client),
+            invalid_id_error()
+        );
+
+        let claim = |start: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(
+                &["XAUTOCLAIM", "s", "g", "c2", "0", start, "JUSTID"],
+                server,
+                client,
+            )
+        };
+        // The JUSTID reply lists bare IDs, so read them directly.
+        let bare = |frame: RespFrame| -> Vec<String> {
+            let RespFrame::Array(parts) = frame else {
+                panic!("XAUTOCLAIM should return an array, got {frame:?}");
+            };
+            let RespFrame::Array(ids) = &parts[1] else {
+                panic!("claimed IDs should be an array");
+            };
+            ids.iter()
+                .map(|id| match id {
+                    RespFrame::BulkString(Some(raw)) => String::from_utf8_lossy(raw).into_owned(),
+                    other => panic!("unexpected {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(bare(claim("(2", &mut server, &mut client)), ["2-7", "3-0"]);
+        assert_eq!(
+            claim(
+                "(18446744073709551615-18446744073709551615",
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR invalid start ID for the interval")
+        );
+        assert_eq!(claim("(-", &mut server, &mut client), invalid_id_error());
+        assert_eq!(
+            bare(claim("+", &mut server, &mut client)),
+            Vec::<String>::new()
+        );
+    }
+
+    fn stream_len(key: &str, server: &mut ServerState, client: &mut ClientState) -> i64 {
+        match run(&["XLEN", key], server, client) {
+            RespFrame::Integer(len) => len,
+            other => panic!("XLEN should reply an integer, got {other:?}"),
+        }
+    }
+
+    fn fill_stream(key: &str, count: u64, server: &mut ServerState, client: &mut ClientState) {
+        for ms in 1..=count {
+            let id = format!("{ms}-0");
+            run(&["XADD", key, &id, "f", "v"], server, client);
+        }
+    }
+
+    #[test]
+    fn xadd_and_xtrim_option_errors_match_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let syntax = |text: &str| RespFrame::error_str(&format!("ERR {text}"));
+        let arity = RespFrame::error_str("ERR wrong number of arguments for 'xadd' command");
+
+        for (parts, expected) in [
+            (
+                &["XADD", "s", "MAXLEN", "-1", "*", "f", "v"][..],
+                RespFrame::error_str("ERR The MAXLEN argument must be >= 0."),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "abc", "*", "f", "v"][..],
+                RespFrame::error_str("ERR value is not an integer or out of range"),
+            ),
+            (
+                &[
+                    "XADD", "s", "MAXLEN", "~", "5", "LIMIT", "-1", "*", "f", "v",
+                ][..],
+                RespFrame::error_str("ERR The LIMIT argument must be >= 0."),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "5", "LIMIT", "2", "*", "f", "v"][..],
+                syntax("syntax error, LIMIT cannot be used without the special ~ option"),
+            ),
+            (
+                &["XADD", "s", "LIMIT", "2", "*", "f", "v"][..],
+                syntax("syntax error, LIMIT cannot be used without specifying a trimming strategy"),
+            ),
+            (
+                &["XADD", "s", "MAXLEN", "5", "MINID", "1", "*", "f", "v"][..],
+                syntax(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ),
+            ),
+            (
+                &["XADD", "s", "MINID", "-", "*", "f", "v"][..],
+                invalid_id_error(),
+            ),
+            // The ID is parsed before the field count is checked.
+            (&["XADD", "s", "badid", "f", "v"][..], invalid_id_error()),
+            (
+                &["XADD", "s", "badid", "f", "v", "g"][..],
+                invalid_id_error(),
+            ),
+            (&["XADD", "s", "1-1", "f", "v", "g"][..], arity.clone()),
+            // Redis's arity check (at least five words) runs first.
+            (&["XADD", "s", "badid", "f"][..], arity.clone()),
+            (&["XADD", "s", "1-1", "f"][..], arity.clone()),
+            (&["XADD", "s", "MAXLEN", "5", "*", "f"][..], arity.clone()),
+            (&["XADD", "s", "MAXLEN", "5"][..], arity),
+            // With no ID, the field name is read as the ID.
+            (
+                &["XADD", "s", "NOMKSTREAM", "MAXLEN", "5", "f"][..],
+                invalid_id_error(),
+            ),
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), expected, "{parts:?}");
+            assert_eq!(
+                run(&["EXISTS", "s"], &mut server, &mut client),
+                RespFrame::Integer(0),
+                "{parts:?} must not create the stream"
+            );
+        }
+
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        for (parts, expected) in [
+            (
+                &["XTRIM", "s", "MAXLEN", "-1"][..],
+                RespFrame::error_str("ERR The MAXLEN argument must be >= 0."),
+            ),
+            (
+                &["XTRIM", "s", "MAXLEN", "5", "LIMIT", "2"][..],
+                syntax("syntax error, LIMIT cannot be used without the special ~ option"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "2", "MAXLEN", "~", "5", "MINID", "1"][..],
+                syntax(
+                    "syntax error, MAXLEN and MINID options at the same time are not compatible",
+                ),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "2", "~"][..],
+                syntax("syntax error"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "0"][..],
+                syntax("syntax error, XTRIM must be called with a trimming strategy"),
+            ),
+            (
+                &["XTRIM", "s", "LIMIT", "3"][..],
+                syntax("syntax error, LIMIT cannot be used without specifying a trimming strategy"),
+            ),
+            (
+                &["XTRIM", "s", "NOMKSTREAM", "MAXLEN", "1"][..],
+                syntax("syntax error"),
+            ),
+            (&["XTRIM", "s", "MINID", "+"][..], invalid_id_error()),
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), expected, "{parts:?}");
+        }
+        assert_eq!(stream_len("s", &mut server, &mut client), 1);
+    }
+
+    #[test]
+    fn xadd_nomkstream_replies_null_without_creating() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        assert_eq!(
+            run(
+                &["XADD", "s", "NOMKSTREAM", "*", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(
+            run(
+                &[
+                    "XADD",
+                    "s",
+                    "NOMKSTREAM",
+                    "MAXLEN",
+                    "~",
+                    "1",
+                    "1-1",
+                    "f",
+                    "v"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(
+            run(&["EXISTS", "s"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+
+        // On an existing stream it adds like plain XADD.
+        run(&["XADD", "s", "1-1", "f", "v"], &mut server, &mut client);
+        assert_eq!(
+            run(
+                &["XADD", "s", "nomkstream", "2-1", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("2-1")
+        );
+        // A wrong-type key still reports WRONGTYPE.
+        run(&["SET", "str", "x"], &mut server, &mut client);
+        assert!(matches!(
+            run(
+                &["XADD", "str", "NOMKSTREAM", "*", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(_)
+        ));
+    }
+
+    #[test]
+    fn xadd_trims_after_appending_and_keeps_max_deleted_id() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 5, &mut server, &mut client);
+        let meta = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_meta().copied())
+                .expect("stream meta")
+        };
+        let before = meta(&server);
+
+        // MAXLEN counts the new entry.
+        assert_eq!(
+            run(
+                &["XADD", "s", "MAXLEN", "3", "6-0", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("6-0")
+        );
+        assert_eq!(
+            stream_ids(run(&["XRANGE", "s", "-", "+"], &mut server, &mut client)),
+            ["4-0", "5-0", "6-0"]
+        );
+        // Trimming does not move max_deleted_id, and entries_added counts the add.
+        let after = meta(&server);
+        assert_eq!(after.max_deleted_id, before.max_deleted_id);
+        assert_eq!(after.entries_added, before.entries_added + 1);
+        assert_eq!(after.last_id, crate::keyspace::StreamId { ms: 6, seq: 0 });
+
+        // MINID, with `=`, and a bare millisecond threshold.
+        assert_eq!(
+            run(
+                &["XADD", "s", "MINID", "=", "5", "7-0", "f", "v"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::bulk_str("7-0")
+        );
+        assert_eq!(
+            stream_ids(run(&["XRANGE", "s", "-", "+"], &mut server, &mut client)),
+            ["5-0", "6-0", "7-0"]
+        );
+
+        // `~` removes whole nodes of 100 entries from the front, and stops
+        // before a node that would take it past LIMIT: 301 entries with
+        // MAXLEN 2 could lose three nodes, LIMIT 150 allows one.
+        run(&["DEL", "s"], &mut server, &mut client);
+        fill_stream("s", 300, &mut server, &mut client);
+        run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "301-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 201);
+        // A LIMIT smaller than a node removes nothing.
+        run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "5", "302-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 202);
+        // Without LIMIT both leading nodes go, and the short last node stays
+        // since removing it would leave the stream under MAXLEN.
+        run(
+            &["XADD", "s", "MAXLEN", "~", "2", "303-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 3);
+        // A stream shorter than a node is one partial node: it goes whole
+        // when MAXLEN allows, otherwise it stays.
+        run(
+            &["XADD", "s", "MAXLEN", "~", "2", "304-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 4);
+        run(
+            &["XADD", "s", "MAXLEN", "~", "0", "305-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 0);
+
+        // LIMIT 0 means no cap.
+        fill_stream("t", 600, &mut server, &mut client);
+        run(
+            &[
+                "XADD", "t", "MAXLEN", "~", "1", "LIMIT", "0", "601-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("t", &mut server, &mut client), 1);
+
+        // Without LIMIT, `~` removes at most 100 nodes (10000 entries).
+        fill_stream("u", 20_000, &mut server, &mut client);
+        run(
+            &["XADD", "u", "MAXLEN", "~", "1", "20001-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("u", &mut server, &mut client), 10_001);
+    }
+
+    #[test]
+    fn xtrim_uses_the_shared_options() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 1000, &mut server, &mut client);
+
+        // Nodes of 100 go while the total stays within LIMIT: one of them.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "~", "8", "LIMIT", "150"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(100)
+        );
+        // The options may come in any order.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "LIMIT", "250", "MAXLEN", "~", "4"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 700);
+        // Exact trims ignore the node size.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "=", "500"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        // A node that would take the stream under MAXLEN stays.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "MAXLEN", "~", "450"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(0)
+        );
+        // Two nodes end below ID 800.
+        assert_eq!(
+            run(
+                &["XTRIM", "s", "minid", "~", "800"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Integer(200)
+        );
+        assert_eq!(
+            run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client),
+            RespFrame::Integer(300)
+        );
+        // An emptied stream stays, and a missing key trims zero entries.
+        assert_eq!(
+            run(&["EXISTS", "s"], &mut server, &mut client),
+            RespFrame::Integer(1)
+        );
+        assert_eq!(
+            run(&["XTRIM", "none", "MAXLEN", "1"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+    }
+
+    fn logged_argv(client: &mut ClientState) -> Option<Vec<String>> {
+        client.take_durability_effects().map(|effects| {
+            assert_eq!(effects.commands.len(), 1);
+            effects.commands[0]
+                .argv
+                .iter()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn aof_capture_rewrites_approximate_trims_to_exact_ones() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let argv = |parts: &[&str]| {
+            Some(
+                parts
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        fill_stream("s", 300, &mut server, &mut client);
+        client.take_durability_effects();
+
+        // `~` becomes `=`, the threshold the resulting length, LIMIT goes,
+        // and `*` becomes the generated ID. 301 entries lose one node of 100
+        // within LIMIT 150.
+        let RespFrame::BulkString(Some(id)) = run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "*", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XADD should reply with an ID");
+        };
+        let id = String::from_utf8_lossy(&id).into_owned();
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "s", "MAXLEN", "=", "201", &id, "f", "v"])
+        );
+
+        // A LIMIT that stops the trim early is reflected in the length.
+        fill_stream("t", 1000, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &[
+                "XADD", "t", "MAXLEN", "~", "2", "LIMIT", "300", "1001-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "t", "MAXLEN", "=", "701", "1001-0", "f", "v"])
+        );
+
+        // MINID logs the first remaining ID, and options before the ID may
+        // come in any order (the ID is not at a fixed position). 599 entries
+        // are below 900, which rounds down to 500, and LIMIT 200 stops there.
+        run(
+            &[
+                "XADD",
+                "t",
+                "NOMKSTREAM",
+                "LIMIT",
+                "200",
+                "MINID",
+                "~",
+                "900",
+                "1002-0",
+                "f",
+                "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&[
+                "XADD",
+                "t",
+                "NOMKSTREAM",
+                "MINID",
+                "=",
+                "501-0",
+                "1002-0",
+                "f",
+                "v"
+            ])
+        );
+
+        // An exact trim is logged as sent, with only the ID resolved.
+        run(
+            &["XADD", "t", "MAXLEN", "5", "1003-*", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XADD", "t", "MAXLEN", "5", "1003-0", "f", "v"])
+        );
+
+        // NOMKSTREAM on a missing key logs nothing.
+        assert_eq!(
+            run(
+                &[
+                    "XADD",
+                    "gone",
+                    "NOMKSTREAM",
+                    "MAXLEN",
+                    "~",
+                    "1",
+                    "*",
+                    "f",
+                    "v"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::BulkString(None)
+        );
+        assert_eq!(logged_argv(&mut client), None);
+
+        // XTRIM: `~` is rewritten and a trim that removed nothing is not logged.
+        fill_stream("w", 400, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &["XTRIM", "w", "MAXLEN", "~", "3", "LIMIT", "150"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MAXLEN", "=", "300"])
+        );
+        run(
+            &["XTRIM", "w", "MINID", "~", "250"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MINID", "=", "201-0"])
+        );
+        run(
+            &["XTRIM", "w", "MAXLEN", "~", "250"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(logged_argv(&mut client), None);
+        run(&["XTRIM", "w", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "w", "MAXLEN", "0"])
+        );
+        run(&["XTRIM", "w", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(logged_argv(&mut client), None);
+
+        // A MINID trim that empties the stream logs the ID after the last one.
+        fill_stream("x", 100, &mut server, &mut client);
+        client.take_durability_effects();
+        run(
+            &["XTRIM", "x", "MINID", "~", "1000"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            logged_argv(&mut client),
+            argv(&["XTRIM", "x", "MINID", "=", "100-1"])
+        );
+    }
+
+    #[test]
+    fn replaying_the_logged_trims_reproduces_the_stream() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        let mut record = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        };
+        for ms in 1..=300 {
+            let id = format!("{ms}-0");
+            record(&["XADD", "s", &id, "f", "v"], &mut server, &mut client);
+        }
+        record(
+            &[
+                "XADD", "s", "MAXLEN", "~", "3", "LIMIT", "100", "*", "g", "w",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &[
+                "XADD",
+                "s",
+                "MINID",
+                "~",
+                "250",
+                "1000000000000000-*",
+                "h",
+                "x",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XTRIM", "s", "MAXLEN", "~", "2", "LIMIT", "150"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XADD", "s", "NOMKSTREAM", "MAXLEN", "0", "*", "z", "z"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XADD", "s", "MAXLEN", "~", "1", "*", "y", "y"],
+            &mut server,
+            &mut client,
+        );
+        assert!(
+            log.iter()
+                .any(|argv| argv.iter().any(|arg| arg.as_ref() == b"=")),
+            "the approximate trims should have been logged as exact ones"
+        );
+
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        let range = |server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", "s", "-", "+"], server, client)
+        };
+        assert_eq!(
+            range(&mut replayed, &mut replay_client),
+            range(&mut server, &mut client)
+        );
+        let meta = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_meta().copied())
+        };
+        assert_eq!(meta(&replayed), meta(&server));
+    }
+
+    /// `(entries-read, lag)` of group `g` on stream `s` from XINFO GROUPS.
+    fn group_progress(
+        server: &mut ServerState,
+        client: &mut ClientState,
+    ) -> (RespFrame, RespFrame) {
+        let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "s"], server, client) else {
+            panic!("XINFO GROUPS should return an array");
+        };
+        let RespFrame::Array(group) = &groups[0] else {
+            panic!("a group should be an array");
+        };
+        let field = |name: &str| {
+            let at = group
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str(name))
+                .unwrap_or_else(|| panic!("XINFO GROUPS has no {name}"));
+            group[at + 1].clone()
+        };
+        (field("entries-read"), field("lag"))
+    }
+
+    #[test]
+    fn xgroup_entriesread_is_validated_and_clamped() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+
+        for (parts, expected) in [
+            (
+                &["XGROUP", "CREATE", "s", "g", "0", "ENTRIESREAD", "-2"][..],
+                "ERR value for ENTRIESREAD must be positive or -1",
+            ),
+            (
+                &["XGROUP", "CREATE", "s", "g", "0", "ENTRIESREAD", "x"][..],
+                "ERR value is not an integer or out of range",
+            ),
+            (
+                &["XGROUP", "SETID", "s", "g", "0", "ENTRIESREAD", "-5"][..],
+                "ERR value for ENTRIESREAD must be positive or -1",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+        // The counter is checked before the key, so no stream is created.
+        assert_eq!(
+            run(
+                &[
+                    "XGROUP",
+                    "CREATE",
+                    "new",
+                    "g",
+                    "0",
+                    "MKSTREAM",
+                    "ENTRIESREAD",
+                    "-2"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value for ENTRIESREAD must be positive or -1")
+        );
+        assert_eq!(
+            run(&["EXISTS", "new"], &mut server, &mut client),
+            RespFrame::Integer(0)
+        );
+
+        // A value above the entries added is clamped to it.
+        assert_eq!(
+            run(
+                &["XGROUP", "CREATE", "s", "g", "0", "ENTRIESREAD", "99"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client).0,
+            RespFrame::Integer(3)
+        );
+        // -1 is the unknown counter, and SETID without the option resets it.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0", "ENTRIESREAD", "-1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(group_progress(&mut server, &mut client).0, RespFrame::Null);
+        run(
+            &["XGROUP", "SETID", "s", "g", "0", "ENTRIESREAD", "2"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client).0,
+            RespFrame::Integer(2)
+        );
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(group_progress(&mut server, &mut client).0, RespFrame::Null);
+        // MKSTREAM on a new stream clamps to its zero entries added.
+        assert_eq!(
+            run(
+                &[
+                    "XGROUP",
+                    "CREATE",
+                    "new",
+                    "g",
+                    "$",
+                    "MKSTREAM",
+                    "ENTRIESREAD",
+                    "5"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        // XSETID lowering entries_added clamps the counters, as Redis does.
+        run(&["XADD", "s", "4-0", "f", "v"], &mut server, &mut client);
+        run(&["XDEL", "s", "4-0"], &mut server, &mut client);
+        run(
+            &["XGROUP", "SETID", "s", "g", "0", "ENTRIESREAD", "4"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client).0,
+            RespFrame::Integer(4)
+        );
+        assert_eq!(
+            run(
+                &["XSETID", "s", "4-0", "ENTRIESADDED", "3"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client).0,
+            RespFrame::Integer(3)
+        );
+    }
+
+    #[test]
+    fn xreadgroup_tracks_entries_read_and_lag_like_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 5, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        // Nothing read: the counter is unknown and the whole stream is lag.
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Null, RespFrame::Integer(5))
+        );
+
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "2",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Integer(2), RespFrame::Integer(3))
+        );
+
+        // A deletion ahead of the group makes the lag unknowable, as the
+        // counter can no longer be trusted.
+        run(&["XDEL", "s", "4-0"], &mut server, &mut client);
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Integer(2), RespFrame::Null)
+        );
+        // Reading past it re-derives the counter from the last ID.
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Integer(5), RespFrame::Integer(0))
+        );
+        // New entries add to the lag and the counter keeps counting.
+        run(&["XADD", "s", "6-0", "f", "v"], &mut server, &mut client);
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Integer(5), RespFrame::Integer(1))
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            group_progress(&mut server, &mut client),
+            (RespFrame::Integer(6), RespFrame::Integer(0))
+        );
+
+        // A group created at `$` has no counter, and the deletion above makes
+        // its lag unknowable too.
+        run(
+            &["XGROUP", "CREATE", "s", "late", "$"],
+            &mut server,
+            &mut client,
+        );
+        run(&["XADD", "s", "7-0", "f", "v"], &mut server, &mut client);
+        let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "s"], &mut server, &mut client)
+        else {
+            panic!("XINFO GROUPS should return an array");
+        };
+        let RespFrame::Array(late) = &groups[1] else {
+            panic!("a group should be an array");
+        };
+        assert_eq!(late[1], RespFrame::bulk_str("late"));
+        assert_eq!(late[9], RespFrame::Null);
+        assert_eq!(late[11], RespFrame::Null);
+
+        // An empty stream and a drained one have no lag.
+        run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            group_progress(&mut server, &mut client).1,
+            RespFrame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn xinfo_stream_full_lists_groups_with_lag() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(info) =
+            run(&["XINFO", "STREAM", "s", "FULL"], &mut server, &mut client)
+        else {
+            panic!("XINFO STREAM FULL should return an array");
+        };
+        let field = |name: &str| {
+            let at = info
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str(name))
+                .unwrap_or_else(|| panic!("XINFO STREAM FULL has no {name}"));
+            info[at + 1].clone()
+        };
+        // FULL replaces the groups count and first/last entry as in Redis.
+        assert!(!info.contains(&RespFrame::bulk_str("first-entry")));
+        let RespFrame::Array(groups) = field("groups") else {
+            panic!("FULL lists the groups");
+        };
+        let RespFrame::Array(group) = &groups[0] else {
+            panic!("a group should be an array");
+        };
+        let group_field = |name: &str| {
+            let at = group
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str(name))
+                .unwrap_or_else(|| panic!("the group has no {name}"));
+            group[at + 1].clone()
+        };
+        assert_eq!(group_field("entries-read"), RespFrame::Integer(1));
+        assert_eq!(group_field("lag"), RespFrame::Integer(2));
+        assert_eq!(group_field("pel-count"), RespFrame::Integer(1));
+        let RespFrame::Array(consumers) = group_field("consumers") else {
+            panic!("the group lists its consumers");
+        };
+        assert_eq!(consumers.len(), 1);
+        // COUNT 0 lists every entry.
+        let RespFrame::Array(info) = run(
+            &["XINFO", "STREAM", "s", "FULL", "COUNT", "0"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XINFO STREAM FULL should return an array");
+        };
+        let at = info
+            .iter()
+            .position(|item| *item == RespFrame::bulk_str("entries"))
+            .expect("entries");
+        assert!(matches!(&info[at + 1], RespFrame::Array(rows) if rows.len() == 3));
+    }
+
+    #[test]
+    fn dump_restore_keeps_entries_read_and_reads_version_three_payloads() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0", "ENTRIESREAD", "2"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XGROUP", "CREATE", "s", "h", "0"],
+            &mut server,
+            &mut client,
+        );
+        dump_and_restore("s", "copy", &mut server, &mut client);
+        let groups = |key: &str, server: &ServerState| {
+            let mut rows = server
+                .db(0)
+                .get(&Bytes::from(key.to_owned()))
+                .and_then(|value| value.as_stream_groups())
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .map(|(name, group)| (name.clone(), group.entries_read))
+                        .collect::<Vec<_>>()
+                })
+                .expect("groups");
+            rows.sort();
+            rows
+        };
+        assert_eq!(groups("copy", &server), groups("s", &server));
+        assert_eq!(groups("s", &server)[0].1, Some(2));
+
+        // A RATSK3 payload has the same layout without groups, so a stream
+        // without groups dumped by 7.x builds still restores.
+        fill_stream("plain", 2, &mut server, &mut client);
+        let RespFrame::BulkString(Some(payload)) =
+            run(&["DUMP", "plain"], &mut server, &mut client)
+        else {
+            panic!("DUMP should return a payload");
+        };
+        assert!(payload.starts_with(b"RATSK4"));
+        let mut old = payload.to_vec();
+        old[..6].copy_from_slice(b"RATSK3");
+        assert_eq!(
+            run_bytes(
+                &[
+                    Bytes::from_static(b"RESTORE"),
+                    Bytes::from_static(b"old"),
+                    Bytes::from_static(b"0"),
+                    Bytes::from(old),
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        assert_eq!(
+            run(&["XLEN", "old"], &mut server, &mut client),
+            RespFrame::Integer(2)
+        );
+    }
+
+    #[test]
+    fn aof_replays_group_entries_read_exactly() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        let mut record = |parts: &[&str], server: &mut ServerState, client: &mut ClientState| {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        };
+        for ms in 1..=5 {
+            let id = format!("{ms}-0");
+            record(&["XADD", "s", &id, "f", "v"], &mut server, &mut client);
+        }
+        record(
+            &["XGROUP", "CREATE", "s", "g", "0", "ENTRIESREAD", "0"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "2",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        record(&["XDEL", "s", "4-0"], &mut server, &mut client);
+        record(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XGROUP", "CREATE", "s", "h", "$"],
+            &mut server,
+            &mut client,
+        );
+        record(
+            &["XGROUP", "SETID", "s", "h", "2", "ENTRIESREAD", "2"],
+            &mut server,
+            &mut client,
+        );
+        let expected = group_progress(&mut server, &mut client);
+
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        assert_eq!(group_progress(&mut replayed, &mut replay_client), expected);
+        assert_eq!(
+            run(&["XINFO", "GROUPS", "s"], &mut replayed, &mut replay_client),
+            run(&["XINFO", "GROUPS", "s"], &mut server, &mut client)
+        );
+    }
+
+    #[test]
+    fn xreadgroup_and_xread_report_redis_errors_for_special_ids() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+
+        for id in ["$", "+"] {
+            assert_eq!(
+                run(
+                    &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", id],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::error_str(&format!(
+                    "ERR The {id} ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The {id} ID would just return an empty result set."
+                ))
+            );
+        }
+        // Nothing was delivered or created by the rejected commands, even
+        // when the bad ID is on the second stream.
+        run(
+            &["XGROUP", "CREATE", "t", "g", "0", "MKSTREAM"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(
+                &[
+                    "XREADGROUP",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "STREAMS",
+                    "s",
+                    "t",
+                    ">",
+                    "$"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str(
+                "ERR The $ ID is meaningless in the context of XREADGROUP: you want to read the history of this consumer by specifying a proper ID, or use the > ID to get new messages. The $ ID would just return an empty result set."
+            )
+        );
+        assert_eq!(
+            run(&["XINFO", "CONSUMERS", "s", "g"], &mut server, &mut client),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(
+                &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", "bad"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        // The group is looked up before the ID is judged.
+        assert!(matches!(
+            run(
+                &["XREADGROUP", "GROUP", "nogroup", "c", "STREAMS", "s", "$"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+        ));
+        assert_eq!(
+            run(&["XREAD", "STREAMS", "s", ">"], &mut server, &mut client),
+            RespFrame::error_str(
+                "ERR The > ID can be specified only when calling XREADGROUP using the GROUP <group> <consumer> option."
+            )
+        );
+    }
+
+    #[test]
+    fn xrange_count_follows_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        // A negative COUNT is 0, and COUNT 0 is a null array.
+        for count in ["-1", "0"] {
+            assert_eq!(
+                run(
+                    &["XRANGE", "s", "-", "+", "COUNT", count],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::NullArray
+            );
+            assert_eq!(
+                run(
+                    &["XREVRANGE", "s", "+", "-", "COUNT", count],
+                    &mut server,
+                    &mut client
+                ),
+                RespFrame::NullArray
+            );
+        }
+        // A missing key is still an empty array, and the last COUNT wins.
+        assert_eq!(
+            run(
+                &["XRANGE", "none", "-", "+", "COUNT", "0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            stream_ids(run(
+                &["XRANGE", "s", "-", "+", "COUNT", "1", "COUNT", "2"],
+                &mut server,
+                &mut client
+            )),
+            ["1-0", "2-0"]
+        );
+        assert_eq!(
+            run(
+                &["XRANGE", "s", "-", "+", "COUNT"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR syntax error")
+        );
+        assert_eq!(
+            run(
+                &["XRANGE", "s", "-", "+", "COUNT", "x"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+    }
+
+    /// Runs a command with the clock frozen at `ms`, so delivery times and
+    /// idle times are exact however loaded the machine is.
+    fn run_at(
+        ms: i64,
+        parts: &[&str],
+        server: &mut ServerState,
+        client: &mut ClientState,
+    ) -> RespFrame {
+        ratatosk_core::time::with_command_time(ms, || run(parts, server, client))
+    }
+
+    #[test]
+    fn xpending_idle_and_argument_order_follow_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run_at(
+            1_000_000,
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let syntax = RespFrame::error_str("ERR syntax error");
+        // Argument shapes Redis rejects as syntax errors.
+        for parts in [
+            &["XPENDING", "s", "g", "-"][..],
+            &["XPENDING", "s", "g", "-", "+"],
+            &[
+                "XPENDING", "s", "g", "-", "+", "10", "c", "extra", "more", "most",
+            ],
+            &["XPENDING", "s", "g", "IDLE", "5", "-", "+"],
+            // More than 9 arguments in all.
+            &[
+                "XPENDING", "s", "g", "IDLE", "0", "-", "+", "10", "c", "extra",
+            ],
+        ] {
+            assert_eq!(run(parts, &mut server, &mut client), syntax, "{parts:?}");
+        }
+        // Within 9 arguments Redis ignores anything past the consumer.
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "-", "+", "10", "c", "extra"],
+                &mut server,
+                &mut client
+            ),
+            run(
+                &["XPENDING", "s", "g", "-", "+", "10", "c"],
+                &mut server,
+                &mut client
+            )
+        );
+        // The IDs and count are checked before the group is looked up.
+        assert_eq!(
+            run(
+                &["XPENDING", "none", "g", "x", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            invalid_id_error()
+        );
+        assert_eq!(
+            run(
+                &["XPENDING", "none", "g", "-", "+", "x"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "IDLE", "x", "-", "+", "10"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::error_str("ERR value is not an integer or out of range")
+        );
+        assert!(matches!(
+            run(&["XPENDING", "none", "g", "-", "+", "10"], &mut server, &mut client),
+            RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+        ));
+        // A negative count lists nothing.
+        assert_eq!(
+            run(
+                &["XPENDING", "s", "g", "-", "+", "-1"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+
+        // IDLE keeps only entries idle for at least that long. The entries
+        // were delivered at 1_000_000 and are listed 5000 ms later.
+        let listed =
+            |idle: &str, tail: &[&str], server: &mut ServerState, client: &mut ClientState| {
+                let mut parts = vec!["XPENDING", "s", "g", "IDLE", idle, "-", "+"];
+                parts.extend_from_slice(tail);
+                stream_ids(run_at(1_005_000, &parts, server, client))
+            };
+        for (idle, expected) in [
+            ("0", vec!["1-0", "2-0", "3-0"]),
+            ("5000", vec!["1-0", "2-0", "3-0"]),
+            ("5001", vec![]),
+            ("3600000", vec![]),
+        ] {
+            assert_eq!(
+                listed(idle, &["10"], &mut server, &mut client),
+                expected,
+                "IDLE {idle}"
+            );
+        }
+        assert_eq!(
+            listed("0", &["2", "c"], &mut server, &mut client),
+            ["1-0", "2-0"]
+        );
+        // The idle time in the reply is exact too.
+        let RespFrame::Array(rows) = run_at(
+            1_005_000,
+            &["XPENDING", "s", "g", "-", "+", "1"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XPENDING should return an array");
+        };
+        let RespFrame::Array(row) = &rows[0] else {
+            panic!("a pending entry should be an array");
+        };
+        assert_eq!(row[2], RespFrame::Integer(5000));
+    }
+
+    #[test]
+    fn xclaim_options_follow_redis() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        for (parts, expected) in [
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "1-0", "BOGUS"][..],
+                "ERR Unrecognized XCLAIM option 'BOGUS'",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "foo"],
+                "ERR Unrecognized XCLAIM option 'foo'",
+            ),
+            // An option before the IDs ends the ID list, so the ID after it
+            // is read as an option.
+            (
+                &["XCLAIM", "s", "g", "c2", "0", "JUSTID", "1-0"],
+                "ERR Unrecognized XCLAIM option '1-0'",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+        // JUSTID after the IDs still works, and no IDs is an empty reply.
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c2", "0", "1-0", "2-0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("2-0")])
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c2", "0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+    }
+
+    /// `(consumer, deliveries)` of each pending entry of group `g` on `s`.
+    fn pending_of(server: &ServerState, group: &str) -> Vec<(String, String, i64, i64)> {
+        let mut rows = server
+            .db(0)
+            .get(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(&Bytes::from(group.to_owned())))
+            .map(|group| {
+                group
+                    .pending
+                    .iter()
+                    .map(|(id, pending)| {
+                        (
+                            format!("{}-{}", id.ms, id.seq),
+                            String::from_utf8_lossy(&pending.consumer).into_owned(),
+                            pending.deliveries,
+                            pending.last_delivered_ms,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        rows.sort();
+        rows
+    }
+
+    fn claim_setup() -> (ServerState, ClientState) {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        (server, client)
+    }
+
+    #[test]
+    fn xclaim_options_and_delivery_counts_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        let deliveries = |server: &ServerState, id: &str| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == id)
+                .map(|row| row.2)
+                .expect("pending entry")
+        };
+        let consumer_of = |server: &ServerState, id: &str| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == id)
+                .map(|row| row.1)
+                .expect("pending entry")
+        };
+
+        // A claim counts a delivery, JUSTID does not, RETRYCOUNT sets it, and a
+        // negative RETRYCOUNT is as if absent.
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "1-0"), 2);
+        assert_eq!(consumer_of(&server, "1-0"), "c2");
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "2-0", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "2-0"), 1);
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "3-0", "RETRYCOUNT", "7"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "3-0"), 7);
+        run(
+            &["XCLAIM", "s", "g", "c3", "0", "3-0", "RETRYCOUNT", "-4"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(deliveries(&server, "3-0"), 8);
+        assert_eq!(consumer_of(&server, "3-0"), "c3");
+        // The reply is the entries, or bare IDs with JUSTID.
+        assert_eq!(
+            stream_ids(run(
+                &["XCLAIM", "s", "g", "c3", "0", "1-0", "2-0"],
+                &mut server,
+                &mut client
+            )),
+            ["1-0", "2-0"]
+        );
+
+        // The minimum idle time skips entries delivered more recently, and a
+        // negative one is 0.
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c4", "3600000", "1-0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "g", "c4", "-5", "1-0", "JUSTID"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0")])
+        );
+
+        // IDLE and TIME set the delivery time; a time in the future is now.
+        // The clock is frozen so the times are exact.
+        let delivery_time = |server: &ServerState| {
+            pending_of(server, "g")
+                .into_iter()
+                .find(|row| row.0 == "1-0")
+                .expect("pending entry")
+                .3
+        };
+        run_at(
+            2_000_000,
+            &[
+                "XCLAIM", "s", "g", "c4", "0", "1-0", "IDLE", "10000", "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(delivery_time(&server), 1_990_000);
+        run_at(
+            2_000_000,
+            &[
+                "XCLAIM", "s", "g", "c4", "0", "1-0", "TIME", "12345", "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(delivery_time(&server), 12345);
+        run_at(
+            2_000_000,
+            &[
+                "XCLAIM",
+                "s",
+                "g",
+                "c4",
+                "0",
+                "1-0",
+                "TIME",
+                "99999999999999",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(delivery_time(&server), 2_000_000);
+
+        // FORCE creates the pending entry of an entry that exists, counting
+        // the creation as the first delivery; a missing entry is ignored.
+        run(
+            &["XGROUP", "CREATE", "s", "h", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "FORCE"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "3-0", "FORCE", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "9-0", "FORCE", "JUSTID"],
+            &mut server,
+            &mut client,
+        );
+        let forced = pending_of(&server, "h");
+        assert_eq!(
+            forced
+                .iter()
+                .map(|row| (row.0.as_str(), row.2))
+                .collect::<Vec<_>>(),
+            [("2-0", 2), ("3-0", 1)]
+        );
+        assert_eq!(
+            run(
+                &["XCLAIM", "s", "h", "c", "0", "1-0"],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(vec![])
+        );
+
+        // LASTID moves the group's last delivered ID forward only.
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "LASTID", "2-5"],
+            &mut server,
+            &mut client,
+        );
+        let last = |server: &ServerState| {
+            server
+                .db(0)
+                .get(&Bytes::from_static(b"s"))
+                .and_then(|value| value.as_stream_groups())
+                .and_then(|groups| groups.get(&Bytes::from_static(b"h")))
+                .map(|group| (group.last_delivered_id.ms, group.last_delivered_id.seq))
+                .unwrap()
+        };
+        assert_eq!(last(&server), (2, 5));
+        run(
+            &["XCLAIM", "s", "h", "c", "0", "2-0", "LASTID", "1-1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(last(&server), (2, 5));
+
+        // Claiming creates the consumer even when nothing is claimed.
+        run(
+            &["XCLAIM", "s", "h", "newbie", "0", "8-0"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(consumers) =
+            run(&["XINFO", "CONSUMERS", "s", "h"], &mut server, &mut client)
+        else {
+            panic!("XINFO CONSUMERS should return an array");
+        };
+        assert_eq!(consumers.len(), 2);
+    }
+
+    #[test]
+    fn xclaim_errors_and_their_order_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        // The key and group come first, whatever else is wrong.
+        for parts in [
+            &["XCLAIM", "none", "g", "c", "x", "bad", "BOGUS"][..],
+            &["XCLAIM", "s", "nogroup", "c", "x", "1-0"],
+        ] {
+            assert!(
+                matches!(
+                    run(parts, &mut server, &mut client),
+                    RespFrame::Error(text) if text.starts_with(b"NOGROUP")
+                ),
+                "{parts:?}"
+            );
+        }
+        for (parts, expected) in [
+            (
+                &["XCLAIM", "s", "g", "c", "x", "1-0"][..],
+                "ERR Invalid min-idle-time argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "IDLE", "x"],
+                "ERR Invalid IDLE option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "TIME", "x"],
+                "ERR Invalid TIME option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "RETRYCOUNT", "x"],
+                "ERR Invalid RETRYCOUNT option argument for XCLAIM",
+            ),
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "LASTID", "x"],
+                "ERR Invalid stream ID specified as stream command argument",
+            ),
+            // An option that needs a value but is last is unrecognized.
+            (
+                &["XCLAIM", "s", "g", "c", "0", "1-0", "IDLE"],
+                "ERR Unrecognized XCLAIM option 'IDLE'",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xautoclaim_bounds_cursor_and_deleted_ids_follow_redis() {
+        let (mut server, mut client) = claim_setup();
+        for (parts, expected) in [
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "0"][..],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "-1"],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT", "x"],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &[
+                    "XAUTOCLAIM",
+                    "s",
+                    "g",
+                    "c2",
+                    "0",
+                    "0",
+                    "COUNT",
+                    "9223372036854775807",
+                ],
+                "ERR COUNT must be > 0",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "x", "0"],
+                "ERR Invalid min-idle-time argument for XAUTOCLAIM",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "COUNT"],
+                "ERR syntax error",
+            ),
+            (
+                &["XAUTOCLAIM", "s", "g", "c2", "0", "0", "BOGUS"],
+                "ERR syntax error",
+            ),
+        ] {
+            assert_eq!(
+                run(parts, &mut server, &mut client),
+                RespFrame::error_str(expected),
+                "{parts:?}"
+            );
+        }
+        // The largest accepted COUNT is LONG_MAX / 16.
+        assert!(matches!(
+            run(
+                &[
+                    "XAUTOCLAIM",
+                    "s",
+                    "g",
+                    "c2",
+                    "0",
+                    "0",
+                    "COUNT",
+                    "576460752303423487",
+                    "JUSTID"
+                ],
+                &mut server,
+                &mut client
+            ),
+            RespFrame::Array(_)
+        ));
+
+        // JUSTID leaves the delivery count alone, a plain claim adds one, and
+        // a negative min-idle is 0.
+        run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c2",
+                "-3",
+                "0",
+                "COUNT",
+                "1",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(pending_of(&server, "g")[0].2, 1);
+        run(
+            &["XAUTOCLAIM", "s", "g", "c3", "0", "0", "COUNT", "1"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(pending_of(&server, "g")[0].2, 2);
+
+        // COUNT bounds the claims and the cursor is the next pending ID.
+        let RespFrame::Array(parts) = run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c4",
+                "0",
+                "0",
+                "COUNT",
+                "2",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("3-0"));
+        assert_eq!(
+            parts[1],
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("2-0")])
+        );
+        assert_eq!(parts[2], RespFrame::Array(vec![]));
+
+        // Only ten times COUNT pending entries are looked at: skipped ones
+        // (too fresh for min-idle) use up attempts, so the cursor stops early.
+        let mut busy = ServerState::with_default_dbs();
+        let mut client2 = ClientState::default();
+        fill_stream("s", 12, &mut busy, &mut client2);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut busy,
+            &mut client2,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut busy,
+            &mut client2,
+        );
+        let RespFrame::Array(parts) = run(
+            &["XAUTOCLAIM", "s", "g", "c2", "3600000", "0", "COUNT", "1"],
+            &mut busy,
+            &mut client2,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("11-0"));
+        assert_eq!(parts[1], RespFrame::Array(vec![]));
+
+        // Entries missing from the stream leave the pending list and are
+        // reported as deleted, using up COUNT.
+        let (mut server, mut client) = claim_setup();
+        server
+            .db_mut(0)
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_entries_mut())
+            .expect("stream")
+            .retain(|entry| entry.id.ms != 2);
+        let RespFrame::Array(parts) = run(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c2",
+                "0",
+                "0",
+                "COUNT",
+                "5",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XAUTOCLAIM should return an array");
+        };
+        assert_eq!(parts[0], RespFrame::bulk_str("0-0"));
+        assert_eq!(
+            parts[1],
+            RespFrame::Array(vec![RespFrame::bulk_str("1-0"), RespFrame::bulk_str("3-0")])
+        );
+        assert_eq!(parts[2], RespFrame::Array(vec![RespFrame::bulk_str("2-0")]));
+        assert_eq!(pending_of(&server, "g").len(), 2);
+    }
+
+    #[test]
+    fn empty_xpending_summary_ends_with_a_null_array() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 1, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(
+            run(&["XPENDING", "s", "g"], &mut server, &mut client),
+            RespFrame::Array(vec![
+                RespFrame::Integer(0),
+                RespFrame::BulkString(None),
+                RespFrame::BulkString(None),
+                RespFrame::NullArray,
+            ])
+        );
+    }
+
+    #[test]
+    fn claims_are_logged_by_outcome_and_replay_to_the_same_pending_list() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let mut log: Vec<Vec<Bytes>> = Vec::new();
+        fn record(
+            parts: &[&str],
+            server: &mut ServerState,
+            client: &mut ClientState,
+            log: &mut Vec<Vec<Bytes>>,
+        ) {
+            run(parts, server, client);
+            if let Some(effects) = client.take_durability_effects() {
+                log.extend(effects.commands.into_iter().map(|command| command.argv));
+            }
+        }
+        fn shape(argv: &[Bytes]) -> Vec<String> {
+            argv.iter()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect()
+        }
+        for ms in 1..=4 {
+            let id = format!("{ms}-0");
+            record(
+                &["XADD", "s", &id, "f", "v"],
+                &mut server,
+                &mut client,
+                &mut log,
+            );
+        }
+        record(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        record(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        record(
+            &["XCLAIM", "s", "g", "c2", "0", "3-0", "4-0", "JUSTID"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        let before = log.len();
+        record(
+            &["XCLAIM", "s", "g", "c2", "0", "1-0", "2-0", "IDLE", "5000"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        // Two claimed entries make two explicit commands.
+        assert_eq!(log.len(), before + 2);
+        let first = shape(&log[before]);
+        assert_eq!(&first[..6], ["XCLAIM", "s", "g", "c2", "0", "1-0"]);
+        assert_eq!(first[6], "TIME");
+        assert_eq!(
+            &first[8..],
+            ["RETRYCOUNT", "2", "FORCE", "JUSTID", "LASTID", "4-0"]
+        );
+        record(
+            &[
+                "XAUTOCLAIM",
+                "s",
+                "g",
+                "c3",
+                "0",
+                "0",
+                "COUNT",
+                "1",
+                "JUSTID",
+            ],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        // A claim that finds nothing is logged as an XCLAIM that only carries
+        // LASTID, which stands for the consumer it created.
+        let before = log.len();
+        record(
+            &["XCLAIM", "s", "g", "c4", "3600000", "3-0"],
+            &mut server,
+            &mut client,
+            &mut log,
+        );
+        assert_eq!(log.len(), before + 1);
+        assert_eq!(shape(&log[before])[0], "XCLAIM");
+        assert_eq!(shape(&log[before])[5], "LASTID");
+        assert_eq!(log[before].len(), 7);
+
+        // Replay later, so that the clock differs; the delivery times and
+        // counts still match because they are logged.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for argv in &log {
+            assert!(
+                !matches!(
+                    run_bytes(argv, &mut replayed, &mut replay_client),
+                    RespFrame::Error(_)
+                ),
+                "replaying {argv:?} failed"
+            );
+        }
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
+    }
+
+    #[test]
+    fn xreadgroup_reassigning_a_pending_id_moves_it_between_consumers() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "a", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        // Rewinding the group delivers the same IDs to another consumer.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let pending = |server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(rows) = run(&["XINFO", "CONSUMERS", "s", "g"], server, client)
+            else {
+                panic!("XINFO CONSUMERS should return an array");
+            };
+            rows.into_iter()
+                .map(|row| {
+                    let RespFrame::Array(fields) = row else {
+                        panic!("a consumer should be an array");
+                    };
+                    (fields[1].clone(), fields[3].clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(3)),
+            ]
+        );
+        // The delivery count restarts at 1 whether or not the owner changed.
+        run(
+            &["XGROUP", "SETID", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "b", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let RespFrame::Array(rows) = run(
+            &["XPENDING", "s", "g", "-", "+", "10"],
+            &mut server,
+            &mut client,
+        ) else {
+            panic!("XPENDING should return an array");
+        };
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let RespFrame::Array(fields) = row else {
+                panic!("a pending entry should be an array");
+            };
+            assert_eq!(fields[1], RespFrame::bulk_str("b"));
+            assert_eq!(fields[3], RespFrame::Integer(1));
+        }
+
+        // Trimming everything leaves no pending entry on either consumer.
+        run(&["XTRIM", "s", "MAXLEN", "0"], &mut server, &mut client);
+        assert_eq!(
+            pending(&mut server, &mut client),
+            [
+                (RespFrame::bulk_str("a"), RespFrame::Integer(0)),
+                (RespFrame::bulk_str("b"), RespFrame::Integer(0)),
+            ]
+        );
+    }
+
+    fn consumers_of(server: &ServerState, group: &str) -> Vec<String> {
+        let mut names = server
+            .db(0)
+            .get(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups())
+            .and_then(|groups| groups.get(&Bytes::from(group.to_owned())))
+            .map(|group| {
+                group
+                    .consumers
+                    .keys()
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// Stream `s` with 1-0 and 2-0 read by c1, plus a pending entry for the
+    /// missing 9-0, which a RESTORE or RDB payload can carry.
+    fn dangling_claim_setup() -> (ServerState, ClientState) {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &["XREADGROUP", "GROUP", "g", "c1", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        let mut db = server.db_mut(0);
+        let group = db
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups_mut())
+            .and_then(|groups| groups.get_mut(&Bytes::from_static(b"g")))
+            .expect("group");
+        // Both builds of this state must match, whatever the clock said.
+        for pending in group.pending.values_mut() {
+            pending.last_delivered_ms = 1;
+        }
+        let id = crate::keyspace::StreamId { ms: 9, seq: 0 };
+        group.pending.insert(
+            id,
+            crate::keyspace::StreamPendingEntry {
+                consumer: Bytes::from_static(b"c1"),
+                deliveries: 1,
+                last_delivered_ms: 1,
+            },
+        );
+        group
+            .consumers
+            .get_mut(&Bytes::from_static(b"c1"))
+            .expect("c1")
+            .pending
+            .insert(id);
+        drop(db);
+        (server, client)
+    }
+
+    fn replay_claim_log(log: &[Vec<Bytes>]) -> ServerState {
+        let (mut replayed, _) = dangling_claim_setup();
+        let mut client = ClientState::default();
+        for argv in log {
+            let reply = run_bytes(argv, &mut replayed, &mut client);
+            assert!(
+                !matches!(reply, RespFrame::Error(_)),
+                "{argv:?} -> {reply:?}"
+            );
+        }
+        replayed
+    }
+
+    #[test]
+    fn claims_that_drop_dangling_entries_are_logged_so_replay_matches() {
+        // XCLAIM of a pending ID whose entry is gone, next to a real claim.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XCLAIM", "s", "g", "c2", "0", "9-0", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        let log = effects
+            .commands
+            .into_iter()
+            .map(|command| command.argv)
+            .collect::<Vec<_>>();
+        assert!(
+            log.iter()
+                .any(|argv| argv[0].as_ref() == b"XACK" && argv[3].as_ref() == b"9-0")
+        );
+        let replayed = replay_claim_log(&log);
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
+        assert_eq!(consumers_of(&replayed, "g"), consumers_of(&server, "g"));
+        assert!(!pending_of(&replayed, "g").iter().any(|row| row.0 == "9-0"));
+
+        // XAUTOCLAIM that only finds the dangling entry still created its
+        // consumer, which the log carries next to the XACK.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XAUTOCLAIM", "s", "g", "c2", "0", "3-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        let log = effects
+            .commands
+            .into_iter()
+            .map(|command| command.argv)
+            .collect::<Vec<_>>();
+        assert!(log.iter().any(|argv| argv[0].as_ref() == b"XACK"));
+        let replayed = replay_claim_log(&log);
+        assert_eq!(pending_of(&replayed, "g"), pending_of(&server, "g"));
+        assert_eq!(consumers_of(&server, "g"), ["c1", "c2"]);
+        assert_eq!(consumers_of(&replayed, "g"), ["c1", "c2"]);
+
+        // A claim that found nothing is logged as a LASTID-only XCLAIM that
+        // stands for the consumer.
+        let (mut server, mut client) = dangling_claim_setup();
+        client.set_durability_capture_enabled(true);
+        run(
+            &["XCLAIM", "s", "g", "ghost", "9223372036854775807", "1-0"],
+            &mut server,
+            &mut client,
+        );
+        let effects = client.take_durability_effects().expect("claim effects");
+        assert_eq!(effects.commands.len(), 1);
+        let shape = effects.commands[0]
+            .argv
+            .iter()
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(shape[..6], ["XCLAIM", "s", "g", "ghost", "0", "LASTID"]);
+        let log = vec![effects.commands[0].argv.clone()];
+        assert_eq!(consumers_of(&replay_claim_log(&log), "g"), ["c1", "ghost"]);
+    }
+
+    #[test]
+    fn xread_and_xreadgroup_count_zero_means_no_limit() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        let read_len = |frame: RespFrame| -> usize {
+            let RespFrame::Array(streams) = frame else {
+                return 0;
+            };
+            let RespFrame::Array(stream) = &streams[0] else {
+                panic!("stream reply should be an array");
+            };
+            let RespFrame::Array(rows) = &stream[1] else {
+                panic!("entries should be an array");
+            };
+            rows.len()
+        };
+        for count in ["0", "-3"] {
+            assert_eq!(
+                read_len(run(
+                    &["XREAD", "COUNT", count, "STREAMS", "s", "0"],
+                    &mut server,
+                    &mut client
+                )),
+                3,
+                "XREAD COUNT {count}"
+            );
+        }
+        assert_eq!(
+            read_len(run(
+                &[
+                    "XREADGROUP",
+                    "GROUP",
+                    "g",
+                    "c",
+                    "COUNT",
+                    "0",
+                    "STREAMS",
+                    "s",
+                    ">"
+                ],
+                &mut server,
+                &mut client
+            )),
+            3
+        );
+
+        // XINFO STREAM FULL: a negative COUNT is the default of 10.
+        fill_stream("big", 12, &mut server, &mut client);
+        let listed = |count: &str, server: &mut ServerState, client: &mut ClientState| {
+            let RespFrame::Array(info) = run(
+                &["XINFO", "STREAM", "big", "FULL", "COUNT", count],
+                server,
+                client,
+            ) else {
+                panic!("XINFO STREAM FULL should return an array");
+            };
+            let at = info
+                .iter()
+                .position(|item| *item == RespFrame::bulk_str("entries"))
+                .expect("entries");
+            match &info[at + 1] {
+                RespFrame::Array(rows) => rows.len(),
+                other => panic!("entries should be an array, got {other:?}"),
+            }
+        };
+        assert_eq!(listed("-1", &mut server, &mut client), 10);
+        assert_eq!(listed("0", &mut server, &mut client), 12);
+        assert_eq!(listed("5", &mut server, &mut client), 5);
+    }
+
+    #[test]
+    fn a_huge_entries_read_counter_does_not_overflow() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        fill_stream("s", 2, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        server
+            .db_mut(0)
+            .get_mut(&Bytes::from_static(b"s"))
+            .and_then(|value| value.as_stream_groups_mut())
+            .and_then(|groups| groups.get_mut(&Bytes::from_static(b"g")))
+            .expect("group")
+            .entries_read = Some(u64::MAX);
+        run(
+            &["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"],
+            &mut server,
+            &mut client,
+        );
+        assert!(matches!(
+            run(&["XINFO", "GROUPS", "s"], &mut server, &mut client),
+            RespFrame::Array(_)
+        ));
+    }
+
+    fn lag_of(
+        server: &mut ServerState,
+        client: &mut ClientState,
+        idx: usize,
+    ) -> (Option<i64>, Option<i64>) {
+        let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "x"], server, client) else {
+            panic!("XINFO GROUPS should return an array");
+        };
+        let RespFrame::Array(fields) = &groups[idx] else {
+            panic!("a group should be an array");
+        };
+        let number = |frame: &RespFrame| match frame {
+            RespFrame::Integer(n) => Some(*n),
+            _ => None,
+        };
+        (number(&fields[9]), number(&fields[11]))
+    }
+
+    /// The consumer group lag tests of Redis's stream-cgroups.tcl.
+    #[test]
+    fn consumer_group_lag_matches_redis_cgroup_tests() {
+        let mut s = ServerState::with_default_dbs();
+        let mut c = ClientState::default();
+        macro_rules! r {
+            ($($a:expr),*) => { run(&[$($a),*], &mut s, &mut c) };
+        }
+        let ids = ["1-0", "2-0", "3-0", "4-0", "5-0"];
+        // Empty streams.
+        r!("XGROUP", "CREATE", "x", "g1", "0", "MKSTREAM");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(0)));
+        r!("XADD", "x", "1-0", "data", "a");
+        r!("XDEL", "x", "1-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(0)));
+        // Sanity.
+        r!("DEL", "x");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!("XGROUP", "CREATE", "x", "g1", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, Some(5)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c11",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(4)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c12",
+            "COUNT",
+            "10",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        // XDELs.
+        r!("DEL", "x");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!("XDEL", "x", "3-0");
+        r!("XGROUP", "CREATE", "x", "g1", "0");
+        r!("XGROUP", "CREATE", "x", "g2", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (None, None));
+        for _ in 0..3 {
+            r!(
+                "XREADGROUP",
+                "GROUP",
+                "g1",
+                "c11",
+                "COUNT",
+                "1",
+                "STREAMS",
+                "x",
+                ">"
+            );
+            assert_eq!(lag_of(&mut s, &mut c, 0), (None, None));
+        }
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "g1",
+            "c11",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        r!("XTRIM", "x", "MINID", "=", "3-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        assert_eq!(lag_of(&mut s, &mut c, 1), (None, Some(3)));
+        r!("XTRIM", "x", "MINID", "=", "5-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        assert_eq!(lag_of(&mut s, &mut c, 1), (None, Some(2)));
+        // A tombstone after the last ID.
+        r!("DEL", "x");
+        r!("XGROUP", "CREATE", "x", "g1", "$", "MKSTREAM");
+        r!("XADD", "x", "1-0", "data", "a");
+        r!("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "x", ">");
+        r!("XADD", "x", "2-0", "data", "c");
+        r!("XADD", "x", "3-0", "data", "d");
+        r!("XDEL", "x", "2-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), None));
+        r!("XDEL", "x", "1-0");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(1)));
+        r!("XREADGROUP", "GROUP", "g1", "alice", "STREAMS", "x", ">");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(3), Some(0)));
+        // XTRIM.
+        r!("DEL", "x");
+        r!("XGROUP", "CREATE", "x", "mygroup", "$", "MKSTREAM");
+        for id in ids {
+            r!("XADD", "x", id, "data", "a");
+        }
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "COUNT",
+            "1",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(4)));
+        r!("XTRIM", "x", "MAXLEN", "1");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(1), Some(1)));
+        r!(
+            "XREADGROUP",
+            "GROUP",
+            "mygroup",
+            "alice",
+            "STREAMS",
+            "x",
+            ">"
+        );
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(0)));
+        r!("XADD", "x", "6-0", "data", "f");
+        assert_eq!(lag_of(&mut s, &mut c, 0), (Some(5), Some(1)));
+        r!("XTRIM", "x", "MAXLEN", "0");
+        assert_eq!(lag_of(&mut s, &mut c, 0).1, Some(0));
+    }
+
+    #[test]
+    fn xreadgroup_logs_leave_out_a_count_of_zero_or_less() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        fill_stream("s", 3, &mut server, &mut client);
+        run(
+            &["XGROUP", "CREATE", "s", "g", "0"],
+            &mut server,
+            &mut client,
+        );
+        client.take_durability_effects();
+        // COUNT 0 is no limit now, so everything is delivered, and the logged
+        // record has no COUNT for an earlier version to read as "nothing".
+        let reply = run(
+            &[
+                "XREADGROUP",
+                "GROUP",
+                "g",
+                "c",
+                "COUNT",
+                "0",
+                "STREAMS",
+                "s",
+                ">",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert!(matches!(reply, RespFrame::Array(_)));
+        assert_eq!(pending_of(&server, "g").len(), 3);
+        let logged = logged_argv(&mut client).expect("XREADGROUP is logged");
+        assert_eq!(
+            logged,
+            ["XREADGROUP", "GROUP", "g", "c", "STREAMS", "s", ">"].map(str::to_owned)
+        );
+        // A repeated COUNT is logged as the one that ran: the last, dropped
+        // when it is 0 or less and kept alone when positive.
+        let cases: [(&[&str], &[&str]); 3] = [
+            (&["COUNT", "2", "COUNT", "-1"], &[]),
+            (&["COUNT", "1", "COUNT", "0"], &[]),
+            (&["COUNT", "5", "COUNT", "2"], &["COUNT", "2"]),
+        ];
+        for (given, logged_count) in cases {
+            run(
+                &["XGROUP", "SETID", "s", "g", "0"],
+                &mut server,
+                &mut client,
+            );
+            client.take_durability_effects();
+            let mut parts = vec!["XREADGROUP", "GROUP", "g", "c"];
+            parts.extend_from_slice(given);
+            parts.extend_from_slice(&["STREAMS", "s", ">"]);
+            run(&parts, &mut server, &mut client);
+            let mut expected = vec!["XREADGROUP", "GROUP", "g", "c"];
+            expected.extend_from_slice(logged_count);
+            expected.extend_from_slice(&["STREAMS", "s", ">"]);
+            let logged = logged_argv(&mut client).expect("XREADGROUP is logged");
+            assert_eq!(
+                logged,
+                expected
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .collect::<Vec<_>>()
+            );
+
+            // Replaying the record reads the same entries as the live command.
+            let mut replayed = ServerState::with_default_dbs();
+            let mut replay_client = ClientState::default();
+            fill_stream("s", 3, &mut replayed, &mut replay_client);
+            run(
+                &["XGROUP", "CREATE", "s", "g", "0"],
+                &mut replayed,
+                &mut replay_client,
+            );
+            let argv = logged
+                .iter()
+                .map(|part| Bytes::from(part.clone()))
+                .collect::<Vec<_>>();
+            run_bytes(&argv, &mut replayed, &mut replay_client);
+            // The cursor and read counter match (the live group also holds
+            // entries pending from the earlier cases).
+            let progress = |server: &mut ServerState, client: &mut ClientState| {
+                let RespFrame::Array(groups) = run(&["XINFO", "GROUPS", "s"], server, client)
+                else {
+                    panic!("XINFO GROUPS should return an array");
+                };
+                let RespFrame::Array(group) = &groups[0] else {
+                    panic!("a group should be an array");
+                };
+                (group[7].clone(), group[9].clone(), group[11].clone())
+            };
+            assert_eq!(
+                progress(&mut replayed, &mut replay_client),
+                progress(&mut server, &mut client),
+                "{given:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dump_restore_roundtrips_stream_ids_across_the_u64_range() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        let ids = [
+            "0-1",
+            "9223372036854775807-5",
+            "18446744073709551615-18446744073709551615",
+        ];
+        for id in ids {
+            run(&["XADD", "s", id, "f", "v"], &mut server, &mut client);
+        }
+        let RespFrame::BulkString(Some(payload)) = run(&["DUMP", "s"], &mut server, &mut client)
+        else {
+            panic!("DUMP should return a payload");
+        };
+        assert_eq!(
+            run_bytes(
+                &[
+                    Bytes::from_static(b"RESTORE"),
+                    Bytes::from_static(b"copy"),
+                    Bytes::from_static(b"0"),
+                    payload,
+                ],
+                &mut server,
+                &mut client,
+            ),
+            RespFrame::ok()
+        );
+        let range = |key: &str, server: &mut ServerState, client: &mut ClientState| {
+            run(&["XRANGE", key, "-", "+"], server, client)
+        };
+        assert_eq!(
+            range("copy", &mut server, &mut client),
+            range("s", &mut server, &mut client)
+        );
+        let RespFrame::Array(rows) = range("copy", &mut server, &mut client) else {
+            panic!("XRANGE should return an array");
+        };
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
