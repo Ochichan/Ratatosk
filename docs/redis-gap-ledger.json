@@ -1430,7 +1430,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": "Default build unsupported. With lua-scripting, Lua callbacks reject AUTH/HELLO and nested scripting; feature behavior does not establish full Redis parity."
+      "notes": "Default build unsupported. With lua-scripting, Lua callbacks reject AUTH/HELLO and nested scripting; feature behavior does not establish full Redis parity. Writes are persisted to the AOF as the commands the script ran (one MULTI/EXEC transaction), not as the EVAL."
     },
     {
       "name": "EVALSHA",
@@ -1443,7 +1443,7 @@
       "capability_tier": "unsupported",
       "milestone": "m5-advanced",
       "owner": "",
-      "notes": "Default build unsupported; lua-scripting enables cached execution with the same callback restrictions as EVAL."
+      "notes": "Default build unsupported; lua-scripting enables cached execution with the same callback restrictions as EVAL. AOF persistence is the same as EVAL: the script's writes are logged, not the EVALSHA."
     },
     {
       "name": "EVALSHA_RO",

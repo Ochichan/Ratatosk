@@ -133,11 +133,15 @@ impl LuaRuntime {
             mode,
         } = request;
 
+        // Redis restores the caller's selected db when a script ends.
+        let caller_db = client.selected_db;
+
         // Wrap mutable references in RefCell for shared access by closures.
         let server_cell = RefCell::new(server);
         let client_cell = RefCell::new(client);
 
-        self.lua
+        let result = self
+            .lua
             .scope(|scope| {
                 let globals = self.lua.globals();
 
@@ -255,7 +259,10 @@ impl LuaRuntime {
                 // Convert the first return value to a RESP frame.
                 Ok(lua_multi_to_resp(&result))
             })
-            .map_err(lua_err)
+            .map_err(lua_err);
+        // Every exit path of the scope, including script errors, lands here.
+        client_cell.borrow_mut().selected_db = caller_db;
+        result
     }
 }
 
@@ -314,6 +321,17 @@ fn redis_call_impl(
         return reject_script_call(lua, protected, message);
     }
 
+    // Redis checks this per nested command (scriptVerifyWriteCommandAllow), not
+    // for the EVAL itself, so read-only scripts keep running under the latch.
+    if server.aof_enabled() && super::is_write_command(&cmd_args) {
+        if let Some(detail) = server.aof_last_error() {
+            let message = format!(
+                "MISCONF writes are blocked because AOF persistence is in an error state; last_error={detail}"
+            );
+            return reject_script_call(lua, protected, &message);
+        }
+    }
+
     // Build a RespFrame::Array for execute()
     let frame = RespFrame::Array(
         cmd_args
@@ -326,6 +344,8 @@ fn redis_call_impl(
         let mut access = super::ServerAccess::new_inline(server);
         super::execute(frame, &mut access, client)
     };
+    // Redis 7 effects replication: log what the script did, not the script.
+    client.collect_script_durability_effects();
 
     if !protected {
         // redis.call() -- propagate errors as Lua errors
@@ -339,7 +359,7 @@ fn redis_call_impl(
     resp_to_lua(lua, &outcome.response)
 }
 
-fn reject_script_call(lua: &Lua, protected: bool, message: &'static str) -> LuaResult<Value> {
+fn reject_script_call(lua: &Lua, protected: bool, message: &str) -> LuaResult<Value> {
     if protected {
         let table = lua.create_table()?;
         table.set("err", message)?;
@@ -361,7 +381,7 @@ fn script_command_restriction(command: &[u8], mode: ScriptMode) -> Option<&'stat
         return Some("ERR Lua scripts can't execute EVAL or EVALSHA commands");
     }
 
-    if matches!(command, b"AUTH" | b"HELLO") {
+    if matches!(command, b"AUTH" | b"HELLO" | b"RESET") {
         return Some("ERR This Redis command is not allowed from script");
     }
 
@@ -645,7 +665,6 @@ mod tests {
             b"PUBLISH",
             b"SPUBLISH",
             b"SELECT",
-            b"RESET",
             b"SORT_RO",
             b"GEOSEARCH",
             b"BITFIELD_RO",
@@ -663,7 +682,7 @@ mod tests {
     #[test]
     fn authentication_nested_eval_and_noscript_metadata_apply_to_all_modes() {
         for mode in [ScriptMode::ReadWrite, ScriptMode::ReadOnly] {
-            for command in [b"AUTH".as_slice(), b"HELLO"] {
+            for command in [b"AUTH".as_slice(), b"HELLO", b"RESET"] {
                 assert_eq!(
                     script_command_restriction(command, mode),
                     Some("ERR This Redis command is not allowed from script")

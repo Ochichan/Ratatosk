@@ -1623,6 +1623,133 @@ mod tests {
         server_task.await.expect("server task complete");
     }
 
+    #[cfg(feature = "lua-scripting")]
+    #[tokio::test]
+    async fn aof_latch_refuses_script_writes_but_runs_read_only_scripts() {
+        let (mut client, shared, server_task) =
+            setup_client_server_with_shared(ClientIoLimits::default()).await;
+        {
+            let mut server = shared.meta.lock().await;
+            server.set_aof_enabled(true);
+            server.set_aof_last_error("injected disk error");
+        }
+
+        let frame = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n".to_vec();
+        client.write_all(&frame).await.expect("write");
+        let reply = read_reply(&mut client).await;
+        assert!(reply.starts_with(b"-MISCONF"), "plain SET: {reply:?}");
+
+        // Redis (compat-mode scripts) lets EVAL start and refuses the nested
+        // write inside the script instead.
+        async fn send(client: &mut TcpStream, parts: &[&str]) -> Vec<u8> {
+            let mut frame = format!("*{}\r\n", parts.len()).into_bytes();
+            for part in parts {
+                frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+            }
+            client.write_all(&frame).await.expect("write");
+            read_reply(client).await
+        }
+        let reply = send(&mut client, &["EVAL", "redis.call('SET','k','v')", "0"]).await;
+        assert!(
+            String::from_utf8_lossy(&reply).contains("MISCONF writes are blocked"),
+            "EVAL write: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        let reply = send(
+            &mut client,
+            &["EVAL", "return redis.pcall('SET','k','v')['err']", "0"],
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&reply).contains("MISCONF writes are blocked"),
+            "EVAL pcall write: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(
+            send(&mut client, &["EVAL", "return redis.call('GET','k')", "0"]).await,
+            b"$-1\r\n"
+        );
+        // A read-only script queued in MULTI runs under the latch.
+        assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert_eq!(
+            send(&mut client, &["EVAL", "return 5", "0"]).await,
+            b"+QUEUED\r\n"
+        );
+        assert_eq!(send(&mut client, &["EXEC"]).await, b"*1\r\n:5\r\n");
+        // A write queued before the latch makes EXEC a write operation too.
+        // Redis aborts the transaction instead of leaving the client in MULTI.
+        shared.meta.lock().await.clear_aof_last_error();
+        assert_eq!(send(&mut client, &["WATCH", "w"]).await, b"+OK\r\n");
+        assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert_eq!(send(&mut client, &["SET", "k", "v"]).await, b"+QUEUED\r\n");
+        shared
+            .meta
+            .lock()
+            .await
+            .set_aof_last_error("injected disk error");
+        let reply = send(&mut client, &["EXEC"]).await;
+        assert!(
+            reply.starts_with(
+                b"-EXECABORT Transaction discarded because of: MISCONF writes are blocked"
+            ),
+            "EXEC: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        {
+            // No AOF writer exists in this harness, so turn the AOF off to let
+            // plain writes succeed while the latch is cleared.
+            let mut server = shared.meta.lock().await;
+            server.clear_aof_last_error();
+            server.set_aof_enabled(false);
+        }
+        // Out of MULTI: a new MULTI is accepted and a plain write is not queued.
+        assert_eq!(send(&mut client, &["SET", "plain", "1"]).await, b"+OK\r\n");
+        // The WATCH is gone: touching the key does not fail a later EXEC.
+        assert_eq!(
+            send(&mut client, &["SET", "w", "changed"]).await,
+            b"+OK\r\n"
+        );
+        assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert_eq!(send(&mut client, &["SET", "z", "1"]).await, b"+QUEUED\r\n");
+        assert_eq!(send(&mut client, &["EXEC"]).await, b"*1\r\n+OK\r\n");
+        {
+            let mut server = shared.meta.lock().await;
+            server.set_aof_enabled(true);
+            server.set_aof_last_error("injected disk error");
+        }
+        // A write refused while queueing flags the transaction.
+        assert_eq!(send(&mut client, &["MULTI"]).await, b"+OK\r\n");
+        assert!(
+            send(&mut client, &["SET", "q", "1"])
+                .await
+                .starts_with(b"-MISCONF")
+        );
+        shared.meta.lock().await.clear_aof_last_error();
+        assert!(
+            send(&mut client, &["EXEC"])
+                .await
+                .starts_with(b"-EXECABORT Transaction discarded because of previous errors")
+        );
+        shared
+            .meta
+            .lock()
+            .await
+            .set_aof_last_error("injected disk error");
+        let mut frame = b"*3\r\n".to_vec();
+        for part in ["EVAL_RO", "return 7", "0"] {
+            frame.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+        }
+        client.write_all(&frame).await.expect("write");
+        assert_eq!(read_reply(&mut client).await, b":7\r\n");
+
+        client.write_all(b"QUIT\r\n").await.expect("write quit");
+        let _ = read_reply(&mut client).await;
+        server_task.await.expect("server task complete");
+        let server = shared.meta.lock().await;
+        assert!(!server.db(0).contains_key(&Bytes::from_static(b"k")));
+        assert!(!server.db(0).contains_key(&Bytes::from_static(b"q")));
+    }
+
     #[tokio::test]
     async fn m1_set_get_exists_del_select() {
         let (mut client, server_task) = setup_client_server().await;

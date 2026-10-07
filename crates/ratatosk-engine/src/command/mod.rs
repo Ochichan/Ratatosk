@@ -3618,6 +3618,10 @@ pub struct ClientState {
     monitor_mode: bool,
     durability_capture_enabled: bool,
     durability_effects: Option<DurabilityEffects>,
+    /// Effects of the nested writes of the script that is currently running,
+    /// in execution order. Drained into one transaction when the script ends.
+    #[cfg(feature = "lua-scripting")]
+    script_durable_commands: Vec<DurableCommand>,
     /// Nested EXEC/EVAL dispatches are admitted as one atomic command unit.
     memory_admission_bypass_depth: usize,
 }
@@ -3699,6 +3703,32 @@ impl ClientState {
         }
     }
 
+    /// Reject a command before it runs, as Redis `rejectCommand` does.
+    ///
+    /// EXEC discards the transaction, drops its watches and replies
+    /// `EXECABORT Transaction discarded because of: <error>`. Any other
+    /// command queued inside MULTI flags the transaction so EXEC aborts.
+    /// Pass `data` when the caller can reach the keyspace so watches are
+    /// released; a client that is not authenticated holds none.
+    pub fn reject_command(
+        &mut self,
+        is_exec: bool,
+        response: RespFrame,
+        data: Option<&DataState>,
+    ) -> RespFrame {
+        if is_exec {
+            self.tx_state = TransactionState::default();
+            if let Some(data) = data {
+                self.release_watches(data);
+            }
+            return execabort_reply(&response);
+        }
+        if let TransactionState::InTransaction { has_error, .. } = &mut self.tx_state {
+            *has_error = true;
+        }
+        response
+    }
+
     pub fn has_queued_writes(&self) -> bool {
         match &self.tx_state {
             TransactionState::InTransaction { queue, .. } => {
@@ -3742,6 +3772,27 @@ impl ClientState {
 
     fn set_durability_effects(&mut self, effects: Option<DurabilityEffects>) {
         self.durability_effects = effects;
+    }
+
+    /// Move the effects of the command that just ran into the running
+    /// script's log. Called after each nested `redis.call`.
+    #[cfg(feature = "lua-scripting")]
+    fn collect_script_durability_effects(&mut self) {
+        if let Some(effects) = self.durability_effects.take() {
+            self.script_durable_commands.extend(effects.commands);
+        }
+    }
+
+    /// Publish the collected script effects as one atomic transaction. Reads
+    /// and writes that changed nothing leave the log empty, so nothing is set.
+    #[cfg(feature = "lua-scripting")]
+    fn finish_script_durability_effects(&mut self) {
+        let commands = std::mem::take(&mut self.script_durable_commands);
+        self.durability_effects = if commands.is_empty() {
+            None
+        } else {
+            Some(DurabilityEffects::transaction(commands))
+        };
     }
 
     pub fn set_protocol_version(&mut self, protocol_version: i64) {
@@ -3960,6 +4011,8 @@ impl ClientState {
             monitor_mode: false,
             durability_capture_enabled: false,
             durability_effects: None,
+            #[cfg(feature = "lua-scripting")]
+            script_durable_commands: Vec::new(),
             memory_admission_bypass_depth: 0,
         }
     }
@@ -4004,6 +4057,18 @@ impl Default for ClientState {
     }
 }
 
+/// Build the reply for an EXEC refused before its queue ran.
+pub fn execabort_reply(error: &RespFrame) -> RespFrame {
+    match error {
+        RespFrame::Error(message) => {
+            let mut text = b"EXECABORT Transaction discarded because of: ".to_vec();
+            text.extend_from_slice(message);
+            RespFrame::Error(Bytes::from(text))
+        }
+        other => other.clone(),
+    }
+}
+
 pub enum ExecuteArgvPrecheck {
     Continue,
     Reject(CommandOutcome),
@@ -4033,9 +4098,12 @@ pub fn precheck_execute_argv_with_default_acl(
 
     let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
     if !client.is_authenticated() && !allow_without_auth {
-        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(err(
-            "NOAUTH Authentication required.",
-        )));
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            err("NOAUTH Authentication required."),
+            None,
+        );
+        return ExecuteArgvPrecheck::Reject(CommandOutcome::reply(response));
     }
 
     ExecuteArgvPrecheck::Continue
@@ -4084,7 +4152,12 @@ fn execute_argv_inner(
     let allow_without_auth = allows_execute_without_auth(command.as_slice(), spec);
 
     if !client.is_authenticated() && !allow_without_auth {
-        return CommandOutcome::reply(err("NOAUTH Authentication required."));
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            err("NOAUTH Authentication required."),
+            None,
+        );
+        return CommandOutcome::reply(response);
     }
 
     if client.is_authenticated()
@@ -4098,9 +4171,12 @@ fn execute_argv_inner(
                 .acl
                 .command_allowed_mask(client.acl_user(), required_mask)
             {
-                return CommandOutcome::reply(err(
-                    "NOPERM this user has no permissions to run the command",
-                ));
+                let response = client.reject_command(
+                    command.as_slice() == b"EXEC",
+                    err("NOPERM this user has no permissions to run the command"),
+                    Some(&access.meta.data),
+                );
+                return CommandOutcome::reply(response);
             }
         }
     }
@@ -4164,7 +4240,12 @@ fn execute_argv_inner(
         })
         && should_reject_for_maxmemory(argv, spec, server, client)
     {
-        return CommandOutcome::reply(maxmemory_oom_error());
+        let response = client.reject_command(
+            command.as_slice() == b"EXEC",
+            maxmemory_oom_error(),
+            Some(&server.data),
+        );
+        return CommandOutcome::reply(response);
     }
 
     let args = &argv[1..];
@@ -4548,10 +4629,16 @@ fn execute_argv_inner(
         track_latency,
     );
 
-    // `cmd_exec` gathers the effects of its nested commands itself.  Replacing
-    // them here with a bare EXEC would make recovery both incomplete and
-    // vulnerable to a torn transaction tail.
-    if client.durability_capture_enabled && command.as_slice() != b"EXEC" {
+    // `cmd_exec` and the script commands gather the effects of their nested
+    // commands themselves.  Replacing them here with a bare EXEC (or an EVAL
+    // that is not flagged as a write) would make recovery incomplete or lose
+    // the script's writes entirely.
+    if client.durability_capture_enabled
+        && !matches!(
+            command.as_slice(),
+            b"EXEC" | b"EVAL" | b"EVALSHA" | b"EVAL_RO" | b"EVALSHA_RO"
+        )
+    {
         client.set_durability_effects(capture_durability_effects(
             command.as_slice(),
             argv,
@@ -5747,6 +5834,63 @@ mod tests {
     }
 
     #[test]
+    fn exec_with_extra_arguments_aborts_the_transaction() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "k", "1"], &mut server, &mut client);
+        assert_eq!(
+            run(&["EXEC", "extra"], &mut server, &mut client),
+            RespFrame::error_str(
+                "EXECABORT Transaction discarded because of: wrong number of arguments for 'exec' command"
+            )
+        );
+        assert!(!client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("ERR EXEC without MULTI")
+        );
+        assert_eq!(
+            run(&["GET", "k"], &mut server, &mut client),
+            RespFrame::BulkString(None)
+        );
+    }
+
+    #[test]
+    fn rejected_exec_aborts_the_transaction_and_releases_watches() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        run(&["WATCH", "w"], &mut server, &mut client);
+        run(&["MULTI"], &mut server, &mut client);
+        run(&["SET", "a", "1"], &mut server, &mut client);
+        let reply = client.reject_command(
+            true,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(
+            reply,
+            RespFrame::error_str("EXECABORT Transaction discarded because of: NOPERM nope")
+        );
+        assert!(!client.in_multi());
+        assert!(client.watched.is_empty());
+
+        // A command refused while queued flags the transaction instead.
+        run(&["MULTI"], &mut server, &mut client);
+        let reply = client.reject_command(
+            false,
+            RespFrame::error_str("NOPERM nope"),
+            Some(&server.data),
+        );
+        assert_eq!(reply, RespFrame::error_str("NOPERM nope"));
+        assert!(client.in_multi());
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut client),
+            RespFrame::error_str("EXECABORT Transaction discarded because of previous errors.")
+        );
+    }
+
+    #[test]
     fn multi_queue_oom_dirties_transaction_and_exec_aborts() {
         let mut server = ServerState::with_default_dbs();
         server.config.set_maxmemory(1);
@@ -5789,7 +5933,13 @@ mod tests {
             run(&["SET", "other", &large], &mut server, &mut concurrent),
             RespFrame::ok()
         );
-        assert_oom(run(&["EXEC"], &mut server, &mut transaction));
+        assert_eq!(
+            run(&["EXEC"], &mut server, &mut transaction),
+            RespFrame::error_str(
+                "EXECABORT Transaction discarded because of: OOM command not allowed when used memory > 'maxmemory'"
+            )
+        );
+        assert!(!transaction.in_multi());
         assert_eq!(
             run(&["GET", "queued"], &mut server, &mut transaction),
             RespFrame::BulkString(None)

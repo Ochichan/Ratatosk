@@ -97,6 +97,7 @@ fn cmd_eval_with_mode(
         client,
         mode,
     });
+    client.finish_script_durability_effects();
     CommandOutcome::reply(result)
 }
 
@@ -154,6 +155,7 @@ fn cmd_evalsha_with_mode(
         client,
         mode,
     });
+    client.finish_script_durability_effects();
     CommandOutcome::reply(result)
 }
 
@@ -658,6 +660,352 @@ mod tests {
         assert_error_contains(
             &error,
             "Number of keys can't be greater than number of args",
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    fn run_argv(
+        server: &mut ServerState,
+        client: &mut ClientState,
+        parts: &[&str],
+    ) -> (RespFrame, Option<crate::command::DurabilityEffects>) {
+        let argv = arguments(parts);
+        let mut access = crate::command::ServerAccess::new_inline(server);
+        let response = crate::command::execute_argv(&argv, &mut access, client).response;
+        (response, client.take_durability_effects())
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    fn durable_strings(effects: &crate::command::DurabilityEffects) -> Vec<(usize, Vec<String>)> {
+        effects
+            .commands
+            .iter()
+            .map(|command| {
+                (
+                    command.db_index,
+                    command
+                        .argv
+                        .iter()
+                        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn eval_writes_become_one_atomic_effect_transaction_that_replays_identically() {
+        let script = "redis.call('SET','s','v') \
+            redis.call('INCR','n') \
+            redis.call('SADD','set','a') \
+            redis.call('XADD','x','*','f','1') \
+            redis.call('HSET','h','f','v') \
+            redis.pcall('LPUSH','s','bad') \
+            redis.call('GET','s') \
+            local popped = redis.call('SPOP','set') \
+            redis.call('SELECT','1') \
+            redis.call('SET','other','1') \
+            return popped";
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let (response, effects) = run_argv(&mut server, &mut client, &["EVAL", script, "0"]);
+        assert_eq!(response, RespFrame::bulk_str("a"));
+        let effects = effects.expect("script writes must be durable");
+        assert!(effects.transaction);
+        let strings = durable_strings(&effects);
+        let names: Vec<(usize, &str)> = strings
+            .iter()
+            .map(|(db, argv)| (*db, argv[0].as_str()))
+            .collect();
+        // The failed LPUSH and the read-only GET log nothing. SPOP becomes DEL
+        // because it emptied the set, and XADD carries its generated ID.
+        assert_eq!(
+            names,
+            vec![
+                (0, "SET"),
+                (0, "INCR"),
+                (0, "SADD"),
+                (0, "XADD"),
+                (0, "HSET"),
+                (0, "DEL"),
+                (1, "SET"),
+            ]
+        );
+        assert_ne!(strings[3].1[2], "*");
+
+        let mut replayed = ServerState::with_default_dbs();
+        let mut replay_client = ClientState::default();
+        for (db, argv) in &strings {
+            let select = db.to_string();
+            run_argv(&mut replayed, &mut replay_client, &["SELECT", &select]);
+            let parts: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let (reply, _) = run_argv(&mut replayed, &mut replay_client, &parts);
+            assert!(!matches!(reply, RespFrame::Error(_)), "{argv:?}: {reply:?}");
+        }
+        for db in 0..2 {
+            assert_eq!(
+                server.db(db).len(),
+                replayed.db(db).len(),
+                "db {db} key count"
+            );
+        }
+        let mut probe = ClientState::default();
+        for parts in [
+            &["GET", "s"][..],
+            &["GET", "n"],
+            &["SMEMBERS", "set"],
+            &["XRANGE", "x", "-", "+"],
+            &["HGETALL", "h"],
+        ] {
+            let (live, _) = run_argv(&mut server, &mut probe, parts);
+            let (again, _) = run_argv(&mut replayed, &mut probe, parts);
+            assert_eq!(live, again, "{parts:?}");
+        }
+        run_argv(&mut server, &mut probe, &["SELECT", "1"]);
+        run_argv(&mut replayed, &mut probe, &["SELECT", "1"]);
+        let (live, _) = run_argv(&mut server, &mut probe, &["GET", "other"]);
+        let (again, _) = run_argv(&mut replayed, &mut probe, &["GET", "other"]);
+        assert_eq!(live, again);
+        assert_eq!(live, RespFrame::bulk_str("1"));
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn read_only_failed_and_ro_scripts_log_nothing() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SET", "k", "v"]);
+
+        let (_, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('GET','k')", "0"],
+        );
+        assert!(effects.is_none());
+        let (_, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.pcall('LPUSH','k','x')", "0"],
+        );
+        assert!(effects.is_none(), "failed write must not be logged");
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL_RO", "return redis.pcall('SET','k','x')", "0"],
+        );
+        assert!(matches!(reply, RespFrame::Error(_)));
+        assert!(effects.is_none());
+        let (_, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["SCRIPT", "LOAD", "return redis.call('SET','k','x')"],
+        );
+        assert!(effects.is_none(), "scripts are not persisted, as in Redis");
+        // Stale effects from an earlier script must not leak into the next.
+        run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','a','1')", "0"],
+        );
+        let (_, effects) = run_argv(&mut server, &mut client, &["PING"]);
+        assert!(effects.is_none());
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn writes_before_a_script_error_are_still_logged() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SET','a','1') return redis.call('LPUSH','a','x')",
+                "0",
+            ],
+        );
+        assert!(matches!(reply, RespFrame::Error(_)));
+        let effects = durable_strings(&effects.expect("SET happened"));
+        assert_eq!(
+            effects,
+            vec![(0, vec!["SET".into(), "a".into(), "1".into()])]
+        );
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn script_select_is_undone_on_every_exit_path() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SELECT", "2"]);
+        let scripts = [
+            "redis.call('SELECT','1') return redis.call('SET','a','1')",
+            "redis.call('SELECT','1') return redis.call('LPUSH','nokey')",
+            "redis.call('SELECT','1') return redis.pcall('NOSUCHCMD')",
+            "redis.call('SELECT','1') error('boom')",
+            "redis.call('SELECT','1') return redis.call('NOSUCHCMD')",
+            "redis.call('SELECT','1') while true do end",
+        ];
+        for script in scripts {
+            for cmd in ["EVAL", "EVAL_RO"] {
+                run_argv(&mut server, &mut client, &[cmd, script, "0"]);
+                assert_eq!(client.selected_db(), 2, "{cmd} {script}");
+            }
+        }
+        let (_, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SELECT','1') return redis.call('SET','b','1')",
+                "0",
+            ],
+        );
+        assert_eq!(
+            durable_strings(&effects.expect("effects")),
+            vec![(1, vec!["SET".into(), "b".into(), "1".into()])]
+        );
+        assert_eq!(client.selected_db(), 2);
+        run_argv(
+            &mut server,
+            &mut client,
+            &["EVALSHA", "0000000000000000000000000000000000000000", "0"],
+        );
+        assert_eq!(client.selected_db(), 2);
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn queued_commands_after_eval_in_multi_run_in_the_original_db() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SELECT", "2"]);
+        run_argv(&mut server, &mut client, &["MULTI"]);
+        run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SELECT','1') return redis.call('SET','in1','x')",
+                "0",
+            ],
+        );
+        run_argv(&mut server, &mut client, &["SET", "in2", "y"]);
+        let (_, effects) = run_argv(&mut server, &mut client, &["EXEC"]);
+        assert_eq!(
+            durable_strings(&effects.expect("effects"))
+                .iter()
+                .map(|(db, a)| (*db, a[1].clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, "in1".to_string()), (2, "in2".to_string())]
+        );
+        assert_eq!(client.selected_db(), 2);
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn reset_is_blocked_in_scripts_and_capture_survives() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &[
+                "EVAL",
+                "redis.call('SET','a','1') redis.pcall('RESET') redis.call('SET','b','2') return 1",
+                "0",
+            ],
+        );
+        assert_eq!(reply, RespFrame::Integer(1));
+        let keys: Vec<String> = durable_strings(&effects.expect("effects"))
+            .into_iter()
+            .map(|(_, a)| a[1].clone())
+            .collect();
+        assert_eq!(keys, vec!["a", "b"]);
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('RESET')", "0"],
+        );
+        assert_error_contains(&reply, "not allowed from script");
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn latched_aof_refuses_nested_writes_but_not_reads() {
+        let mut server = ServerState::with_default_dbs();
+        server.set_aof_enabled(true);
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["SET", "k", "v"]);
+        server.set_aof_last_error("disk gone");
+
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('GET','k')", "0"],
+        );
+        assert_eq!(reply, RespFrame::bulk_str("v"));
+        assert!(effects.is_none());
+        let (reply, effects) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','k','x')", "0"],
+        );
+        assert_error_contains(&reply, "MISCONF writes are blocked");
+        assert_error_contains(&reply, "disk gone");
+        assert!(effects.is_none());
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.pcall('DEL','k')['err']", "0"],
+        );
+        assert!(matches!(reply, RespFrame::BulkString(Some(_))), "{reply:?}");
+        let (reply, _) = run_argv(&mut server, &mut client, &["GET", "k"]);
+        assert_eq!(reply, RespFrame::bulk_str("v"));
+
+        // With the AOF off there is nothing to latch.
+        server.set_aof_enabled(false);
+        let (reply, _) = run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','k','x')", "0"],
+        );
+        assert!(!matches!(reply, RespFrame::Error(_)));
+    }
+
+    #[cfg(feature = "lua-scripting")]
+    #[test]
+    fn eval_inside_multi_exec_joins_the_exec_transaction() {
+        let mut server = ServerState::with_default_dbs();
+        let mut client = ClientState::default();
+        client.set_durability_capture_enabled(true);
+        run_argv(&mut server, &mut client, &["MULTI"]);
+        run_argv(&mut server, &mut client, &["SET", "before", "1"]);
+        run_argv(
+            &mut server,
+            &mut client,
+            &["EVAL", "return redis.call('SET','in-script','2')", "0"],
+        );
+        let (reply, effects) = run_argv(&mut server, &mut client, &["EXEC"]);
+        assert!(matches!(reply, RespFrame::Array(_)));
+        let effects = effects.expect("EXEC effects");
+        assert!(effects.transaction);
+        let strings = durable_strings(&effects);
+        assert_eq!(
+            strings
+                .iter()
+                .map(|(_, a)| a[1].as_str())
+                .collect::<Vec<_>>(),
+            vec!["before", "in-script"]
         );
     }
 

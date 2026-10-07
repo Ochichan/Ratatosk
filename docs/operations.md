@@ -522,6 +522,29 @@ an explicit data-read allowlist before dispatch, for both `redis.call` and
 `redis.pcall`. This boundary restricts Redis command effects; it is not a general
 host sandbox. AUTH and HELLO are forbidden inside all Lua callbacks.
 
+With `lua-scripting` and AOF enabled, EVAL and EVALSHA persist what the script did
+(Redis 7 effects replication), not the script text. Each successful nested write
+logs its canonical form (for example XADD with its generated ID, SPOP as SREM or
+DEL), in execution order, with the database it ran in, so a `SELECT` inside the
+script replays against the right database. The caller's selected database is restored when the script ends, on success and on every error path. The writes of one invocation form a
+single MULTI/EXEC transaction, and inside a client MULTI they join the EXEC
+transaction. A script that wrote nothing, or whose writes all failed, logs
+nothing, and writes made before a script error are still logged (even though the
+client gets an error reply) because they already changed the dataset. RESET is
+refused inside scripts like AUTH and HELLO. Scripts have no shebang flags, so all
+run in Redis compat mode. While the AOF is latched after a write error, EVAL and
+EVALSHA still start, and a nested write command inside the script fails with
+MISCONF (`redis.call` raises it, `redis.pcall` returns it), as Redis does in
+`scriptVerifyWriteCommandAllow`. Read-only scripts keep running under the latch,
+including from MULTI/EXEC. EVAL_RO and EVALSHA_RO never log. As in Redis, a
+refused EXEC (latch, OOM, NOAUTH, NOPERM, or extra arguments) discards the
+transaction, drops its watches and replies
+`EXECABORT Transaction discarded because of: <error>`. A write refused while
+queueing flags the transaction so EXEC replies with the "previous errors"
+EXECABORT. SCRIPT LOAD and the
+script cache are not persisted, so after a restart EVALSHA returns NOSCRIPT until
+the script is loaded again, as in Redis.
+
 All four EVAL variants retain conservative potentially-growing admission because
 script execution/caching can allocate. RO requests can therefore be rejected
 under OOM even when their dataset reads would be safe. Ordinary read commands
