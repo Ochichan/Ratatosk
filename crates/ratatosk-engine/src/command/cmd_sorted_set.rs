@@ -176,10 +176,8 @@ pub(super) fn cmd_zadd(
                     continue;
                 }
 
-                let _ = new_score; // suppress warning
-                if (new_score - old_score).abs() > f64::EPSILON
-                    || new_score.to_bits() != old_score.to_bits()
-                {
+                // Redis compares with `!=`, so -0 -> 0 is not a change.
+                if new_score != old_score {
                     zset.insert(member.clone(), new_score);
                     changed += 1;
                 }

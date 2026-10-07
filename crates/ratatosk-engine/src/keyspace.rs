@@ -105,6 +105,9 @@ pub struct StreamGroup {
 // SortedSet data types
 // ---------------------------------------------------------------------------
 
+/// A sorted-set score. Like Redis, `-0.0` and `0.0` compare equal and ties
+/// break by member; the stored value keeps its sign so `ZSCORE` still prints
+/// `-0`. NaN never enters a set, but `Ord` stays total for it via `total_cmp`.
 #[derive(Debug, Clone, Copy)]
 pub struct SortedSetScore(pub f64);
 
@@ -113,9 +116,10 @@ impl SortedSetScore {
         self.0
     }
 
-    /// Unsigned integer whose order matches `total_cmp` on the score.
+    /// Unsigned integer whose order matches the score order, with `-0.0` and
+    /// `0.0` mapped to the same key.
     fn order_key(self) -> u64 {
-        let bits = self.0.to_bits();
+        let bits = if self.0 == 0.0 { 0 } else { self.0.to_bits() };
         if bits >> 63 == 1 {
             !bits
         } else {
@@ -126,7 +130,7 @@ impl SortedSetScore {
 
 impl PartialEq for SortedSetScore {
     fn eq(&self, other: &Self) -> bool {
-        self.0.total_cmp(&other.0) == Ordering::Equal
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -140,7 +144,12 @@ impl PartialOrd for SortedSetScore {
 
 impl Ord for SortedSetScore {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
+        if self.0 == other.0 {
+            // Covers -0.0 == 0.0, which `total_cmp` would order apart.
+            Ordering::Equal
+        } else {
+            self.0.total_cmp(&other.0)
+        }
     }
 }
 
@@ -292,8 +301,9 @@ impl SortedSet {
     /// The ordered index is seeked to both ends, so this costs
     /// O(log n + matches) rather than a scan of the whole set; iterate with
     /// `.rev()` for descending order. The seek bounds are deliberately a
-    /// little wide (the index orders `-0.0` before `0.0`) and the exact range
-    /// test is applied to every candidate.
+    /// little wide (the upper seek bound is the next float above `max`, since
+    /// a probe with an empty member sorts before every real member) and the
+    /// exact range test is applied to every candidate.
     pub fn range_by_score(
         &self,
         min: ScoreBound,
@@ -309,7 +319,7 @@ impl SortedSet {
         let lower = if low == f64::NEG_INFINITY {
             Bound::Unbounded
         } else {
-            Bound::Included(probe(if low == 0.0 { -0.0 } else { low }))
+            Bound::Included(probe(low))
         };
         let high = max.value();
         let upper = if high == f64::INFINITY {
@@ -3552,6 +3562,80 @@ mod sorted_set_rank_tests {
             let got_rev: Vec<_> = zset.range_by_score(min, max).rev().collect();
             let want_rev: Vec<_> = want.iter().rev().copied().collect();
             assert_eq!(got_rev, want_rev);
+        }
+    }
+
+    fn zero_set() -> SortedSet {
+        let mut zset = SortedSet::default();
+        zset.insert(Bytes::from("n"), -0.0);
+        zset.insert(Bytes::from("p"), 0.0);
+        zset.insert(Bytes::from("x"), 1.0);
+        zset
+    }
+
+    fn members<'a>(entries: impl Iterator<Item = &'a SortedSetEntry>) -> Vec<String> {
+        entries
+            .map(|e| String::from_utf8_lossy(&e.member).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn negative_zero_equals_zero_and_ties_break_by_member() {
+        let mut zset = SortedSet::default();
+        zset.insert(Bytes::from("b"), -0.0);
+        zset.insert(Bytes::from("a"), 0.0);
+        assert_eq!(members(zset.by_score.iter()), ["a", "b"]);
+        assert_eq!(zset.rank(&Bytes::from("a")), Some(0));
+        assert_eq!(zset.rank(&Bytes::from("b")), Some(1));
+        assert_eq!(SortedSetScore(-0.0), SortedSetScore(0.0));
+
+        // Rescoring -0 to 0 changes nothing, and the stored sign survives.
+        assert!(!zset.insert(Bytes::from("b"), 0.0));
+        assert!(zset.score(b"b").unwrap().is_sign_negative());
+        zset.by_score.assert_invariants();
+
+        // Removing a member scored -0.0 works through either zero.
+        assert!(zset.remove(&Bytes::from("b")));
+        assert_eq!(members(zset.by_score.iter()), ["a"]);
+    }
+
+    #[test]
+    fn remove_range_by_score_includes_negative_zero() {
+        for (min, max, removed) in [
+            (0.0, 0.0, 2),
+            (-0.0, 0.0, 2),
+            (-0.0, -0.0, 2),
+            (0.0, 5.0, 3),
+            (-5.0, -0.0, 2),
+            (0.5, 5.0, 1),
+        ] {
+            let mut zset = zero_set();
+            assert_eq!(zset.remove_range_by_score(min, max), removed, "{min} {max}");
+            assert_eq!(zset.len(), 3 - removed);
+            zset.by_score.assert_invariants();
+        }
+    }
+
+    #[test]
+    fn range_by_score_treats_both_zeros_alike() {
+        let zset = zero_set();
+        let incl = |v: f64| ScoreBound::Inclusive(v);
+        let excl = |v: f64| ScoreBound::Exclusive(v);
+        for (min, max, want) in [
+            (incl(0.0), incl(0.0), vec!["n", "p"]),
+            (incl(-0.0), incl(-0.0), vec!["n", "p"]),
+            (incl(-0.0), incl(0.0), vec!["n", "p"]),
+            (excl(0.0), incl(1.0), vec!["x"]),
+            (excl(-0.0), incl(1.0), vec!["x"]),
+            (incl(f64::NEG_INFINITY), excl(0.0), vec![]),
+            (incl(f64::NEG_INFINITY), excl(-0.0), vec![]),
+            (incl(-1.0), incl(1.0), vec!["n", "p", "x"]),
+        ] {
+            assert_eq!(
+                members(zset.range_by_score(min, max)),
+                want,
+                "{min:?} {max:?}"
+            );
         }
     }
 
