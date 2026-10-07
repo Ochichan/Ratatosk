@@ -294,7 +294,15 @@ mod tests {
     fn replay_accepts_raw_stream_records_from_earlier_versions() {
         let padded_id = format!("{}2-0", "0".repeat(130));
         let mut commands: Vec<Vec<String>> = Vec::new();
-        for (key, count) in [("a", 6), ("b", 6), ("c", 6), ("d", 6), ("e", 6)] {
+        for (key, count) in [
+            ("a", 6),
+            ("b", 6),
+            ("c", 6),
+            ("d", 6),
+            ("e", 6),
+            ("f", 6),
+            ("g", 6),
+        ] {
             for ms in 1..=count {
                 commands.push(
                     ["XADD", key, &format!("{ms}-0"), "f", "v"]
@@ -308,6 +316,9 @@ mod tests {
             &["XTRIM", "b", "MAXLEN", "=", "3", "LIMIT", "2"],
             &["XTRIM", "c", "MINID", "4", "LIMIT", "0"],
             &["XTRIM", "d", "MAXLEN", "~", "3"],
+            // Earlier versions parsed these as unsigned numbers of any size.
+            &["XTRIM", "f", "MAXLEN", "0", "LIMIT", "18446744073709551615"],
+            &["XTRIM", "g", "MAXLEN", "18446744073709551615"],
         ] {
             commands.push(raw.iter().map(|part| (*part).to_owned()).collect());
         }
@@ -335,6 +346,9 @@ mod tests {
         assert_eq!(stream_ids(&state, "c"), ids(&[1, 2, 3, 4, 5, 6]));
         // `~` trimmed exactly, with no node rounding or default cap.
         assert_eq!(stream_ids(&state, "d"), ids(&[4, 5, 6]));
+        // A LIMIT past i64::MAX caps nothing, and a MAXLEN past it keeps all.
+        assert_eq!(stream_ids(&state, "f"), ids(&[]));
+        assert_eq!(stream_ids(&state, "g"), ids(&[1, 2, 3, 4, 5, 6]));
         // The long padded ID is 2-0.
         assert_eq!(stream_ids(&state, "e"), ids(&[1, 3, 4, 5, 6]));
     }

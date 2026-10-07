@@ -7272,37 +7272,50 @@ mod tests {
             ["5-0", "6-0", "7-0"]
         );
 
-        // `~` removes whole nodes of 100 entries, at most LIMIT. 301 entries
-        // with MAXLEN 2 have 299 in excess, which rounds down to 200, and
-        // LIMIT 150 stops it there.
+        // `~` removes whole nodes of 100 entries from the front, and stops
+        // before a node that would take it past LIMIT: 301 entries with
+        // MAXLEN 2 could lose three nodes, LIMIT 150 allows one.
         run(&["DEL", "s"], &mut server, &mut client);
         fill_stream("s", 300, &mut server, &mut client);
-        assert_eq!(
-            run(
-                &[
-                    "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "301-0", "f", "v"
-                ],
-                &mut server,
-                &mut client
-            ),
-            RespFrame::bulk_str("301-0")
-        );
-        assert_eq!(stream_len("s", &mut server, &mut client), 151);
-        // Without LIMIT the default cap (10000) does not bite here: 150 in
-        // excess rounds down to 100.
         run(
-            &["XADD", "s", "MAXLEN", "~", "2", "302-0", "f", "v"],
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "301-0", "f", "v",
+            ],
             &mut server,
             &mut client,
         );
-        assert_eq!(stream_len("s", &mut server, &mut client), 52);
-        // Under 100 in excess nothing is trimmed.
+        assert_eq!(stream_len("s", &mut server, &mut client), 201);
+        // A LIMIT smaller than a node removes nothing.
+        run(
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "5", "302-0", "f", "v",
+            ],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 202);
+        // Without LIMIT both leading nodes go, and the short last node stays
+        // since removing it would leave the stream under MAXLEN.
         run(
             &["XADD", "s", "MAXLEN", "~", "2", "303-0", "f", "v"],
             &mut server,
             &mut client,
         );
-        assert_eq!(stream_len("s", &mut server, &mut client), 53);
+        assert_eq!(stream_len("s", &mut server, &mut client), 3);
+        // A stream shorter than a node is one partial node: it goes whole
+        // when MAXLEN allows, otherwise it stays.
+        run(
+            &["XADD", "s", "MAXLEN", "~", "2", "304-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 4);
+        run(
+            &["XADD", "s", "MAXLEN", "~", "0", "305-0", "f", "v"],
+            &mut server,
+            &mut client,
+        );
+        assert_eq!(stream_len("s", &mut server, &mut client), 0);
 
         // LIMIT 0 means no cap.
         fill_stream("t", 600, &mut server, &mut client);
@@ -7331,14 +7344,14 @@ mod tests {
         let mut client = ClientState::default();
         fill_stream("s", 1000, &mut server, &mut client);
 
-        // 992 in excess rounds down to 900 and LIMIT stops at 150.
+        // Nodes of 100 go while the total stays within LIMIT: one of them.
         assert_eq!(
             run(
                 &["XTRIM", "s", "MAXLEN", "~", "8", "LIMIT", "150"],
                 &mut server,
                 &mut client
             ),
-            RespFrame::Integer(150)
+            RespFrame::Integer(100)
         );
         // The options may come in any order.
         assert_eq!(
@@ -7347,9 +7360,9 @@ mod tests {
                 &mut server,
                 &mut client
             ),
-            RespFrame::Integer(250)
+            RespFrame::Integer(200)
         );
-        assert_eq!(stream_len("s", &mut server, &mut client), 600);
+        assert_eq!(stream_len("s", &mut server, &mut client), 700);
         // Exact trims ignore the node size.
         assert_eq!(
             run(
@@ -7357,9 +7370,9 @@ mod tests {
                 &mut server,
                 &mut client
             ),
-            RespFrame::Integer(100)
+            RespFrame::Integer(200)
         );
-        // Under 100 in excess a `~` trim does nothing.
+        // A node that would take the stream under MAXLEN stays.
         assert_eq!(
             run(
                 &["XTRIM", "s", "MAXLEN", "~", "450"],
@@ -7368,7 +7381,7 @@ mod tests {
             ),
             RespFrame::Integer(0)
         );
-        // 299 entries are below 800, which rounds down to 200.
+        // Two nodes end below ID 800.
         assert_eq!(
             run(
                 &["XTRIM", "s", "minid", "~", "800"],
@@ -7420,10 +7433,12 @@ mod tests {
         client.take_durability_effects();
 
         // `~` becomes `=`, the threshold the resulting length, LIMIT goes,
-        // and `*` becomes the generated ID. 301 entries, 299 in excess,
-        // rounds down to 200 and LIMIT 5 stops it at 5.
+        // and `*` becomes the generated ID. 301 entries lose one node of 100
+        // within LIMIT 150.
         let RespFrame::BulkString(Some(id)) = run(
-            &["XADD", "s", "MAXLEN", "~", "2", "LIMIT", "5", "*", "f", "v"],
+            &[
+                "XADD", "s", "MAXLEN", "~", "2", "LIMIT", "150", "*", "f", "v",
+            ],
             &mut server,
             &mut client,
         ) else {
@@ -7432,7 +7447,7 @@ mod tests {
         let id = String::from_utf8_lossy(&id).into_owned();
         assert_eq!(
             logged_argv(&mut client),
-            argv(&["XADD", "s", "MAXLEN", "=", "296", &id, "f", "v"])
+            argv(&["XADD", "s", "MAXLEN", "=", "201", &id, "f", "v"])
         );
 
         // A LIMIT that stops the trim early is reflected in the length.
@@ -7527,19 +7542,19 @@ mod tests {
         );
         assert_eq!(
             logged_argv(&mut client),
-            argv(&["XTRIM", "w", "MAXLEN", "=", "250"])
+            argv(&["XTRIM", "w", "MAXLEN", "=", "300"])
         );
         run(
-            &["XTRIM", "w", "MINID", "~", "10000"],
+            &["XTRIM", "w", "MINID", "~", "250"],
             &mut server,
             &mut client,
         );
         assert_eq!(
             logged_argv(&mut client),
-            argv(&["XTRIM", "w", "MINID", "=", "351-0"])
+            argv(&["XTRIM", "w", "MINID", "=", "201-0"])
         );
         run(
-            &["XTRIM", "w", "MAXLEN", "~", "100"],
+            &["XTRIM", "w", "MAXLEN", "~", "250"],
             &mut server,
             &mut client,
         );
@@ -7604,7 +7619,7 @@ mod tests {
             &mut client,
         );
         record(
-            &["XTRIM", "s", "MAXLEN", "~", "2", "LIMIT", "50"],
+            &["XTRIM", "s", "MAXLEN", "~", "2", "LIMIT", "150"],
             &mut server,
             &mut client,
         );

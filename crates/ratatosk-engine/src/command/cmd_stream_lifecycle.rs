@@ -147,25 +147,56 @@ pub(super) fn purge_stream_pending_id(groups: &mut HashMap<Bytes, StreamGroup>, 
     }
 }
 
-/// Entries per radix node in Redis (`stream-node-max-entries` default). A
-/// `~` trim only removes whole nodes, so it leaves up to this many entries
-/// past the threshold and skips the work when less than that is in excess.
+/// Entries per radix node in Redis (`stream-node-max-entries` default).
 const APPROX_TRIM_NODE_ENTRIES: usize = 100;
 
 /// What a `~` trim without `LIMIT` may remove at most, Redis's default of 100
 /// nodes.
 const APPROX_TRIM_DEFAULT_LIMIT: usize = 100 * APPROX_TRIM_NODE_ENTRIES;
 
+/// How many entries a `~` trim removes, modelling Redis's `streamTrim` on
+/// nodes of [`APPROX_TRIM_NODE_ENTRIES`] entries counted from the front (the
+/// last node may be partial, and is the whole stream when it is short). Whole
+/// leading nodes go while removing one keeps the stream at or above MAXLEN, or
+/// for MINID while the node's last ID is below it, and the trim stops before a
+/// node that would take the total past `limit` (`None` is no cap).
+fn approx_trim_count(
+    entries: &[StreamEntry],
+    strategy: TrimStrategy,
+    limit: Option<usize>,
+) -> usize {
+    let length = entries.len();
+    let mut removed = 0usize;
+    while removed < length {
+        let node = APPROX_TRIM_NODE_ENTRIES.min(length - removed);
+        let eligible = match strategy {
+            TrimStrategy::MaxLen(max_len) => {
+                let max_len = usize::try_from(max_len).unwrap_or(usize::MAX);
+                if length - removed <= max_len {
+                    break;
+                }
+                length - removed - node >= max_len
+            }
+            TrimStrategy::MinId(min_id) => entries[removed + node - 1].id < min_id,
+        };
+        if limit.is_some_and(|cap| removed + node > cap) || !eligible {
+            break;
+        }
+        removed += node;
+    }
+    removed
+}
+
 /// Trims the stream at `entry` as `options` ask and returns how many entries
 /// went.
 ///
-/// A `~` trim follows Redis's granularity: it removes whole multiples of
-/// [`APPROX_TRIM_NODE_ENTRIES`] and stops at `LIMIT` (default
-/// [`APPROX_TRIM_DEFAULT_LIMIT`]; `LIMIT 0` is no cap). The logged form of
-/// the command is the exact result, so replay stays deterministic. Under AOF
-/// replay `~` is exact and `LIMIT` is the plain cap older versions applied.
-/// Like Redis, trimming leaves `max_deleted_id` alone. Group pending lists
-/// drop the removed IDs.
+/// An exact trim removes everything past the threshold, up to `LIMIT` when
+/// one is given (`LIMIT 0` is no cap). A `~` trim removes whole nodes as
+/// [`approx_trim_count`] describes, with `LIMIT` defaulting to
+/// [`APPROX_TRIM_DEFAULT_LIMIT`]. The logged form of the command is the
+/// exact result, so replay stays deterministic. Under AOF replay `~` is exact
+/// and `LIMIT` is the plain cap older versions applied. Like Redis, trimming
+/// leaves `max_deleted_id` alone. Group pending lists drop the removed IDs.
 pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usize {
     let Some(strategy) = options.strategy else {
         return 0;
@@ -175,12 +206,6 @@ pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usiz
     };
     let replay = super::cmd_stream::replay_mode();
 
-    let mut remove_count = match strategy {
-        TrimStrategy::MaxLen(max_len) => stream
-            .len()
-            .saturating_sub(usize::try_from(max_len).unwrap_or(usize::MAX)),
-        TrimStrategy::MinId(min_id) => stream.partition_point(|item| item.id < min_id),
-    };
     let cap = if replay {
         options.limit
     } else {
@@ -191,12 +216,21 @@ pub(super) fn apply_trim(entry: &mut StoredValue, options: &AddTrimArgs) -> usiz
             None => None,
         }
     };
-    if options.approx && !replay {
-        remove_count -= remove_count % APPROX_TRIM_NODE_ENTRIES;
-    }
-    if let Some(cap) = cap {
-        remove_count = remove_count.min(cap);
-    }
+    let mut remove_count = if options.approx && !replay {
+        approx_trim_count(stream, strategy, cap)
+    } else {
+        let mut count = match strategy {
+            TrimStrategy::MaxLen(max_len) => stream
+                .len()
+                .saturating_sub(usize::try_from(max_len).unwrap_or(usize::MAX)),
+            TrimStrategy::MinId(min_id) => stream.partition_point(|item| item.id < min_id),
+        };
+        if let Some(cap) = cap {
+            count = count.min(cap);
+        }
+        count
+    };
+    remove_count = remove_count.min(stream.len());
     if remove_count == 0 {
         return 0;
     }

@@ -340,6 +340,19 @@ pub(super) struct AddTrimArgs {
     pub id: Option<(usize, IdSpec)>,
 }
 
+/// Under AOF replay, a MAXLEN or LIMIT of digits only, however large. Earlier
+/// versions parsed these as unsigned numbers and logged them as sent, so a
+/// value past `i64::MAX` is on disk and saturates here.
+fn replayed_count(raw: &Bytes) -> Option<u64> {
+    if !replay_mode() || raw.is_empty() || !raw.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(raw.iter().fold(0u64, |acc, digit| {
+        acc.saturating_mul(10)
+            .saturating_add(u64::from(digit - b'0'))
+    }))
+}
+
 fn syntax_error_reply(message: &str) -> RespFrame {
     err(&format!("ERR {message}"))
 }
@@ -380,11 +393,16 @@ pub(super) fn parse_add_or_trim_args(args: &[Bytes], xadd: bool) -> Result<AddTr
             } else if more >= 2 && next == b"=" {
                 i += 1;
             }
-            let Some(maxlen) = parse_i64(&args[i + 1]) else {
-                return Err(not_an_integer());
-            };
-            let Ok(maxlen) = u64::try_from(maxlen) else {
-                return Err(err("ERR The MAXLEN argument must be >= 0."));
+            let maxlen = if let Some(count) = replayed_count(&args[i + 1]) {
+                count
+            } else {
+                let Some(maxlen) = parse_i64(&args[i + 1]) else {
+                    return Err(not_an_integer());
+                };
+                let Ok(maxlen) = u64::try_from(maxlen) else {
+                    return Err(err("ERR The MAXLEN argument must be >= 0."));
+                };
+                maxlen
             };
             i += 1;
             parsed.strategy = Some(TrimStrategy::MaxLen(maxlen));
@@ -410,11 +428,16 @@ pub(super) fn parse_add_or_trim_args(args: &[Bytes], xadd: bool) -> Result<AddTr
             parsed.strategy = Some(TrimStrategy::MinId(min_id));
             parsed.strategy_arg_idx = i;
         } else if opt.eq_ignore_ascii_case(b"LIMIT") && more > 0 {
-            let Some(limit) = parse_i64(&args[i + 1]) else {
-                return Err(not_an_integer());
-            };
-            let Ok(limit) = usize::try_from(limit) else {
-                return Err(err("ERR The LIMIT argument must be >= 0."));
+            let limit = if let Some(count) = replayed_count(&args[i + 1]) {
+                usize::try_from(count).unwrap_or(usize::MAX)
+            } else {
+                let Some(limit) = parse_i64(&args[i + 1]) else {
+                    return Err(not_an_integer());
+                };
+                let Ok(limit) = usize::try_from(limit) else {
+                    return Err(err("ERR The LIMIT argument must be >= 0."));
+                };
+                limit
             };
             parsed.limit = Some(limit);
             parsed.limit_positions.push(i);

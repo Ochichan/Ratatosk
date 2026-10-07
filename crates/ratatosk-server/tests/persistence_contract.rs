@@ -289,7 +289,7 @@ fn aof_replays_trimmed_xadd_and_xtrim_to_identical_entries() -> io::Result<()> {
     client.command(&[
         "XADD", "events", "MAXLEN", "~", "3", "LIMIT", "100", "*", "g", "w",
     ])?;
-    client.command(&["XTRIM", "events", "MAXLEN", "~", "4", "LIMIT", "50"])?;
+    client.command(&["XTRIM", "events", "MAXLEN", "~", "4", "LIMIT", "150"])?;
     // NOMKSTREAM on a missing key creates and logs nothing.
     assert_eq!(
         client.command(&["XADD", "absent", "NOMKSTREAM", "*", "f", "v"])?,
@@ -299,7 +299,7 @@ fn aof_replays_trimmed_xadd_and_xtrim_to_identical_entries() -> io::Result<()> {
     let RespFrame::Array(rows) = &before else {
         panic!("XRANGE should return an array");
     };
-    assert_eq!(rows.len(), 151);
+    assert_eq!(rows.len(), 101);
     drop(client);
     server.stop(false)?;
     server.start()?;
