@@ -111,8 +111,15 @@ the contract — it is exercised by `scripts/recovery_matrix.sh` (Phase 4).
 |---|---|---|---|
 | `appendonly no` (RDB only) | everything since the last `SAVE`/`BGSAVE` | everything since the last completed snapshot | explicitly complete and verify a snapshot before shutdown |
 | `appendonly yes`, `appendfsync always` | **0** — every acknowledged write is fsynced | 0 | strongest; highest per-write cost |
-| `appendonly yes`, `appendfsync everysec` | approximately 1 second of acknowledged writes | 0 | default-recommended balance |
+| `appendonly yes`, `appendfsync everysec` | writes acknowledged while a background fsync was running (the fsync's duration, normally milliseconds, never more than 64 MiB of records) | 0 | default-recommended balance; see the everysec notes below |
 | `appendonly yes`, `appendfsync no` | up to the OS page-cache flush interval | 0 | OS decides; weakest AOF durability |
+
+`appendfsync everysec` runs the fsync on a background thread so a slow disk does not stall writers or hold the keyspace lock. While that fsync runs, new records are acknowledged and kept in an in-memory buffer instead of being written to the file, because on macOS `F_FULLFSYNC` blocks concurrent `write` calls on the same file. When the fsync finishes (the server checks every 10 ms), the buffer is written to the file in order. The loss bounds are:
+
+- **Process crash (`kill -9`)**: records still in that buffer, meaning the writes acknowledged during one fsync. Records written before the fsync started are already in the OS page cache and survive.
+- **Power loss or OS crash**: writes not yet covered by a completed fsync, at most about 1 second between fsyncs plus the duration of the fsync in flight.
+- **Stuck disk**: the buffer holds at most 64 MiB. When it reaches that size, the next write waits for the fsync to finish and the buffer to be written, so memory use stays bounded and the loss window stays bounded by 64 MiB of records.
+- An fsync failure is reported on the next write or timer tick and latches AOF writes, as before. `CONFIG SET appendfsync`, `BGREWRITEAOF`, and shutdown wait for the running fsync and write the buffer first, so record order never changes.
 
 Recovery invariants (asserted by `scripts/recovery_matrix.sh`):
 

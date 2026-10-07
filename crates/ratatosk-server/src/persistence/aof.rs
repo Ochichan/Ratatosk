@@ -22,6 +22,8 @@ use super::PersistenceRuntime;
 use super::util::env_truthy;
 
 const DEFAULT_AOF_QUEUE_CAPACITY: usize = 4096;
+/// How often the worker checks a background fsync for completion while idle.
+const AOF_FSYNC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const AOF_APPEND_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 const AOF_APPEND_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 const AOF_FLUSH_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -49,6 +51,12 @@ pub(crate) enum AofWorkerCommand {
     },
     SetPolicy {
         policy: FsyncPolicy,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Periodic `appendfsync everysec` housekeeping. Collects a finished
+    /// background fsync and starts the next one when due. Does not wait for
+    /// the disk and is a no-op under other policies.
+    EverySecTick {
         reply: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
@@ -94,7 +102,21 @@ pub(crate) fn spawn_aof_worker(
         let mut manifest_path = manifest_path;
         let mut policy = policy;
         let exit = loop {
-            let Some(command) = rx.recv().await else {
+            // While an everysec fsync runs, wake briefly so records postponed
+            // behind it are written soon after it finishes even if no client
+            // appends again.
+            let received = if writer.fsync_in_flight() {
+                match tokio::time::timeout(AOF_FSYNC_POLL_INTERVAL, rx.recv()).await {
+                    Ok(received) => received,
+                    Err(_) => {
+                        writer.poll_background();
+                        continue;
+                    }
+                }
+            } else {
+                rx.recv().await
+            };
+            let Some(command) = received else {
                 break Exit::ChannelClosed;
             };
             crate::metrics::set_aof_queue_depth(rx.len());
@@ -145,9 +167,19 @@ pub(crate) fn spawn_aof_worker(
                     policy: next_policy,
                     reply,
                 } => {
-                    writer.set_policy(next_policy);
-                    policy = next_policy;
-                    let _ = reply.send(Ok(()));
+                    let result = writer
+                        .set_policy(next_policy)
+                        .map_err(|error| format!("draining AOF before policy change: {error}"));
+                    if result.is_ok() {
+                        policy = next_policy;
+                    }
+                    let _ = reply.send(result);
+                }
+                AofWorkerCommand::EverySecTick { reply } => {
+                    let result = writer
+                        .everysec_tick()
+                        .map_err(|error| format!("periodic AOF fsync: {error}"));
+                    let _ = reply.send(result);
                 }
                 AofWorkerCommand::Shutdown { reply } => {
                     let result = writer
@@ -473,6 +505,60 @@ pub async fn flush_aof(runtime: &PersistenceRuntime) -> io::Result<()> {
             crate::metrics::record_aof_write("always");
             Ok(())
         }
+        Ok(Ok(Err(error))) => {
+            crate::metrics::record_aof_write_error();
+            Err(io::Error::other(error))
+        }
+    }
+}
+
+/// Drive the `everysec` background fsync from the server timer.
+///
+/// The worker answers immediately: it never waits for the disk here, so this
+/// is safe to call without holding the server `meta` lock. It is a no-op when
+/// the worker's policy is not `everysec`.
+pub async fn tick_aof_everysec(runtime: &PersistenceRuntime) -> io::Result<()> {
+    let Some((sender, generation)) = runtime.aof_sender_with_generation() else {
+        return Ok(());
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match tokio::time::timeout(
+        AOF_APPEND_QUEUE_TIMEOUT,
+        sender.send(AofWorkerCommand::EverySecTick { reply: reply_tx }),
+    )
+    .await
+    {
+        Err(_) => {
+            crate::metrics::record_aof_worker_enqueue_timeout("everysec_tick");
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out enqueueing AOF everysec tick",
+            ));
+        }
+        Ok(Err(_)) => {
+            clear_aof_sender_if_current(runtime, generation);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AOF worker channel closed while enqueueing everysec tick",
+            ));
+        }
+        Ok(Ok(())) => {}
+    }
+
+    match tokio::time::timeout(AOF_FLUSH_REPLY_TIMEOUT, reply_rx).await {
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "timed out waiting for AOF everysec tick",
+        )),
+        Ok(Err(_)) => {
+            clear_aof_sender_if_current(runtime, generation);
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "AOF worker dropped everysec tick completion channel",
+            ))
+        }
+        Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(error))) => {
             crate::metrics::record_aof_write_error();
             Err(io::Error::other(error))
@@ -1884,6 +1970,102 @@ mod tests {
                 .all(|line| !line.contains(" WARN ")),
             "graceful worker shutdown emitted a warning:\n{output}"
         );
+    }
+
+    async fn worker_append(sender: &mpsc::Sender<AofWorkerCommand>, key: &str) {
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Append {
+                db_index: 0,
+                argv: vec![
+                    Bytes::from("SET"),
+                    Bytes::from(key.to_string()),
+                    Bytes::from("v"),
+                ],
+                timestamp_ms: 1,
+                reply,
+            })
+            .await
+            .expect("enqueue append");
+        reply_rx
+            .await
+            .expect("append reply")
+            .expect("append acknowledged");
+    }
+
+    fn aof_has_keys_in_order(path: &Path, keys: &[&str]) -> bool {
+        let text = String::from_utf8_lossy(&std::fs::read(path).expect("read aof")).into_owned();
+        let mut from = 0;
+        for key in keys {
+            let needle = format!("${}\r\n{key}\r\n", key.len());
+            match text[from..].find(&needle) {
+                Some(at) => from += at + needle.len(),
+                None => return false,
+            }
+        }
+        true
+    }
+
+    #[tokio::test]
+    async fn everysec_worker_keeps_order_across_background_fsync_and_drains_on_controls() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("everysec-worker.aof");
+        let writer = AofWriter::open(&path, FsyncPolicy::EverySec).expect("open AOF writer");
+        let sender = spawn_aof_worker(path.clone(), None, writer, FsyncPolicy::EverySec, 64);
+
+        worker_append(&sender, "k1").await;
+        // Make an fsync due so the next append starts the background fsync.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        worker_append(&sender, "k2").await;
+        worker_append(&sender, "k3").await;
+
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Flush { reply })
+            .await
+            .expect("enqueue flush");
+        reply_rx.await.expect("flush reply").expect("flush");
+        assert!(aof_has_keys_in_order(&path, &["k1", "k2", "k3"]));
+
+        // A tick with nothing due is accepted and changes nothing.
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::EverySecTick { reply })
+            .await
+            .expect("enqueue tick");
+        reply_rx.await.expect("tick reply").expect("tick");
+
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        worker_append(&sender, "k4").await;
+        worker_append(&sender, "k5").await;
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::SetPolicy {
+                policy: FsyncPolicy::No,
+                reply,
+            })
+            .await
+            .expect("enqueue set policy");
+        reply_rx
+            .await
+            .expect("set policy reply")
+            .expect("set policy");
+        assert!(aof_has_keys_in_order(
+            &path,
+            &["k1", "k2", "k3", "k4", "k5"]
+        ));
+
+        worker_append(&sender, "k6").await;
+        let (reply, reply_rx) = oneshot::channel();
+        sender
+            .send(AofWorkerCommand::Shutdown { reply })
+            .await
+            .expect("enqueue shutdown");
+        reply_rx.await.expect("shutdown reply").expect("shutdown");
+        assert!(aof_has_keys_in_order(
+            &path,
+            &["k1", "k2", "k3", "k4", "k5", "k6"]
+        ));
     }
 
     #[tokio::test(flavor = "current_thread")]

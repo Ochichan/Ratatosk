@@ -872,10 +872,14 @@ writer.append_command(0, &[
 | Policy | 동작 | 특성 |
 |--------|------|------|
 | `Always` | 매 write 후 `flush + sync_all` | 가장 강한 durability, 가장 느림 |
-| `EverySec` | 쓰기 경로와 독립 1초 timer에서 fsync | 유휴 상태의 마지막 쓰기도 동기화 |
+| `EverySec` | fsync 시점이 되면 지금까지의 버퍼를 fd에 쓰고, 복제한 fd의 fsync를 별도 스레드에서 시작. 1초 timer가 유휴 상태의 마지막 쓰기도 동기화 | writer는 fsync를 기다리지 않음 |
 | `No` | `flush`만 (OS에 맡김) | 가장 빠름, 데이터 손실 가능 |
 
 `CONFIG SET appendfsync always|everysec|no`로 런타임 변경 가능.
+
+`EverySec`의 background fsync 동안 새 record는 응답한 뒤 메모리 pending buffer에만 쌓고 fd에는 쓰지 않는다(macOS의 `F_FULLFSYNC`가 같은 파일의 `write`를 막기 때문). fsync가 끝나면(worker가 10ms마다 확인) pending buffer를 순서대로 fd에 쓰고 `last_fsync`를 갱신한다. fsync 실패는 다음 append 또는 timer tick에서 보고되어 기존처럼 AOF 쓰기를 latch한다. pending buffer는 64 MiB로 제한되며, 한도에 도달하면 다음 append가 fsync 완료를 기다린다(backpressure). `Flush`, `Shutdown`, `Rewrite`, `SetPolicy`는 진행 중인 fsync를 기다리고 pending buffer를 비운 뒤 자기 작업을 수행하므로 파일 안의 record 순서와 SELECT 추적은 논리적 append 순서를 따른다. 1초 timer는 `meta` lock을 잡지 않고 worker에 tick만 보내며, tick은 디스크를 기다리지 않는다.
+
+손실 한도: 프로세스 crash는 한 번의 fsync 동안 응답한 write(보통 수 ms 분량, 최대 64 MiB), 전원 장애/OS crash는 마지막 완료된 fsync 이후의 write(fsync 간격 약 1초 + 진행 중인 fsync 시간).
 
 ### AofManifest
 
