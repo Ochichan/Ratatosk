@@ -72,7 +72,7 @@ tempfile = "3"
 fs2 = "0.4"
 
 # Random
-rand = "0.8"
+rand = "0.10"
 sha2 = "0.10"
 
 # Password hashing
