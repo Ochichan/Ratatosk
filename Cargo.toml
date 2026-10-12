@@ -32,7 +32,7 @@ bytes = "1"
 
 # Allocator experiments
 mimalloc = "0.1"
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 
 # Error handling
 thiserror = "2"
